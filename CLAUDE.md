@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-OxideBSD is a 100% Rust-based BSD-like operating system. It is early-stage: a bootable, testable
-`no_std` kernel skeleton exists (boots to a serial "kernel booting" message and halts), but no
-kernel subsystems (memory management, scheduling, drivers, filesystem, syscalls, etc.) have been
-built yet. Architecture decisions for those subsystems have not been made and should be discussed
-with the user before large structural commitments are made.
+OxideBSD is a 100% Rust-based BSD-like operating system. It is early-stage, working through
+`ROADMAP.md`'s phase 1 (a running, interactive kernel with a shell). So far: GDT/TSS/IDT with a
+dedicated double-fault stack, fatal exceptions reboot the machine, PIC-driven hardware interrupts
+with a timer tick, a VGA text-mode console mirroring serial output, and a heap allocator backed by
+bootloader-provided paging. Scheduling, drivers beyond keyboard/timer/serial/VGA, a filesystem, and
+syscalls do not exist yet. Architecture decisions for those subsystems have not been made and
+should be discussed with the user before large structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -78,13 +80,56 @@ them wrong fails obscurely:
   second, ABI-incompatible build of `core` and failing with "duplicate lang item" errors when
   linked against the `panic=abort` build used everywhere else.
 
+## Memory management (`src/memory.rs`, `src/allocator.rs`)
+
+The kernel doesn't build its own page tables from scratch — it reuses the ones the bootloader
+already set up, which the `map_physical_memory` bootloader feature exposes as a full mapping of
+physical memory at `BootInfo::physical_memory_offset`:
+- `memory::init` walks `CR3` to find the level 4 table's physical address, then adds
+  `physical_memory_offset` to get a virtual pointer to it — this is *not* a general-purpose
+  physical-to-virtual scheme, it only works because the bootloader identity-mapped-with-offset all
+  of physical RAM. `memory::init` must be called at most once (it hands out a `&'static mut`
+  reference to that table); calling it twice would alias mutable references to the same memory.
+- `memory::BootInfoFrameAllocator` allocates physical frames by walking
+  `BootInfo::memory_map`'s `Usable` regions in order and never reusing one — there's no
+  deallocation path yet, so freed frames currently just leak. Fine for a single heap-mapping call
+  at boot; will need revisiting once anything frees frames at runtime.
+- The heap lives at a fixed virtual range (`allocator::HEAP_START`/`HEAP_SIZE`, currently 100 KiB
+  at `0x_4444_4444_0000`) chosen to be far from anything else mapped; `allocator::init_heap` maps
+  that range page-by-page before handing it to the global allocator.
+- The `#[global_allocator]` is `linked_list_allocator`'s `Heap` wrapped in a project-local
+  `Locked<T>` (a thin `spin::Mutex` newtype), not the crate's own `LockedHeap` — see Dependency
+  notes below for why.
+- `oxidebsd::init` now takes `&'static BootInfo` (previously took nothing) because heap setup
+  needs `physical_memory_offset` and `memory_map` from it. All three entry points
+  (`src/main.rs`, `src/lib.rs`'s `#[cfg(test)]` entry, `tests/basic_boot.rs`) pass their
+  `BootInfo` straight through.
+
 ## Dependency notes
 
-- `x86_64` crate is pinned with `default-features = false, features = ["instructions"]`. The
-  default feature set pulls in `step_trait`, which implements the unstable `core::iter::Step`
-  trait — that trait's shape is a moving target on nightly and the crate has broken against newer
-  nightlies before. Only `instructions` (port I/O, `hlt`, etc.) is actually used.
+- `x86_64` crate is pinned with `default-features = false, features = ["instructions",
+  "abi_x86_interrupt"]`. The default feature set pulls in `step_trait`, which implements the
+  unstable `core::iter::Step` trait — that trait's shape is a moving target on nightly and the
+  crate has broken against newer nightlies before. `instructions` (port I/O, `hlt`, GDT/IDT/TSS
+  loads, etc.) and `abi_x86_interrupt` (needed for `idt::Entry::set_handler_fn` and the
+  `extern "x86-interrupt"` handler types used in `src/interrupts.rs`) are both needed explicitly —
+  without `abi_x86_interrupt` those handler function types compile as opaque, non-constructable
+  structs instead of real function pointers, since it's normally bundled into the (disabled)
+  `nightly` feature. The `#![feature(abi_x86_interrupt)]` crate attribute in `src/lib.rs` is the
+  separate, unstable-Rust half of the same requirement — the crate feature and the language
+  feature are two different gates for the same thing.
 - The `bootloader` crate is pinned to `0.9`, not the current `0.11+`. The newer API drops the
   `bootimage` tool in favor of cargo artifact-dependencies to embed the kernel into a separate
   builder crate, which is a bigger structural change; `0.9` was chosen to keep the setup in one
   crate for now. Revisit if artifact-dependencies become worth the migration.
+- `bootloader` has the `map_physical_memory` feature enabled — without it, `BootInfo` has no
+  `physical_memory_offset` field at all (it's `#[cfg]`'d out crate-side), and `src/memory.rs`
+  can't get from a physical frame (e.g. the one `CR3` points at) to a virtual address it can
+  dereference.
+- `linked_list_allocator` is pinned with `default-features = false`, skipping its default
+  `use_spin`/`spinning_top` features. Those features provide a ready-made `LockedHeap` type, but
+  it's built on the `spinning_top` crate — a second, separate spinlock implementation alongside
+  the `spin` crate already used everywhere else in this codebase (`serial.rs`, `vga.rs`,
+  `interrupts.rs`'s `PICS`). `src/allocator.rs` instead wraps the crate's plain `Heap` type in a
+  local `Locked<T>` built on `spin::Mutex`, so there's one spinlock crate in the dependency graph,
+  not two.

@@ -1,17 +1,41 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
+#![feature(abi_x86_interrupt)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
+pub mod allocator;
+pub mod gdt;
+pub mod interrupts;
+pub mod memory;
 pub mod qemu;
+pub mod reboot;
 pub mod serial;
+pub mod vga;
 
 use core::panic::PanicInfo;
 
+use bootloader::BootInfo;
 #[cfg(test)]
-use bootloader::{entry_point, BootInfo};
-use qemu::{exit_qemu, QemuExitCode};
+use bootloader::entry_point;
+use qemu::{QemuExitCode, exit_qemu};
+
+pub fn init(boot_info: &'static BootInfo) {
+    gdt::init();
+    interrupts::init_idt();
+    interrupts::init_pics();
+    x86_64::instructions::interrupts::enable();
+
+    let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator =
+        unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
+
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+}
 
 pub trait Testable {
     fn run(&self);
@@ -40,9 +64,16 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
     hlt_loop();
 }
 
+/// Spins forever and never returns.
+///
+/// This deliberately does not use `hlt`: `hlt` only resumes on the next interrupt, so if it's
+/// ever reached with interrupts disabled (e.g. a panic during a `without_interrupts` critical
+/// section) the CPU parks on that single instruction forever — indistinguishable from a genuine
+/// halt/crash from outside the VM. A plain spin loop keeps the CPU visibly executing regardless
+/// of interrupt state, at the cost of burning a full core doing nothing.
 pub fn hlt_loop() -> ! {
     loop {
-        x86_64::instructions::hlt();
+        core::hint::spin_loop();
     }
 }
 
@@ -50,9 +81,39 @@ pub fn hlt_loop() -> ! {
 entry_point!(test_kernel_main);
 
 #[cfg(test)]
-fn test_kernel_main(_boot_info: &'static BootInfo) -> ! {
+fn test_kernel_main(boot_info: &'static BootInfo) -> ! {
+    init(boot_info);
     test_main();
     hlt_loop();
+}
+
+#[test_case]
+fn test_breakpoint_exception() {
+    x86_64::instructions::interrupts::int3();
+}
+
+#[test_case]
+fn test_timer_interrupt_fires() {
+    let ticks_before = interrupts::ticks();
+    while interrupts::ticks() == ticks_before {
+        x86_64::instructions::hlt();
+    }
+    assert!(interrupts::ticks() > ticks_before);
+}
+
+#[test_case]
+fn test_heap_allocation() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    let heap_value = Box::new(41);
+    assert_eq!(*heap_value, 41);
+
+    let mut vec = Vec::new();
+    for i in 0..500 {
+        vec.push(i);
+    }
+    assert_eq!(vec.iter().sum::<u64>(), (0..500).sum());
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ pub fn _print(args: fmt::Arguments) {
             .write_fmt(args)
             .expect("printing to serial port failed");
     });
+    crate::vga::_print(args);
 }
 
 #[macro_export]

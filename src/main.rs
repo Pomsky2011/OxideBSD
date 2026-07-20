@@ -6,12 +6,14 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{entry_point, BootInfo};
+use bootloader::{BootInfo, entry_point};
 use oxidebsd::serial_println;
 
 entry_point!(kernel_main);
 
-fn kernel_main(_boot_info: &'static BootInfo) -> ! {
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
+    oxidebsd::init(boot_info);
+
     #[cfg(test)]
     test_main();
 
