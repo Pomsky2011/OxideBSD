@@ -7,13 +7,17 @@
 
 extern crate alloc;
 
+pub mod address_space;
 pub mod allocator;
+pub mod elf;
 pub mod gdt;
 pub mod interrupts;
 pub mod memory;
+pub mod pic;
 pub mod qemu;
 pub mod reboot;
 pub mod serial;
+pub mod usermode;
 pub mod vga;
 
 use core::panic::PanicInfo;
@@ -23,7 +27,18 @@ use bootloader::BootInfo;
 use bootloader::entry_point;
 use qemu::{QemuExitCode, exit_qemu};
 
-pub fn init(boot_info: &'static BootInfo) {
+/// Brings up the kernel: GDT/TSS, IDT, PIC + hardware interrupts, paging, and the heap.
+///
+/// Returns the kernel's own page-table mapper and physical frame allocator so callers can keep
+/// using the *same* frame allocator afterward (e.g. to build further address spaces) — a second,
+/// separately-`init`'d `BootInfoFrameAllocator` would restart handing out frames from the start of
+/// the usable memory map, re-allocating ones the heap has already claimed.
+pub fn init(
+    boot_info: &'static BootInfo,
+) -> (
+    x86_64::structures::paging::OffsetPageTable<'static>,
+    memory::BootInfoFrameAllocator,
+) {
     serial_println!("[boot] kernel initialization starting");
 
     gdt::init();
@@ -41,6 +56,8 @@ pub fn init(boot_info: &'static BootInfo) {
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
 
     serial_println!("[boot] kernel initialization complete");
+
+    (mapper, frame_allocator)
 }
 
 pub trait Testable {

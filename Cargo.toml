@@ -1,3 +1,6 @@
+[workspace]
+members = ["userland/ring3-smoke"]
+
 [package]
 name = "oxidebsd"
 version = "0.1.0"
@@ -8,9 +11,7 @@ license = "BSD-3-Clause"
 bootloader = { version = "0.9", features = ["map_physical_memory"] }
 linked_list_allocator = { version = "0.10", default-features = false }
 pc-keyboard = "0.9"
-pic8259 = "0.11"
 spin = "0.9"
-uart_16550 = "0.3"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 [[test]]

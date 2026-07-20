@@ -28,9 +28,23 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
 /// Same requirements as `init`.
 unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
     let (level_4_table_frame, _flags) = Cr3::read();
+    unsafe { frame_to_page_table(level_4_table_frame, physical_memory_offset) }
+}
 
-    let phys = level_4_table_frame.start_address();
-    let virt = physical_memory_offset + phys.as_u64();
+/// Views an arbitrary physical frame as a page table, through the physical-memory-offset window.
+/// Used both for the currently-active level 4 table (`active_level_4_table`) and, by
+/// `src/address_space.rs`, for a not-yet-active one.
+///
+/// # Safety
+///
+/// `physical_memory_offset` must be where the bootloader mapped all of physical memory (same
+/// requirement as `init`), `frame` must actually contain a valid, live page table, and the
+/// caller must ensure no other `&mut` view of the same frame exists concurrently.
+pub unsafe fn frame_to_page_table(
+    frame: PhysFrame,
+    physical_memory_offset: VirtAddr,
+) -> &'static mut PageTable {
+    let virt = physical_memory_offset + frame.start_address().as_u64();
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
 
     unsafe { &mut *page_table_ptr }

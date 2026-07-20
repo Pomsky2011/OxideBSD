@@ -2,20 +2,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
-use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
+use crate::pic::{self, PIC_1_OFFSET, PIC_2_OFFSET};
 use crate::reboot::reboot;
 use crate::{serial_print, serial_println};
-
-/// The 8259 PIC pair defaults to mapping IRQ0-15 onto interrupt vectors 0x8-0xF, which collides
-/// with CPU exception vectors (0x0-0x1F) — so both PICs are remapped to start right after them.
-const PIC_1_OFFSET: u8 = 32;
-const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -29,10 +24,6 @@ impl InterruptIndex {
         self as u8
     }
 }
-
-static PICS: Mutex<ChainedPics> =
-    // SAFETY: PIC_1_OFFSET/PIC_2_OFFSET place both PICs' vectors outside the CPU exception range.
-    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -50,7 +41,13 @@ static KEYBOARD: Mutex<PS2Keyboard<Us104Key, ScancodeSet1>> = Mutex::new(PS2Keyb
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
-    idt.breakpoint.set_handler_fn(breakpoint_handler);
+    // DPL 3 so ring-3 code can hit this via `int3` directly: interrupt gates default to DPL 0,
+    // and a *software*-invoked interrupt (unlike a hardware exception) additionally requires
+    // CPL <= gate DPL, so leaving this at the default causes int3-from-ring-3 to fault with a
+    // #GP on the gate itself instead of ever reaching this handler.
+    idt.breakpoint
+        .set_handler_fn(breakpoint_handler)
+        .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
@@ -86,7 +83,7 @@ pub fn init_pics() {
         PIC_2_OFFSET
     );
     unsafe {
-        PICS.lock().initialize();
+        pic::init();
     }
     serial_println!("[boot] PICs initialized and unmasked");
 }
@@ -137,8 +134,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     TICKS.fetch_add(1, Ordering::Relaxed);
 
     unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+        pic::notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
 }
 
@@ -163,7 +159,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+        pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }

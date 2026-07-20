@@ -4,14 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-OxideBSD is a 100% Rust-based BSD-like operating system. It is early-stage, working through
-`ROADMAP.md`'s phase 1 (a running, interactive kernel with a shell). So far: GDT/TSS/IDT with a
-dedicated double-fault stack, fatal exceptions reboot the machine, PIC-driven hardware interrupts
-with a timer tick and a PS/2 keyboard IRQ handler (decodes scancodes and echoes typed characters —
-no line editing or shell yet), a VGA text-mode console mirroring serial output, and a heap allocator
-backed by bootloader-provided paging. Scheduling, drivers beyond keyboard/timer/serial/VGA, a
-filesystem, and syscalls do not exist yet. Architecture decisions for those subsystems have not been
-made and should be discussed with the user before large structural commitments are made.
+OxideBSD is a 100% Rust-based BSD-like operating system. Phase 1 of `ROADMAP.md` (a running,
+interactive kernel) is essentially done: GDT/TSS/IDT with a dedicated double-fault stack, fatal
+exceptions reboot the machine, PIC-driven hardware interrupts with a timer tick and a PS/2 keyboard
+IRQ handler (decodes scancodes and echoes typed characters — no line editing or shell yet), a VGA
+text-mode console mirroring serial output, and a heap allocator backed by bootloader-provided
+paging. Phase 2 has started: the kernel can build a *separate* address space (`src/address_space.rs`),
+load a static ELF64 binary into it (`src/elf.rs`), and jump into ring 3 (`src/usermode.rs`) — see
+the "User-mode execution" section below for the current, deliberate limits of that (no syscalls, no
+return path, one demo binary). Scheduling, a real process abstraction, a filesystem, and a syscall
+ABI do not exist yet. Architecture decisions for those subsystems have not been made and should be
+discussed with the user before large structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -39,6 +42,14 @@ Target architecture is x86_64 only for now.
 - Lint: `cargo clippy`
 - Format: `cargo fmt`
 
+`cargo build`/`cargo run`/`cargo test`/`cargo clippy`/`cargo fmt` at the repo root only ever
+target the `oxidebsd` package, even though it's now a workspace — `userland/ring3-smoke` is a
+separate member cargo doesn't build by default in a "root package" workspace like this one; the
+root package's own `build.rs` cross-builds it as a side effect of building `oxidebsd` (see "User-mode
+execution" below). To build/lint/format it directly: append
+`--manifest-path userland/ring3-smoke/Cargo.toml` (and, to avoid the target-directory-locking
+gotcha described below, `--target-dir target/userland`).
+
 There is no `cargo check`/`cargo test` fast path that skips QEMU — every test target is its own
 bootable kernel image that QEMU actually boots, so `cargo test` is slow (each target rebuilds a
 bootimage and launches an emulator instance).
@@ -51,8 +62,8 @@ under, so tests instead boot in QEMU and self-report:
 - `src/qemu.rs`: writes to the `isa-debug-exit` QEMU device (port `0xf4`) to make QEMU exit with a
   code that encodes pass/fail. `test-success-exit-code` in `Cargo.toml` (`33`) must stay in sync
   with `QemuExitCode::Success` — QEMU maps a written value `v` to process exit code `(v << 1) | 1`.
-- `src/serial.rs`: a serial port (COM1) writer, used for all kernel/test output — read via
-  `-serial stdio` (set in `Cargo.toml`'s `[package.metadata.bootimage]`).
+- `src/serial.rs`: a hand-rolled 16550 UART (COM1) driver, write-only, used for all kernel/test
+  output — read via `-serial stdio` (set in `Cargo.toml`'s `[package.metadata.bootimage]`).
 - `src/lib.rs`: defines the shared `no_std` test scaffolding (`test_runner`, `test_panic_handler`,
   `hlt_loop`) built on the nightly `custom_test_frameworks` feature (`#[test_case]`,
   `#![test_runner(...)]`, `#![reexport_test_harness_main = "test_main"]`). It also boots itself
@@ -106,6 +117,58 @@ physical memory at `BootInfo::physical_memory_offset`:
   (`src/main.rs`, `src/lib.rs`'s `#[cfg(test)]` entry, `tests/basic_boot.rs`) pass their
   `BootInfo` straight through.
 
+## User-mode execution (`src/address_space.rs`, `src/elf.rs`, `src/usermode.rs`)
+
+Proves paging beyond the kernel's own address space, address-space separation, and ELF loading all
+work, by loading a tiny embedded userland binary and jumping into ring 3. Deliberately does *not*
+include a syscall ABI yet (next up in `ROADMAP.md`'s phase 2) — see `src/main.rs`'s
+`run_ring3_smoke_demo` and `userland/ring3-smoke/src/main.rs` for what that means in practice: the
+demo binary does some arithmetic, executes `int3`, and the kernel's ordinary (unmodified)
+`breakpoint_handler` logs the exception — `code_segment.rpl == Ring3` there is the actual proof.
+After the breakpoint returns, the demo just spins forever; there's no way back into the kernel
+without a syscall, so this is a one-shot demo, not a process that "finishes."
+
+- **The userland demo build.** `userland/ring3-smoke/` is a separate workspace member (root
+  `Cargo.toml` gained a `[workspace]` table; the root package is still its own workspace member,
+  same as before). The root package's `build.rs` cross-builds it into `target/userland/` — a
+  **separate** target directory from the outer build's own `target/`, not the shared one:
+  invoking a nested `cargo build` against the *same* target directory a still-running outer cargo
+  invocation already holds a lock on (build scripts run as part of that outer build) can deadlock.
+  The resulting ELF's path is exposed via `cargo:rustc-env=RING3_SMOKE_ELF_PATH=...`, so
+  `src/main.rs` can `include_bytes!(env!("RING3_SMOKE_ELF_PATH"))` — this keeps `cargo build`/
+  `cargo run`/`cargo test` working with no manual pre-step. `userland/ring3-smoke/linker.ld` forces
+  a `0x400000` load base, clear of the kernel's own image, heap, and phys-memory-offset window (see
+  below); its own tiny `build.rs` passes that script as a link arg to just its own binary, not via
+  `RUSTFLAGS`, which would apply to (and force a rebuild of) the `-Z build-std`-compiled
+  core/alloc/compiler_builtins shared with the outer build.
+- **Address spaces are a shallow copy.** `AddressSpace::new` allocates a fresh frame for a new
+  level 4 table and copies all 512 entries from the kernel's currently-active one into it — not a
+  "higher half only" split, and not a deep clone: the copy is just raw entries (pointers to
+  lower-level tables), so the new address space shares the kernel's code, heap, stacks, and
+  phys-memory-offset window with the original. This is deliberate: interrupt/exception handlers
+  always run in the kernel's context, regardless of which address space was active when they
+  fired, so the kernel must stay identically mapped and reachable no matter what.
+- **RSP0 must actually be writable — `static`, not `static mut`, silently isn't.** `gdt.rs`'s
+  ring-0 stacks (both the double-fault IST stack and the new RSP0 stack for ring-3-triggered
+  interrupts) are declared `static mut STACK: [u8; N]`, not `static STACK: [u8; N]`. This is
+  load-bearing, not stylistic: with a plain `static` and only ever taking `&raw const` to it nowhere
+  in Rust code ever forms a `&mut` to it — Rust/LLVM is free to (and did) intern the all-zero array
+  into read-only `.rodata`. The actual writes happen entirely via the CPU pushing an interrupt frame
+  in hardware, invisible to that analysis. The failure mode is exactly as confusing as it sounds: a
+  `#GP`/`#PF` double-fault-cascading-to-triple-fault the instant any exception tries to use that
+  stack, with a `CR2`/fault address landing inside the kernel's own `.text`/`.rodata` region. If a
+  future stack (IST slot, per-process kernel stack, etc.) is added the same way, it needs the same
+  `static mut` + `&raw mut` treatment.
+- **Software interrupt gates need `DPL = Ring3` explicitly.** `int3` executed from ring 3 needs
+  `idt.breakpoint`'s gate `.set_privilege_level(PrivilegeLevel::Ring3)` — `set_handler_fn` defaults
+  every gate's DPL to `Ring0`. This only matters for *software*-invoked interrupts (`int n`,
+  `int3`, `into`, `bound`); hardware-generated exceptions and IRQs bypass the gate's DPL check
+  entirely. Getting this wrong doesn't look like a permissions error: it's a `#GP` on the IDT entry
+  itself (decode the error code's selector-index bits to confirm — they name the IDT vector).
+- **Known simplification:** ELF segments are mapped without `NO_EXECUTE`, even for non-executable
+  segments. Enforcing that also requires setting `EFER.NXE`, which deserves its own focused pass
+  rather than bundling into this already-large change.
+
 ## Dependency notes
 
 - `x86_64` crate is pinned with `default-features = false, features = ["instructions",
@@ -131,9 +194,9 @@ physical memory at `BootInfo::physical_memory_offset`:
   `use_spin`/`spinning_top` features. Those features provide a ready-made `LockedHeap` type, but
   it's built on the `spinning_top` crate — a second, separate spinlock implementation alongside
   the `spin` crate already used everywhere else in this codebase (`serial.rs`, `vga.rs`,
-  `interrupts.rs`'s `PICS`). `src/allocator.rs` instead wraps the crate's plain `Heap` type in a
-  local `Locked<T>` built on `spin::Mutex`, so there's one spinlock crate in the dependency graph,
-  not two.
+  `interrupts.rs`'s `KEYBOARD`). `src/allocator.rs` instead wraps the crate's plain `Heap` type in
+  a local `Locked<T>` built on `spin::Mutex`, so there's one spinlock crate in the dependency
+  graph, not two.
 - `pc-keyboard` 0.9's constructor type is `PS2Keyboard<L, S>` (older tutorials/blog posts online
   reference a `Keyboard<L, S>` type from pre-0.9 versions — that name no longer exists). Decoding a
   scancode is two steps, not one: `add_byte` turns a raw byte into a `KeyEvent` (key up/down plus
@@ -141,3 +204,9 @@ physical memory at `BootInfo::physical_memory_offset`:
   using the keyboard's layout/modifier state — both must be called through the same locked
   `KEYBOARD` guard in `src/interrupts.rs`, not two separate `.lock()` calls, since `spin::Mutex`
   isn't reentrant.
+- `pic8259` and `uart_16550` are deliberately *not* dependencies, unlike most from-scratch-OS
+  tutorials that pull both in. Both wrap a handful of `outb`/`inb` calls against a well-documented,
+  stable hardware protocol (see `src/pic.rs` and `src/serial.rs`) — small and mechanical enough
+  that owning the code outweighs the dependency. This is different from `pc-keyboard` (hundreds of
+  lines of scancode/layout tables) or `linked_list_allocator` (memory-safety-critical free-list
+  logic), which stay external for the opposite reason.

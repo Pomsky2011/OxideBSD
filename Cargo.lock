@@ -10,12 +10,6 @@ checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
 
 [[package]]
 name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
-
-[[package]]
-name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
@@ -54,9 +48,7 @@ dependencies = [
  "bootloader",
  "linked_list_allocator",
  "pc-keyboard",
- "pic8259",
  "spin",
- "uart_16550",
  "x86_64",
 ]
 
@@ -67,22 +59,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73c53b65bbadd653c9d125e745d2659a3a060539b17d96ab1c59f9f5bfdacce5"
 
 [[package]]
-name = "pic8259"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62d9a86c292b165f757e47e7fd66855def189b2564609bc4203727b27c33db22"
-dependencies = [
- "x86_64",
-]
-
-[[package]]
-name = "raw-cpuid"
-version = "10.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c297679cb867470fa8c9f67dbba74a78d78e3e98d7cf2b08d6d71540f797332"
-dependencies = [
- "bitflags 1.3.2",
-]
+name = "ring3-smoke"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"
@@ -106,32 +84,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "uart_16550"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e492212ac378a5e00da953718dafb1340d9fbaf4f27d6f3c5cab03d931d1c049"
-dependencies = [
- "bitflags 2.13.1",
- "rustversion",
- "x86",
-]
-
-[[package]]
 name = "volatile"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
-
-[[package]]
-name = "x86"
-version = "0.52.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2781db97787217ad2a2845c396a5efe286f87467a5810836db6d74926e94a385"
-dependencies = [
- "bit_field",
- "bitflags 1.3.2",
- "raw-cpuid",
-]
 
 [[package]]
 name = "x86_64"
@@ -140,7 +96,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be4ec631e1a81d50e46c35a4a00322bd076c47491b64c2fb10a7ffa89002c697"
 dependencies = [
  "bit_field",
- "bitflags 2.13.1",
+ "bitflags",
  "const_fn",
  "rustversion",
  "volatile",
