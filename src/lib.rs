@@ -24,9 +24,13 @@ use bootloader::entry_point;
 use qemu::{QemuExitCode, exit_qemu};
 
 pub fn init(boot_info: &'static BootInfo) {
+    serial_println!("[boot] kernel initialization starting");
+
     gdt::init();
     interrupts::init_idt();
     interrupts::init_pics();
+
+    serial_println!("[boot] enabling interrupts");
     x86_64::instructions::interrupts::enable();
 
     let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
@@ -35,6 +39,8 @@ pub fn init(boot_info: &'static BootInfo) {
         unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+
+    serial_println!("[boot] kernel initialization complete");
 }
 
 pub trait Testable {

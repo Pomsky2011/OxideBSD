@@ -12,12 +12,14 @@ use oxidebsd::serial_println;
 entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
+    serial_println!("OxideBSD kernel booting...");
+
     oxidebsd::init(boot_info);
 
     #[cfg(test)]
     test_main();
 
-    serial_println!("OxideBSD kernel booting...");
+    serial_println!("OxideBSD kernel is up, entering idle loop");
 
     oxidebsd::hlt_loop();
 }

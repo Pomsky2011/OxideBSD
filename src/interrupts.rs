@@ -56,15 +56,27 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 });
 
 pub fn init_idt() {
+    serial_println!(
+        "[boot] loading IDT: breakpoint, invalid_opcode, general_protection_fault, page_fault, \
+         double_fault, timer (vector {:#x})",
+        InterruptIndex::Timer.as_u8()
+    );
     IDT.load();
+    serial_println!("[boot] IDT loaded");
 }
 
 /// Remaps the PIC pair's interrupt vectors and unmasks them. Must run after `init_idt` and
 /// before interrupts are enabled, so every unmasked IRQ already has a handler installed.
 pub fn init_pics() {
+    serial_println!(
+        "[boot] remapping PIC1/PIC2 to vectors {:#x}/{:#x}",
+        PIC_1_OFFSET,
+        PIC_2_OFFSET
+    );
     unsafe {
         PICS.lock().initialize();
     }
+    serial_println!("[boot] PICs initialized and unmasked");
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {

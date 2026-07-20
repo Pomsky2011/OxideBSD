@@ -5,6 +5,8 @@ use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 
+use crate::serial_println;
+
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 const STACK_SIZE: usize = 4096 * 5;
@@ -39,9 +41,15 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
 });
 
 pub fn init() {
+    serial_println!(
+        "[boot] loading GDT/TSS (double-fault stack at IST[{}], {} bytes)",
+        DOUBLE_FAULT_IST_INDEX,
+        STACK_SIZE
+    );
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1.code_selector);
         load_tss(GDT.1.tss_selector);
     }
+    serial_println!("[boot] GDT/TSS loaded");
 }

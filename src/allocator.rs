@@ -8,6 +8,8 @@ use x86_64::structures::paging::{
     FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
 };
 
+use crate::serial_println;
+
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 100 * 1024; // 100 KiB
 
@@ -51,6 +53,13 @@ pub fn init_heap(
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapToError<Size4KiB>> {
+    serial_println!(
+        "[boot] mapping heap: {:#x}..{:#x} ({} KiB)",
+        HEAP_START,
+        HEAP_START + HEAP_SIZE,
+        HEAP_SIZE / 1024
+    );
+
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);
         let heap_end = heap_start + (HEAP_SIZE - 1) as u64;
@@ -75,6 +84,7 @@ pub fn init_heap(
             .lock()
             .init(HEAP_START as *mut u8, HEAP_SIZE);
     }
+    serial_println!("[boot] heap ready");
 
     Ok(())
 }
