@@ -1,13 +1,16 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use pc_keyboard::layouts::Us104Key;
+use pc_keyboard::{DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
+use x86_64::instructions::port::Port;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::reboot::reboot;
-use crate::serial_println;
+use crate::{serial_print, serial_println};
 
 /// The 8259 PIC pair defaults to mapping IRQ0-15 onto interrupt vectors 0x8-0xF, which collides
 /// with CPU exception vectors (0x0-0x1F) — so both PICs are remapped to start right after them.
@@ -18,6 +21,7 @@ const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 #[repr(u8)]
 enum InterruptIndex {
     Timer = PIC_1_OFFSET,
+    Keyboard,
 }
 
 impl InterruptIndex {
@@ -37,6 +41,12 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+static KEYBOARD: Mutex<PS2Keyboard<Us104Key, ScancodeSet1>> = Mutex::new(PS2Keyboard::new(
+    ScancodeSet1::new(),
+    Us104Key,
+    HandleControl::Ignore,
+));
+
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
@@ -51,6 +61,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
     }
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+    idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
 
     idt
 });
@@ -58,8 +69,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 pub fn init_idt() {
     serial_println!(
         "[boot] loading IDT: breakpoint, invalid_opcode, general_protection_fault, page_fault, \
-         double_fault, timer (vector {:#x})",
-        InterruptIndex::Timer.as_u8()
+         double_fault, timer (vector {:#x}), keyboard (vector {:#x})",
+        InterruptIndex::Timer.as_u8(),
+        InterruptIndex::Keyboard.as_u8()
     );
     IDT.load();
     serial_println!("[boot] IDT loaded");
@@ -127,5 +139,31 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let mut port: Port<u8> = Port::new(0x60);
+    // SAFETY: 0x60 is the PS/2 controller's data port; reading it is how a keyboard IRQ is
+    // acknowledged at the hardware level, and it's only ever read here.
+    let scancode: u8 = unsafe { port.read() };
+
+    let mut keyboard = KEYBOARD.lock();
+    if let Ok(Some(key_event)) = keyboard.add_byte(scancode)
+        && let Some(key) = keyboard.process_keyevent(key_event)
+    {
+        match key {
+            DecodedKey::Unicode(character) => {
+                serial_print!("{character}");
+            }
+            DecodedKey::RawKey(key) => {
+                serial_print!("{key:?}");
+            }
+        }
+    }
+
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }

@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 OxideBSD is a 100% Rust-based BSD-like operating system. It is early-stage, working through
 `ROADMAP.md`'s phase 1 (a running, interactive kernel with a shell). So far: GDT/TSS/IDT with a
 dedicated double-fault stack, fatal exceptions reboot the machine, PIC-driven hardware interrupts
-with a timer tick, a VGA text-mode console mirroring serial output, and a heap allocator backed by
-bootloader-provided paging. Scheduling, drivers beyond keyboard/timer/serial/VGA, a filesystem, and
-syscalls do not exist yet. Architecture decisions for those subsystems have not been made and
-should be discussed with the user before large structural commitments are made.
+with a timer tick and a PS/2 keyboard IRQ handler (decodes scancodes and echoes typed characters —
+no line editing or shell yet), a VGA text-mode console mirroring serial output, and a heap allocator
+backed by bootloader-provided paging. Scheduling, drivers beyond keyboard/timer/serial/VGA, a
+filesystem, and syscalls do not exist yet. Architecture decisions for those subsystems have not been
+made and should be discussed with the user before large structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -133,3 +134,10 @@ physical memory at `BootInfo::physical_memory_offset`:
   `interrupts.rs`'s `PICS`). `src/allocator.rs` instead wraps the crate's plain `Heap` type in a
   local `Locked<T>` built on `spin::Mutex`, so there's one spinlock crate in the dependency graph,
   not two.
+- `pc-keyboard` 0.9's constructor type is `PS2Keyboard<L, S>` (older tutorials/blog posts online
+  reference a `Keyboard<L, S>` type from pre-0.9 versions — that name no longer exists). Decoding a
+  scancode is two steps, not one: `add_byte` turns a raw byte into a `KeyEvent` (key up/down plus
+  which key), then `process_keyevent` turns that into a `DecodedKey` (a `char` or a raw `KeyCode`)
+  using the keyboard's layout/modifier state — both must be called through the same locked
+  `KEYBOARD` guard in `src/interrupts.rs`, not two separate `.lock()` calls, since `spin::Mutex`
+  isn't reentrant.
