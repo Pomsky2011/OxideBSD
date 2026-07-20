@@ -1,0 +1,3 @@
+[submodule "rustrc"]
+	path = rustrc
+	url = https://github.com/Pomsky2011/RustRC.git
