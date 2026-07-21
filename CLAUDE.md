@@ -11,16 +11,18 @@ IRQ handler (decodes scancodes and echoes typed characters — no line editing o
 text-mode console mirroring serial output, and a heap allocator backed by bootloader-provided
 paging. Phase 2 is underway: the kernel can build a *separate* address space
 (`src/address_space.rs`), load a static ELF64 binary into it (`src/elf.rs`), jump into ring 3
-(`src/usermode.rs`), and user-mode code can call back into the kernel via two independent syscall
-mechanisms — this kernel's own `int 0x80` ABI (`src/syscall.rs`) and a real Linux-compatible
-`SYSCALL`/`SYSRET` path (`src/linux_syscall.rs`), aimed specifically at eventually running
-unmodified musl/BusyBox binaries. See "User-mode execution", "Syscall ABI", and "Linux-compatible
-syscall mechanism" below for the current, deliberate limits (no process abstraction/scheduler, one
-demo binary at a time, `sys_write` doesn't validate its pointer, and — for the Linux path — only
-`write`/`exit`/`exit_group` are implemented; musl's actual startup needs many more syscalls and is
-real follow-up work, not done). Scheduling, a real process abstraction, and a filesystem do not
-exist yet. Architecture decisions for those subsystems have not been made and should be discussed
-with the user before large structural commitments are made.
+(`src/usermode.rs`), and user-mode code can call back into the kernel via two independent, and
+deliberately different, syscall mechanisms — OxideBSD's own native, BSD-style `int 0x80` ABI
+(`src/syscall.rs`: carry-flag error signaling, the traditional BSD/x86-Unix convention) and a real
+Linux-compatible `SYSCALL`/`SYSRET` path (`src/linux_syscall.rs`: negative-`RAX` error signaling,
+aimed specifically at eventually running unmodified musl/BusyBox binaries). See "User-mode
+execution", "Syscall ABI", and "Linux-compatible syscall mechanism" below for the current,
+deliberate limits (no process abstraction/scheduler, one demo binary at a time, `sys_write` doesn't
+validate its pointer, and — for the Linux path — only `write`/`exit`/`exit_group` are implemented;
+musl's actual startup needs many more syscalls and is real follow-up work, not done). Scheduling, a
+real process abstraction, and a filesystem do not exist yet. Architecture decisions for those
+subsystems have not been made and should be discussed with the user before large structural
+commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -128,13 +130,14 @@ physical memory at `BootInfo::physical_memory_offset`:
 Proves paging beyond the kernel's own address space, address-space separation, and ELF loading all
 work, by loading a tiny embedded userland binary and jumping into ring 3. `src/main.rs`'s
 `run_userland_demo` is generic over which binary — `kernel_main` currently points it at
-`userland/linux-syscall-smoke/` (see "Linux-compatible syscall mechanism" below); the older
-`userland/ring3-smoke/` (this kernel's own `int 0x80` ABI, see "Syscall ABI" below) still works,
-it's just not what's wired up by default at the moment, since only one demo can run per boot
-(`SYS_EXIT` idles the whole system — there's no scheduler to hand control to something else
-afterward). Whichever binary runs, the pattern is the same: it does something observable (prints a
-message, exits with a distinctive code), and that output over serial/VGA is the actual end-to-end
-proof paging/ELF-loading/ring-3/syscalls all work together.
+`userland/ring3-smoke/` (OxideBSD's own native, BSD-style `int 0x80` ABI, see "Syscall ABI" below);
+`userland/linux-syscall-smoke/` (the Linux-compatible `SYSCALL`/`SYSRET` path, see
+"Linux-compatible syscall mechanism" below) still works, it's just not what's wired up by default
+at the moment, since only one demo can run per boot (`SYS_EXIT` idles the whole system — there's no
+scheduler to hand control to something else afterward). Whichever binary runs, the pattern is the
+same: it does something observable (prints a message, exits with a distinctive code), and that
+output over serial/VGA is the actual end-to-end proof paging/ELF-loading/ring-3/syscalls all work
+together.
 
 - **The userland demo build.** `userland/ring3-smoke/` and `userland/linux-syscall-smoke/` are
   separate workspace members (root `Cargo.toml` gained a `[workspace]` table; the root package is
@@ -193,34 +196,58 @@ proof paging/ELF-loading/ring-3/syscalls all work together.
 
 ## Syscall ABI (`src/syscall.rs`)
 
-`int 0x80`; syscall number in `RDI`, up to three arguments in `RSI`/`RDX`/`RCX`, return value in
-`RAX`. Deliberately *not* the more traditional "number in `RAX`": System V already passes a
-function's first four integer arguments in `RDI`/`RSI`/`RDX`/`RCX`, so choosing the same order for
-the syscall convention means `syscall_entry` (the hand-written `global_asm!` stub — the first raw
-assembly in this codebase beyond `usermode.rs`'s `iretq` frame) can `call syscall_dispatch` with
-zero register shuffling; whatever's already in those registers at `int 0x80` is exactly what the
-Rust dispatcher's `extern "C" fn(number, arg0, arg1, arg2)` expects.
+OxideBSD's own, native ABI — deliberately BSD-flavored, not Linux-flavored (see
+"Linux-compatible syscall mechanism" below for the other, separate path). `int 0x80`; syscall
+number in `RAX`, up to three arguments in `RDI`/`RSI`/`RDX` (`R10` reserved in the layout for a
+future 4th argument). Success/failure is signaled via the **carry flag** — the traditional BSD/x86
+Unix convention: `CF = 0` on success with the return value in `RAX`, `CF = 1` on failure with the
+*positive* `errno` in `RAX`. This is genuinely different from `src/linux_syscall.rs`'s convention
+(negative value in `RAX`, no `CF` involvement) — both conventions deliberately coexist in this
+kernel, one per entry mechanism, matching how real Linux and real BSD differ. Syscall numbers
+(`SYS_EXIT = 1`, `SYS_WRITE = 4`) match real FreeBSD's long-stable values for these two calls, as a
+nod to authenticity — not a claim of binary compatibility with real BSD userland. errno values are
+*mostly* shared between Linux and the BSDs (`EBADF`, `EINVAL` are identical) but not universally —
+`ENOSYS` is 38 on Linux, 78 on FreeBSD; each module here uses its own OS's real value.
 
 - **The gate is installed via `set_handler_addr`, not `set_handler_fn`.** `syscall_entry` is a raw
   symbol, not an `extern "x86-interrupt" fn` — that ABI doesn't expose general-purpose registers to
   Rust code at all, only the hardware-pushed `InterruptStackFrame`, which is useless for a
   register-based syscall convention. `set_handler_addr` (unsafe, but not gated behind
   `HandlerFuncType`/`abi_x86_interrupt`) takes any `VirtAddr`.
+- **`SyscallFrame` spans both the pushed GPRs and the CPU's own interrupt frame** — this is how the
+  carry-flag trick actually works. The struct's first 15 fields are the stub's own pushed
+  registers; its last 5 fields are `InterruptStackFrame`'s fields (`rip`/`cs`/`rflags`/`rsp`/`ss`),
+  which the CPU already pushed *above* them in the same contiguous stack region before the stub
+  even started — no separate pointer needed to reach it. `syscall_dispatch` writes the return
+  value/errno into `frame.rax` *and* flips bit 0 (`CF`) of `frame.rflags` directly in that memory;
+  since it's the exact same memory `iretq` reads the frame back out of, nothing else needs to touch
+  it. Field order must match the stub's push order exactly (last pushed = lowest address = first
+  field) — same rule as `linux_syscall.rs`'s frame, just one struct larger here.
+- **The actual number→handler dispatch lives in a small, pure `dispatch` function**, deliberately
+  separated from `syscall_dispatch`'s raw-pointer/frame handling specifically so it stays directly
+  unit-testable (see `test_syscall_dispatch_rejects_unknown_number` in `src/lib.rs`) without
+  needing a real `SyscallFrame` or any interrupt machinery to exercise it.
 - **The stub saves/restores every general-purpose register uniformly**, not just the System-V
   caller-saved set (the callee-saved ones — `RBX`/`RBP`/`R12`-`R15` — are technically already
   preserved across the `call` by the Rust ABI's own contract). Redundant for those five, but a
   uniform save/restore is simpler to get right than relying on which specific registers a given
   ABI happens to guarantee, and this is exactly the kind of place a subtle mistake shows up as
   silent post-syscall register corruption in a user program, not a loud crash.
-- **Stack alignment was reasoned through, not just eyeballed:** the CPU 16-byte-aligns `RSP` before
-  pushing the 5-word interrupt frame (a value not itself a multiple of 16), and the stub then
-  pushes exactly 15 general-purpose registers (also not a multiple of 16) — the two odd-alignment
-  pushes cancel out, landing exactly on the 16-byte boundary System V requires at the `call`
-  instruction. If the pushed-register count or the frame shape ever changes, redo this arithmetic;
-  don't assume it still lines up.
+- **Stack alignment was reasoned through, not just eyeballed, and needs no extra padding here**
+  (contrast `linux_syscall.rs`'s stub, which does): the CPU 16-byte-aligns `RSP` before pushing the
+  5-word interrupt frame (a value not itself a multiple of 16), and the stub then pushes exactly 15
+  general-purpose registers (also not a multiple of 16) — the two odd-alignment pushes cancel out,
+  landing exactly on the 16-byte boundary System V requires at the `call` instruction. If the
+  pushed-register count or the frame shape ever changes, redo this arithmetic; don't assume it
+  still lines up.
 - **`sys_exit` doesn't return control to anything.** There's no process abstraction or scheduler,
   so "exiting" means the kernel logs the code and calls `hlt_loop()` — it's the whole system's
-  stopping point, not a per-process one.
+  stopping point, not a per-process one. Not represented as `Result` since exit can't meaningfully
+  fail.
+- **`sys_write`/`sys_exit` return `Result<u64, u64>`** (`Ok(value)` / `Err(positive errno)`) — the
+  shared, canonical representation both this module's own dispatcher *and*
+  `linux_syscall.rs`'s adapt into their own respective wire formats (carry flag here; negated into
+  `RAX` there).
 - **`sys_write` does not validate `[ptr, ptr+len)`** before dereferencing it as user memory — no
   check that the range is mapped, `USER_ACCESSIBLE`, or doesn't reach into kernel-only mappings. A
   bad pointer page-faults, which `page_fault_handler` already handles safely (log + `reboot()`)
@@ -289,9 +316,12 @@ the *mechanism* in isolation first.
   alignment) — needed so its computed top is guaranteed 16-aligned for the reason above. (The
   older RSP0/IST stacks in `src/gdt.rs` aren't similarly annotated and have worked fine in
   practice, but that's not a *guarantee* — worth tightening if they ever become a problem.)
-- **Unrecognized syscall numbers return `-ENOSYS` (`-38`, two's-complement in `RAX`)**, matching
-  real Linux error-return convention, and log the number — that log line is the intended tool for
-  iteratively discovering what musl's startup needs in the follow-up milestone.
+- **Unrecognized syscall numbers return `-ENOSYS`** (Linux's real value, 38, negated into `RAX`),
+  and log the number — that log line is the intended tool for iteratively discovering what musl's
+  startup needs in the follow-up milestone. Like `write`/`exit`, this adapts from the shared
+  `Result<u64, u64>` `src/syscall.rs`'s `sys_write`/`sys_exit` return (positive errno in) into
+  Linux's own negative-`RAX` wire format — the same underlying functions feed both this module and
+  `src/syscall.rs`'s own carry-flag-based dispatcher, each converting `Err(errno)` differently.
 
 ## Dependency notes
 

@@ -23,9 +23,10 @@ const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 60;
 const SYS_EXIT_GROUP: u64 = 231;
 
-/// `-ENOSYS` (38), Linux's real "no such syscall" error, returned two's-complement in `RAX` the
-/// same way a real Linux kernel would for an unimplemented syscall number.
-const ENOSYS: u64 = (-38i64) as u64;
+/// Linux's real `ENOSYS` ("no such syscall") value, positive per the shared `Result<u64, u64>`
+/// convention `src/syscall.rs`'s `sys_write`/`sys_exit` use — negated into `RAX` (Linux's actual
+/// wire convention) down in `linux_syscall_dispatch`, same as any other error these return.
+const ENOSYS: u64 = 38;
 
 const SCRATCH_STACK_SIZE: usize = 4096 * 5;
 
@@ -133,15 +134,22 @@ extern "C" fn linux_syscall_dispatch(frame: *mut SyscallFrame) {
     // call.
     let frame = unsafe { &mut *frame };
 
+    // src/syscall.rs's sys_write/sys_exit return Result<u64, u64> (Ok(value) / Err(positive
+    // errno)) -- that's the shared, canonical representation; adapt it to Linux's own convention
+    // here (negative value in RAX) rather than the BSD carry-flag convention src/syscall.rs's own
+    // dispatcher uses for the exact same underlying functions.
     let result = match frame.rax {
         SYS_WRITE => crate::syscall::sys_write(frame.rdi, frame.rsi, frame.rdx),
         SYS_EXIT | SYS_EXIT_GROUP => crate::syscall::sys_exit(frame.rdi),
         other => {
             serial_println!("[boot] unrecognized Linux syscall number {}", other);
-            ENOSYS
+            Err(ENOSYS)
         }
     };
-    frame.rax = result;
+    frame.rax = match result {
+        Ok(value) => value,
+        Err(errno) => (-(errno as i64)) as u64,
+    };
 }
 
 core::arch::global_asm!(

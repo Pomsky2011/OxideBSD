@@ -130,7 +130,7 @@ fn test_timer_interrupt_fires() {
 #[test_case]
 fn test_syscall_dispatch_rejects_unknown_number() {
     let unknown = syscall::SYS_WRITE + 1000;
-    assert_eq!(syscall::syscall_dispatch(unknown, 0, 0, 0), u64::MAX);
+    assert_eq!(syscall::dispatch(unknown, 0, 0, 0), Err(syscall::ENOSYS));
 }
 
 #[test_case]

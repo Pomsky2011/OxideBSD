@@ -27,27 +27,29 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 /// ABI by loading and jumping into a userland demo binary — see `run_userland_demo` and
 /// `usermode::jump_to_usermode` for why this never returns here.
 ///
-/// Currently runs `linux-syscall-smoke` (see `userland/linux-syscall-smoke/`), which exercises
-/// the new `SYSCALL`/`SYSRET` mechanism (`src/linux_syscall.rs`) directly, in isolation from musl.
-/// `ring3-smoke` (`userland/ring3-smoke/`, this kernel's own `int 0x80` ABI) still works —
-/// verified separately by booting with it loaded instead — it's just not what's wired up here at
-/// the moment, since only one demo can run per boot (`SYS_EXIT` idles the whole system, there's no
-/// scheduler to hand control to something else afterward).
+/// Currently runs `ring3-smoke` (see `userland/ring3-smoke/`), which exercises OxideBSD's own
+/// native, BSD-style `int 0x80` ABI (`src/syscall.rs`) — including its carry-flag error
+/// convention, in both the success and deliberate-failure direction. `linux-syscall-smoke`
+/// (`userland/linux-syscall-smoke/`, the Linux-compatible `SYSCALL`/`SYSRET` path,
+/// `src/linux_syscall.rs`) still works — verified separately by booting with it loaded instead —
+/// it's just not what's wired up here at the moment, since only one demo can run per boot
+/// (`SYS_EXIT` idles the whole system, there's no scheduler to hand control to something else
+/// afterward).
 #[cfg(not(test))]
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("OxideBSD kernel booting...");
 
     let (_mapper, mut frame_allocator) = oxidebsd::init(boot_info);
 
-    const LINUX_SYSCALL_SMOKE_ELF: &[u8] = include_bytes!(env!("LINUX_SYSCALL_SMOKE_ELF_PATH"));
+    const RING3_SMOKE_ELF: &[u8] = include_bytes!(env!("RING3_SMOKE_ELF_PATH"));
     // Arbitrary, just clear of the kernel image, heap, and phys-memory-offset window.
     const USER_STACK_TOP: u64 = 0x_5000_0000_0000;
 
     run_userland_demo(
         boot_info,
         &mut frame_allocator,
-        "linux-syscall-smoke",
-        LINUX_SYSCALL_SMOKE_ELF,
+        "ring3-smoke",
+        RING3_SMOKE_ELF,
         USER_STACK_TOP,
     )
 }
