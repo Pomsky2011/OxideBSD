@@ -7,20 +7,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 OxideBSD is a 100% Rust-based BSD-like operating system. Phase 1 of `ROADMAP.md` (a running,
 interactive kernel) is essentially done: GDT/TSS/IDT with a dedicated double-fault stack, fatal
 exceptions reboot the machine, PIC-driven hardware interrupts with a timer tick and a PS/2 keyboard
-IRQ handler (decodes scancodes and echoes typed characters — no line editing or shell yet), a VGA
-text-mode console mirroring serial output, and a heap allocator backed by bootloader-provided
-paging. Phase 2 is underway: the kernel can build a *separate* address space
-(`src/address_space.rs`), load a static ELF64 binary into it (`src/elf.rs`), jump into ring 3
-(`src/usermode.rs`), and user-mode code can call back into the kernel via two independent, and
-deliberately different, syscall mechanisms — OxideBSD's own native, BSD-style `int 0x80` ABI
-(`src/syscall.rs`: carry-flag error signaling, the traditional BSD/x86-Unix convention) and a real
-Linux-compatible `SYSCALL`/`SYSRET` path (`src/linux_syscall.rs`: negative-`RAX` error signaling,
-aimed specifically at eventually running unmodified musl/BusyBox binaries). See "User-mode
-execution", "Syscall ABI", and "Linux-compatible syscall mechanism" below for the current,
-deliberate limits (no process abstraction/scheduler, one demo binary at a time, `sys_write` doesn't
-validate its pointer, and — for the Linux path — only `write`/`exit`/`exit_group` are implemented;
-musl's actual startup needs many more syscalls and is real follow-up work, not done). Scheduling, a
-real process abstraction, and a filesystem do not exist yet. Architecture decisions for those
+IRQ handler (decodes scancodes, echoes typed characters, and feeds a small kernel-side stdin buffer
+— see "Interactive shell" below), a VGA text-mode console mirroring serial output, and a heap
+allocator backed by bootloader-provided paging. Phase 2 is underway: the kernel can build a
+*separate* address space (`src/address_space.rs`), load a static ELF64 binary into it
+(`src/elf.rs`), jump into ring 3 (`src/usermode.rs`), and user-mode code can call back into the
+kernel via two independent, and deliberately different, syscall mechanisms — OxideBSD's own
+native, BSD-style `int 0x80` ABI (`src/syscall.rs`: carry-flag error signaling, the traditional
+BSD/x86-Unix convention) and a real Linux-compatible `SYSCALL`/`SYSRET` path
+(`src/linux_syscall.rs`: negative-`RAX` error signaling, aimed specifically at eventually running
+unmodified musl/BusyBox binaries). A first genuinely interactive userland program,
+`userland/stsh/` ("stupidshell"), now runs by default — see "Interactive shell" below.
+
+The kernel also has a real **dynamic module loader** (`src/module.rs` — see "Dynamic kernel
+modules" below): it relocates independently-compiled `#![no_std]` code into the running kernel at
+boot, resolves the handful of symbols that code references against a small hand-curated kernel API,
+and calls the module's `module_init`. The native `int 0x80` ABI's syscall-number → handler dispatch
+table (`src/syscall.rs`) is no longer a hardcoded `match` — it's populated by one such module,
+`modules/native_abi/`. A second module, `modules/fat32/` (see "FAT32 filesystem module" below),
+implements a basic FAT32 filesystem — parsed from a build-time-generated, embedded in-memory disk
+image, since no real block device driver exists yet — with read and write support (including
+subdirectories), registering `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` and, via a small
+kernel-owned fd registry (`src/fd.rs`), extending `SYS_READ`/`SYS_WRITE` to real files. `stsh`'s
+`cat`/`write`/`cd`/`ls`/`mkdir` commands exercise this end to end.
+
+See "User-mode execution", "Syscall ABI", "Linux-compatible syscall mechanism", "Interactive
+shell", "Dynamic kernel modules", and "FAT32 filesystem module" below for the current, deliberate
+limits (no process abstraction/scheduler, one demo binary at a time, `sys_write`/`sys_read` don't
+validate their pointers, no line editing in the shell, no module unload/reload, FAT32 writes don't
+persist across reboot, and — for the Linux path — only `write`/`exit`/`exit_group` are implemented;
+musl's actual startup needs many more syscalls and is real follow-up work, not done). Scheduling
+and a real process abstraction do not exist yet; a *real* filesystem (backed by an actual block
+device, not an embedded image) doesn't either. Architecture decisions for those remaining
 subsystems have not been made and should be discussed with the user before large structural
 commitments are made.
 
@@ -51,12 +69,19 @@ Target architecture is x86_64 only for now.
 - Format: `cargo fmt`
 
 `cargo build`/`cargo run`/`cargo test`/`cargo clippy`/`cargo fmt` at the repo root only ever
-target the `oxidebsd` package, even though it's now a workspace — `userland/ring3-smoke` and
-`userland/linux-syscall-smoke` are separate members cargo doesn't build by default in a "root
-package" workspace like this one; the root package's own `build.rs` cross-builds both as a side
-effect of building `oxidebsd` (see "User-mode execution" below). To build/lint/format one of them
-directly: append `--manifest-path userland/<name>/Cargo.toml` (and, to avoid the
-target-directory-locking gotcha described below, `--target-dir target/userland`).
+target the `oxidebsd` package, even though it's now a workspace — the `userland/*` crates and the
+`modules/*` crates (`modules/hello`, `modules/native_abi`, `modules/fat32` — see "Dynamic kernel
+modules" below) are all separate members cargo doesn't build by default in a "root package"
+workspace like this one; the root package's own `build.rs` cross-builds all of them as a side
+effect of building `oxidebsd` (see "User-mode execution" and "Dynamic kernel modules" below). To
+build/lint/format one of them directly: append `--manifest-path <userland-or-modules>/<name>/
+Cargo.toml` (and, to avoid the target-directory-locking gotcha described below, `--target-dir
+target/userland` or `--target-dir target/modules` as appropriate). `modules/fat32/` additionally
+needs `FAT32_IMAGE_PATH` set in the environment when built this way (its own `include_bytes!`
+depends on it, normally supplied by the root `build.rs`'s generated image — see "Dynamic kernel
+modules" below) — e.g. `FAT32_IMAGE_PATH=$(pwd)/target/modules/fat32.img cargo clippy
+--manifest-path modules/fat32/Cargo.toml --target-dir target/modules` (after at least one full
+`cargo build` has generated that file).
 
 There is no `cargo check`/`cargo test` fast path that skips QEMU — every test target is its own
 bootable kernel image that QEMU actually boots, so `cargo test` is slow (each target rebuilds a
@@ -130,31 +155,33 @@ physical memory at `BootInfo::physical_memory_offset`:
 Proves paging beyond the kernel's own address space, address-space separation, and ELF loading all
 work, by loading a tiny embedded userland binary and jumping into ring 3. `src/main.rs`'s
 `run_userland_demo` is generic over which binary — `kernel_main` currently points it at
-`userland/ring3-smoke/` (OxideBSD's own native, BSD-style `int 0x80` ABI, see "Syscall ABI" below);
-`userland/linux-syscall-smoke/` (the Linux-compatible `SYSCALL`/`SYSRET` path, see
-"Linux-compatible syscall mechanism" below) still works, it's just not what's wired up by default
-at the moment, since only one demo can run per boot (`SYS_EXIT` idles the whole system — there's no
-scheduler to hand control to something else afterward). Whichever binary runs, the pattern is the
-same: it does something observable (prints a message, exits with a distinctive code), and that
-output over serial/VGA is the actual end-to-end proof paging/ELF-loading/ring-3/syscalls all work
-together.
+`userland/stsh/` (see "Interactive shell" below); `userland/ring3-smoke/` and
+`userland/linux-syscall-smoke/` (OxideBSD's own native `int 0x80` ABI and the Linux-compatible
+`SYSCALL`/`SYSRET` path respectively — see "Syscall ABI" and "Linux-compatible syscall mechanism"
+below) still work, they're just not what's wired up by default at the moment, since only one demo
+can run per boot (`SYS_EXIT` idles the whole system — there's no scheduler to hand control to
+something else afterward). Whichever binary runs, the pattern is the same: it does something
+observable (prints a message and exits with a distinctive code, or — for `stsh` — runs an
+interactive read/dispatch loop), and that output over serial/VGA is the actual end-to-end proof
+paging/ELF-loading/ring-3/syscalls all work together.
 
-- **The userland demo build.** `userland/ring3-smoke/` and `userland/linux-syscall-smoke/` are
-  separate workspace members (root `Cargo.toml` gained a `[workspace]` table; the root package is
-  still its own workspace member, same as before). The root package's `build.rs` cross-builds both
-  (via a shared `build_userland_crate` helper) into `target/userland/` — a **separate** target
-  directory from the outer build's own `target/`, not the shared one: invoking a nested
-  `cargo build` against the *same* target directory a still-running outer cargo invocation already
-  holds a lock on (build scripts run as part of that outer build) can deadlock. Each resulting
-  ELF's path is exposed via `cargo:rustc-env=<NAME>_ELF_PATH=...`, so `src/main.rs` can
-  `include_bytes!(env!("..._ELF_PATH"))` — this keeps `cargo build`/`cargo run`/`cargo test`
-  working with no manual pre-step. Each userland crate's `linker.ld` forces its own distinct load
-  base (`0x400000` for `ring3-smoke`, `0x500000` for `linux-syscall-smoke` — not currently required
-  since only one demo loads at a time, but keeps them from colliding if that changes), clear of the
-  kernel's own image, heap, and phys-memory-offset window (see below); each crate's own tiny
-  `build.rs` passes its script as a link arg to just its own binary, not via `RUSTFLAGS`, which
-  would apply to (and force a rebuild of) the `-Z build-std`-compiled core/alloc/compiler_builtins
-  shared with the outer build.
+- **The userland demo build.** `userland/ring3-smoke/`, `userland/linux-syscall-smoke/`, and
+  `userland/stsh/` are separate workspace members (root `Cargo.toml` gained a `[workspace]` table;
+  the root package is still its own workspace member, same as before). The root package's
+  `build.rs` cross-builds all three (via a shared `build_userland_crate` helper) into
+  `target/userland/` — a **separate** target directory from the outer build's own `target/`, not
+  the shared one: invoking a nested `cargo build` against the *same* target directory a
+  still-running outer cargo invocation already holds a lock on (build scripts run as part of that
+  outer build) can deadlock. Each resulting ELF's path is exposed via
+  `cargo:rustc-env=<NAME>_ELF_PATH=...`, so `src/main.rs` can `include_bytes!(env!("..._ELF_PATH"))`
+  — this keeps `cargo build`/`cargo run`/`cargo test` working with no manual pre-step. Each
+  userland crate's `linker.ld` forces its own distinct load base (`0x400000` for `ring3-smoke`,
+  `0x500000` for `linux-syscall-smoke`, `0x600000` for `stsh` — not currently required since only
+  one demo loads at a time, but keeps them from colliding if that changes), clear of the kernel's
+  own image, heap, and phys-memory-offset window (see below); each crate's own tiny `build.rs`
+  passes its script as a link arg to just its own binary, not via `RUSTFLAGS`, which would apply to
+  (and force a rebuild of) the `-Z build-std`-compiled core/alloc/compiler_builtins shared with the
+  outer build.
 - **Address spaces are a shallow copy.** `AddressSpace::new` allocates a fresh frame for a new
   level 4 table and copies all 512 entries from the kernel's currently-active one into it — not a
   "higher half only" split, and not a deep clone: the copy is just raw entries (pointers to
@@ -203,11 +230,23 @@ future 4th argument). Success/failure is signaled via the **carry flag** — the
 Unix convention: `CF = 0` on success with the return value in `RAX`, `CF = 1` on failure with the
 *positive* `errno` in `RAX`. This is genuinely different from `src/linux_syscall.rs`'s convention
 (negative value in `RAX`, no `CF` involvement) — both conventions deliberately coexist in this
-kernel, one per entry mechanism, matching how real Linux and real BSD differ. Syscall numbers
-(`SYS_EXIT = 1`, `SYS_WRITE = 4`) match real FreeBSD's long-stable values for these two calls, as a
-nod to authenticity — not a claim of binary compatibility with real BSD userland. errno values are
-*mostly* shared between Linux and the BSDs (`EBADF`, `EINVAL` are identical) but not universally —
-`ENOSYS` is 38 on Linux, 78 on FreeBSD; each module here uses its own OS's real value.
+kernel, one per entry mechanism, matching how real Linux and real BSD differ. Syscall numbers for
+calls implemented so far (`SYS_EXIT = 1`, `SYS_READ = 3`, `SYS_WRITE = 4`, `SYS_OPEN = 5`,
+`SYS_CLOSE = 6`) match real FreeBSD's long-stable values, as a nod to authenticity — not a claim of
+binary compatibility with real BSD userland. errno values are *mostly* shared between Linux and the
+BSDs (`EBADF`, `EINVAL` are identical) but not universally — `ENOSYS` is 38 on Linux, 78 on
+FreeBSD; this file uses the FreeBSD value.
+
+**The number → handler mapping is a registry populated by a dynamically loaded module, not a
+hardcoded `match`.** `modules/native_abi/` registers `SYS_EXIT`/`SYS_READ`/`SYS_WRITE` (and
+`modules/fat32/` separately registers `SYS_OPEN`/`SYS_CLOSE`) via `oxidebsd_register_syscall` from
+their own `module_init` — see "Dynamic kernel modules" below. What's genuinely still
+kernel-resident, deliberately *not* moved into `native_abi`, is the actual `sys_exit`/`sys_read`/
+`sys_write` *behavior*: `src/linux_syscall.rs` calls these same three functions directly (its own,
+separate `SYSCALL`/`SYSRET` mechanism, out of scope for modularization), so duplicating their logic
+into the module would either break those direct calls or require converting `linux_syscall.rs`
+too. `oxidebsd_sys_exit`/`oxidebsd_sys_read`/`oxidebsd_sys_write` (thin FFI adapters over them) are
+what the module actually calls through.
 
 - **The gate is installed via `set_handler_addr`, not `set_handler_fn`.** `syscall_entry` is a raw
   symbol, not an `extern "x86-interrupt" fn` — that ABI doesn't expose general-purpose registers to
@@ -225,8 +264,18 @@ nod to authenticity — not a claim of binary compatibility with real BSD userla
   field) — same rule as `linux_syscall.rs`'s frame, just one struct larger here.
 - **The actual number→handler dispatch lives in a small, pure `dispatch` function**, deliberately
   separated from `syscall_dispatch`'s raw-pointer/frame handling specifically so it stays directly
-  unit-testable (see `test_syscall_dispatch_rejects_unknown_number` in `src/lib.rs`) without
-  needing a real `SyscallFrame` or any interrupt machinery to exercise it.
+  unit-testable (see `test_syscall_dispatch_rejects_unknown_number` and
+  `test_syscall_dispatch_routes_registered_handlers` in `src/lib.rs`, the latter registering a
+  throwaway handler directly — no module loading or interrupt machinery needed) without needing a
+  real `SyscallFrame`. It's now a lookup into `SYSCALL_TABLE` (an `alloc::collections::BTreeMap`,
+  guarded by a `spin::Mutex`), populated at runtime by `oxidebsd_register_syscall` — see this
+  file's module doc comment and "Dynamic kernel modules" below.
+- **A registered handler's own FFI convention (`SyscallHandler`) is a third, distinct wire
+  format** from either public syscall ABI: a plain `i64`, negative for `-errno`, non-negative for
+  a success value. Not the carry-flag convention this file's own ABI uses, not
+  `linux_syscall.rs`'s negative-`RAX` convention either — purely the internal shape of the
+  module↔kernel registration boundary, chosen because it's representable in a plain scalar return
+  without needing a `#[repr(C)]` result struct passed across a module-relocation boundary.
 - **The stub saves/restores every general-purpose register uniformly**, not just the System-V
   caller-saved set (the callee-saved ones — `RBX`/`RBP`/`R12`-`R15` — are technically already
   preserved across the `call` by the Rust ABI's own contract). Redundant for those five, but a
@@ -248,12 +297,28 @@ nod to authenticity — not a claim of binary compatibility with real BSD userla
   shared, canonical representation both this module's own dispatcher *and*
   `linux_syscall.rs`'s adapt into their own respective wire formats (carry flag here; negated into
   `RAX` there).
-- **`sys_write` does not validate `[ptr, ptr+len)`** before dereferencing it as user memory — no
-  check that the range is mapped, `USER_ACCESSIBLE`, or doesn't reach into kernel-only mappings. A
-  bad pointer page-faults, which `page_fault_handler` already handles safely (log + `reboot()`)
-  rather than corrupting kernel state, so this is a missing safety net for user programs, not a
-  kernel soundness hole — but real validation (walking the active page table to confirm the range)
-  is a natural follow-up, not yet implemented.
+- **`sys_write`/`sys_read` do not validate `[ptr, ptr+len)`** before dereferencing it as user
+  memory — no check that the range is mapped, `USER_ACCESSIBLE`, or doesn't reach into kernel-only
+  mappings. A bad pointer page-faults, which `page_fault_handler` already handles safely (log +
+  `reboot()`) rather than corrupting kernel state, so this is a missing safety net for user
+  programs, not a kernel soundness hole — but real validation (walking the active page table to
+  confirm the range) is a natural follow-up, not yet implemented.
+- **`sys_read` is non-blocking, not a limitation but a deliberate simplification that follows from
+  having no scheduler.** A real `read` on an empty, non-`O_NONBLOCK` fd blocks the calling process
+  and reschedules another one; this kernel has no process abstraction to switch away to, so
+  blocking in `sys_read` would just halt the entire machine until a key is pressed. Returning
+  `Ok(0)` immediately when the buffer is empty pushes the polling loop into userland instead — see
+  "Interactive shell" below for the caller side of that contract. Native-ABI only for now;
+  `src/linux_syscall.rs` has no `read` equivalent yet. This non-blocking property is specific to
+  fd 0 (stdin) — a FAT32 file's `read`, routed through `crate::fd` below, always completes
+  immediately regardless (there's no "not ready yet" state for an in-memory file), so `cat` in
+  `stsh` doesn't need to busy-poll it the way reading from stdin does.
+- **`sys_read`/`sys_write`, for any `fd` other than stdin/stdout, delegate to `crate::fd`'s
+  registry** (`src/fd.rs`) rather than returning `EBADF` outright — the only channel two
+  independently loaded modules have to coordinate (`modules/fat32/`'s open files register their
+  read/write/close callbacks there; modules can't call each other directly, only module → kernel —
+  see "Dynamic kernel modules" below). `EBADF` is still what comes back if `fd` isn't stdin/stdout
+  *and* isn't registered in that table either.
 
 ## Linux-compatible syscall mechanism (`src/linux_syscall.rs`)
 
@@ -322,6 +387,369 @@ the *mechanism* in isolation first.
   `Result<u64, u64>` `src/syscall.rs`'s `sys_write`/`sys_exit` return (positive errno in) into
   Linux's own negative-`RAX` wire format — the same underlying functions feed both this module and
   `src/syscall.rs`'s own carry-flag-based dispatcher, each converting `Err(errno)` differently.
+
+## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
+
+The first genuinely interactive userland program: unlike every earlier demo (`ring3-smoke`,
+`linux-syscall-smoke`), which print a message and exit, `stsh` ("stupidshell") loops forever,
+reading a line at a time from the keyboard and dispatching a small set of built-ins (`help`, `echo
+<text>`, `exit`, `cat <name>`, `write <name> <text>`, `cd [path]`, `ls [path]`, `mkdir <name>`)
+until told to exit. It's wired up by default — see "User-mode execution" above — and runs entirely
+over OxideBSD's own native `int 0x80` ABI; it has no equivalent on the Linux-compatible path yet.
+`cat`/`write`/`cd`/`ls`/`mkdir` exercise `modules/fat32/`'s `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/
+`SYS_MKDIR` end to end — see "Dynamic kernel modules" and "FAT32 filesystem module" below.
+
+- **`cd`/`ls`/`mkdir` are built-in commands, not separate programs `stsh` loads and execs** — a
+  deliberate scope decision, not an oversight. A real `exec` would need a new syscall *and* some
+  way to return control to the shell once the child exits; today `sys_exit` halts the whole
+  machine, since there's no process abstraction or scheduler at all yet (exactly the kind of
+  structural commitment `CLAUDE.md`'s "Project" section flags as needing a real discussion first).
+  `cd` specifically has to be a built-in regardless of that constraint, for the same reason it
+  always is in a real shell: a child process changing its own working directory can never affect
+  its parent's, so "changing directory" only means anything if the shell does it to itself.
+- **`ls` needed no new syscall** — `modules/fat32/`'s `fat32_open`, when the resolved target is a
+  directory, hands back a formatted listing through the exact same `OpenFile::Read`/`SYS_READ`
+  path a real file's content would use, so `ls` is implemented identically to `cat` on the `stsh`
+  side. See "FAT32 filesystem module" below for why this is a pragmatic simplification, not a
+  claim of matching real `open()`-on-a-directory semantics.
+
+- **The data path: keyboard IRQ → `src/stdin.rs` ring buffer → `SYS_READ` → userland.**
+  `keyboard_interrupt_handler` (`src/interrupts.rs`) already decoded scancodes into `DecodedKey`s
+  for echoing; it now also pushes each ASCII `DecodedKey::Unicode` byte into `stdin`'s
+  fixed-capacity (`256`-byte) ring buffer (non-ASCII is silently dropped — a US layout won't
+  produce it, and it keeps the buffer's contract to raw bytes, not full UTF-8, simple). `sys_read`
+  (`src/syscall.rs`) drains that buffer into the caller's pointer.
+- **The keyboard handler only echoes printable characters and `\n`/`\r` itself; every other ASCII
+  byte is still pushed to stdin but left unechoed at the IRQ level.** Control bytes (backspace,
+  delete, Ctrl+C, Ctrl+D, ...) are forwarded raw either way, but *how* one should look on screen —
+  erasing a character, printing `^C`, doing nothing — is inherently a userland concern (see
+  `read_line`'s own handling, below), and echoing them here unconditionally used to just produce
+  VGA's placeholder glyph (`src/vga.rs`'s `write_string` maps anything outside `0x20..=0x7e`/`\n`
+  to one) for every one of them, which wasn't useful for any. The keyboard handler also now
+  constructs its `PS2Keyboard` with `HandleControl::MapLettersToUnicode`, not `Ignore` — the
+  reason `stsh` can see Ctrl+C/Ctrl+D as the C0 control codes 0x03/0x04 at all, rather than
+  Ctrl being silently dropped and the bare letter coming through instead.
+- **`src/vga.rs`'s `Writer` special-cases a raw `0x08` (backspace) as "step the cursor back one
+  column, draw nothing"**, rather than falling into its placeholder-glyph path for
+  not-`0x20..=0x7e`/`\n` bytes. This exists specifically so the standard `"\x08 \x08"` terminal
+  idiom (backspace, space, backspace) `stsh`'s `read_line` writes to erase a character works
+  correctly on the VGA console too, not just over a real serial terminal that already understands
+  backspace on its own. Doesn't cross a wrapped-row boundary — nothing in this kernel tracks
+  cursor position across VGA's own line wrapping.
+- **The ring buffer is a plain fixed array, not `alloc::collections::VecDeque`**, specifically to
+  avoid needing to reason about whether allocating from inside an interrupt handler is sound here —
+  sidestepping the question is simpler than answering it. When full, `push_byte` drops the newest
+  incoming byte rather than growing or overwriting unread data.
+- **The shared `spin::Mutex` around the ring buffer can't deadlock, despite being touched from both
+  the keyboard IRQ and syscall code**, because `int 0x80` is an interrupt gate like every other
+  handler in this kernel, so `IF` is already clear for the entire duration of any syscall — the
+  keyboard IRQ can never preempt a syscall in progress on this single core. The two sides of the
+  buffer are mutually exclusive by construction, not because the lock itself provides it; this
+  reasoning breaks if the kernel ever gains SMP, at which point the buffer needs a real
+  cross-core-safe lock.
+- **`sys_read` is non-blocking** (see "Syscall ABI" above for why: no scheduler to block against),
+  so `stsh` busy-polls it one byte at a time in a `spin_loop()` until a byte arrives. This is a
+  userland concern, not a kernel one — a future blocking-capable `read` would still need this same
+  polling shim until there's a scheduler to actually block against.
+- **Basic line editing exists, but it's still not full readline** — no cursor movement (arrow
+  keys) and no history; `read_line` silently discards bytes past its 128-byte `LINE_CAPACITY`
+  rather than growing or erroring. What it does handle: Backspace (`0x08`) and Delete (`0x7f`)
+  both erase the most recently typed byte and re-emit `"\x08 \x08"` to erase it on screen too
+  (both keys are treated identically — there's no cursor position to distinguish "erase before"
+  from "erase under", so this is the pragmatic choice, not an oversight); Ctrl+C (`0x03`) aborts
+  the in-progress line, prints `^C` and a newline, and returns as if an empty line had been
+  entered, so `run_command` no-ops and the main loop just reprompts; Ctrl+D (`0x04`) on an empty
+  line signals EOF and exits the shell via `SYS_EXIT` (matching real shell convention), and is
+  ignored on a non-empty line (again, no cursor position to delete "under"). Any other control
+  byte is dropped rather than inserted literally into the line. This relies on the keyboard
+  handler's `HandleControl::MapLettersToUnicode` setting (see above) to actually produce the
+  Ctrl+C/Ctrl+D bytes in the first place.
+
+## Dynamic kernel modules (`src/module.rs`, `modules/*`)
+
+Loads independently-compiled, relocatable (`ET_REL`) `#![no_std]` code into the kernel's own,
+currently active address space at boot: relocates it, resolves the handful of symbols it
+references against a small hand-curated kernel API, and calls its `module_init`. Not a static
+compile-time registry — real runtime relocation and symbol resolution, closer in spirit to a
+(much smaller, much more constrained) Linux kernel module than to a plugin system. Three modules
+exist so far: `modules/hello/` (trivial, proves the mechanism), `modules/native_abi/` (populates
+`src/syscall.rs`'s dispatch table — see "Syscall ABI" above), `modules/fat32/` (see "FAT32
+filesystem module" below).
+
+This is a genuinely different job from `src/elf.rs`'s userland loader: `elf.rs` loads a handful of
+`PT_LOAD` segments from a statically-linked, non-relocatable `ET_EXEC` binary with zero
+relocations. A relocatable object has no program headers at all — what it has instead is
+potentially hundreds to thousands of small linker sections (one per function/global, before any
+size optimization), a symbol table, and relocation entries that must be resolved and applied by
+hand. `src/module.rs` shares only low-level "read an ELF64 field" helpers with `elf.rs`
+(`crate::elf::read_u{16,32,64}`); its loading logic is independent, and is itself the largest new
+subsystem this feature added (~500+ LOC, comparable in scope to `elf.rs` + `address_space.rs`
+combined).
+
+- **Module crates are plain `#![no_std]` `lib` crates** — no `_start`, no linker script, no final
+  link, and (unlike `userland/*/`) no per-crate `build.rs` either. `build.rs`'s
+  `build_module_crate` cross-builds each one via `cargo rustc --release --lib --target-dir
+  target/modules -- --emit=obj -C codegen-units=1`, which produces exactly one relocatable
+  (`ET_REL`) object and skips the link step entirely — confirmed empirically for this project's
+  exact target/toolchain before relying on it.
+- **`RUSTFLAGS="-C relocation-model=static"`, scoped to only this nested build (never the outer
+  kernel build or `userland/*`'s own), eliminates GOT-indirected (`R_X86_64_GOTPCREL`)
+  relocations almost everywhere** — including inside the precompiled `core`/`alloc` this nested
+  `-Z build-std` invocation produces, which doesn't inherit the trailing `--emit=obj`-style flags,
+  only `RUSTFLAGS`. In exchange, every module's mapped virtual-address region must stay within the
+  low 2 GiB (`src/module.rs`'s `MODULE_VA_BASE = 0x_1000_0000`, `MODULE_REGION_CEILING =
+  0x_8000_0000`) — the two absolute 32-bit relocation forms this makes everything resolve to
+  (`R_X86_64_32`/`32S`) would otherwise silently truncate/corrupt. **"Almost everywhere" turned out
+  to matter**: `core::panicking::panic_bounds_check`'s own internal panic-message formatting still
+  references a numeric `Display::fmt` impl via `GOTPCREL`, unavoidably, in any module whose code
+  does ordinary slice indexing — i.e. essentially all of them. Discovered when `modules/fat32/`'s
+  first real (non-trivial) boot attempt needed it. Rather than eliminate this one further (not
+  possible without avoiding all indexing, an unreasonable constraint), `src/module.rs`'s loader
+  implements a **minimal, eagerly-populated GOT**: one 8-byte slot per `R_X86_64_GOTPCREL` site (no
+  dedup — a module has at most a handful, not worth the bookkeeping), allocated in the module's own
+  region right after its placed sections, populated with the already-resolved symbol address at
+  relocation-application time (no lazy binding — nothing to defer, every symbol is resolved right
+  there). `R_X86_64_GOTPCREL`'s formula (`G + GOT + A - P`) is then just `R_X86_64_PC32`'s own
+  formula with the GOT slot's address standing in for the symbol's — `apply_relocation`'s `PC32`
+  branch is reused directly rather than duplicated.
+- **A mandatory build-time partial relink** (`rust-lld -flavor gnu -r`, a *relocatable* merge, not
+  a final link) merges each module's own object against the exact `core`/`alloc`/
+  `compiler_builtins` `.rlib`s that same `-Z build-std` invocation produced (paths discovered via
+  `std::fs::read_dir` at build time — filenames carry a non-deterministic metadata hash). Without
+  this, a module's undefined-symbol set is open-ended and code-content-dependent — confirmed by
+  building real test modules and finding things like `core::fmt::write`,
+  `<u32 as LowerHex>::fmt`, `memcpy`, and the panic-entry symbol itself, none of which a hand-
+  curated kernel API table could practically enumerate in advance. Archives are wrapped in
+  `--start-group`/`--end-group` since `core`/`alloc`/`compiler_builtins` reference each other and a
+  single linker pass wouldn't otherwise guarantee a resolving order.
+- **`--gc-sections -u module_init` on that same relink step is required, not an optional size
+  optimization** — an earlier draft of this design assumed it could be deferred. Archive-member
+  selection during a `-r` link is coarse (a whole `.o` file, and `-Z build-std`'s own precompiled
+  `core`/`alloc` bundle many unrelated functions into a handful of such files) — referencing just
+  one symbol from a bundled member pulls in everything else defined alongside it. Concretely: the
+  `panic_bounds_check` reference above, left unpruned, pulled in most of `core::fmt`'s numeric and
+  Unicode tables, ballooning `modules/fat32/`'s very first build to 3+ MB across ~2900 sections —
+  and the kernel-side loader (which uses `alloc`/`BTreeMap` freely, unlike module code) exhausted
+  the kernel's small 100 KiB heap just parsing that many section headers, crashing on the very
+  first real boot attempt. `-u module_init` marks every module's sole real entry point as a GC
+  root (a bare `-r` output has no executable's implicit entry point, so nothing is reachable by
+  default without one); `--gc-sections` then prunes everything not transitively reachable from it.
+  Brought that same object down to ~60-75 sections.
+- **No `core::fmt::Write`/`write!` anywhere in module code — discovered the hard way, not a
+  stylistic preference.** An earlier draft of `modules/fat32/`'s logging used `write!` into a
+  custom `core::fmt::Write` sink for readability. `core::fmt::Write::write_fmt`'s default
+  implementation calls `core::fmt::write(&mut dyn Write, ..)`, and constructing *that* trait
+  object's vtable is what actually emits a `GOTPCREL` reference (a different, more severe
+  occurrence than the panic_bounds_check one above, and — before `--gc-sections` was added —
+  responsible for most of that 3+ MB/2900-section bloat on its own). None of the simpler
+  `{}`/`{:x}`-on-a-primitive cases this GOT design was first validated against exercise this path.
+  Modules use hand-rolled byte-level formatting instead (see `modules/fat32/`'s `ByteBuf`).
+- **Modules do not use `alloc`/`Vec`/`BTreeMap`.** Not a hard technical impossibility, but avoids
+  depending on the internal, unstable-ABI `__rust_alloc`-family symbols `#[global_allocator]`
+  wires up (whether a relocated-by-hand module could safely resolve and call through those wasn't
+  worth the risk to validate). Module state instead lives in fixed-size `static mut` arrays — same
+  pattern already established as load-bearing for `gdt.rs`'s RSP0/IST stacks (see "User-mode
+  execution" above), for a *different* underlying reason (see the next point). Kernel-side code
+  that a module merely *calls into* (the loader itself, the syscall registry, the fd registry) is
+  unaffected — `alloc` is fine there, since it's ordinary kernel code, not relocated module code.
+- **A new `static mut` gotcha, distinct from `gdt.rs`'s own.** `gdt.rs`'s stacks need `static mut`
+  because a plain `static`, never Rust-visibly written, gets interned into `.rodata` by the
+  optimizer (the actual writes are hardware-only, invisible to that analysis). The risk found
+  here is the *opposite* direction: a **private** `static mut` buffer that *is* written by real,
+  Rust-visible code, but whose write is never observably read back through an *externally visible*
+  function, can have that write (and the computation feeding it) deleted entirely as an
+  unobservable dead store — confirmed via a controlled test. `modules/fat32/`'s `DISK` buffer
+  (module_init copies the embedded read-only template into it once) avoids this because every read
+  of it happens from within exported, syscall-registered handler functions whose results feed
+  observably into `oxidebsd_log` calls or syscall return values — the optimizer can't prove any of
+  that away. Any *future* module state with a similar "write once, read later" shape needs this
+  same discipline: make sure something externally reachable actually reads it back.
+- **Modules are mapped kernel-only (no `USER_ACCESSIBLE`), and every page gets `WRITABLE`
+  regardless of section type.** Module code runs only in kernel context — invoked via
+  `module_init` at load time, and (for `native_abi`/`fat32`) via syscall-registry/fd-registry
+  callbacks the kernel itself calls into directly — never executed by ring-3 code, so no
+  `USER_ACCESSIBLE` bit is needed even in address spaces that later shallow-copy the kernel's live
+  table (see "Address spaces are a shallow copy" above). Every page (including ones backing
+  `.text`-equivalent sections) is `WRITABLE` because relocation application must patch bytes
+  inside them; this kernel doesn't implement `NO_EXECUTE`/W^X anywhere yet (same simplification
+  `elf.rs`'s own doc comment already calls out), so there's no protection benefit to a stricter
+  per-section split today.
+- **Panic inside a module, concretely answered.** A `lib` crate can't define its own
+  `#[panic_handler]` (only `bin` crates may), and `panic-strategy = "abort"` is the only strategy
+  this target supports anyway — no unwinding to reason about. Every panicking-path function in a
+  module's merged `core`/`alloc` code ultimately calls a fixed, compiler-synthesized symbol for the
+  panic entry point (`core::panicking`'s own internal `rust_begin_unwind` declaration). Its exact
+  mangled name embeds a toolchain-dependent crate-metadata hash not worth hardcoding — `build.rs`'s
+  `discover_panic_symbol` finds it per-module via `llvm-nm --undefined-only` and a substring search
+  for `rust_begin_unwind` (Rust's v0 mangling spells path components out as length-prefixed text,
+  so the literal name still appears inside the hash-bearing mangled symbol). `src/module.rs`'s
+  resolver has one fixed, non-optional entry pointing that symbol at `module_panic_trampoline`,
+  which logs `[module] panic: <PanicInfo>` and calls `hlt_loop()` — a module panic is exactly as
+  fatal as a kernel panic, just logged with a different prefix. `module_panic_trampoline` is
+  declared `extern "Rust"` (not `"C"`) to match how `core::panicking` itself declares this symbol —
+  relying on both sides being compiled by the very same rustc invocation's ABI for a plain
+  single-reference-argument function, which isn't an officially stable guarantee but holds in
+  practice within one compiler version.
+- **The loader's own two-pass placement.** Pass 1 walks every `SHF_ALLOC` section (the ones that
+  actually consume runtime memory — non-`SHF_ALLOC` sections like `.comment`/relocation/symbol-
+  table sections are skipped entirely), assigning each a bump-allocated offset within the module's
+  region respecting `sh_addralign`. Pass 2 maps a page-aligned region (via `allocate_region`, a
+  bump allocator over the fixed low-2GiB range, mirroring `BootInfoFrameAllocator`'s own "hand out
+  forward, never reuse" philosophy — no module unload/reload exists yet, so there's nothing to
+  reclaim), then copies `SHT_PROGBITS` bytes in (`SHT_NOBITS`/`.bss`-equivalent sections are
+  already zeroed by the fresh frame allocation, so nothing further is needed for them). Pages are
+  mapped into the kernel's own **currently active** table (not a separate, not-yet-active one the
+  way `elf.rs`'s userland loading targets) — so unlike `elf.rs`, relocation writes and section
+  copies go through ordinary virtual pointers directly, no physical-memory-offset indirection
+  needed.
+- **The five other relocation types applied (`R_X86_64_64`, `R_X86_64_32`, `R_X86_64_32S`,
+  `R_X86_64_PC32`, `R_X86_64_PLT32`) are the complete set observed empirically** across every
+  module tried (plain calls/data references, `core::fmt`-heavy code including what
+  `panic_bounds_check` itself references, large static-buffer fills/copies). `PLT32` is resolved
+  exactly like `PC32` (direct-referencing the real target, no actual PLT/lazy binding — correct
+  whenever, as here, every symbol is eagerly resolved at load time). The two absolute 32-bit forms
+  validate that the computed value actually fits before writing — a computed address that doesn't
+  losslessly fit returns `ModuleError::RelocationOverflow` rather than silently truncating and
+  corrupting the write, the same "fail loud, not silent" discipline `Star::write`'s own validation
+  already established elsewhere in this codebase. An unrecognized relocation type is reported the
+  same way, not ignored — a module built with different codegen could plausibly need one this
+  loader doesn't handle yet.
+- **`serial_println!` can't use implicit `{name}`-style format-string captures — only
+  `serial_print!` can.** Discovered while writing `src/module.rs`'s own logging:
+  `serial_println!`'s macro expansion wraps its format string in `concat!($fmt, "\n")`, and
+  `concat!`-produced format strings can't capture variables from the surrounding scope (a hard
+  compiler error, not a lint) — `serial_print!` doesn't have this problem since it doesn't go
+  through `concat!`. Every `serial_println!` call anywhere in this codebase (not just
+  `module.rs`) already uses explicit positional arguments for this reason; new call sites should
+  follow the same pattern rather than reaching for `{variable}` captures.
+- **Known limitations, deliberate for this pass:** no module unload/reload, no versioning, no
+  inter-module direct calls (only module → kernel, via each module's own resolved symbol table —
+  this is *why* `src/fd.rs`'s registry exists at all, as the only coordination point two modules
+  like `native_abi` and `fat32` have). The `--gc-sections`-driven object-size reduction above is
+  itself further improvable (fewer, coarser-grained sections to begin with) but wasn't pursued
+  further once it solved the actual crash it was needed for.
+
+## FAT32 filesystem module (`modules/fat32/`, `src/fd.rs`)
+
+A basic FAT32 filesystem, loaded as a dynamic kernel module (see above) and backed by a small,
+build-time-generated, embedded in-memory disk image — there's no real block device driver yet, so
+this is squarely a filesystem-*format* proof, not a storage-*driver* one. Read and write are both
+implemented; writes mutate the in-memory working copy only and **do not persist across reboot**.
+
+- **The disk image is hand-generated at build time, not `mkfs.fat`-produced.** `build.rs`'s
+  `write_fat32_image` writes real FAT32 structures (BPB, FSInfo sector, 2 mirrored FAT copies with
+  32-bit entries, root directory as a proper cluster chain rather than FAT16's fixed region) — but
+  at ~2 MiB total, far below Microsoft's conventional FAT32 minimum-volume-size heuristic (real
+  `mkfs.fat` wants tens of megabytes, to guarantee ≥65525 clusters — impractical to embed). Since
+  only this module's own hand-rolled parser ever reads the image, deliberately violating that
+  heuristic (while staying structurally correct otherwise) is safe — the same "authenticity nod,
+  not compatibility claim" spirit already used for syscall numbers elsewhere in this codebase.
+  Generating it with own code rather than shelling out to `mkfs.fat` also keeps the build hermetic
+  — no new required host tool, consistent with `cargo build` needing no manual pre-step anywhere
+  else in this repo.
+- **Two demo files ship in the image**, embedded via the generator: `HELLO.TXT` (a short, single-
+  cluster message) and `BIG.TXT` (1224 bytes spanning 3 clusters, content generated by a formula
+  — `b'A' + index % 26` — rather than a literal, so `modules/fat32/`'s own self-check can
+  independently recompute the expected bytes instead of keeping a second copy of a large literal in
+  sync by hand). `BIG.TXT` specifically exercises cluster-chain-following, not just single-cluster
+  reads.
+- **Deliberate simplifications, all documented in the module's own doc comment rather than
+  accidental:** 8.3 short names only (no VFAT/long-filename entries); no directory's own cluster
+  chain is ever extended once full (`create_file`/`sys_mkdir` return `DirectoryFull`/`ENOSPC`
+  instead — fine for this module's tiny demo scale, a real gap for heavier use); sequential reads
+  via an internal cluster-chain walk (no `lseek`); writes only ever *create* a brand-new file with
+  its complete contents in one logical operation — no append, no truncate, no rewriting an existing
+  file (name collisions aren't even checked for at the FAT32-logic level for files; `SYS_OPEN`'s
+  handler is responsible for that — `sys_mkdir` *does* check, returning `EEXIST`).
+- **Subdirectories exist, but the path grammar is deliberately a single component at a time** —
+  `resolve_dir`/`to_short_name` accept `""`/`"."` (current directory), `"/"` (root), `".."`
+  (current directory's parent, read from its own `..` entry), or one plain name, optionally
+  `/`-prefixed to resolve against root instead of the current directory — never a multi-level path
+  like `a/b/c` in a single call (`to_short_name` rejects any embedded `/` outright, returning
+  `EINVAL`). Real shells already build multi-level navigation out of repeated single-component
+  `cd`s, so this isn't a real capability gap for `stsh`'s own use, just a bound on what any one
+  syscall call understands. A subdirectory's `..` entry follows FAT32's own real (if surprising)
+  convention: its cluster field is `0` when the parent is *root* specifically (inherited from
+  FAT12/16, where root had no cluster number at all, being a separate fixed region), not root's
+  actual cluster number — `parent_of` translates that back on read, `sys_mkdir` writes it correctly
+  on create.
+- **There is exactly one, kernel-wide "current directory" (`CURRENT_DIR_CLUSTER`), not a
+  per-process one** — this kernel has no process abstraction at all yet, so there's nothing to
+  scope it to; fine for a single interactive shell, would need real per-process state once more
+  than one thing can be "current" at once. `static mut` for the same reason `DISK`/`OPEN_FILES`
+  are (see below): every read of it happens from within this module's own exported,
+  syscall-reachable functions, so the optimizer can't prove a write to it unobservable.
+- **A real aliasing bug, found and fixed before it shipped: `module_init`'s own self-check must
+  never call `sys_mkdir`/`sys_chdir` while its own `&mut DISK` reference is still "live" in the
+  compiler's sense (i.e., used again afterward).** Both functions independently derive their own
+  fresh `&mut DISK` internally; if the caller's own reference is considered live across that call
+  (Rust's NLL tracks a binding's live range through to its *last actual use*, not its lexical
+  scope, but if the outer binding *is* used again later, its live range spans the call regardless),
+  that's two simultaneously-live exclusive references to the same static — real, LLVM-exploitable
+  undefined behavior, not just a style nit, since `&mut` carries a noalias guarantee the optimizer
+  is entitled to rely on. The subdirectory portion of `module_init`'s self-check calls
+  `sys_mkdir`/`sys_chdir` and *then* derives a deliberately fresh reference (`disk2` in the source,
+  not a reuse of the function's original `disk` binding) for everything after — the original
+  binding's last use is earlier, in the root-level checks, so there's no overlap. Any future
+  self-check code added in the same function needs the same discipline: once you're going to call
+  another exported function that itself touches `DISK`, stop using your own outstanding reference
+  to it, don't just assume "I'm not writing through it right now" is enough.
+- **Writes are all-at-once-on-`close`, not incremental per `write` call.** `open(..., O_CREAT)` on
+  a new name allocates an `OpenFile::Write` slot with a fixed `[u8; MAX_FILE_BUFFER]` (4096 bytes)
+  accumulator; each `SYS_WRITE` call appends into it; the file is only actually committed to
+  `DISK` (cluster allocation, FAT chaining, directory-entry creation, all via `create_file`) at
+  `close` time. A file opened for reading instead caches its *entire* contents into a same-sized
+  fixed buffer at `open` time (rather than walking the cluster chain incrementally per `read`
+  call) — simpler, and reuses the same "whole file into a fixed buffer" shape already established
+  by this module's self-check, at the cost of capping both readable and writable file size at
+  `MAX_FILE_BUFFER` (`open` returns `EFBIG` past that on the read side).
+- **Testing note: no `#[test_case]` unit tests exist for this module's parsing logic, by
+  necessity, not oversight.** `modules/fat32/` is compiled entirely independently of the kernel
+  (see "Dynamic kernel modules" above) and only ever runs as relocated, loaded module code — the
+  kernel's `#[test_case]`-based framework (`src/lib.rs`) has no way to reach into a separately-
+  compiled module crate at all, and duplicating this parsing logic into a second, kernel-side copy
+  purely for test coverage would risk the two silently drifting apart. Instead, `module_init` runs
+  a self-check against its own real, already-loaded code (parses the embedded image, lists the
+  root directory, reads `HELLO.TXT`/`BIG.TXT` back and compares, then exercises the write path by
+  creating a throwaway file and reading it back) and logs `[fat32] self-check passed` or a specific
+  `FAILED` reason over serial — the same "boot in QEMU and self-report" testing philosophy this
+  codebase's "Test architecture" section already establishes for the kernel as a whole, just
+  applied one level deeper.
+- **`ls` reuses `open`/`read`/`close` rather than a dedicated syscall.** `fat32_open`, when the
+  resolved target is a directory (including the current directory itself, or root), doesn't cache
+  file content into the `OpenFile::Read` slot it registers — it formats a listing (name plus
+  `<DIR>` or a byte count, one per line, `.`/`..` hidden) into that same buffer instead
+  (`open_directory_listing`). Nothing downstream (`fat32_read`, `stsh`'s `ls`) needs to know or
+  care that the bytes came from a listing rather than a real file — same fd-registry callbacks,
+  same read loop. A pragmatic simplification, not a claim of matching real `open()`-on-a-directory
+  semantics (which hands back a fd meant for `getdents`/`readdir`, not raw bytes).
+- **Syscall integration and the fd registry (`src/fd.rs`).** `modules/fat32/` registers
+  `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` directly against the same syscall dispatch table
+  `native_abi` uses (see "Syscall ABI" above). `SYS_READ`/`SYS_WRITE` themselves stay owned by
+  `native_abi`/
+  `src/syscall.rs`, though — for any fd that isn't stdin/stdout, they now delegate to `src/fd.rs`'s
+  small kernel-owned registry, which this module's `fat32_open` populates (via
+  `oxidebsd_alloc_fd`/`oxidebsd_register_fd_ops`) with per-fd read/write/close callbacks into its
+  own code. This registry exists *specifically* because modules can't call each other directly —
+  only module → kernel, via each module's own independently resolved symbol table — so routing a
+  read/write for a fd `fat32` owns, issued through syscall machinery `native_abi` owns, has no
+  path except through a kernel-resident coordination point. `SYS_CLOSE`'s handler delegates to the
+  kernel's `oxidebsd_close_fd` (which removes the registry entry *then* invokes the module's own
+  `fat32_close` callback), not directly to `fat32_close` — so a closed fd is also no longer
+  reachable via `SYS_READ`/`SYS_WRITE` afterward, not just cleaned up on the FAT32 side. Like
+  `BootInfoFrameAllocator` and `module::allocate_region`, `src/fd.rs`'s fd numbers are a simple
+  bump counter — never reused, even after `close`.
+- **`stsh`'s `cat`/`write`/`cd`/`ls`/`mkdir` (see "Interactive shell" above) are the end-to-end
+  proof**: `cat` opens read-only and streams bytes via `SYS_READ` until it returns `0` (clean EOF —
+  a FAT32 read never needs busy-polling the way stdin's non-blocking `SYS_READ` does); `write`
+  opens with `O_CREAT`, issues one `SYS_WRITE`, then closes. Verified by booting in QEMU and
+  driving `stsh` via injected keystrokes (same method used throughout this codebase's manual
+  verification passes): `write foo hello world` → `wrote 11 bytes`; `cat foo` → `hello world`;
+  `cat hello.txt` → the embedded demo file's real contents; `cat nope` → `errno 2` (`ENOENT`);
+  `mkdir projects` then `cd projects` then `ls` shows an empty listing (a genuinely distinct
+  directory, not an alias for root); `write notes hi there` inside it, followed by `ls`, shows
+  `NOTES` there and *not* back in root's own listing after `cd ..`; `cat /hello.txt` from inside
+  `projects` (root-relative, despite the current directory) still finds the original demo file.
 
 ## Dependency notes
 

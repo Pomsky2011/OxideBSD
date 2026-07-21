@@ -224,14 +224,18 @@ pub fn load(
     Ok(elf.entry_point())
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+// pub(crate), not private: src/module.rs's ET_REL parser reads the same little-endian ELF64
+// field shapes and reuses these rather than duplicating them -- everything past "read a field",
+// section-header/symbol-table parsing and relocation application, is genuinely different from
+// this file's PT_LOAD-segment loading and stays separate (see src/module.rs's own doc comment).
+pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }

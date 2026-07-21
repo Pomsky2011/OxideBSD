@@ -27,29 +27,70 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 /// ABI by loading and jumping into a userland demo binary — see `run_userland_demo` and
 /// `usermode::jump_to_usermode` for why this never returns here.
 ///
-/// Currently runs `ring3-smoke` (see `userland/ring3-smoke/`), which exercises OxideBSD's own
-/// native, BSD-style `int 0x80` ABI (`src/syscall.rs`) — including its carry-flag error
-/// convention, in both the success and deliberate-failure direction. `linux-syscall-smoke`
-/// (`userland/linux-syscall-smoke/`, the Linux-compatible `SYSCALL`/`SYSRET` path,
-/// `src/linux_syscall.rs`) still works — verified separately by booting with it loaded instead —
-/// it's just not what's wired up here at the moment, since only one demo can run per boot
-/// (`SYS_EXIT` idles the whole system, there's no scheduler to hand control to something else
-/// afterward).
+/// Currently runs `stsh` (see `userland/stsh/`), a genuinely interactive shell over OxideBSD's own
+/// native, BSD-style `int 0x80` ABI (`src/syscall.rs`) — unlike every earlier demo, this one loops
+/// forever reading keyboard input instead of printing a message and exiting. `ring3-smoke` and
+/// `linux-syscall-smoke` (`userland/ring3-smoke/`, `userland/linux-syscall-smoke/`) still work —
+/// verified separately by booting with one of them loaded instead — they're just not what's wired
+/// up here at the moment, since only one demo can run per boot.
+///
+/// Before that, loads the `hello` kernel module (`modules/hello/`) via `oxidebsd::module::load`
+/// — see `CLAUDE.md`'s module-loading section. This is the first, deliberately minimal proof that
+/// dynamic module loading works end to end; later modules (the native syscall ABI, FAT32) load
+/// the same way.
 #[cfg(not(test))]
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("OxideBSD kernel booting...");
 
-    let (_mapper, mut frame_allocator) = oxidebsd::init(boot_info);
+    let (mut mapper, mut frame_allocator) = oxidebsd::init(boot_info);
 
-    const RING3_SMOKE_ELF: &[u8] = include_bytes!(env!("RING3_SMOKE_ELF_PATH"));
+    const HELLO_MOD: &[u8] = include_bytes!(env!("HELLO_MOD_PATH"));
+    const HELLO_PANIC_SYMBOL: &str = env!("HELLO_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "hello",
+        HELLO_MOD,
+        HELLO_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the hello module: {e:?}"));
+
+    // Populates src/syscall.rs's dispatch table (SYS_EXIT/SYS_READ/SYS_WRITE) -- must load before
+    // stsh, below, is jumped into, since stsh's syscalls resolve through that table.
+    const NATIVE_ABI_MOD: &[u8] = include_bytes!(env!("NATIVE_ABI_MOD_PATH"));
+    const NATIVE_ABI_PANIC_SYMBOL: &str = env!("NATIVE_ABI_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "native_abi",
+        NATIVE_ABI_MOD,
+        NATIVE_ABI_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the native_abi module: {e:?}"));
+
+    // Parses its embedded FAT32 image and runs its own self-check (logged over serial) --
+    // read-only for now, see modules/fat32's doc comment. Not yet wired into any syscall (that's
+    // later work), so this only proves the filesystem-format parsing itself for the moment.
+    const FAT32_MOD: &[u8] = include_bytes!(env!("FAT32_MOD_PATH"));
+    const FAT32_PANIC_SYMBOL: &str = env!("FAT32_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "fat32",
+        FAT32_MOD,
+        FAT32_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the fat32 module: {e:?}"));
+
+    const STSH_ELF: &[u8] = include_bytes!(env!("STSH_ELF_PATH"));
     // Arbitrary, just clear of the kernel image, heap, and phys-memory-offset window.
     const USER_STACK_TOP: u64 = 0x_5000_0000_0000;
 
     run_userland_demo(
         boot_info,
         &mut frame_allocator,
-        "ring3-smoke",
-        RING3_SMOKE_ELF,
+        "stsh",
+        STSH_ELF,
         USER_STACK_TOP,
     )
 }

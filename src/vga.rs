@@ -74,6 +74,27 @@ impl Writer {
     fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.new_line(),
+            // Backspace: step the cursor back a column and blank the character that was there,
+            // mirroring `src/serial.rs`'s `SerialPort::send`, which expands a raw 0x08/0x7f into
+            // the standard "\x08 \x08" terminal idiom for the same reason -- a caller (see
+            // `userland/stsh/`'s `read_line`) just writes a single raw backspace byte and expects
+            // *something* to actually erase the character, not just move a cursor over it.
+            // Doesn't cross a line boundary; nothing in this kernel tracks cursor position across
+            // wrapped rows.
+            0x08 => {
+                self.column_position = self.column_position.saturating_sub(1);
+                let row = BUFFER_HEIGHT - 1;
+                let col = self.column_position;
+                let color_code = self.color_code;
+                self.write_char_at(
+                    row,
+                    col,
+                    ScreenChar {
+                        ascii_character: b' ',
+                        color_code,
+                    },
+                );
+            }
             byte => {
                 if self.column_position >= BUFFER_WIDTH {
                     self.new_line();
@@ -98,8 +119,8 @@ impl Writer {
     fn write_string(&mut self, s: &str) {
         for byte in s.bytes() {
             match byte {
-                // Printable ASCII, plus newline.
-                0x20..=0x7e | b'\n' => self.write_byte(byte),
+                // Printable ASCII, plus newline and backspace (see `write_byte`).
+                0x20..=0x7e | b'\n' | 0x08 => self.write_byte(byte),
                 // Anything else isn't representable in code page 437; show a placeholder.
                 _ => self.write_byte(0xfe),
             }

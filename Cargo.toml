@@ -1,5 +1,12 @@
 [workspace]
-members = ["userland/ring3-smoke", "userland/linux-syscall-smoke"]
+members = [
+  "userland/ring3-smoke",
+  "userland/linux-syscall-smoke",
+  "userland/stsh",
+  "modules/hello",
+  "modules/native_abi",
+  "modules/fat32",
+]
 
 [package]
 name = "oxidebsd"

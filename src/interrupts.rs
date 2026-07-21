@@ -33,10 +33,14 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+// MapLettersToUnicode (not Ignore) so Ctrl+<letter> decodes to the corresponding C0 control code
+// (Ctrl+C => 0x03, Ctrl+D => 0x04, etc.) instead of being silently dropped to the plain letter --
+// stsh's read_line (see `userland/stsh/`) relies on those bytes reaching stdin to implement
+// abort-line/EOF handling.
 static KEYBOARD: Mutex<PS2Keyboard<Us104Key, ScancodeSet1>> = Mutex::new(PS2Keyboard::new(
     ScancodeSet1::new(),
     Us104Key,
-    HandleControl::Ignore,
+    HandleControl::MapLettersToUnicode,
 ));
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
@@ -164,11 +168,28 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     {
         match key {
             DecodedKey::Unicode(character) => {
-                serial_print!("{character}");
+                // Non-ASCII is silently dropped here -- a US keyboard layout won't produce it,
+                // and it keeps sys_read's contract (raw bytes, not full UTF-8) simple.
+                if character.is_ascii() {
+                    let byte = character as u8;
+                    // Only echo printable characters and newline directly here. Control bytes
+                    // (backspace, delete, Ctrl+C, Ctrl+D, ...) are still pushed to stdin below,
+                    // but *how* they should look on screen (erasing a character, printing "^C",
+                    // etc.) is a userland concern -- see `userland/stsh/`'s `read_line` -- and
+                    // echoing them raw here just produces VGA's placeholder glyph for anything
+                    // outside 0x20..=0x7e, which isn't useful for any of them.
+                    if byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte) {
+                        serial_print!("{character}");
+                    }
+                    crate::stdin::push_byte(byte);
+                }
             }
-            DecodedKey::RawKey(key) => {
-                serial_print!("{key:?}");
-            }
+            // Modifier/lock keys (Shift, Ctrl, CapsLock, ...) and any other non-Unicode key --
+            // nothing to echo or push to stdin. These used to be logged via `{key:?}` for
+            // debugging during early keyboard-decode bring-up, but that printed raw debug names
+            // like "LControl" inline with real typed text (e.g. right before a Ctrl+C's "^C"),
+            // which is exactly the kind of noise a real shell shouldn't produce.
+            DecodedKey::RawKey(_) => {}
         }
     }
 

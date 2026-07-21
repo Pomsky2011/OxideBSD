@@ -10,14 +10,17 @@ extern crate alloc;
 pub mod address_space;
 pub mod allocator;
 pub mod elf;
+pub mod fd;
 pub mod gdt;
 pub mod interrupts;
 pub mod linux_syscall;
 pub mod memory;
+pub mod module;
 pub mod pic;
 pub mod qemu;
 pub mod reboot;
 pub mod serial;
+pub mod stdin;
 pub mod syscall;
 pub mod usermode;
 pub mod vga;
@@ -129,8 +132,39 @@ fn test_timer_interrupt_fires() {
 
 #[test_case]
 fn test_syscall_dispatch_rejects_unknown_number() {
-    let unknown = syscall::SYS_WRITE + 1000;
-    assert_eq!(syscall::dispatch(unknown, 0, 0, 0), Err(syscall::ENOSYS));
+    // Nothing registers a number anywhere near this one -- `dispatch`'s table starts empty in
+    // this test binary regardless, since module loading only happens in src/main.rs's non-test
+    // kernel_main, never in this crate's own #[cfg(test)] entry point.
+    assert_eq!(syscall::dispatch(0xFFFF, 0, 0, 0), Err(syscall::ENOSYS));
+}
+
+#[test_case]
+fn test_syscall_dispatch_routes_registered_handlers() {
+    extern "C" fn ok_handler(a0: u64, a1: u64, a2: u64) -> i64 {
+        (a0 + a1 + a2) as i64
+    }
+    extern "C" fn err_handler(_a0: u64, _a1: u64, _a2: u64) -> i64 {
+        -5
+    }
+
+    const TEST_OK_NUMBER: u64 = 0xF001;
+    const TEST_ERR_NUMBER: u64 = 0xF002;
+    assert_eq!(
+        syscall::oxidebsd_register_syscall(TEST_OK_NUMBER, ok_handler),
+        0
+    );
+    assert_eq!(
+        syscall::oxidebsd_register_syscall(TEST_ERR_NUMBER, err_handler),
+        0
+    );
+    // Re-registering an already-claimed number is rejected, not silently overwritten.
+    assert_eq!(
+        syscall::oxidebsd_register_syscall(TEST_OK_NUMBER, ok_handler),
+        -1
+    );
+
+    assert_eq!(syscall::dispatch(TEST_OK_NUMBER, 1, 2, 3), Ok(6));
+    assert_eq!(syscall::dispatch(TEST_ERR_NUMBER, 0, 0, 0), Err(5));
 }
 
 #[test_case]
