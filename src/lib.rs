@@ -12,6 +12,7 @@ pub mod allocator;
 pub mod elf;
 pub mod gdt;
 pub mod interrupts;
+pub mod linux_syscall;
 pub mod memory;
 pub mod pic;
 pub mod qemu;
@@ -45,6 +46,7 @@ pub fn init(
     gdt::init();
     interrupts::init_idt();
     interrupts::init_pics();
+    linux_syscall::init();
 
     serial_println!("[boot] enabling interrupts");
     x86_64::instructions::interrupts::enable();

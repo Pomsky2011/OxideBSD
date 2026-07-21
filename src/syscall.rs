@@ -43,7 +43,10 @@ pub(crate) extern "C" fn syscall_dispatch(number: u64, arg0: u64, arg1: u64, arg
 
 /// Terminates the calling process. Since there's no scheduler to switch to something else, this
 /// is the *whole system's* clean stopping point, not a per-process one: log the code and idle.
-fn sys_exit(code: u64) -> ! {
+///
+/// Shared with `src/linux_syscall.rs`'s `exit`/`exit_group` — the underlying "terminate" semantics
+/// are identical regardless of which ABI a program called through.
+pub(crate) fn sys_exit(code: u64) -> ! {
     serial_println!("[boot] process exited with code {}", code as i64);
     hlt_loop();
 }
@@ -51,7 +54,10 @@ fn sys_exit(code: u64) -> ! {
 /// Writes `len` bytes at `ptr` to `fd` (only `fd == 1`, "stdout", is supported — routed through
 /// `serial_print!`, which already mirrors to VGA). Returns the byte count on success, or
 /// `SYSCALL_ERROR`.
-fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
+///
+/// Shared with `src/linux_syscall.rs`'s `write` — same known pointer-validation gap applies there
+/// too.
+pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
     const STDOUT: u64 = 1;
     if fd != STDOUT {
         return SYSCALL_ERROR;

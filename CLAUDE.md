@@ -11,12 +11,16 @@ IRQ handler (decodes scancodes and echoes typed characters — no line editing o
 text-mode console mirroring serial output, and a heap allocator backed by bootloader-provided
 paging. Phase 2 is underway: the kernel can build a *separate* address space
 (`src/address_space.rs`), load a static ELF64 binary into it (`src/elf.rs`), jump into ring 3
-(`src/usermode.rs`), and user-mode code can call back into the kernel via a minimal syscall ABI
-(`src/syscall.rs`, `int 0x80`, `SYS_EXIT`/`SYS_WRITE`) — see "User-mode execution" and "Syscall ABI"
-below for the current, deliberate limits of that (no process abstraction/scheduler, one demo
-binary, `sys_write` doesn't validate its pointer). Scheduling, a real process abstraction, and a
-filesystem do not exist yet. Architecture decisions for those subsystems have not been made and
-should be discussed with the user before large structural commitments are made.
+(`src/usermode.rs`), and user-mode code can call back into the kernel via two independent syscall
+mechanisms — this kernel's own `int 0x80` ABI (`src/syscall.rs`) and a real Linux-compatible
+`SYSCALL`/`SYSRET` path (`src/linux_syscall.rs`), aimed specifically at eventually running
+unmodified musl/BusyBox binaries. See "User-mode execution", "Syscall ABI", and "Linux-compatible
+syscall mechanism" below for the current, deliberate limits (no process abstraction/scheduler, one
+demo binary at a time, `sys_write` doesn't validate its pointer, and — for the Linux path — only
+`write`/`exit`/`exit_group` are implemented; musl's actual startup needs many more syscalls and is
+real follow-up work, not done). Scheduling, a real process abstraction, and a filesystem do not
+exist yet. Architecture decisions for those subsystems have not been made and should be discussed
+with the user before large structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -45,12 +49,12 @@ Target architecture is x86_64 only for now.
 - Format: `cargo fmt`
 
 `cargo build`/`cargo run`/`cargo test`/`cargo clippy`/`cargo fmt` at the repo root only ever
-target the `oxidebsd` package, even though it's now a workspace — `userland/ring3-smoke` is a
-separate member cargo doesn't build by default in a "root package" workspace like this one; the
-root package's own `build.rs` cross-builds it as a side effect of building `oxidebsd` (see "User-mode
-execution" below). To build/lint/format it directly: append
-`--manifest-path userland/ring3-smoke/Cargo.toml` (and, to avoid the target-directory-locking
-gotcha described below, `--target-dir target/userland`).
+target the `oxidebsd` package, even though it's now a workspace — `userland/ring3-smoke` and
+`userland/linux-syscall-smoke` are separate members cargo doesn't build by default in a "root
+package" workspace like this one; the root package's own `build.rs` cross-builds both as a side
+effect of building `oxidebsd` (see "User-mode execution" below). To build/lint/format one of them
+directly: append `--manifest-path userland/<name>/Cargo.toml` (and, to avoid the
+target-directory-locking gotcha described below, `--target-dir target/userland`).
 
 There is no `cargo check`/`cargo test` fast path that skips QEMU — every test target is its own
 bootable kernel image that QEMU actually boots, so `cargo test` is slow (each target rebuilds a
@@ -122,26 +126,32 @@ physical memory at `BootInfo::physical_memory_offset`:
 ## User-mode execution (`src/address_space.rs`, `src/elf.rs`, `src/usermode.rs`)
 
 Proves paging beyond the kernel's own address space, address-space separation, and ELF loading all
-work, by loading a tiny embedded userland binary (`userland/ring3-smoke/`) and jumping into ring 3.
-See `src/main.rs`'s `run_ring3_smoke_demo`: it does some arithmetic, calls `SYS_WRITE` to print a
-message, then `SYS_EXIT`s with the checksum as its exit code (see "Syscall ABI" below) — both the
-printed message and the logged exit code are the actual end-to-end proof this all works. There's
-still no process abstraction or scheduler, so this really is a one-shot demo: `SYS_EXIT` doesn't
-resume anything, it just idles the whole system (see below).
+work, by loading a tiny embedded userland binary and jumping into ring 3. `src/main.rs`'s
+`run_userland_demo` is generic over which binary — `kernel_main` currently points it at
+`userland/linux-syscall-smoke/` (see "Linux-compatible syscall mechanism" below); the older
+`userland/ring3-smoke/` (this kernel's own `int 0x80` ABI, see "Syscall ABI" below) still works,
+it's just not what's wired up by default at the moment, since only one demo can run per boot
+(`SYS_EXIT` idles the whole system — there's no scheduler to hand control to something else
+afterward). Whichever binary runs, the pattern is the same: it does something observable (prints a
+message, exits with a distinctive code), and that output over serial/VGA is the actual end-to-end
+proof paging/ELF-loading/ring-3/syscalls all work together.
 
-- **The userland demo build.** `userland/ring3-smoke/` is a separate workspace member (root
-  `Cargo.toml` gained a `[workspace]` table; the root package is still its own workspace member,
-  same as before). The root package's `build.rs` cross-builds it into `target/userland/` — a
-  **separate** target directory from the outer build's own `target/`, not the shared one:
-  invoking a nested `cargo build` against the *same* target directory a still-running outer cargo
-  invocation already holds a lock on (build scripts run as part of that outer build) can deadlock.
-  The resulting ELF's path is exposed via `cargo:rustc-env=RING3_SMOKE_ELF_PATH=...`, so
-  `src/main.rs` can `include_bytes!(env!("RING3_SMOKE_ELF_PATH"))` — this keeps `cargo build`/
-  `cargo run`/`cargo test` working with no manual pre-step. `userland/ring3-smoke/linker.ld` forces
-  a `0x400000` load base, clear of the kernel's own image, heap, and phys-memory-offset window (see
-  below); its own tiny `build.rs` passes that script as a link arg to just its own binary, not via
-  `RUSTFLAGS`, which would apply to (and force a rebuild of) the `-Z build-std`-compiled
-  core/alloc/compiler_builtins shared with the outer build.
+- **The userland demo build.** `userland/ring3-smoke/` and `userland/linux-syscall-smoke/` are
+  separate workspace members (root `Cargo.toml` gained a `[workspace]` table; the root package is
+  still its own workspace member, same as before). The root package's `build.rs` cross-builds both
+  (via a shared `build_userland_crate` helper) into `target/userland/` — a **separate** target
+  directory from the outer build's own `target/`, not the shared one: invoking a nested
+  `cargo build` against the *same* target directory a still-running outer cargo invocation already
+  holds a lock on (build scripts run as part of that outer build) can deadlock. Each resulting
+  ELF's path is exposed via `cargo:rustc-env=<NAME>_ELF_PATH=...`, so `src/main.rs` can
+  `include_bytes!(env!("..._ELF_PATH"))` — this keeps `cargo build`/`cargo run`/`cargo test`
+  working with no manual pre-step. Each userland crate's `linker.ld` forces its own distinct load
+  base (`0x400000` for `ring3-smoke`, `0x500000` for `linux-syscall-smoke` — not currently required
+  since only one demo loads at a time, but keeps them from colliding if that changes), clear of the
+  kernel's own image, heap, and phys-memory-offset window (see below); each crate's own tiny
+  `build.rs` passes its script as a link arg to just its own binary, not via `RUSTFLAGS`, which
+  would apply to (and force a rebuild of) the `-Z build-std`-compiled core/alloc/compiler_builtins
+  shared with the outer build.
 - **Address spaces are a shallow copy.** `AddressSpace::new` allocates a fresh frame for a new
   level 4 table and copies all 512 entries from the kernel's currently-active one into it — not a
   "higher half only" split, and not a deep clone: the copy is just raw entries (pointers to
@@ -217,6 +227,71 @@ Rust dispatcher's `extern "C" fn(number, arg0, arg1, arg2)` expects.
   rather than corrupting kernel state, so this is a missing safety net for user programs, not a
   kernel soundness hole — but real validation (walking the active page table to confirm the range)
   is a natural follow-up, not yet implemented.
+
+## Linux-compatible syscall mechanism (`src/linux_syscall.rs`)
+
+A second, independent syscall entry point from `src/syscall.rs` — aimed at compatibility with
+*real* x86_64 Linux binaries (which is what an unmodified musl/BusyBox userland actually is)
+rather than this kernel's own ABI. Real x86_64 Linux binaries never use `int 0x80` — that's the
+32-bit legacy path, and musl's x86_64 target has no fallback to it at all — they use the dedicated
+`SYSCALL`/`SYSRETQ` instruction pair: number in `RAX`, up to six arguments in
+`RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9` (`R10`, not `RCX`, for the 4th argument, specifically because
+`SYSCALL` itself clobbers `RCX`/`R11` to save `RIP`/`RFLAGS`), return value in `RAX`, and Linux's
+own syscall numbers (`write` = 1, `exit` = 60, `exit_group` = 231 — the only three implemented so
+far; verified against the real kernel headers' well-known values, not guessed).
+
+**Explicitly out of scope here:** an actual musl or BusyBox binary running. musl's startup reads
+the auxiliary vector off the initial stack (this kernel's ELF loader/`jump_to_usermode` don't set
+one up), needs `arch_prctl` for TLS, needs `mmap`/`brk` for its allocator, and calls a number of
+other syscalls only really discoverable by trying and watching what fails — real, substantial
+follow-up work, not attempted yet. Verification here is a hand-written raw-assembly test program
+(`userland/linux-syscall-smoke/`, no libc at all) that calls `write` then `exit` directly, proving
+the *mechanism* in isolation first.
+
+- **`SYSRETQ`'s segment-selector scheme forced a GDT reorder.** `SYSRETQ` reconstructs target
+  `CS`/`SS` from `IA32_STAR` bits `[63:48]` (call it `X`) as `SS = X+8`, `CS = X+16` — user *data*
+  must sit immediately before user *code*, backwards from the natural ordering. `SYSCALL` needs
+  `STAR[47:32]` (`Y`) as kernel `CS = Y`, `SS = Y+8`, which needed an explicit kernel data segment
+  that didn't exist before (this kernel had never needed one — `SS` was never reloaded in ring 0,
+  and long mode doesn't re-validate it unless you do). `src/gdt.rs`'s GDT is now, in order:
+  kernel code, kernel data, an unused placeholder (historically 32-bit-compat user code, needed
+  only so the offsets land right — its *contents* are never loaded since this kernel only uses
+  `SYSRETQ`), user data, user code, TSS. Don't reorder or insert entries in this block without
+  redoing the `STAR` arithmetic. `init` now also explicitly reloads `SS` on boot, closing that
+  latent gap. Use `x86_64::registers::model_specific::Star::write` (not hand-rolled offset math)
+  to program `IA32_STAR` — it validates the selectors' offsets and privilege levels against exactly
+  this scheme and fails loudly (a `panic!`, not silent misprogramming) if the GDT ever regresses.
+- **No automatic stack switch, and no per-CPU `swapgs` — single-core simplification.** Unlike an
+  interrupt gate + TSS `RSP0`, `SYSCALL` does not switch stacks: control arrives at
+  `linux_syscall_entry` still on the *user's own* stack (now at CPL 0). Real kernels use `swapgs` +
+  a per-CPU `IA32_KERNEL_GS_BASE`-anchored structure to safely find a kernel stack; this kernel has
+  no SMP/APIC multi-processor support at all yet, so a single global scratch stack
+  (`KERNEL_RSP_TOP`/`USER_RSP_SCRATCH`) swapped in by the entry stub is legitimate for now —
+  revisit if multiple cores ever show up.
+- **The entry stub passes a frame pointer, not loose arguments — Linux's argument registers don't
+  line up with System V's.** `src/syscall.rs`'s `int 0x80` stub can `call` straight into Rust
+  because its *own* convention was chosen to match System V exactly. Linux's real convention can't:
+  its 4th argument is `R10`, System V's 4th parameter register is `RCX`. Rather than shuffle
+  registers by hand, `linux_syscall_entry` pushes all saved registers to its stack and passes a
+  single pointer (`&mut SyscallFrame`, matching System V's first argument register, `RDI`) to
+  `linux_syscall_dispatch`, which reads/writes fields on it directly (`frame.rax` doubles as both
+  the incoming syscall number and the outgoing return value slot). `SyscallFrame`'s field order
+  must match the stub's push order exactly (last pushed = lowest address = first field).
+- **Stack alignment needed explicit padding here, unlike `src/syscall.rs`'s stub.** There, the
+  CPU's own 40-byte interrupt-frame push left `RSP` off by 8 before the stub's 15 register pushes,
+  and the two odd offsets canceled out. Here, `SYSCALL` doesn't push anything, so `RSP` starts
+  exactly 16-aligned at `KERNEL_RSP_TOP`; 15 pushes (120 bytes, not a multiple of 16) alone would
+  leave `RSP` misaligned for `call linux_syscall_dispatch`. The stub does an explicit `sub rsp, 8`
+  before the pushes (and matching `add rsp, 8` after) to compensate. If the register set or push
+  count changes, redo this arithmetic — it's specific to this stub's exact shape, not a general
+  rule.
+- **`ScratchStack` is `#[repr(align(16))]`**, not a bare `[u8; N]` (which only guarantees 1-byte
+  alignment) — needed so its computed top is guaranteed 16-aligned for the reason above. (The
+  older RSP0/IST stacks in `src/gdt.rs` aren't similarly annotated and have worked fine in
+  practice, but that's not a *guarantee* — worth tightening if they ever become a problem.)
+- **Unrecognized syscall numbers return `-ENOSYS` (`-38`, two's-complement in `RAX`)**, matching
+  real Linux error-return convention, and log the number — that log line is the intended tool for
+  iteratively discovering what musl's startup needs in the follow-up milestone.
 
 ## Dependency notes
 

@@ -1,6 +1,6 @@
 use spin::Lazy;
 use x86_64::VirtAddr;
-use x86_64::instructions::segmentation::{CS, Segment};
+use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
@@ -41,28 +41,39 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
 });
 
 struct Selectors {
-    code_selector: SegmentSelector,
-    tss_selector: SegmentSelector,
-    user_code_selector: SegmentSelector,
+    kernel_code_selector: SegmentSelector,
+    kernel_data_selector: SegmentSelector,
     user_data_selector: SegmentSelector,
+    user_code_selector: SegmentSelector,
+    tss_selector: SegmentSelector,
 }
 
 static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
-    let code_selector = gdt.append(Descriptor::kernel_code_segment());
-    let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
-    // `Descriptor::user_code_segment`/`user_data_segment` are already tagged Ring 3 (DPL 3), and
+    // Order matters: SYSCALL/SYSRETQ (see src/linux_syscall.rs) reconstruct target segment
+    // selectors from IA32_STAR using fixed offsets from two base values, which only works if
+    // kernel_code/kernel_data/[placeholder]/user_data/user_code stay in exactly this order and
+    // adjacency. `Descriptor::user_*_segment` are already tagged Ring 3 (DPL 3), and
     // `GlobalDescriptorTable::append` bakes the descriptor's DPL into the returned selector's RPL
-    // bits — these selectors are ready to use for a ring 3 jump as-is.
-    let user_code_selector = gdt.append(Descriptor::user_code_segment());
+    // bits.
+    let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
+    let kernel_data_selector = gdt.append(Descriptor::kernel_data_segment());
+    // Reserves the GDT slot SYSRETQ's fixed offset scheme needs 8 bytes before
+    // user_data_selector — historically a 32-bit-compat user code segment, but since this kernel
+    // only ever uses SYSRETQ (64-bit), that slot's *contents* are never actually loaded by
+    // hardware. Its selector value is never used past this point; only its position matters.
+    let _syscall_compat_placeholder = gdt.append(Descriptor::user_code_segment());
     let user_data_selector = gdt.append(Descriptor::user_data_segment());
+    let user_code_selector = gdt.append(Descriptor::user_code_segment());
+    let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
     (
         gdt,
         Selectors {
-            code_selector,
-            tss_selector,
-            user_code_selector,
+            kernel_code_selector,
+            kernel_data_selector,
             user_data_selector,
+            user_code_selector,
+            tss_selector,
         },
     )
 });
@@ -76,7 +87,8 @@ pub fn init() {
     );
     GDT.0.load();
     unsafe {
-        CS::set_reg(GDT.1.code_selector);
+        CS::set_reg(GDT.1.kernel_code_selector);
+        SS::set_reg(GDT.1.kernel_data_selector);
         load_tss(GDT.1.tss_selector);
     }
     serial_println!("[boot] GDT/TSS loaded");
@@ -90,4 +102,14 @@ pub fn user_code_selector() -> SegmentSelector {
 /// The ring 3 data segment selector, for building an `iretq` frame into user mode.
 pub fn user_data_selector() -> SegmentSelector {
     GDT.1.user_data_selector
+}
+
+/// The ring 0 code segment selector — needed by `src/linux_syscall.rs` to program `IA32_STAR`.
+pub fn kernel_code_selector() -> SegmentSelector {
+    GDT.1.kernel_code_selector
+}
+
+/// The ring 0 data segment selector — needed by `src/linux_syscall.rs` to program `IA32_STAR`.
+pub fn kernel_data_selector() -> SegmentSelector {
+    GDT.1.kernel_data_selector
 }
