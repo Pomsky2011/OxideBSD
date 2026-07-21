@@ -8,15 +8,16 @@ use crate::gdt::{user_code_selector, user_data_selector};
 
 /// RFLAGS value used for the jump: bit 1 is a reserved bit that must always read as 1, and
 /// `INTERRUPT_FLAG` (bit 9) keeps interrupts enabled in user mode — otherwise the timer could
-/// never preempt a runaway (or, before syscalls exist, *every*) user program.
+/// never preempt a runaway user program, and `int 0x80` (syscalls) would be the only way in.
 const USER_RFLAGS: u64 = 0x202;
 
 /// Jumps into ring 3 at `entry`, running on `user_stack_top`, by hand-building an `iretq` frame.
 ///
-/// This is genuinely one-way: `iretq` never returns to its caller here, and — since there is no
-/// syscall ABI yet — nothing user-mode code does can hand control back to the kernel either. The
-/// only way the kernel regains control at all is via an interrupt or exception firing while this
-/// code runs (e.g. the `int3` the `ring3-smoke` demo executes).
+/// This is genuinely one-way: `iretq` never returns to its caller here. The kernel only regains
+/// control via an interrupt, exception, or syscall (see `src/syscall.rs`) firing while this code
+/// runs — and even `SYS_EXIT` doesn't "return" in the traditional sense, since there's still no
+/// scheduler to resume anything; it just idles the whole system. See the `ring3-smoke` demo
+/// (`userland/ring3-smoke/src/main.rs`) and `src/main.rs`'s `run_ring3_smoke_demo`.
 ///
 /// # Safety
 ///

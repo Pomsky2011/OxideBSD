@@ -9,12 +9,14 @@ interactive kernel) is essentially done: GDT/TSS/IDT with a dedicated double-fau
 exceptions reboot the machine, PIC-driven hardware interrupts with a timer tick and a PS/2 keyboard
 IRQ handler (decodes scancodes and echoes typed characters — no line editing or shell yet), a VGA
 text-mode console mirroring serial output, and a heap allocator backed by bootloader-provided
-paging. Phase 2 has started: the kernel can build a *separate* address space (`src/address_space.rs`),
-load a static ELF64 binary into it (`src/elf.rs`), and jump into ring 3 (`src/usermode.rs`) — see
-the "User-mode execution" section below for the current, deliberate limits of that (no syscalls, no
-return path, one demo binary). Scheduling, a real process abstraction, a filesystem, and a syscall
-ABI do not exist yet. Architecture decisions for those subsystems have not been made and should be
-discussed with the user before large structural commitments are made.
+paging. Phase 2 is underway: the kernel can build a *separate* address space
+(`src/address_space.rs`), load a static ELF64 binary into it (`src/elf.rs`), jump into ring 3
+(`src/usermode.rs`), and user-mode code can call back into the kernel via a minimal syscall ABI
+(`src/syscall.rs`, `int 0x80`, `SYS_EXIT`/`SYS_WRITE`) — see "User-mode execution" and "Syscall ABI"
+below for the current, deliberate limits of that (no process abstraction/scheduler, one demo
+binary, `sys_write` doesn't validate its pointer). Scheduling, a real process abstraction, and a
+filesystem do not exist yet. Architecture decisions for those subsystems have not been made and
+should be discussed with the user before large structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -120,13 +122,12 @@ physical memory at `BootInfo::physical_memory_offset`:
 ## User-mode execution (`src/address_space.rs`, `src/elf.rs`, `src/usermode.rs`)
 
 Proves paging beyond the kernel's own address space, address-space separation, and ELF loading all
-work, by loading a tiny embedded userland binary and jumping into ring 3. Deliberately does *not*
-include a syscall ABI yet (next up in `ROADMAP.md`'s phase 2) — see `src/main.rs`'s
-`run_ring3_smoke_demo` and `userland/ring3-smoke/src/main.rs` for what that means in practice: the
-demo binary does some arithmetic, executes `int3`, and the kernel's ordinary (unmodified)
-`breakpoint_handler` logs the exception — `code_segment.rpl == Ring3` there is the actual proof.
-After the breakpoint returns, the demo just spins forever; there's no way back into the kernel
-without a syscall, so this is a one-shot demo, not a process that "finishes."
+work, by loading a tiny embedded userland binary (`userland/ring3-smoke/`) and jumping into ring 3.
+See `src/main.rs`'s `run_ring3_smoke_demo`: it does some arithmetic, calls `SYS_WRITE` to print a
+message, then `SYS_EXIT`s with the checksum as its exit code (see "Syscall ABI" below) — both the
+printed message and the logged exit code are the actual end-to-end proof this all works. There's
+still no process abstraction or scheduler, so this really is a one-shot demo: `SYS_EXIT` doesn't
+resume anything, it just idles the whole system (see below).
 
 - **The userland demo build.** `userland/ring3-smoke/` is a separate workspace member (root
   `Cargo.toml` gained a `[workspace]` table; the root package is still its own workspace member,
@@ -159,15 +160,63 @@ without a syscall, so this is a one-shot demo, not a process that "finishes."
   stack, with a `CR2`/fault address landing inside the kernel's own `.text`/`.rodata` region. If a
   future stack (IST slot, per-process kernel stack, etc.) is added the same way, it needs the same
   `static mut` + `&raw mut` treatment.
-- **Software interrupt gates need `DPL = Ring3` explicitly.** `int3` executed from ring 3 needs
-  `idt.breakpoint`'s gate `.set_privilege_level(PrivilegeLevel::Ring3)` — `set_handler_fn` defaults
-  every gate's DPL to `Ring0`. This only matters for *software*-invoked interrupts (`int n`,
-  `int3`, `into`, `bound`); hardware-generated exceptions and IRQs bypass the gate's DPL check
-  entirely. Getting this wrong doesn't look like a permissions error: it's a `#GP` on the IDT entry
-  itself (decode the error code's selector-index bits to confirm — they name the IDT vector).
+- **Rule, not a one-off: every gate ring 3 triggers with a software interrupt needs `DPL = Ring3`
+  explicitly.** Interrupt gates default to `DPL = Ring0`, and a *software*-invoked interrupt
+  (`int n`, `int3`, `into`, `bound` — as opposed to a hardware exception or IRQ, which bypass the
+  gate's `DPL` check entirely) additionally requires `CPL <= gate DPL`. This has bitten this
+  project twice now: first `idt.breakpoint` (for `int3`), then `idt[syscall::SYSCALL_VECTOR]` (for
+  `int 0x80`) — both need `.set_privilege_level(PrivilegeLevel::Ring3)`. Any *future* software
+  interrupt gate ring-3 code needs to trigger directly will need it too. Getting this wrong doesn't
+  look like a permissions error: it's a `#GP` on the IDT entry itself (decode the error code's
+  selector-index bits to confirm — they name the IDT vector).
+- **`elf::load` must not re-map or re-zero a page two different `PT_LOAD` segments both touch.**
+  Segments are aligned to `p_align`, not to each other, so small binaries routinely have e.g.
+  `.text` and `.rodata` sharing a page. `load` tracks already-mapped pages in a
+  `BTreeMap<Page, PhysFrame>` for the duration of one call: mapping the same page twice fails
+  (`MapToError::PageAlreadyMapped`), and zeroing it twice would erase the earlier segment's bytes.
+  Flags aren't unioned across segments sharing a page — fine while every segment maps
+  `PRESENT | USER_ACCESSIBLE` and only conditionally adds `WRITABLE`, worth revisiting if that
+  stops being true.
 - **Known simplification:** ELF segments are mapped without `NO_EXECUTE`, even for non-executable
   segments. Enforcing that also requires setting `EFER.NXE`, which deserves its own focused pass
   rather than bundling into this already-large change.
+
+## Syscall ABI (`src/syscall.rs`)
+
+`int 0x80`; syscall number in `RDI`, up to three arguments in `RSI`/`RDX`/`RCX`, return value in
+`RAX`. Deliberately *not* the more traditional "number in `RAX`": System V already passes a
+function's first four integer arguments in `RDI`/`RSI`/`RDX`/`RCX`, so choosing the same order for
+the syscall convention means `syscall_entry` (the hand-written `global_asm!` stub — the first raw
+assembly in this codebase beyond `usermode.rs`'s `iretq` frame) can `call syscall_dispatch` with
+zero register shuffling; whatever's already in those registers at `int 0x80` is exactly what the
+Rust dispatcher's `extern "C" fn(number, arg0, arg1, arg2)` expects.
+
+- **The gate is installed via `set_handler_addr`, not `set_handler_fn`.** `syscall_entry` is a raw
+  symbol, not an `extern "x86-interrupt" fn` — that ABI doesn't expose general-purpose registers to
+  Rust code at all, only the hardware-pushed `InterruptStackFrame`, which is useless for a
+  register-based syscall convention. `set_handler_addr` (unsafe, but not gated behind
+  `HandlerFuncType`/`abi_x86_interrupt`) takes any `VirtAddr`.
+- **The stub saves/restores every general-purpose register uniformly**, not just the System-V
+  caller-saved set (the callee-saved ones — `RBX`/`RBP`/`R12`-`R15` — are technically already
+  preserved across the `call` by the Rust ABI's own contract). Redundant for those five, but a
+  uniform save/restore is simpler to get right than relying on which specific registers a given
+  ABI happens to guarantee, and this is exactly the kind of place a subtle mistake shows up as
+  silent post-syscall register corruption in a user program, not a loud crash.
+- **Stack alignment was reasoned through, not just eyeballed:** the CPU 16-byte-aligns `RSP` before
+  pushing the 5-word interrupt frame (a value not itself a multiple of 16), and the stub then
+  pushes exactly 15 general-purpose registers (also not a multiple of 16) — the two odd-alignment
+  pushes cancel out, landing exactly on the 16-byte boundary System V requires at the `call`
+  instruction. If the pushed-register count or the frame shape ever changes, redo this arithmetic;
+  don't assume it still lines up.
+- **`sys_exit` doesn't return control to anything.** There's no process abstraction or scheduler,
+  so "exiting" means the kernel logs the code and calls `hlt_loop()` — it's the whole system's
+  stopping point, not a per-process one.
+- **`sys_write` does not validate `[ptr, ptr+len)`** before dereferencing it as user memory — no
+  check that the range is mapped, `USER_ACCESSIBLE`, or doesn't reach into kernel-only mappings. A
+  bad pointer page-faults, which `page_fault_handler` already handles safely (log + `reboot()`)
+  rather than corrupting kernel state, so this is a missing safety net for user programs, not a
+  kernel soundness hole — but real validation (walking the active page table to confirm the range)
+  is a natural follow-up, not yet implemented.
 
 ## Dependency notes
 

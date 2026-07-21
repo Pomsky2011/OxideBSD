@@ -17,6 +17,7 @@ pub mod pic;
 pub mod qemu;
 pub mod reboot;
 pub mod serial;
+pub mod syscall;
 pub mod usermode;
 pub mod vga;
 
@@ -122,6 +123,12 @@ fn test_timer_interrupt_fires() {
         x86_64::instructions::hlt();
     }
     assert!(interrupts::ticks() > ticks_before);
+}
+
+#[test_case]
+fn test_syscall_dispatch_rejects_unknown_number() {
+    let unknown = syscall::SYS_WRITE + 1000;
+    assert_eq!(syscall::syscall_dispatch(unknown, 0, 0, 0), u64::MAX);
 }
 
 #[test_case]

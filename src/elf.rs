@@ -9,9 +9,11 @@
 //! input to a `#[repr(C)]` struct: `include_bytes!` output has no alignment guarantee, and an
 //! unaligned struct cast would be undefined behavior.
 
+use alloc::collections::BTreeMap;
+
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
+    FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB, mapper::MapToError,
 };
 
 const MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -135,6 +137,13 @@ pub fn load(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
 ) -> Result<VirtAddr, ElfError> {
+    // Tiny binaries routinely have multiple PT_LOAD segments (e.g. `.text` then `.rodata`)
+    // sharing a page, since segments aren't aligned to each other, just each internally aligned
+    // to `p_align`. Track which pages this call has already mapped so a later segment reuses the
+    // same frame instead of re-mapping (which fails: the page is already present) or re-zeroing
+    // it (which would wipe out an earlier segment's bytes already written there).
+    let mut mapped_pages: BTreeMap<Page<Size4KiB>, PhysFrame<Size4KiB>> = BTreeMap::new();
+
     for header in elf.program_headers() {
         if header.p_type != PT_LOAD {
             continue;
@@ -172,21 +181,31 @@ pub fn load(
             };
 
         for page in Page::range_inclusive(start_page, end_page) {
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or(ElfError::OutOfMemory)?;
-            unsafe {
-                mapper
-                    .map_to(page, frame, flags, frame_allocator)
-                    .map_err(|_: MapToError<Size4KiB>| ElfError::MappingFailed)?
-                    .flush();
-            }
+            let frame = match mapped_pages.get(&page) {
+                Some(&frame) => frame,
+                None => {
+                    let frame = frame_allocator
+                        .allocate_frame()
+                        .ok_or(ElfError::OutOfMemory)?;
+                    unsafe {
+                        mapper
+                            .map_to(page, frame, flags, frame_allocator)
+                            .map_err(|_: MapToError<Size4KiB>| ElfError::MappingFailed)?
+                            .flush();
+                    }
 
-            // Zero the whole frame first (covers BSS and any partial-page padding), then copy in
-            // whatever file bytes actually land in this page.
+                    // Zero the whole frame (covers BSS and any partial-page padding) before any
+                    // segment's bytes get copied in below.
+                    let frame_ptr = (physical_memory_offset + frame.start_address().as_u64())
+                        .as_mut_ptr::<u8>();
+                    unsafe { core::ptr::write_bytes(frame_ptr, 0, PAGE_SIZE as usize) };
+
+                    mapped_pages.insert(page, frame);
+                    frame
+                }
+            };
             let frame_ptr =
                 (physical_memory_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
-            unsafe { core::ptr::write_bytes(frame_ptr, 0, PAGE_SIZE as usize) };
 
             let page_start = page.start_address().as_u64();
             let page_end = page_start + PAGE_SIZE;
