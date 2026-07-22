@@ -105,6 +105,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // reach them from arbitrary syscall contexts via memory::with_frame_allocator/phys_mem_offset.
     oxidebsd::memory::install_global_memory_state(frame_allocator, physical_memory_offset);
 
+    // Registers fd 0/1/2 as real crate::fd entries (see that module's own doc comment for why
+    // stdin/stdout/stderr moved out of being special-cased directly in sys_read/sys_write) --
+    // must happen before any process (starting with pid 1 below) can issue its first read/write.
+    oxidebsd::fd::init();
+
     const STSH_ELF: &[u8] = include_bytes!(env!("STSH_ELF_PATH"));
     serial_println!(
         "[boot] spawning stsh as pid 1 ({} byte ELF)",

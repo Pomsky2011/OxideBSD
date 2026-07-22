@@ -115,12 +115,13 @@ const EINVAL: i64 = 22;
 /// directory listing's) contents at `open` time (see `OpenFile::Read`'s doc comment for why),
 /// write accumulates a whole file's contents across possibly-multiple `write` calls until `close`.
 /// Comfortably larger than every file/listing this module's own demo/self-check content produces,
-/// and than `SMOKE.ELF`/`MUSL.ELF` (the embedded `ring3-smoke`/`musl-smoke` binaries `stsh`'s
-/// `execve` support -- see `src/process.rs`'s `do_execve` -- exercises end to end). Raised twice
-/// now: 4096 -> 16384 for `SMOKE.ELF`'s debug build, then 16384 -> 65536 here for `musl-smoke`
-/// (~23 KB once statically linked against a real libc -- meaningfully bigger than a bare
-/// hand-written demo binary, being real compiled C plus musl's crt/malloc/stdio).
-const MAX_FILE_BUFFER: usize = 65536;
+/// and than `SMOKE.ELF`/`MUSL.ELF`/BusyBox's own applets (the embedded binaries `stsh`'s `execve`
+/// support -- see `src/process.rs`'s `do_execve` -- exercises end to end). Raised three times now:
+/// 4096 -> 16384 for `SMOKE.ELF`'s debug build, 16384 -> 65536 for `musl-smoke` (~23 KB once
+/// statically linked against a real libc), then 65536 -> 131072 here for BusyBox's `hush` applet
+/// (`SH.ELF`, ~102 KB -- real object code from BusyBox's own shell parser/interpreter, bigger by
+/// far than `true`/`echo`/`cat`, all comfortably under the previous 64 KiB cap).
+const MAX_FILE_BUFFER: usize = 131072;
 const MAX_OPEN_FILES: usize = 8;
 
 /// An open file's own state, keyed by fd in `OPEN_FILES` below.

@@ -106,6 +106,12 @@ pub enum BlockReason {
     /// `None` = waiting for any child (`wait4(-1, ...)`); `Some(pid)` = waiting for one specific
     /// child.
     WaitingForChild(Option<Pid>),
+    /// Blocked in a `crate::pipe` read on an empty, still-open pipe (identified by that pipe's own
+    /// id, not by fd — a pipe's read end can be `dup2`'d to other fds, but there's still only one
+    /// underlying pipe). See `crate::pipe`'s module doc comment for why a pipe read has to
+    /// genuinely block (not just return `Ok(0)`/`EAGAIN`) for a pipeline to work at all on this
+    /// single-core, cooperatively-scheduled kernel.
+    WaitingForPipeData(u64),
 }
 
 /// A process's own kernel stack: heap-allocated (not a fixed-size `static`/`static mut` array like
@@ -169,6 +175,22 @@ pub struct Process {
     /// The current top of this process's `SYS_BRK`-managed heap region — see `do_brk`. Starts at
     /// the loaded ELF's `Elf::highest_loaded_address()` (page-aligned), grows/shrinks from there.
     pub brk: VirtAddr,
+    /// This process's own `IA32_FS_BASE` value (see `SYS_SET_FS_BASE`), restored into the real MSR
+    /// on every context switch into this process (`scheduler::activate_and_prepare`) — `IA32_FS_BASE`
+    /// is a single global MSR, not something `context_switch::switch_context` saves/restores the
+    /// way it does `RSP`/callee-saved GPRs, so without this every musl-linked process (which uses
+    /// `%fs`-relative TLS, including the stack-protector canary check at `%fs:0x28`) would silently
+    /// clobber every *other* process's TLS base the instant it set its own. A real, previously-
+    /// latent bug: never surfaced by `true`/`echo`/`cat`/`musl-smoke` (each run directly by `stsh`,
+    /// which isn't musl-linked and never touches `%fs` itself, and none of them survives long enough
+    /// for a *different* still-running musl-linked process to resume and read a stale value) --
+    /// only found once `sh` (BusyBox's `hush`, itself musl-linked) forked and `execve`'d another
+    /// musl-linked child and then kept running *after* that child exited: `hush`'s own next
+    /// stack-protector check read through the dead child's own leftover `FS_BASE`, page-faulting on
+    /// whatever happened to be at that address in `hush`'s own (unrelated) address space. Starts at
+    /// `0` for a freshly spawned/`execve`'d process (no TLS set up yet); a forked child inherits the
+    /// parent's live value (real `fork()` semantics — TLS state is copied, not reset).
+    pub fs_base: u64,
     /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
     #[allow(dead_code)]
     pub priority: u8,
@@ -248,6 +270,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         entry_point: entry,
         user_stack_top: initial_rsp,
         brk: VirtAddr::new(elf.highest_loaded_address()),
+        fs_base: 0,
         priority: 0,
     };
 
@@ -260,6 +283,10 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         }
         table.insert(pid, Box::new(process));
     }
+    // Bootstraps this process's own stdin/stdout/stderr from crate::fd::init's own pseudo-pid
+    // registration -- the same fork_inherit path a real fork() uses, see that function's own doc
+    // comment.
+    crate::fd::fork_inherit(0, pid);
     scheduler::enqueue_ready(pid);
     Ok(pid)
 }
@@ -321,7 +348,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
     let phys_offset = memory::phys_mem_offset();
 
     let child_pid = alloc_pid();
-    let (child_address_space, parent_brk) = {
+    let (child_address_space, parent_brk, parent_fs_base) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
             .get_mut(&caller_pid)
@@ -331,7 +358,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // with its own CR3 still live.
         let child_address_space =
             with_frame_allocator(|fa| parent.address_space.fork(phys_offset, fa));
-        (child_address_space, parent.brk)
+        (child_address_space, parent.brk, parent.fs_base)
     };
 
     let kernel_stack = KernelStack::new();
@@ -352,6 +379,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         entry_point: VirtAddr::zero(),
         user_stack_top: VirtAddr::zero(),
         brk: parent_brk,
+        fs_base: parent_fs_base,
         priority: 0,
     };
 
@@ -360,6 +388,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         table.get_mut(&caller_pid).unwrap().children.push(child_pid);
         table.insert(child_pid, Box::new(child));
     }
+    // Real fork() semantics: the child gets its own independently-closable copy of every fd the
+    // parent has open, not a shared view of the parent's own table entries -- see
+    // crate::fd::fork_inherit's own doc comment for why this specifically matters for pipes.
+    crate::fd::fork_inherit(caller_pid, child_pid);
     scheduler::enqueue_ready(child_pid);
     crate::serial_println!("[proc] pid {} forked pid {}", caller_pid, child_pid);
     Ok(child_pid)
@@ -507,6 +539,14 @@ pub fn do_execve(
         me.user_stack_top = initial_rsp;
         me.entry_point = entry;
         me.brk = VirtAddr::new(elf.highest_loaded_address());
+        // The old program's TLS base doesn't mean anything to the new one -- reset the stored value
+        // (restored on every future context switch, see Process::fs_base's own doc comment) *and*
+        // the live MSR right now, since execve keeps running as this exact process/kernel stack with
+        // no context switch in between; leaving the stale value live until the new program's own
+        // crt1 gets around to calling SYS_SET_FS_BASE would be a real (if narrow) window for it to
+        // read garbage through %fs before then.
+        me.fs_base = 0;
+        x86_64::registers::model_specific::FsBase::write(VirtAddr::new(0));
     }
     crate::serial_println!("[proc] pid {} execve'd, entry={:?}", caller_pid, entry);
 
@@ -603,6 +643,10 @@ pub fn do_wait4(caller_pid: Pid, target_pid: i64, status_ptr: u64) -> Result<u64
 /// simplification (see CLAUDE.md), not required for fork/exec/wait correctness.
 pub fn do_exit(caller_pid: Pid, code: i32) -> ! {
     crate::serial_println!("[proc] pid {} exited with code {}", caller_pid, code);
+    // Real exit() semantics: every fd this process still has open gets closed automatically.
+    // Genuinely load-bearing, not just tidiness -- see crate::fd::close_all's own doc comment for
+    // why a leaked fd here can leave a pipe's reader blocked forever.
+    crate::fd::close_all(caller_pid);
     {
         let mut table = PROCESS_TABLE.lock();
         if let Some(me) = table.get_mut(&caller_pid) {

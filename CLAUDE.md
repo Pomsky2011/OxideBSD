@@ -56,31 +56,35 @@ the hardware level at all (`src/fpu.rs`, new); and a new `SYS_WRITEV` syscall wa
 musl's entire stdio write path goes through `writev`, not plain `write` — see "musl port" for the
 full story of each.
 
-**Three BusyBox applets now run on top of that same musl** (see "BusyBox port" below): `true`/
-`echo`/`cat`, each its own genuinely standalone, single-applet static binary (not a multi-call
-`busybox` binary dispatching on argv[0], which this codebase's `execve` doesn't support),
-`execve`'d by `stsh` as `TRUE.ELF`/`ECHO.ELF`/`CAT.ELF` exactly like `MUSL.ELF`. `true`/`echo`
-needed no new kernel syscalls at all — both ran cleanly the first time they were booted, modulo the
-same already-known-harmless `set_tid_address` gap musl's own startup already has. `cat` needed one
-real fix: real `open()`'s argument convention didn't match OxideBSD's `SYS_OPEN` at all (a gap
-`musl-smoke` itself never exercised, since it never calls `open()`) — now fixed on the musl side,
-see "BusyBox port" below. New syscalls a future applet needs will be registered by a new,
-deliberately separate module, `modules/posix_compat/` (currently empty), rather than growing
-`modules/native_abi/` further.
+**Four BusyBox applets now run on top of that same musl** (see "BusyBox port" below): `true`/
+`echo`/`cat`/`sh` (BusyBox's `hush`), each its own genuinely standalone, single-applet static
+binary (not a multi-call `busybox` binary dispatching on argv[0], which this codebase's `execve`
+doesn't support), `execve`'d by `stsh` as `TRUE.ELF`/`ECHO.ELF`/`CAT.ELF`/`SH.ELF` exactly like
+`MUSL.ELF`. `true`/`echo` needed no new kernel syscalls at all; `cat` needed `open()`'s argument
+convention fixed (musl-side); `sh` needed the most by far — a real 4th syscall argument (`R10`,
+for `envp` passthrough across `execve`), real `pipe(2)`/`dup2(2)` with a genuinely blocking pipe
+read (`src/pipe.rs`), a per-process (not kernel-wide) file-descriptor table (`src/fd.rs`), and a
+real, previously-latent kernel bug found only by running it: `IA32_FS_BASE` (TLS) is a single
+global MSR that context switches never saved/restored per-process, so any musl-linked parent that
+resumed after a musl-linked child exited would silently run with the dead child's own TLS base —
+see "BusyBox port" below for the full story, including what still doesn't work (`sh.elf -c
+"command"` runs real pipelines correctly; plain interactive `sh.elf`, reading commands from the
+keyboard, does not — a separate, harder problem, see below). New syscalls a future applet needs
+are registered by a new, deliberately separate module, `modules/posix_compat/` (`pipe`/`dup2` so
+far), rather than growing `modules/native_abi/` further.
 
 See "User-mode execution", "Syscall ABI", "musl port", "BusyBox port", "Interactive shell",
 "Dynamic kernel modules", "FAT32 filesystem module", and "Process abstraction, scheduler, and
 fork/exec/wait" below for the current, deliberate limits (`sys_write`/`sys_read` don't validate
 their pointers, no line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/
 reload, FAT32 writes don't persist across reboot, no preemptive scheduling, no copy-on-write fork,
-no frame deallocation anywhere, and — for the musl port — `execve` can't give a process a different
-`argv[0]` than its own exec path, and several syscalls musl's fuller startup would need still
-unimplemented (`open`'s and `execve`'s own argument-convention mismatches with real musl calls of
-the same name, and `envp` passthrough across `execve`, are both fixed now — see "musl port" and
-"BusyBox port" below). A *real* filesystem (backed by an
-actual block device, not an embedded image) doesn't exist yet. Architecture decisions for
-remaining subsystems have not been made and should be discussed with the user before large
-structural commitments are made.
+no frame deallocation anywhere, `execve` can't give a process a different `argv[0]` than its own
+exec path, `stdin`'s own non-blocking `sys_read` means no program can read a real interactive
+prompt from the keyboard except via `stsh`'s own busy-poll convention — real blocking would need
+interrupts re-enabled mid-syscall, not attempted — and a handful of syscalls musl's fuller startup
+would still need are unimplemented). A *real* filesystem (backed by an actual block device, not an
+embedded image) doesn't exist yet. Architecture decisions for remaining subsystems have not been
+made and should be discussed with the user before large structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -337,11 +341,13 @@ convention: `CF = 0` on success with the return value in `RAX`, `CF = 1` on fail
 = 1`, `SYS_READ = 3`, `SYS_WRITE = 4`, `SYS_OPEN = 5`, `SYS_CLOSE = 6`) match real FreeBSD's
 long-stable values, as a nod to authenticity — not a claim of binary compatibility with real BSD
 userland. Syscalls added *for* the musl port (`SYS_MMAP`/`SYS_MUNMAP`/`SYS_BRK`/
-`SYS_SET_FS_BASE`/`SYS_WRITEV` — see "musl port" below) don't extend that convention: they're
-OxideBSD's own invention, numbers and argument shapes chosen for what porting musl actually needed,
-not copied from FreeBSD or Linux. errno values are *mostly* shared between Linux and the BSDs
-(`EBADF`, `EINVAL` are identical) but not universally — `ENOSYS` is 38 on Linux, 78 on FreeBSD;
-this file uses the FreeBSD value.
+`SYS_SET_FS_BASE`/`SYS_WRITEV`, then `SYS_PIPE`/`SYS_DUP2` for `sh` — see "musl port"/"BusyBox
+port" below) don't extend that convention: they're OxideBSD's own invention, numbers and argument
+shapes chosen for what porting musl actually needed, not copied from FreeBSD or Linux (`SYS_PIPE`/
+`SYS_DUP2` happen to match real `pipe(2)`/`dup2(2)`'s own wire formats exactly, unlike most of this
+group, simply because there was no argument-convention reason to invent anything different). errno
+values are *mostly* shared between Linux and the BSDs (`EBADF`, `EINVAL` are identical) but not
+universally — `ENOSYS` is 38 on Linux, 78 on FreeBSD; this file uses the FreeBSD value.
 
 **This mechanism used to be two independent, deliberately different paths**: this one over
 `int 0x80`, and a separate `src/linux_syscall.rs` that proved the `SYSCALL`/`SYSRETQ` mechanism in
@@ -661,7 +667,10 @@ BusyBox applets, built against that same patched musl, `execve`'d by `stsh` exac
 `MUSL.ELF`. Scoped deliberately narrowly for the first pass — just `true` and `echo` — to prove
 the mechanism (a real BusyBox build, cross-compiled and embedded) before attempting anything
 resembling a shell or a real toolbox. A second pass added `cat` — see the `open()`-argument-
-convention-fix bullet below, since `cat` is the first applet that actually needs it.
+convention-fix bullet below, since `cat` is the first applet that actually needs it. A third pass
+added `sh` (BusyBox's `hush`) — by far the largest of the four, needing a real 4th syscall
+argument, real `pipe(2)`/`dup2(2)`, a per-process fd table, and a real, previously-latent
+`IA32_FS_BASE` bug fixed — see the dedicated bullets below.
 
 - **Vendored as a submodule pointing at a personal GitHub fork** (`third_party/busybox`, pinned to
   release tag `1_36_1`), mirroring `third_party/musl`'s own setup exactly — a parking spot for
@@ -694,8 +703,9 @@ convention-fix bullet below, since `cat` is the first applet that actually needs
   comment about this exact same trap). The build asserts `NUM_APPLETS == 1` via
   `include/NUM_APPLETS.h` before returning, rather than trusting the config silently produced what
   was asked for. Each applet gets its own load address (`0xb00000` for `true`, `0xc00000` for
-  `echo`), following the same clear-of-everything-else discipline every prior userland load address
-  in this codebase already needed (see "User-mode execution" above).
+  `echo`, `0xd00000` for `cat`, `0xe00000` for `sh`), following the same clear-of-everything-else
+  discipline every prior userland load address in this codebase already needed (see "User-mode
+  execution" above).
 - **Embedded into the FAT32 image as `TRUE.ELF`/`ECHO.ELF`, deliberately with an extension** —
   extending `generate_fat32_image` the same way `MUSL.ELF` was, chained on right after it. The
   `.ELF` extension isn't just convention here: `stsh`'s `run_command` matches built-ins (`echo`
@@ -830,14 +840,110 @@ convention-fix bullet below, since `cat` is the first applet that actually needs
   last exactly the way `MUSL.ELF` already chained after `SMOKE.ELF`. Adding the next applet is now
   a one-line addition to `BUSYBOX_APPLETS`, not matching edits scattered across four different
   spots in this file.
-- **What's explicitly still out of scope**: the `sh` applet (needs real process spawning/piping
-  from *inside* a BusyBox process, a much bigger undertaking than a `NOFORK` applet like
-  `true`/`echo`/`cat`), multi-applet dispatch in a single binary (still blocked — `argv[0]` itself
-  is still always the `execve` path, never caller-chosen, even now that `envp` is real — see
-  above), overriding `argv[0]` to anything other than the `execve` path (same underlying cause), a
-  real `fstat` implementation (see the numeric-collision note above), persistence, and any
-  automated integration test (verified manually via QEMU + injected keystrokes instead, the same
-  method every interactive `stsh` feature already uses — see "FAT32 filesystem module" below).
+- **`sh` (BusyBox's `hush`, embedded as `SH.ELF`) is the fourth applet, by far the largest single
+  addition since the musl port itself.** Built the same way as every other applet
+  (`configure_busybox_single_applet` flips `CONFIG_HUSH=y`), but deliberately **not**
+  `CONFIG_HUSH_INTERACTIVE` (`allnoconfig`'s own default, left alone) — without it, `hush` just
+  reads and executes commands from stdin like a script, no prompt/readline/job-control machinery
+  that would need real termios/`ioctl` support this kernel doesn't have. `MAX_FILE_BUFFER`
+  (`modules/fat32/src/lib.rs`) raised a third time, `65536` → `131072`, since `SH.ELF` (~102 KiB of
+  real BusyBox shell-parser/interpreter object code) is bigger than every applet before it,
+  `open()` was returning `EFBIG` on it until this.
+- **`execvp()`'s `$PATH` search needed a real workaround, not a kernel change: `stsh` now passes
+  every `execve`'d process a fixed `envp` of `PATH=` (present, empty value).** `hush` itself calls
+  real `execvp()` to run external commands; musl's `__execvpe`
+  (`third_party/musl/src/process/execvp.c`) only skips `$PATH` search when the command name already
+  contains `/`, and its search loop unconditionally inserts a `/` between whatever path segment
+  it's trying and the filename. With `$PATH` unset (this kernel had no `envp` at all before the
+  execve/envp fix above), musl falls back to a hardcoded `/usr/local/bin:/bin:/usr/bin`, and every
+  resulting candidate (e.g. `/usr/local/bin/true.elf`) is a multi-component path —
+  `fat32_open`/`to_short_name` flatly rejects any path with more than one component (`EINVAL`;
+  there's no real directory hierarchy to walk in the first place — see "FAT32 filesystem module"
+  below). First symptom: `hush: can't execute 'true.elf': Invalid argument`. Fix: an **empty**
+  `PATH` value short-circuits `__execvpe`'s loop into trying exactly one candidate, built from an
+  empty path segment + `/` + the filename — i.e. `/true.elf`, root-relative, exactly the one shape
+  `fat32_open` already accepts. `userland/stsh/src/main.rs`'s `execve()` wrapper now always passes
+  this one-entry `envp` (harmless for every applet that doesn't call `execvp`/care about `$PATH`).
+- **A real 4th syscall argument, real `pipe(2)`/`dup2(2)`, and a per-process fd table — all needed
+  together for real pipeline support (`cmd1 | cmd2`), which is what `hush` actually needs beyond
+  running one external command.** See "Syscall ABI" above for `R10` becoming a real, read 4th
+  argument (needed first, for `envp`, but reused here). New pieces:
+  - **`SYS_PIPE = 105`/`SYS_DUP2 = 106`** (`src/syscall.rs`'s `sys_pipe`/`sys_dup2`,
+    `modules/posix_compat/`'s `handle_pipe`/`handle_dup2`) — unlike most of this ABI's own
+    inventions, both happen to match real `pipe(2)`/`dup2(2)`'s exact wire formats already, so no
+    musl-side argument-convention patch was needed, just a number remap in
+    `bits/syscall.h.in` (`__NR_pipe`/`__NR_dup2`).
+  - **`src/pipe.rs` (new): a real, blocking, in-kernel pipe buffer.** The one genuinely new
+    subsystem here. A pipe read **must** actually block (`process::BlockReason::
+    WaitingForPipeData`, the same block-then-`scheduler::schedule()` pattern `do_wait4` already
+    established) rather than returning `Ok(0)`/`EAGAIN` immediately the way stdin's own
+    non-blocking `sys_read` does — this kernel is single-core and purely cooperatively scheduled
+    (see "Process abstraction, scheduler, and fork/exec/wait" below), so a reader that just spun on
+    an empty pipe would starve the writer forever (nothing else could ever run to produce the data
+    it's waiting for). `pipe_write`/`pipe_close` wake any process blocked on the pipe they touched,
+    the same way `do_exit` wakes a parent blocked in `wait4`. Deliberately unbounded (a plain
+    `VecDeque<u8>`, no capacity limit) so only the read side ever needs to block — a real capacity
+    bound (and the write-side blocking that comes with it) is a follow-up, not attempted here.
+  - **`src/fd.rs`'s registry is now scoped `(Pid, fd)`, not a single flat table keyed by fd alone —
+    a real bug, not a preemptive refactor.** The flat table (a known, documented limitation before
+    this) broke the very first real pipeline tried: `hush` creates a pipe in the parent, forks
+    twice, and each child `dup2`s one end onto its own stdin/stdout then closes its own copy of the
+    originals — completely ordinary shell behavior. With one shared table, the *parent* closing its
+    own copy of a pipe fd (it doesn't need the pipe itself once both children have it) tore the
+    entry down globally, out from under children that still needed it; symptom: `hush: can't
+    duplicate file descriptor: Bad file descriptor` in both children. Real `fork()` duplicates the
+    whole fd table into the child instead — `crate::fd::fork_inherit(parent, child)` now does
+    exactly that (each process gets its own independently-closable reference to the same underlying
+    resource), called from both `process::do_fork_from_current` and `process::spawn` (the latter
+    against a reserved pseudo-pid `0` that `fd::init` registers stdin/stdout/stderr under at boot,
+    so every spawned process bootstraps its own copies the same way a forked child would).
+    `process::do_exit` now also calls `crate::fd::close_all(caller_pid)` — real `exit()` semantics
+    ("all descriptors open in the calling process are closed"), not implemented at all before this,
+    and genuinely load-bearing now: a pipe reader blocks until the write end's refcount reaches
+    zero, so a process that exited without explicitly closing its own copy would otherwise leave a
+    reader blocked forever.
+  - **Verified working end to end**: `sh.elf -c "cat.elf hello.txt | cat.elf"` correctly pipes
+    `hello.txt`'s contents through a second `cat.elf` and prints it — real blocking read, real
+    `dup2` redirection, real per-process fd independence, all exercised together.
+- **A real, previously-latent kernel bug, found only by running `sh`: `IA32_FS_BASE` (the MSR
+  `%fs`-relative TLS access — including the stack-protector canary check every musl-linked binary
+  emits — reads through) is a single global register that `context_switch::switch_context` never
+  saved or restored per-process.** `SYS_SET_FS_BASE` (see "musl port" above) only ever wrote the
+  live MSR directly; nothing recorded *which process* that value belonged to, and nothing restored
+  a different value when switching to a different process. Symptom, found via `sh.elf -c true.elf`:
+  a page fault in `hush`'s own code (`%fs:0x28`, the canary check) at an address that scaled
+  exactly with whichever child (`true.elf`, `echo.elf`, ...) had *just exited* — `hush` (the
+  parent, itself musl-linked and TLS-dependent) resumed running with the dead child's own leftover
+  `FS_BASE` still live in the MSR, since nothing had restored `hush`'s own value. Never surfaced
+  before: `true`/`echo`/`cat`/`musl-smoke` were each run directly by `stsh` (not musl-linked,
+  never touches `%fs` at all) and none of them survived long enough for a *different*,
+  still-running musl-linked process to resume and read a stale value — this needed a musl-linked
+  parent (`hush`) that forks and `execve`s *another* musl-linked child and then keeps running
+  after it exits, a shape nothing before `sh` ever exercised. Fixed with a new `Process::fs_base`
+  field (`src/process.rs`): `sys_set_fs_base` now records the value there too, `scheduler::
+  activate_and_prepare` restores it into the MSR on every context switch (right alongside `CR3`/
+  `TSS.RSP0`), a forked child inherits the parent's live value (real `fork()` semantics), and
+  `do_execve` resets it to `0` (and writes the MSR immediately, since `execve` keeps running as the
+  same process/kernel stack with no context switch in between) since the old program's TLS layout
+  means nothing to the new one.
+- **What's explicitly still out of scope**: real interactive `sh` (typing `sh.elf` alone and
+  getting a live prompt) — `sh.elf -c "command"` works, including real pipelines, but plain
+  `sh.elf` reading commands from the keyboard does not, and confirmed *why* it can't just be turned
+  on: `sys_read` on stdin is non-blocking by design (`Ok(0)` immediately whenever the ring buffer
+  is empty, which is nearly always — see "Syscall ABI"/"Interactive shell" — `stsh`'s own read loop
+  busy-polls around this), so `hush`, reading in ordinary blocking mode, sees an instant 0-byte
+  read as genuine EOF and exits before a human can type anything. A real fix would need `sys_read`
+  to actually block *and* interrupts re-enabled while blocked (unlike `wait4`/pipe blocking, which
+  only need cooperation between already-scheduled processes, stdin can only ever be woken by the
+  keyboard IRQ — impossible while `SFMASK` keeps interrupts masked for the whole syscall, the
+  current invariant every blocking syscall today relies on) — real, substantial follow-up work,
+  deliberately not attempted in this pass. Also still out of scope: multi-applet dispatch in a
+  single binary (still blocked — `argv[0]` itself is still always the `execve` path, never
+  caller-chosen, even now that `envp` is real), overriding `argv[0]` to anything other than the
+  `execve` path (same underlying cause), a real `fstat` implementation (see the numeric-collision
+  note above), persistence, and any automated integration test (verified manually via QEMU +
+  injected keystrokes instead, the same method every interactive `stsh` feature already uses — see
+  "FAT32 filesystem module" below).
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 
@@ -938,6 +1044,23 @@ not a new regression). `argv`/`envp` are both real now — see "musl port" below
 `src/user_stack.rs`, which builds a real initial argc/argv/envp/auxv stack for every process, and
 "BusyBox port" below for how `envp` itself actually reaches `execve` (added well after this
 subsystem's first pass, once a 4th syscall argument existed to carry it).
+
+- **`Process` also carries `fs_base` now — restored on every context switch, but *not* by
+  `context_switch::switch_context` itself.** `IA32_FS_BASE` (the MSR real `%fs`-relative TLS access
+  reads through — see "musl port" above) is a single *global* register, invisible to
+  `switch_context`'s own callee-saved-GPRs-plus-`RSP` save/restore. `scheduler::
+  activate_and_prepare` restores it explicitly, right alongside `CR3`/`TSS.RSP0`, on every switch —
+  added only once `sh` (BusyBox's `hush`) exposed a real bug from its absence: see "BusyBox port"
+  below for the full story (a musl-linked parent resuming with a just-exited musl-linked child's
+  own leftover TLS base, page-faulting on its own next stack-protector check). `do_fork_from_current`
+  copies the parent's live value into the child (real `fork()` semantics — TLS state is copied, not
+  reset); `do_execve` resets it to `0` immediately (both the stored field and the live MSR, since
+  `execve` keeps running as the same process with no context switch in between).
+- **`BlockReason` gained a second variant, `WaitingForPipeData`, once `sh` needed real pipeline
+  support** — see "BusyBox port" below and `src/pipe.rs`'s own module doc comment for why a pipe
+  read has to genuinely block (the same `Blocked` state + `scheduler::schedule()` pattern
+  `WaitingForChild`/`do_wait4` already established) rather than returning `Ok(0)`/`EAGAIN`
+  immediately the way stdin's own non-blocking `sys_read` does.
 
 - **The process table (`process::Process`, `process::table()`) is a `Mutex<BTreeMap<Pid,
   Box<Process>>>`, `Box`-wrapped deliberately.** Letting a caller pull a raw `*mut Process` (or copy
@@ -1341,19 +1464,25 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
 - **Syscall integration and the fd registry (`src/fd.rs`).** `modules/fat32/` registers
   `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` directly against the same syscall dispatch table
   `native_abi` uses (see "Syscall ABI" above). `SYS_READ`/`SYS_WRITE` themselves stay owned by
-  `native_abi`/
-  `src/syscall.rs`, though — for any fd that isn't stdin/stdout, they now delegate to `src/fd.rs`'s
-  small kernel-owned registry, which this module's `fat32_open` populates (via
-  `oxidebsd_alloc_fd`/`oxidebsd_register_fd_ops`) with per-fd read/write/close callbacks into its
-  own code. This registry exists *specifically* because modules can't call each other directly —
-  only module → kernel, via each module's own independently resolved symbol table — so routing a
-  read/write for a fd `fat32` owns, issued through syscall machinery `native_abi` owns, has no
-  path except through a kernel-resident coordination point. `SYS_CLOSE`'s handler delegates to the
-  kernel's `oxidebsd_close_fd` (which removes the registry entry *then* invokes the module's own
-  `fat32_close` callback), not directly to `fat32_close` — so a closed fd is also no longer
-  reachable via `SYS_READ`/`SYS_WRITE` afterward, not just cleaned up on the FAT32 side. Like
-  `BootInfoFrameAllocator` and `module::allocate_region`, `src/fd.rs`'s fd numbers are a simple
-  bump counter — never reused, even after `close`.
+  `native_abi`/`src/syscall.rs`, and now delegate to `src/fd.rs`'s registry *unconditionally, for
+  every fd including stdin/stdout/stderr* (no fd is special-cased directly in `sys_read`/
+  `sys_write` anymore — see "BusyBox port" above for why that changed: `dup2` needs fd 0/1/2 to be
+  ordinary, overwritable registry entries too, not hardcoded branches). `fat32_open` populates it
+  (via `oxidebsd_alloc_fd`/`oxidebsd_register_fd_ops`) with per-fd read/write/close callbacks into
+  its own code, the same way `src/pipe.rs`'s pipe ends do. This registry exists *specifically*
+  because modules can't call each other directly — only module → kernel, via each module's own
+  independently resolved symbol table — so routing a read/write for a fd `fat32` owns, issued
+  through syscall machinery `native_abi` owns, has no path except through a kernel-resident
+  coordination point. `SYS_CLOSE`'s handler delegates to the kernel's `oxidebsd_close_fd` (which
+  removes the registry entry *then* invokes the module's own `fat32_close` callback), not directly
+  to `fat32_close` — so a closed fd is also no longer reachable via `SYS_READ`/`SYS_WRITE`
+  afterward, not just cleaned up on the FAT32 side. Like `BootInfoFrameAllocator` and
+  `module::allocate_region`, `src/fd.rs`'s fd numbers are a simple bump counter — never reused,
+  even after `close`. **Scoped per-process (`(Pid, fd)`), not a single flat table** — see "BusyBox
+  port" above for the real pipeline bug this fixed (a flat table broke `dup2`-based pipe
+  redirection the moment a shell's own parent/child fd-closing behavior came into play); `fat32`'s
+  own usage (one process opening and closing its own files) never depended on the old flat
+  behavior, so this was a pure fix, not a tradeoff against anything FAT32 itself needed.
 - **`stsh`'s `cat`/`write`/`cd`/`ls`/`mkdir` (see "Interactive shell" above) are the end-to-end
   proof**: `cat` opens read-only and streams bytes via `SYS_READ` until it returns `0` (clean EOF —
   a FAT32 read never needs busy-polling the way stdin's non-blocking `SYS_READ` does); `write`

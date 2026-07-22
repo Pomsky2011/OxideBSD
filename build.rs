@@ -49,10 +49,20 @@ fn main() {
     // path -- see CLAUDE.md's musl-port section for the open()/SYS_OPEN argument-convention fix
     // (musl's `open()` is now patched to speak fat32_open's own (path_ptr, path_len, flags) wire
     // format directly) that had to land before this could work at all.
+    //
+    // "HUSH" (embedded as SH.ELF, not HUSH.ELF -- this codebase's own choice of filename, same as
+    // every other applet here) is BusyBox's smaller/simpler shell, not "ASH" -- deliberately:
+    // `CONFIG_HUSH_INTERACTIVE` is left off (`allnoconfig`'s own default), so hush just reads and
+    // executes commands from stdin like a script, no prompt/readline/job-control machinery that
+    // would need real termios/ioctl support this kernel doesn't have. See CLAUDE.md's BusyBox
+    // section for what this needed: real pipe(2)/dup2(2) (modules/posix_compat, src/pipe.rs,
+    // src/fd.rs), discovered the same iterative "boot and see what's unrecognized" way musl/cat's
+    // own new syscalls were.
     const BUSYBOX_APPLETS: &[(&str, &str, u64)] = &[
         ("TRUE", "true", 0xb00000),
         ("ECHO", "echo", 0xc00000),
         ("CAT", "cat", 0xd00000),
+        ("HUSH", "sh", 0xe00000),
     ];
     let busybox_applet_elfs: Vec<(&str, Vec<u8>)> = BUSYBOX_APPLETS
         .iter()

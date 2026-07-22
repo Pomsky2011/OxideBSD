@@ -54,9 +54,9 @@ use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 
 use crate::gdt;
-use crate::{serial_print, serial_println};
+use crate::serial_println;
 
-/// Standard, POSIX-heritage errno values. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC` happen to be
+/// Standard, POSIX-heritage errno values. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC`/`EPIPE` happen to be
 /// identical on Linux and the BSDs; `ENOSYS` is not (see module doc comment) — this is FreeBSD's
 /// real value.
 pub(crate) const EBADF: u64 = 9;
@@ -65,6 +65,8 @@ pub(crate) const ENOSYS: u64 = 78;
 pub(crate) const ECHILD: u64 = 10;
 pub(crate) const ENOEXEC: u64 = 8;
 pub(crate) const ENOMEM: u64 = 12;
+/// Returned by `crate::pipe`'s `pipe_write` once a pipe's read end has been closed.
+pub(crate) const EPIPE: u64 = 32;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -306,54 +308,23 @@ fn ffi_result_to_result(raw: i64) -> Result<u64, u64> {
     }
 }
 
-/// Reads up to `len` bytes into `ptr` from `fd`. `fd == 0` ("stdin") is routed through
-/// `crate::stdin`'s keyboard buffer, non-blocking (`Ok(0)` immediately if nothing is buffered yet
-/// rather than waiting — see `CLAUDE.md`'s shell section for why). Any other `fd` is looked up in
-/// `crate::fd`'s registry (populated by e.g. `modules/fat32/`'s open files) and delegated to
-/// whichever module registered it; `EBADF` if nothing has.
+/// Reads up to `len` bytes into `ptr` from `fd` — a pure lookup into `crate::fd`'s registry now,
+/// for *every* fd including 0/1/2 (see `src/fd.rs`'s module doc comment for why stdin/stdout/
+/// stderr moved from being special-cased here into being ordinary, `dup2`-able registry entries:
+/// stdin's own non-blocking-ring-buffer behavior lives in that file's `stdin_read` now, not here).
+/// `EBADF` if `fd` isn't registered at all.
 pub(crate) fn sys_read(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
-    const STDIN: u64 = 0;
-    if fd == STDIN {
-        // SAFETY: same known pointer-validation gap as sys_write -- [ptr, ptr+len) isn't checked
-        // against the caller's actual mappings before we write through it.
-        let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
-        return Ok(crate::stdin::read(buf) as u64);
-    }
-
     match crate::fd::read(fd, ptr, len) {
         Some(raw) => ffi_result_to_result(raw),
         None => Err(EBADF),
     }
 }
 
-/// Writes `len` bytes at `ptr` to `fd`. `fd == 1` ("stdout") *and* `fd == 2` ("stderr") are both
-/// routed through `serial_print!` (which already mirrors to VGA) — this kernel has no real
-/// terminal/multiplexing concept to give stderr a genuinely separate destination, so it's treated
-/// as an alias for stdout rather than the previous behavior (falling through to `crate::fd`'s
-/// registry, which never has fd 2 registered, so it always came back `EBADF` and every BusyBox
-/// diagnostic written to stderr — e.g. `cat`'s own `ENOENT` message — was silently dropped; see
-/// CLAUDE.md's BusyBox section for how this was found). Returns `EINVAL` if the bytes aren't valid
-/// UTF-8 (real `write` doesn't care about UTF-8 at all; this is a self-imposed restriction of
-/// piping to a text-mode console). Any other `fd` is looked up in `crate::fd`'s registry and
-/// delegated; `EBADF` if nothing has registered it.
+/// Writes `len` bytes at `ptr` to `fd` — a pure lookup into `crate::fd`'s registry now, for *every*
+/// fd including 0/1/2 (see `src/fd.rs`'s module doc comment; stdout/stderr's own UTF-8-checked
+/// `serial_print!` path lives in that file's `stdout_write` now, not here). `EBADF` if `fd` isn't
+/// registered at all.
 pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
-    const STDOUT: u64 = 1;
-    const STDERR: u64 = 2;
-    if fd == STDOUT || fd == STDERR {
-        // SAFETY: this does not validate that [ptr, ptr+len) is actually mapped and user-
-        // accessible before dereferencing it -- see CLAUDE.md's syscall ABI section. A bad
-        // pointer page-faults, which the existing page_fault_handler already handles safely (log
-        // + reboot).
-        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-        return match core::str::from_utf8(bytes) {
-            Ok(s) => {
-                serial_print!("{s}");
-                Ok(len)
-            }
-            Err(_) => Err(EINVAL),
-        };
-    }
-
     match crate::fd::write(fd, ptr, len) {
         Some(raw) => ffi_result_to_result(raw),
         None => Err(EBADF),
@@ -364,7 +335,7 @@ pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
 /// stdio write path goes through `writev`, never plain `write` (see `third_party/musl`'s
 /// `src/stdio/__stdio_write.c`) — without this, `printf` et al. silently produce no output at all.
 /// `(fd, iov_ptr, iovcnt)` matches real `writev`'s own argument positions exactly (unlike
-/// `SYS_MMAP`, nothing here needs to be dropped to fit this ABI's 3-argument width). Reads
+/// `SYS_MMAP`, nothing here needs to be dropped to fit into this ABI's argument registers). Reads
 /// `iovcnt` real C `struct iovec { void *iov_base; size_t iov_len; }` entries (16 bytes each,
 /// standard layout) from `iov_ptr`, and calls `sys_write` once per entry, accumulating the total.
 /// Matches real `writev`'s partial-write semantics: if an entry fails after at least one earlier
@@ -390,6 +361,26 @@ pub(crate) fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64>
     Ok(total)
 }
 
+/// `SYS_PIPE` (`105`) — unlike most of this ABI's own inventions, matches real `pipe(2)`'s wire
+/// format exactly (a single pointer to a `[i32; 2]` the kernel fills in): there's no
+/// argument-convention reason to invent anything different the way `open`/`execve` needed to (see
+/// "musl port"/"BusyBox port" in CLAUDE.md). Delegates to `crate::pipe` for the real logic — a
+/// genuinely new subsystem, needed once `sh` (BusyBox's `hush`) required real pipeline support;
+/// see that module's own doc comment for why a pipe read needs to actually block (not just return
+/// `Ok(0)`/`EAGAIN` the way `sys_read`'s stdin case does) for a pipeline to work at all on this
+/// single-core, cooperatively-scheduled kernel.
+pub(crate) fn sys_pipe(fds_ptr: u64) -> Result<u64, u64> {
+    crate::pipe::do_pipe(fds_ptr)
+}
+
+/// `SYS_DUP2` (`106`) — matches real `dup2(2)`'s exact `(oldfd, newfd)` signature (no
+/// argument-convention mismatch here either). Delegates to `crate::fd::dup2` — see that function's
+/// own doc comment, and `src/fd.rs`'s module doc comment, for the refcount-aware fd-aliasing this
+/// needs to actually work (not just copy function pointers around).
+pub(crate) fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, u64> {
+    crate::fd::dup2(oldfd, newfd).map_err(|_| EBADF)
+}
+
 /// `SYS_SET_FS_BASE` (`103`) — OxideBSD's own invention, not modeled on any real OS's syscall (see
 /// `modules/native_abi/`'s doc comment for why new syscalls this ABI adds don't chase FreeBSD
 /// authenticity the way the pre-existing ones do). musl's x86_64 port needs a way to point `FS`
@@ -398,8 +389,22 @@ pub(crate) fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64>
 /// subcommand or indirection needed since it's the only operation this call will ever perform.
 /// Always succeeds: writing `IA32_FS_BASE` has no failure mode on this kernel (no permission check,
 /// no address validation — same known gap `sys_write`/`sys_read` already have for user pointers).
+///
+/// **Also records `base` into the calling process's own `Process::fs_base`**, not just the live
+/// MSR — `IA32_FS_BASE` is a single global register, not saved/restored per-process by
+/// `context_switch::switch_context` the way `RSP`/callee-saved GPRs are, so without this every
+/// *other* process's `%fs`-relative TLS access (including the stack-protector canary check every
+/// musl-linked binary emits) would silently break the instant a second musl-linked process ever
+/// ran. `scheduler`'s own `activate_and_prepare` restores this stored value into the MSR on every
+/// switch into a process — see `Process::fs_base`'s own doc comment for the real crash this fixed.
 pub(crate) fn sys_set_fs_base(base: u64) -> Result<u64, u64> {
     x86_64::registers::model_specific::FsBase::write(VirtAddr::new(base));
+    if let Some(me) = crate::process::table()
+        .lock()
+        .get_mut(&crate::scheduler::current_pid())
+    {
+        me.fs_base = base;
+    }
     Ok(0)
 }
 
@@ -425,6 +430,14 @@ pub(crate) extern "C" fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64 
 
 pub(crate) extern "C" fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     result_to_ffi(sys_writev(fd, iov_ptr, iovcnt))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_pipe(fds_ptr: u64) -> i64 {
+    result_to_ffi(sys_pipe(fds_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_dup2(oldfd: u64, newfd: u64) -> i64 {
+    result_to_ffi(sys_dup2(oldfd, newfd))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_set_fs_base(base: u64) -> i64 {

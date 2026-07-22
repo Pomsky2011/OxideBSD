@@ -18,6 +18,7 @@ pub mod interrupts;
 pub mod memory;
 pub mod module;
 pub mod pic;
+pub mod pipe;
 pub mod process;
 pub mod qemu;
 pub mod reboot;

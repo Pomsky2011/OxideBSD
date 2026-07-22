@@ -296,6 +296,24 @@ struct RawArgvEntry {
     len: u64,
 }
 
+/// A single fixed `envp` entry, `PATH=` (empty value, not absent) -- given to *every* `execve`
+/// call this shell makes. Musl's `execvp()` (`third_party/musl/src/process/execvp.c`) only
+/// PATH-searches when the command name has no `/` in it, and its search loop unconditionally
+/// inserts a `/` between whatever path segment it's trying and the filename -- with musl's own
+/// hardcoded fallback search path (used when `$PATH` is unset entirely, `getenv("PATH") ==
+/// NULL`), every candidate ends up looking like `/usr/local/bin/foo`, a multi-component path
+/// `fat32_open`'s own path grammar flatly rejects (`EINVAL`) since it only ever supports a single
+/// component, optionally `/`-prefixed to mean root (see CLAUDE.md's FAT32 section) -- there's no
+/// real directory hierarchy for a real PATH search to walk in the first place. An *empty* `PATH`
+/// value (present, not absent) short-circuits `execvp`'s loop into trying exactly one candidate,
+/// built as an empty segment + `/` + the filename -- i.e. `/foo`, root-relative, exactly the one
+/// shape `fat32_open` already accepts. This is what actually makes `sh.elf -c "true.elf"` able to
+/// find `true.elf` at all -- discovered the hard way (`hush: can't execute 'true.elf': Invalid
+/// argument`) once `sh` (BusyBox's `hush`) was the first program run under this shell that itself
+/// calls `execvp` on something. Harmless for every other `execve` call site here, none of which go
+/// through `execvp`/care about `$PATH` at all.
+const ENVP: &[u8] = b"PATH=";
+
 /// `extra_args` becomes argv[1..] -- see `RawArgvEntry`. An empty `extra_args` passes `argv_ptr =
 /// 0`, the same "no extra args" wire value every pre-existing `execve` call site here already
 /// relied on before this parameter existed, so `cat`/`ls`/etc.'s internal machinery (none of which
@@ -314,16 +332,20 @@ fn execve(path: &[u8], extra_args: &[&[u8]]) -> Result<u64, u64> {
     } else {
         entries.as_ptr() as u64
     };
-    // envp_ptr = 0: stsh has no real environment of its own to forward (it's the top of this
-    // system's process tree, not spawned by any shell that gave it one) -- explicit 0, not a
-    // stray/uninitialized r10, which do_execve would otherwise try to read as a real envp array.
+    let envp_entries = [
+        RawArgvEntry {
+            ptr: ENVP.as_ptr() as u64,
+            len: ENVP.len() as u64,
+        },
+        RawArgvEntry { ptr: 0, len: 0 },
+    ];
     unsafe {
         syscall4(
             SYS_EXECVE,
             path.as_ptr() as u64,
             path.len() as u64,
             argv_ptr,
-            0,
+            envp_entries.as_ptr() as u64,
         )
     }
 }

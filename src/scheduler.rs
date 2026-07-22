@@ -113,8 +113,8 @@ pub fn start(first_pid: Pid) -> ! {
 }
 
 /// Marks `pid` `Running`, activates its address space (`CR3`), repoints `TSS.RSP0` at its own
-/// kernel stack, and returns its saved `rsp` — the common tail shared by `schedule()` and
-/// `start()` just before the actual `switch_context` call.
+/// kernel stack, restores its own `IA32_FS_BASE`, and returns its saved `rsp` — the common tail
+/// shared by `schedule()` and `start()` just before the actual `switch_context` call.
 fn activate_and_prepare(pid: Pid) -> u64 {
     let mut table = process::table().lock();
     let next = table
@@ -127,5 +127,11 @@ fn activate_and_prepare(pid: Pid) -> u64 {
     // AddressSpace::activate's own safety contract.
     unsafe { next.address_space.activate() };
     gdt::set_kernel_stack(next.kernel_stack_top);
+    // IA32_FS_BASE is a single global MSR, not something switch_context itself saves/restores (it
+    // only touches RSP/callee-saved GPRs) -- without this, one process's own %fs-relative TLS
+    // (every musl-linked binary's stack-protector check among it) would silently see whichever
+    // *other* process last called SYS_SET_FS_BASE. See Process::fs_base's own doc comment for the
+    // real crash this fixed.
+    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(next.fs_base));
     next.rsp
 }
