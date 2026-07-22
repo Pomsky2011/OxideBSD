@@ -17,6 +17,7 @@ fn main() {
 
     build_module_crate("hello", "HELLO", &[]);
     build_module_crate("native_abi", "NATIVE_ABI", &[]);
+    build_module_crate("posix_compat", "POSIX_COMPAT", &[]);
 
     // ring3-smoke is embedded into the FAT32 image below (as SMOKE.ELF) so stsh's fork+execve+wait
     // path has a real, already-working target it can run as an actual file, not just another
@@ -32,7 +33,24 @@ fn main() {
     let musl_smoke_elf = std::fs::read(&musl_smoke_elf_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", musl_smoke_elf_path.display()));
 
-    let fat32_image_path = write_fat32_image(&ring3_smoke_elf, &musl_smoke_elf);
+    // The first two BusyBox applets ported to OxideBSD -- see CLAUDE.md's BusyBox section. Each is
+    // its own genuinely standalone, single-applet static binary (not a multi-call `busybox` binary
+    // dispatching on argv[0], which this codebase's execve doesn't support -- see
+    // build_busybox_applet's own doc comment), embedded into the FAT32 image below as TRUE.ELF/
+    // ECHO.ELF the same way SMOKE.ELF/MUSL.ELF already are.
+    let busybox_true_elf_path = build_busybox_applet("TRUE", "true", 0xb00000, &musl_sysroot);
+    let busybox_true_elf = std::fs::read(&busybox_true_elf_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", busybox_true_elf_path.display()));
+    let busybox_echo_elf_path = build_busybox_applet("ECHO", "echo", 0xc00000, &musl_sysroot);
+    let busybox_echo_elf = std::fs::read(&busybox_echo_elf_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", busybox_echo_elf_path.display()));
+
+    let fat32_image_path = write_fat32_image(
+        &ring3_smoke_elf,
+        &musl_smoke_elf,
+        &busybox_true_elf,
+        &busybox_echo_elf,
+    );
     build_module_crate(
         "fat32",
         "FAT32",
@@ -133,6 +151,143 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
         panic!("building musl-smoke failed: {status}");
     }
     out
+}
+
+/// Cross-builds a single, standalone BusyBox applet (`applet_symbol`, e.g. `"TRUE"`/`"ECHO"` --
+/// the exact Kconfig symbol name, confirmed against the vendored source's own `//config:` comments
+/// in `coreutils/true.c`/`coreutils/echo.c`) against the musl sysroot `build_musl_sysroot` already
+/// produced -- BusyBox's own build system (`make`), not Cargo, the same "shell out to the real
+/// toolchain" idiom `build_musl_smoke` already uses for a single `.c` file.
+///
+/// Follows BusyBox's own documented recipe for a minimal, non-interactive single-applet config --
+/// the comment at `third_party/busybox/scripts/kconfig/Makefile:22`: `make allnoconfig`, flip the
+/// one applet's config line to `=y` by hand, then build directly. Confirmed empirically (not just
+/// followed blindly) that this produces a real `NUM_APPLETS == 1` build -- checked below via
+/// `include/NUM_APPLETS.h` -- which is what makes BusyBox's own `main()` (`libbb/appletlib.c`)
+/// skip all argv[0]/basename-based applet dispatch entirely and call the applet's `_main` function
+/// directly (the `SINGLE_APPLET_MAIN` path). That matters specifically because this codebase's
+/// `execve` doesn't pass a real, chosen argv[0] through at all yet (see CLAUDE.md's BusyBox
+/// section) -- a multi-applet `busybox` binary relying on argv[0] to pick an applet wouldn't work
+/// here at all, but a genuinely single-applet binary doesn't need argv[0] for anything.
+///
+/// `allnoconfig`'s own defaults also have to be overridden for the "which shell provides `sh`"
+/// choice (`SH_IS_ASH` by default, never `SH_IS_NONE`) -- left alone, that default drags in a
+/// second applet (`ash`) and `NUM_APPLETS` becomes 2, not 1 (confirmed the hard way; BusyBox's own
+/// `make_single_applets.sh` script carries a comment about this exact same trap).
+///
+/// No `config.mak`-exists-style caching here, unlike `build_musl_sysroot`: BusyBox's own
+/// `allnoconfig` + single-applet `.config` edit is fast (roughly a second, not musl's own
+/// multi-second `configure` re-probe of the host compiler), so always regenerating from scratch is
+/// simpler and can't go stale. `out_name` is used both for this applet's own
+/// `target/busybox-<out_name>` out-of-tree (`O=`) build directory and to describe it in panics;
+/// `load_addr` becomes its `-Wl,-Ttext-segment=` link address, which -- like every other userland
+/// binary's load base in this codebase -- must stay clear of every other one already claimed.
+fn build_busybox_applet(
+    applet_symbol: &str,
+    out_name: &str,
+    load_addr: u64,
+    musl_sysroot: &Path,
+) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let busybox_dir = Path::new(manifest_dir).join("third_party/busybox");
+    let out_dir = Path::new(manifest_dir).join(format!("target/busybox-{out_name}"));
+    std::fs::create_dir_all(&out_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        busybox_dir.join("coreutils").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        busybox_dir.join("libbb").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        busybox_dir.join("Config.in").display()
+    );
+
+    let out_arg = format!("O={}", out_dir.display());
+    let status = Command::new("make")
+        .current_dir(&busybox_dir)
+        .arg(&out_arg)
+        .arg("allnoconfig")
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make allnoconfig for busybox {out_name}: {e}"));
+    if !status.success() {
+        panic!("busybox allnoconfig for {out_name} failed: {status}");
+    }
+
+    configure_busybox_single_applet(&out_dir, applet_symbol);
+
+    let musl_gcc = musl_sysroot.join("bin/musl-gcc");
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let status = Command::new("make")
+        .current_dir(&busybox_dir)
+        .arg(&out_arg)
+        .arg(format!("CC={}", musl_gcc.display()))
+        .arg(format!(
+            "EXTRA_LDFLAGS=-static -no-pie -Wl,-Ttext-segment={load_addr:#x}"
+        ))
+        .args(["-j", &jobs.to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make for busybox {out_name}: {e}"));
+    if !status.success() {
+        panic!("building busybox {out_name} failed: {status}");
+    }
+
+    let num_applets_path = out_dir.join("include/NUM_APPLETS.h");
+    let num_applets = std::fs::read_to_string(&num_applets_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", num_applets_path.display()));
+    assert!(
+        num_applets.trim() == "#define NUM_APPLETS 1",
+        "busybox {out_name} build produced {:?} ({}), not a standalone single-applet binary -- \
+         argv[0]-based applet dispatch would be required, which this codebase's execve doesn't \
+         support",
+        num_applets.trim(),
+        num_applets_path.display()
+    );
+
+    out_dir.join("busybox")
+}
+
+/// Rewrites the `.config` `make allnoconfig` (in `out_dir`) just produced so exactly one applet
+/// (`applet_symbol`) plus `CONFIG_STATIC` are enabled and the `sh`-provider choice is forced to
+/// `SH_IS_NONE` (see `build_busybox_applet`'s own doc comment for why) -- by direct text
+/// replacement of the exact lines `allnoconfig` is known (confirmed empirically) to produce,
+/// rather than shelling out to `sed` as BusyBox's own documented recipe does, so a shape this
+/// doesn't expect fails loudly (the `assert!` below) instead of silently doing nothing.
+fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
+    let config_path = out_dir.join(".config");
+    let mut config = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", config_path.display()));
+    for (from, to) in [
+        (
+            format!("# CONFIG_{applet_symbol} is not set"),
+            format!("CONFIG_{applet_symbol}=y"),
+        ),
+        (
+            "# CONFIG_STATIC is not set".to_string(),
+            "CONFIG_STATIC=y".to_string(),
+        ),
+        (
+            "CONFIG_SH_IS_ASH=y".to_string(),
+            "# CONFIG_SH_IS_ASH is not set".to_string(),
+        ),
+        (
+            "# CONFIG_SH_IS_NONE is not set".to_string(),
+            "CONFIG_SH_IS_NONE=y".to_string(),
+        ),
+    ] {
+        assert!(
+            config.contains(&from),
+            "busybox .config for {applet_symbol} is missing the expected line {from:?} -- \
+             allnoconfig's output shape may have changed"
+        );
+        config = config.replacen(&from, &to, 1);
+    }
+    std::fs::write(&config_path, config)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", config_path.display()));
 }
 
 /// Cross-builds the userland crate at `userland/<crate_name>/` and exposes its resulting ELF's
@@ -403,8 +558,18 @@ fn discover_panic_symbol(llvm_bin: &Path, object: &Path) -> Option<String> {
 /// root directory as a proper cluster chain (not FAT16's fixed region) -- only this kernel's own
 /// hand-rolled parser (`modules/fat32/`) ever needs to read it, so the "real minimum size" rule is
 /// safe to deliberately violate.
-fn write_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> PathBuf {
-    let image = generate_fat32_image(smoke_elf_bytes, musl_elf_bytes);
+fn write_fat32_image(
+    smoke_elf_bytes: &[u8],
+    musl_elf_bytes: &[u8],
+    busybox_true_elf_bytes: &[u8],
+    busybox_echo_elf_bytes: &[u8],
+) -> PathBuf {
+    let image = generate_fat32_image(
+        smoke_elf_bytes,
+        musl_elf_bytes,
+        busybox_true_elf_bytes,
+        busybox_echo_elf_bytes,
+    );
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let target_dir = Path::new(manifest_dir).join("target/modules");
     std::fs::create_dir_all(&target_dir).expect("failed to create target/modules");
@@ -444,11 +609,29 @@ fn fat32_big_file_byte(index: usize) -> u8 {
     b'A' + (index % 26) as u8
 }
 
-fn generate_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> Vec<u8> {
+fn generate_fat32_image(
+    smoke_elf_bytes: &[u8],
+    musl_elf_bytes: &[u8],
+    busybox_true_elf_bytes: &[u8],
+    busybox_echo_elf_bytes: &[u8],
+) -> Vec<u8> {
     let smoke_cluster_count =
         (smoke_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
     let musl_first_cluster = FAT32_SMOKE_FIRST_CLUSTER + smoke_cluster_count;
     let musl_cluster_count = (musl_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
+    // TRUE.ELF/ECHO.ELF (the first two BusyBox applets ported to OxideBSD -- see CLAUDE.md's
+    // BusyBox section) chain on after MUSL.ELF exactly the way MUSL.ELF itself chains on after
+    // SMOKE.ELF above -- same pattern, just two files further down the chain.
+    let busybox_true_first_cluster = musl_first_cluster + musl_cluster_count;
+    let busybox_true_cluster_count = (busybox_true_elf_bytes
+        .len()
+        .div_ceil(FAT32_BYTES_PER_SECTOR) as u32)
+        .max(1);
+    let busybox_echo_first_cluster = busybox_true_first_cluster + busybox_true_cluster_count;
+    let busybox_echo_cluster_count = (busybox_echo_elf_bytes
+        .len()
+        .div_ceil(FAT32_BYTES_PER_SECTOR) as u32)
+        .max(1);
 
     // Solve for the FAT size (in sectors) that exactly covers the clusters left over once that
     // same FAT size is reserved -- a small fixed-point iteration, since the FAT's own size is
@@ -463,15 +646,18 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> Vec<u8
     }
     let data_start_sector = FAT32_RESERVED_SECTORS + FAT32_NUM_FATS * fat_size_sectors;
 
-    let highest_cluster_used = musl_first_cluster + musl_cluster_count - 1;
+    let highest_cluster_used = busybox_echo_first_cluster + busybox_echo_cluster_count - 1;
     let data_clusters =
         (FAT32_TOTAL_SECTORS - data_start_sector) / FAT32_SECTORS_PER_CLUSTER as u32;
     assert!(
         highest_cluster_used < 2 + data_clusters,
-        "ring3-smoke ({} bytes) + musl-smoke ({} bytes) no longer fit in the embedded FAT32 image \
-         ({} total bytes) -- raise FAT32_TOTAL_SECTORS",
+        "ring3-smoke ({} bytes) + musl-smoke ({} bytes) + busybox true ({} bytes) + busybox echo \
+         ({} bytes) no longer fit in the embedded FAT32 image ({} total bytes) -- raise \
+         FAT32_TOTAL_SECTORS",
         smoke_elf_bytes.len(),
         musl_elf_bytes.len(),
+        busybox_true_elf_bytes.len(),
+        busybox_echo_elf_bytes.len(),
         FAT32_TOTAL_SECTORS as usize * FAT32_BYTES_PER_SECTOR
     );
 
@@ -568,6 +754,24 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> Vec<u8
             };
             write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
         }
+        for i in 0..busybox_true_cluster_count {
+            let cluster = busybox_true_first_cluster + i;
+            let value = if i + 1 == busybox_true_cluster_count {
+                FAT32_EOC
+            } else {
+                cluster + 1
+            };
+            write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
+        }
+        for i in 0..busybox_echo_cluster_count {
+            let cluster = busybox_echo_first_cluster + i;
+            let value = if i + 1 == busybox_echo_cluster_count {
+                FAT32_EOC
+            } else {
+                cluster + 1
+            };
+            write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
+        }
     }
 
     let cluster_offset = |cluster: u32| -> usize {
@@ -616,6 +820,24 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> Vec<u8
             musl_first_cluster,
             musl_elf_bytes.len() as u32,
         );
+        entry_offset += 32;
+        write_dir_entry(
+            &mut image,
+            entry_offset,
+            b"TRUE    ELF",
+            0x20,
+            busybox_true_first_cluster,
+            busybox_true_elf_bytes.len() as u32,
+        );
+        entry_offset += 32;
+        write_dir_entry(
+            &mut image,
+            entry_offset,
+            b"ECHO    ELF",
+            0x20,
+            busybox_echo_first_cluster,
+            busybox_echo_elf_bytes.len() as u32,
+        );
         // No further entries -- the byte after this one is already 0 (image starts zeroed),
         // which is the FAT directory end-of-listing marker.
     }
@@ -657,6 +879,27 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> Vec<u8
     {
         for (i, chunk) in musl_elf_bytes.chunks(FAT32_BYTES_PER_SECTOR).enumerate() {
             let cluster = musl_first_cluster + i as u32;
+            let offset = cluster_offset(cluster);
+            image[offset..offset + chunk.len()].copy_from_slice(chunk);
+        }
+    }
+
+    // --- TRUE.ELF / ECHO.ELF contents (the built standalone BusyBox applets -- see CLAUDE.md's
+    // BusyBox section -- chunked the same way SMOKE.ELF/MUSL.ELF's own bytes are above) ---
+    {
+        for (i, chunk) in busybox_true_elf_bytes
+            .chunks(FAT32_BYTES_PER_SECTOR)
+            .enumerate()
+        {
+            let cluster = busybox_true_first_cluster + i as u32;
+            let offset = cluster_offset(cluster);
+            image[offset..offset + chunk.len()].copy_from_slice(chunk);
+        }
+        for (i, chunk) in busybox_echo_elf_bytes
+            .chunks(FAT32_BYTES_PER_SECTOR)
+            .enumerate()
+        {
+            let cluster = busybox_echo_first_cluster + i as u32;
             let offset = cluster_offset(cluster);
             image[offset..offset + chunk.len()].copy_from_slice(chunk);
         }

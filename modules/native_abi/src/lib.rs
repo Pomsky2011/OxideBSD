@@ -27,7 +27,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_fork() -> i64;
     fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: u64) -> i64;
-    fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64) -> i64;
+    fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64) -> i64;
     fn oxidebsd_sys_getpid() -> i64;
     fn oxidebsd_sys_mmap(addr_hint: u64, len: u64, prot: u64) -> i64;
     fn oxidebsd_sys_munmap(addr: u64, len: u64) -> i64;
@@ -69,8 +69,8 @@ extern "C" fn handle_wait4(pid: u64, status_ptr: u64, options: u64) -> i64 {
     unsafe { oxidebsd_sys_wait4(pid, status_ptr, options) }
 }
 
-extern "C" fn handle_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> i64 {
-    unsafe { oxidebsd_sys_execve(path_ptr, path_len) }
+extern "C" fn handle_execve(path_ptr: u64, path_len: u64, argv_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_execve(path_ptr, path_len, argv_ptr) }
 }
 
 extern "C" fn handle_getpid(_arg0: u64, _arg1: u64, _arg2: u64) -> i64 {

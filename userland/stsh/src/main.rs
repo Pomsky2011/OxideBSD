@@ -59,6 +59,10 @@ const STDOUT: u64 = 1;
 const O_CREAT: u64 = 1;
 
 const LINE_CAPACITY: usize = 128;
+/// Bounds how many words past the command name `execve`'s argv[1..] can carry -- a sanity cap,
+/// not a deliberate limit; `LINE_CAPACITY`-worth of single-space-separated words can't come close
+/// to this many anyway.
+const MAX_ARGV: usize = 16;
 
 /// Issues a syscall via `SYSCALL`: number in `rax`, up to three arguments in `rdi`/`rsi`/`rdx`.
 /// Success/failure comes back via the carry flag (OxideBSD's native, BSD-style convention) —
@@ -197,6 +201,23 @@ fn split_first_word(s: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// Splits `s` into up to `MAX_ARGV` single-space-delimited words (repeated `split_first_word`,
+/// same no-quoting parsing this shell already uses everywhere else) -- these become `execve`'s
+/// argv[1..] in `run_program`/`execve` below. Words past `MAX_ARGV` are silently dropped, not
+/// buffered or erred on, same "quietly bounded, not unbounded" choice `read_line`'s own
+/// `LINE_CAPACITY` overflow handling already makes.
+fn split_words<'a>(s: &'a [u8], out: &mut [&'a [u8]; MAX_ARGV]) -> usize {
+    let mut count = 0;
+    let mut rest = trim(s);
+    while !rest.is_empty() && count < out.len() {
+        let (word, tail) = split_first_word(rest);
+        out[count] = word;
+        count += 1;
+        rest = trim(tail);
+    }
+    count
+}
+
 fn run_command(line: &[u8]) {
     let line = trim(line);
     if line.is_empty() {
@@ -221,7 +242,7 @@ fn run_command(line: &[u8]) {
         b"cd" => cd(trim(rest)),
         b"ls" => ls(trim(rest)),
         b"mkdir" => mkdir(trim(rest)),
-        _ => run_program(command),
+        _ => run_program(command, rest),
     }
 }
 
@@ -235,18 +256,56 @@ fn wait4(pid: u64, status: &mut i32, options: u64) -> Result<u64, u64> {
     unsafe { syscall(SYS_WAIT4, pid, status as *mut i32 as u64, options) }
 }
 
-fn execve(path: &[u8]) -> Result<u64, u64> {
-    unsafe { syscall(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64, 0) }
+/// Wire format for `SYS_EXECVE`'s optional third argument -- see `src/process.rs`'s
+/// `RawArgvEntry` (the kernel-side counterpart this must match exactly: two `u64`s, `ptr` then
+/// `len`). A sequence of these describes argv[1..] (argv[0] is always the `path` `execve` itself
+/// was given), terminated by a `ptr == 0` entry.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawArgvEntry {
+    ptr: u64,
+    len: u64,
+}
+
+/// `extra_args` becomes argv[1..] -- see `RawArgvEntry`. An empty `extra_args` passes `argv_ptr =
+/// 0`, the same "no extra args" wire value every pre-existing `execve` call site here already
+/// relied on before this parameter existed, so `cat`/`ls`/etc.'s internal machinery (none of which
+/// calls `execve`) and every other caller stay unaffected.
+fn execve(path: &[u8], extra_args: &[&[u8]]) -> Result<u64, u64> {
+    let mut entries = [RawArgvEntry { ptr: 0, len: 0 }; MAX_ARGV + 1];
+    for (i, arg) in extra_args.iter().enumerate() {
+        entries[i] = RawArgvEntry {
+            ptr: arg.as_ptr() as u64,
+            len: arg.len() as u64,
+        };
+    }
+    // entries[extra_args.len()] is still the {0, 0} terminator from initialization above.
+    let argv_ptr = if extra_args.is_empty() {
+        0
+    } else {
+        entries.as_ptr() as u64
+    };
+    unsafe {
+        syscall(
+            SYS_EXECVE,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            argv_ptr,
+        )
+    }
 }
 
 /// Anything that isn't a recognized built-in is treated as a real program to run: `fork`, `execve`
-/// the typed word as a path in the child, `wait4` in the parent. `execve` only ever "returns" here
-/// on failure -- on success the kernel redirects the child's own execution directly, so the
-/// `is_err()` check below is the only path that can run afterward.
-fn run_program(name: &[u8]) {
+/// the typed word as a path (with `rest`, split on whitespace, as its arguments) in the child,
+/// `wait4` in the parent. `execve` only ever "returns" here on failure -- on success the kernel
+/// redirects the child's own execution directly, so the `is_err()` check below is the only path
+/// that can run afterward.
+fn run_program(name: &[u8], rest: &[u8]) {
+    let mut argv_buf: [&[u8]; MAX_ARGV] = [&[]; MAX_ARGV];
+    let argc = split_words(rest, &mut argv_buf);
     match fork() {
         Ok(0) => {
-            if execve(name).is_err() {
+            if execve(name, &argv_buf[..argc]).is_err() {
                 write_bytes(b"unknown command: ");
                 write_bytes(name);
                 write_bytes(b"\n");

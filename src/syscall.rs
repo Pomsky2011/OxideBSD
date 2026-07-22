@@ -427,11 +427,12 @@ pub(crate) extern "C" fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: 
     ))
 }
 
-pub(crate) extern "C" fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64) -> i64 {
+pub(crate) extern "C" fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64) -> i64 {
     result_to_ffi(crate::process::do_execve(
         crate::scheduler::current_pid(),
         path_ptr,
         path_len,
+        argv_ptr,
     ))
 }
 

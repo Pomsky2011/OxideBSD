@@ -71,6 +71,22 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     )
     .unwrap_or_else(|e| panic!("failed to load the native_abi module: {e:?}"));
 
+    // The home for whatever POSIX/libc-surface syscalls BusyBox's applets need beyond what
+    // native_abi/fat32 already provide -- see CLAUDE.md's BusyBox section and
+    // modules/posix_compat/src/lib.rs's own doc comment. Empty (registers nothing) at this point;
+    // must still load before stsh is spawned, same as native_abi, since anything it later
+    // registers needs to be in place before a program calling it can run.
+    const POSIX_COMPAT_MOD: &[u8] = include_bytes!(env!("POSIX_COMPAT_MOD_PATH"));
+    const POSIX_COMPAT_PANIC_SYMBOL: &str = env!("POSIX_COMPAT_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "posix_compat",
+        POSIX_COMPAT_MOD,
+        POSIX_COMPAT_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
+
     const FAT32_MOD: &[u8] = include_bytes!(env!("FAT32_MOD_PATH"));
     const FAT32_PANIC_SYMBOL: &str = env!("FAT32_MOD_PANIC_SYMBOL");
     oxidebsd::module::load(

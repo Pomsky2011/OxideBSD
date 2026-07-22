@@ -56,13 +56,22 @@ the hardware level at all (`src/fpu.rs`, new); and a new `SYS_WRITEV` syscall wa
 musl's entire stdio write path goes through `writev`, not plain `write` — see "musl port" for the
 full story of each.
 
-See "User-mode execution", "Syscall ABI", "musl port", "Interactive shell", "Dynamic kernel
-modules", "FAT32 filesystem module", and "Process abstraction, scheduler, and fork/exec/wait"
-below for the current, deliberate limits (`sys_write`/`sys_read` don't validate their pointers, no
-line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/reload, FAT32 writes
-don't persist across reboot, no preemptive scheduling, no copy-on-write fork, no frame
-deallocation anywhere, and — for the musl port — no `envp` passthrough across `execve`, `open`/
-`execve`'s argument-convention mismatches with real musl calls of the same name, and several
+**The first two BusyBox applets now run on top of that same musl** (see "BusyBox port" below):
+`true`/`echo`, each its own genuinely standalone, single-applet static binary (not a multi-call
+`busybox` binary dispatching on argv[0], which this codebase's `execve` doesn't support),
+`execve`'d by `stsh` as `TRUE.ELF`/`ECHO.ELF` exactly like `MUSL.ELF`. Unlike the musl port, this
+needed no new kernel syscalls at all — both ran cleanly the first time they were booted, modulo the
+same already-known-harmless `set_tid_address` gap musl's own startup already has. New syscalls
+BusyBox's *later* applets need will be registered by a new, deliberately separate module,
+`modules/posix_compat/` (currently empty), rather than growing `modules/native_abi/` further.
+
+See "User-mode execution", "Syscall ABI", "musl port", "BusyBox port", "Interactive shell",
+"Dynamic kernel modules", "FAT32 filesystem module", and "Process abstraction, scheduler, and
+fork/exec/wait" below for the current, deliberate limits (`sys_write`/`sys_read` don't validate
+their pointers, no line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/
+reload, FAT32 writes don't persist across reboot, no preemptive scheduling, no copy-on-write fork,
+no frame deallocation anywhere, and — for the musl port — no `envp` passthrough across `execve`,
+`open`/`execve`'s argument-convention mismatches with real musl calls of the same name, and several
 syscalls musl's fuller startup would need still unimplemented). A *real* filesystem (backed by an
 actual block device, not an embedded image) doesn't exist yet. Architecture decisions for
 remaining subsystems have not been made and should be discussed with the user before large
@@ -572,9 +581,12 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
   - **`execve`**: numerically unchanged from upstream (`59` happens to already be OxideBSD's real
     `SYS_EXECVE`), but not actually argument-compatible: musl's `execve()` passes `(path, argv,
     envp)` in `RDI`/`RSI`/`RDX`; OxideBSD's `SYS_EXECVE` (`process::do_execve`) expects `(path_ptr,
-    path_len)` — no `argv`/`envp` support at all. Unreachable so far since nothing in this port's
-    own test programs calls `execve()` on itself (only `stsh`, over the native ABI it already
-    speaks correctly, `execve`'s *other* programs).
+    path_len, argv_ptr)` — a completely different shape in `RSI` (a length, not the real `argv`
+    pointer) and no `envp` support at all (see "BusyBox port" below for `argv_ptr`'s own,
+    unrelated-to-real-`execve` wire format, added for `stsh`'s own direct native-ABI callers, not
+    for musl-compatibility). Still unreachable so far since nothing in this port's own test programs
+    calls `execve()` on itself (only `stsh`, over the native ABI it already speaks correctly,
+    `execve`'s *other* programs).
 - **Two syscalls musl's startup reaches but this kernel doesn't implement, left unmapped
   (their original Linux numbers) rather than stubbed — both confirmed harmless for `musl-smoke`
   specifically, not fixed just because they were seen:** `set_tid_address` (`__init_tp`, right
@@ -602,11 +614,110 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
   raised once before (`4096` → `16384` for `SMOKE.ELF`): `musl-smoke`, a real compiled C binary
   against a real libc, is bigger (~23 KiB) than any hand-written demo binary this codebase had
   embedded before.
-- **What's explicitly still out of scope, the same way real musl/BusyBox running was flagged
-  out of scope before this port started:** a real, general-purpose libc-on-OxideBSD story (this is
-  one hand-picked static binary exercising `printf`, not a validated general surface), `envp`
-  passthrough across `execve`, fixing the `open`/`execve` argument mismatches above, and anything
-  resembling BusyBox itself — real, substantial follow-up work, not attempted yet.
+- **What's explicitly still out of scope, the same way real BusyBox running was flagged out of
+  scope before that port started (see "BusyBox port" below for where it actually started)**: a
+  real, general-purpose libc-on-OxideBSD story (this is one hand-picked static binary exercising
+  `printf`, not a validated general surface), `envp` passthrough across `execve`, and fixing the
+  `open`/`execve` argument mismatches above — real, substantial follow-up work, not attempted yet.
+
+## BusyBox port (`third_party/busybox`, `modules/posix_compat/`)
+
+The natural next step once a real musl static binary ran end to end (see "musl port" above):
+BusyBox applets, built against that same patched musl, `execve`'d by `stsh` exactly like
+`MUSL.ELF`. Scoped deliberately narrowly for this first pass — just `true` and `echo` — to prove
+the mechanism (a real BusyBox build, cross-compiled and embedded) before attempting anything
+resembling a shell or a real toolbox.
+
+- **Vendored as a submodule pointing at a personal GitHub fork** (`third_party/busybox`, pinned to
+  release tag `1_36_1`), mirroring `third_party/musl`'s own setup exactly — a parking spot for
+  patches on the fork's own `oxidebsd` branch, even though none turned out to be needed for this
+  pass (unlike musl, BusyBox mostly goes through libc rather than making raw syscalls itself, so
+  patches were always less certain to be needed here than they were for musl). BusyBox's own
+  canonical repo is self-hosted at `git.busybox.net`, not GitHub directly — same situation musl was
+  in — so the fork is of `mirror/busybox`, a long-standing GitHub mirror, confirmed to match
+  canonical's real `1_36_1` tag commit hash before forking it (the same "authenticity, not blind
+  trust" discipline musl's own fork source was picked with).
+- **Each applet is built as its own genuinely standalone, single-applet static binary — not a
+  multi-call `busybox` binary dispatching on argv[0].** This is a hard requirement, not a style
+  choice: this codebase's `execve` (`src/process.rs`'s `do_execve`) doesn't pass a real, chosen
+  argv[0] through at all yet (`argv[0]` is always just whatever path string was passed to `execve`
+  itself — see "Process abstraction, scheduler, and fork/exec/wait" below), so a multi-call binary
+  relying on argv[0]/basename matching to pick an applet (the usual BusyBox trick) couldn't work
+  here. A genuinely single-applet build sidesteps the whole problem: confirmed by reading
+  `libbb/appletlib.c`'s own `main()`, when only one applet is compiled in
+  (`#if defined(SINGLE_APPLET_MAIN)`), BusyBox calls that applet's `_main` function directly and
+  never looks at argv[0]/basename at all.
+- **`build.rs`'s `build_busybox_applet` follows BusyBox's own documented recipe for this** — the
+  comment at `third_party/busybox/scripts/kconfig/Makefile:22`: `make allnoconfig`, flip the one
+  applet's Kconfig line to `=y` by hand (`configure_busybox_single_applet`, direct text replacement
+  rather than shelling out to `sed`, so an unexpected `.config` shape fails loudly instead of
+  silently doing nothing), then build directly with `CC` pointed at the musl sysroot
+  `build_musl_sysroot` (see "musl port" above) already produced. `allnoconfig`'s own default for
+  "which shell provides `sh`" (`SH_IS_ASH`, never `SH_IS_NONE`) has to be overridden too — left
+  alone, that default drags in a second applet (`ash`) and `NUM_APPLETS` becomes 2, not 1, breaking
+  the single-applet dispatch bypass above (BusyBox's own `make_single_applets.sh` script carries a
+  comment about this exact same trap). The build asserts `NUM_APPLETS == 1` via
+  `include/NUM_APPLETS.h` before returning, rather than trusting the config silently produced what
+  was asked for. Each applet gets its own load address (`0xb00000` for `true`, `0xc00000` for
+  `echo`), following the same clear-of-everything-else discipline every prior userland load address
+  in this codebase already needed (see "User-mode execution" above).
+- **Embedded into the FAT32 image as `TRUE.ELF`/`ECHO.ELF`, deliberately with an extension** —
+  extending `generate_fat32_image` the same way `MUSL.ELF` was, chained on right after it. The
+  `.ELF` extension isn't just convention here: `stsh`'s `run_command` matches built-ins (`echo`
+  among them — see "Interactive shell" below) by exact first-word string *before* ever falling
+  through to `execve`, so a bare `echo` typed at the prompt always hits the shell built-in, never an
+  embedded applet of the same name. Naming the file `ECHO.ELF` (typed as `echo.elf`) sidesteps that
+  collision entirely. Both binaries are small enough (13 KiB / 38 KiB) that neither
+  `MAX_FILE_BUFFER` (`modules/fat32/src/lib.rs`, `65536`) nor `FAT32_TOTAL_SECTORS` needed raising
+  for this pass.
+- **Ran cleanly the very first time both were booted — no new kernel syscalls were needed at all**,
+  a real contrast with the musl port itself (which needed three previously-latent kernel bugs found
+  and fixed — see "musl port" above). The only syscall either hits that this kernel doesn't
+  recognize is number `218` (`set_tid_address`, from musl's own `__init_tp` startup path, common to
+  *every* musl binary, not BusyBox-specific) — already documented as confirmed harmless (see "musl
+  port" above: "failing just leaves an unused `tid` field with a bogus value"). Verified via `stsh`
+  (`fork`+`execve`+`wait4`, same path `SMOKE.ELF`/`MUSL.ELF` already exercise): `true.elf` exits `0`
+  silently; bare `echo.elf` (no arguments) prints a single blank line and exits `0` — see the next
+  bullet for real arguments, which didn't work yet at this point.
+- **`SYS_EXECVE` grew a real, working `argv[1..]` mechanism** (`argv_ptr`, its optional third
+  argument) once bare `echo.elf` only ever printing a blank line turned out to be an actual
+  usability problem, not just a documented limitation: `echo.elf hello world` needs `hello`/`world`
+  to reach `echo` as real arguments, not be silently dropped. `argv_ptr` (`src/process.rs`) points
+  at a sequence of `RawArgvEntry { ptr: u64, len: u64 }` structs, length-prefixed like every other
+  pointer this ABI passes — not real `execve`'s NUL-terminated `char **argv` (see the
+  argument-convention-mismatches bullet in "musl port" above, which this doesn't touch or fix) —
+  terminated by a `ptr == 0` entry. `argv[0]` is still always the `execve` path itself
+  (`path_bytes`), unchanged; `argv_ptr` only ever supplies `argv[1..]`, and `argv_ptr == 0` (every
+  pre-existing caller) means "no extra arguments," so this is fully backward compatible. `stsh`'s
+  own `execve` wrapper (`userland/stsh/`) builds this via a new `split_words` helper — the same
+  single-space, no-quoting word splitting `split_first_word` already did once, just repeated up to
+  `MAX_ARGV` (`16`) times — so `run_program` now carries the typed line's remaining words through to
+  the child instead of discarding them.
+- **`echo.elf --help` printing the literal text `--help`, not a help page, is correct BusyBox
+  behavior, not a leftover bug in the `argv` work above** — confirmed both by reading the source
+  (`libbb/appletlib.c`'s `show_usage_if_dash_dash_help` explicitly excludes `echo`/`true`/`false`/
+  `test` from the generic `--help`-shows-usage interception, per its own comment: `"true", "false",
+  "echo" are also special`) and by comparing against a real BusyBox instance run elsewhere, which
+  matched exactly. POSIX's `echo` isn't specified to treat `-`-prefixed words as options at all.
+- **New syscalls live in `modules/posix_compat/`, a new module, not `modules/native_abi/`** — a
+  deliberate choice, made before writing any code: keeps `native_abi` as the small, BSD-authentic
+  core (`exit`/`read`/`write`/`fork`/`wait4`/`execve`/`getpid`, plus the musl-port-driven
+  `mmap`/`munmap`/`brk`/`set_fs_base`/`writev` it already grew to include) while giving whatever
+  broader POSIX/libc surface later BusyBox applets need (candidates: `fstat`, `fcntl`, `dup`/
+  `dup2`, `pipe`, an `ioctl` stub) its own home — matching this codebase's "kernel stays micro,
+  modules carry the extra function" philosophy (see "Dynamic kernel modules" below). Currently
+  empty (registers nothing) — `true`/`echo` didn't need it — but wired into the boot sequence
+  (`src/main.rs`, loaded right after `native_abi`) and the workspace already, so the next syscall a
+  future applet needs is a one-line addition to its `module_init`, not new scaffolding.
+- **What's explicitly still out of scope for this pass**: the `sh` applet (needs real process
+  spawning/piping from *inside* a BusyBox process, a much bigger undertaking than a `NOFORK`
+  applet like `true`/`echo`), multi-applet dispatch in a single binary (still blocked — `argv[0]`
+  itself is still always the `execve` path, never caller-chosen; only `argv[1..]` is real now, see
+  above), `envp` passthrough through `execve` (`argv[1..]` is real now, `envp` still isn't), the
+  `open`/`execve` argument-convention mismatches "musl port" above already flags (still
+  not needed — neither `true` nor `echo` calls `open()` or re-`execve`s itself), persistence, and
+  any automated integration test (verified manually via QEMU + injected keystrokes instead, the
+  same method every interactive `stsh` feature already uses — see "FAT32 filesystem module" below).
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 

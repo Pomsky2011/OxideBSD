@@ -5,6 +5,7 @@ members = [
   "userland/fork-exec-smoke",
   "modules/hello",
   "modules/native_abi",
+  "modules/posix_compat",
   "modules/fat32",
 ]
 
