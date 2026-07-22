@@ -5,25 +5,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 OxideBSD is a 100% Rust-based BSD-like operating system. Phase 1 of `ROADMAP.md` (a running,
-interactive kernel) is essentially done: GDT/TSS/IDT with a dedicated double-fault stack, fatal
-exceptions reboot the machine, PIC-driven hardware interrupts with a timer tick and a PS/2 keyboard
-IRQ handler (decodes scancodes, echoes typed characters, and feeds a small kernel-side stdin buffer
-— see "Interactive shell" below), a VGA text-mode console mirroring serial output, and a heap
-allocator backed by bootloader-provided paging. Phase 2 is underway: the kernel can build a
+interactive kernel) is done: GDT/TSS/IDT with a dedicated double-fault stack, fatal exceptions
+reboot the machine, PIC-driven hardware interrupts with a timer tick and a PS/2 keyboard IRQ
+handler (decodes scancodes, echoes typed characters, and feeds a small kernel-side stdin buffer —
+see "Interactive shell" below), a VGA text-mode console mirroring serial output, and a heap
+allocator backed by bootloader-provided paging. Phase 2 is well underway: the kernel can build a
 *separate* address space (`src/address_space.rs`), load a static ELF64 binary into it
 (`src/elf.rs`), jump into ring 3 (`src/usermode.rs`), and user-mode code can call back into the
-kernel via two independent, and deliberately different, syscall mechanisms — OxideBSD's own
-native, BSD-style `int 0x80` ABI (`src/syscall.rs`: carry-flag error signaling, the traditional
-BSD/x86-Unix convention) and a real Linux-compatible `SYSCALL`/`SYSRET` path
-(`src/linux_syscall.rs`: negative-`RAX` error signaling, aimed specifically at eventually running
-unmodified musl/BusyBox binaries). A first genuinely interactive userland program,
-`userland/stsh/` ("stupidshell"), now runs by default — see "Interactive shell" below.
+kernel via a single native, BSD-style syscall ABI (`src/syscall.rs`: `SYSCALL`/`SYSRETQ`,
+carry-flag error signaling, the traditional BSD/x86-Unix convention). A first genuinely interactive
+userland program, `userland/stsh/` ("stupidshell"), now runs by default — see "Interactive shell"
+below.
+
+**This ABI used to be two independent, deliberately different mechanisms**: this native one over
+`int 0x80`, and a separate Linux-compatible `SYSCALL`/`SYSRET` path (`src/linux_syscall.rs`,
+negative-`RAX` error signaling) aimed at eventually running unmodified musl/BusyBox binaries. That
+plan changed: rather than making the kernel Linux-syscall-compatible, musl is instead being ported
+to speak *this* native ABI directly (patched on a fork, see "musl port" below) — so the native ABI
+now owns the `SYSCALL`/`SYSRETQ` mechanism outright, and `src/linux_syscall.rs`/
+`userland/linux-syscall-smoke/` are gone, having already served their purpose of proving the
+mechanism works at all.
 
 The kernel also has a real **dynamic module loader** (`src/module.rs` — see "Dynamic kernel
 modules" below): it relocates independently-compiled `#![no_std]` code into the running kernel at
 boot, resolves the handful of symbols that code references against a small hand-curated kernel API,
-and calls the module's `module_init`. The native `int 0x80` ABI's syscall-number → handler dispatch
-table (`src/syscall.rs`) is no longer a hardcoded `match` — it's populated by one such module,
+and calls the module's `module_init`. The native ABI's syscall-number → handler dispatch table
+(`src/syscall.rs`) is no longer a hardcoded `match` — it's populated by one such module,
 `modules/native_abi/`. A second module, `modules/fat32/` (see "FAT32 filesystem module" below),
 implements a basic FAT32 filesystem — parsed from a build-time-generated, embedded in-memory disk
 image, since no real block device driver exists yet — with read and write support (including
@@ -31,25 +38,35 @@ subdirectories), registering `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` and,
 kernel-owned fd registry (`src/fd.rs`), extending `SYS_READ`/`SYS_WRITE` to real files. `stsh`'s
 `cat`/`write`/`cd`/`ls`/`mkdir` commands exercise this end to end.
 
-There is now a real **process abstraction and cooperative scheduler** too (`src/process.rs`,
+There is also a real **process abstraction and cooperative scheduler** (`src/process.rs`,
 `src/scheduler.rs`, `src/context_switch.rs` — see "Process abstraction, scheduler, and
 fork/exec/wait" below): a dynamically-allocated process table, kernel-thread-style context
 switching between per-process kernel stacks, and `fork`/`execve`/`wait4`/`getpid` over the native
-`int 0x80` ABI. `stsh` now genuinely runs other programs — any command that isn't a recognized
-built-in is `fork`+`execve`+`wait`ed as a real child process, resolved through the same FAT32
-filesystem `cat`/`write` already use.
+ABI. `stsh` genuinely runs other programs — any command that isn't a recognized built-in is
+`fork`+`execve`+`wait`ed as a real child process, resolved through the same FAT32 filesystem
+`cat`/`write` already use.
 
-See "User-mode execution", "Syscall ABI", "Linux-compatible syscall mechanism", "Interactive
-shell", "Dynamic kernel modules", "FAT32 filesystem module", and "Process abstraction, scheduler,
-and fork/exec/wait" below for the current, deliberate limits (`sys_write`/`sys_read` don't validate
-their pointers, no line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/
-reload, FAT32 writes don't persist across reboot, no preemptive scheduling, no copy-on-write fork,
-no frame deallocation anywhere, and — for the Linux path — only `write`/`exit`/`exit_group` are
-implemented and no process/scheduler support exists there at all; musl's actual startup needs many
-more syscalls and is real follow-up work, not done). A *real* filesystem (backed by an actual block
-device, not an embedded image) doesn't exist yet. Architecture decisions for remaining subsystems
-have not been made and should be discussed with the user before large structural commitments are
-made.
+**A real, unmodified-above-the-syscall-layer musl static binary now runs** (see "musl port"
+below): `userland/musl-smoke/`, built against a vendored, patched fork of musl
+(`third_party/musl`), `execve`'d by `stsh` (`MUSL.ELF` in the embedded FAT32 image) exactly like
+any other program. Getting there needed three real, previously-latent kernel bugs found and fixed
+by actually running it (not caught by any test or lint): the initial process stack never carried a
+real `argv`/`envp`/auxiliary vector (`src/user_stack.rs`, new); this kernel never enabled SSE at
+the hardware level at all (`src/fpu.rs`, new); and a new `SYS_WRITEV` syscall was needed because
+musl's entire stdio write path goes through `writev`, not plain `write` — see "musl port" for the
+full story of each.
+
+See "User-mode execution", "Syscall ABI", "musl port", "Interactive shell", "Dynamic kernel
+modules", "FAT32 filesystem module", and "Process abstraction, scheduler, and fork/exec/wait"
+below for the current, deliberate limits (`sys_write`/`sys_read` don't validate their pointers, no
+line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/reload, FAT32 writes
+don't persist across reboot, no preemptive scheduling, no copy-on-write fork, no frame
+deallocation anywhere, and — for the musl port — no `envp` passthrough across `execve`, `open`/
+`execve`'s argument-convention mismatches with real musl calls of the same name, and several
+syscalls musl's fuller startup would need still unimplemented). A *real* filesystem (backed by an
+actual block device, not an embedded image) doesn't exist yet. Architecture decisions for
+remaining subsystems have not been made and should be discussed with the user before large
+structural commitments are made.
 
 Target architecture is x86_64 only for now.
 
@@ -194,34 +211,36 @@ builds the first process (`stsh`, pid 1 — see "Interactive shell" below) this 
 `src/process.rs`'s `do_execve` builds every subsequent one the same way, just later and mid-syscall
 — see "Process abstraction, scheduler, and fork/exec/wait" below for how control actually reaches
 ring 3 now (through the scheduler's own trampolines, not a direct call). `userland/ring3-smoke/`
-and `userland/linux-syscall-smoke/` (OxideBSD's own native `int 0x80` ABI and the Linux-compatible
-`SYSCALL`/`SYSRET` path respectively — see "Syscall ABI" and "Linux-compatible syscall mechanism"
-below) aren't spawned directly at boot; `ring3-smoke` is instead embedded into the FAT32 image (see
-"FAT32 filesystem module" below) as `SMOKE.ELF` so `stsh` can genuinely `execve` it as a real file.
-Whichever binary runs, the pattern is the same: it does something observable (prints a message and
-exits with a distinctive code, or — for `stsh` — runs an interactive read/dispatch loop), and that
-output over serial/VGA is the actual end-to-end proof paging/ELF-loading/ring-3/syscalls all work
-together.
+(OxideBSD's own native ABI — see "Syscall ABI" below) isn't spawned directly at boot; it's instead
+embedded into the FAT32 image (see "FAT32 filesystem module" below) as `SMOKE.ELF` so `stsh` can
+genuinely `execve` it as a real file. `userland/musl-smoke/` (see "musl port" below) is embedded
+and `execve`'d the exact same way, as `MUSL.ELF`. Whichever binary runs, the pattern is the same:
+it does something observable (prints a message and exits with a distinctive code, or — for `stsh`
+— runs an interactive read/dispatch loop), and that output over serial/VGA is the actual
+end-to-end proof paging/ELF-loading/ring-3/syscalls all work together.
 
-- **The userland demo build.** `userland/ring3-smoke/`, `userland/linux-syscall-smoke/`,
-  `userland/stsh/`, and `userland/fork-exec-smoke/` (a minimal fork/wait-only smoke test purpose-
-  built for `tests/fork_wait.rs` — see "Process abstraction, scheduler, and fork/exec/wait" below)
-  are separate workspace members (root `Cargo.toml` gained a `[workspace]` table; the root package
-  is still its own workspace member, same as before). The root package's `build.rs` cross-builds
-  all of them (via a shared `build_userland_crate` helper) into `target/userland/` — a **separate**
+- **The userland demo build.** `userland/ring3-smoke/`, `userland/stsh/`, and
+  `userland/fork-exec-smoke/` (a minimal fork/wait-only smoke test purpose-built for
+  `tests/fork_wait.rs` — see "Process abstraction, scheduler, and fork/exec/wait" below) are
+  separate workspace members (root `Cargo.toml` gained a `[workspace]` table; the root package is
+  still its own workspace member, same as before). The root package's `build.rs` cross-builds all
+  of them (via a shared `build_userland_crate` helper) into `target/userland/` — a **separate**
   target directory from the outer build's own `target/`, not the shared one: invoking a nested
   `cargo build` against the *same* target directory a still-running outer cargo invocation already
   holds a lock on (build scripts run as part of that outer build) can deadlock. Each resulting
   ELF's path is exposed via `cargo:rustc-env=<NAME>_ELF_PATH=...`, so `src/main.rs`/`tests/*.rs` can
   `include_bytes!(env!("..._ELF_PATH"))` — this keeps `cargo build`/`cargo run`/`cargo test` working
   with no manual pre-step. Each userland crate's `linker.ld` forces its own distinct load base
-  (`0x800000` for `ring3-smoke`, `0x900000` for `linux-syscall-smoke`, `0x600000` for `stsh`,
-  `0x700000` for `fork-exec-smoke`) clear of the kernel's own image, heap, and phys-memory-offset
-  window (see below) — genuinely required now, not just future-proofing, since `execve` can load a
-  binary into a running system rather than only at a one-binary-per-boot demo; each crate's own
-  tiny `build.rs` passes its script as a link arg to just its own binary, not via `RUSTFLAGS`, which
-  would apply to (and force a rebuild of) the `-Z build-std`-compiled core/alloc/compiler_builtins
-  shared with the outer build.
+  (`0x800000` for `ring3-smoke`, `0x600000` for `stsh`, `0x700000` for `fork-exec-smoke`) clear of
+  the kernel's own image, heap, and phys-memory-offset window (see below) — genuinely required
+  now, not just future-proofing, since `execve` can load a binary into a running system rather than
+  only at a one-binary-per-boot demo; each crate's own tiny `build.rs` passes its script as a link
+  arg to just its own binary, not via `RUSTFLAGS`, which would apply to (and force a rebuild of)
+  the `-Z build-std`-compiled core/alloc/compiler_builtins shared with the outer build.
+  `userland/musl-smoke/` is built completely differently — see "musl port" below — since it isn't
+  a Rust crate at all, just one `.c` file compiled with `musl-gcc`; its load base (`0xa00000`) was
+  picked the same way, just via an explicit `-Wl,-Ttext-segment=` linker flag instead of a
+  `linker.ld`.
   - **These load bases must also stay clear of the `bootloader` crate's own identity-mapped
     low-memory region** — a real bug, found and fixed: `bootloader` (v0.9) identity-maps roughly
     the first 6 MiB of physical memory (kernel-only, not `USER_ACCESSIBLE`) as part of its own
@@ -263,9 +282,11 @@ together.
 - **Rule, not a one-off: every gate ring 3 triggers with a software interrupt needs `DPL = Ring3`
   explicitly.** Interrupt gates default to `DPL = Ring0`, and a *software*-invoked interrupt
   (`int n`, `int3`, `into`, `bound` — as opposed to a hardware exception or IRQ, which bypass the
-  gate's `DPL` check entirely) additionally requires `CPL <= gate DPL`. This has bitten this
-  project twice now: first `idt.breakpoint` (for `int3`), then `idt[syscall::SYSCALL_VECTOR]` (for
-  `int 0x80`) — both need `.set_privilege_level(PrivilegeLevel::Ring3)`. Any *future* software
+  gate's `DPL` check entirely) additionally requires `CPL <= gate DPL`. This bit this project once
+  already, on `idt.breakpoint` (for `int3`), which needs `.set_privilege_level(PrivilegeLevel::
+  Ring3)`. It also used to apply to the native ABI's own syscall gate (`int 0x80`, before it moved
+  to `SYSCALL`/`SYSRETQ` — see "Syscall ABI" below; `SYSCALL` isn't a software interrupt at all and
+  has no IDT gate/DPL concept, so this rule no longer applies there). Any *future* software
   interrupt gate ring-3 code needs to trigger directly will need it too. Getting this wrong doesn't
   look like a permissions error: it's a `#GP` on the IDT entry itself (decode the error code's
   selector-index bits to confirm — they name the IDT vector).
@@ -283,131 +304,39 @@ together.
 
 ## Syscall ABI (`src/syscall.rs`)
 
-OxideBSD's own, native ABI — deliberately BSD-flavored, not Linux-flavored (see
-"Linux-compatible syscall mechanism" below for the other, separate path). `int 0x80`; syscall
-number in `RAX`, up to three arguments in `RDI`/`RSI`/`RDX` (`R10` reserved in the layout for a
-future 4th argument). Success/failure is signaled via the **carry flag** — the traditional BSD/x86
-Unix convention: `CF = 0` on success with the return value in `RAX`, `CF = 1` on failure with the
-*positive* `errno` in `RAX`. This is genuinely different from `src/linux_syscall.rs`'s convention
-(negative value in `RAX`, no `CF` involvement) — both conventions deliberately coexist in this
-kernel, one per entry mechanism, matching how real Linux and real BSD differ. Syscall numbers for
-calls implemented so far (`SYS_EXIT = 1`, `SYS_READ = 3`, `SYS_WRITE = 4`, `SYS_OPEN = 5`,
-`SYS_CLOSE = 6`) match real FreeBSD's long-stable values, as a nod to authenticity — not a claim of
-binary compatibility with real BSD userland. errno values are *mostly* shared between Linux and the
-BSDs (`EBADF`, `EINVAL` are identical) but not universally — `ENOSYS` is 38 on Linux, 78 on
-FreeBSD; this file uses the FreeBSD value.
+OxideBSD's own, native ABI — deliberately BSD-flavored, not Linux-flavored. `SYSCALL`/`SYSRETQ`;
+syscall number in `RAX`, up to three arguments in `RDI`/`RSI`/`RDX` (`R10` reserved in the layout
+for a future 4th argument, avoiding `RCX`/`R11` since `SYSCALL` itself clobbers them to save
+`RIP`/`RFLAGS`). Success/failure is signaled via the **carry flag** — the traditional BSD/x86 Unix
+convention: `CF = 0` on success with the return value in `RAX`, `CF = 1` on failure with the
+*positive* `errno` in `RAX`. Syscall numbers for calls implemented before the musl port (`SYS_EXIT
+= 1`, `SYS_READ = 3`, `SYS_WRITE = 4`, `SYS_OPEN = 5`, `SYS_CLOSE = 6`) match real FreeBSD's
+long-stable values, as a nod to authenticity — not a claim of binary compatibility with real BSD
+userland. Syscalls added *for* the musl port (`SYS_MMAP`/`SYS_MUNMAP`/`SYS_BRK`/
+`SYS_SET_FS_BASE`/`SYS_WRITEV` — see "musl port" below) don't extend that convention: they're
+OxideBSD's own invention, numbers and argument shapes chosen for what porting musl actually needed,
+not copied from FreeBSD or Linux. errno values are *mostly* shared between Linux and the BSDs
+(`EBADF`, `EINVAL` are identical) but not universally — `ENOSYS` is 38 on Linux, 78 on FreeBSD;
+this file uses the FreeBSD value.
+
+**This mechanism used to be two independent, deliberately different paths**: this one over
+`int 0x80`, and a separate `src/linux_syscall.rs` that proved the `SYSCALL`/`SYSRETQ` mechanism in
+isolation (Linux's numbering, negative-`RAX` error convention, aimed at eventually running
+unmodified Linux binaries). That plan changed — musl is instead being ported to speak *this* ABI
+directly (see "musl port" below) — so there was no longer a reason to keep two different syscall
+conventions each tied to a different trap instruction. Since `IA32_LSTAR` can only point at one
+entry stub, this ABI now **owns** `SYSCALL`/`SYSRETQ` outright; `src/linux_syscall.rs` and its
+dedicated `userland/linux-syscall-smoke/` test are gone, having already served their purpose of
+proving the mechanism (`IA32_STAR`/`LSTAR`/`SFMASK` setup, the GDT segment-ordering requirement,
+the stack-switch-on-entry problem, all below) works at all.
 
 **The number → handler mapping is a registry populated by a dynamically loaded module, not a
-hardcoded `match`.** `modules/native_abi/` registers `SYS_EXIT`/`SYS_READ`/`SYS_WRITE` (and
+hardcoded `match`.** `modules/native_abi/` registers `SYS_EXIT`/`SYS_READ`/`SYS_WRITE`/etc. (and
 `modules/fat32/` separately registers `SYS_OPEN`/`SYS_CLOSE`) via `oxidebsd_register_syscall` from
 their own `module_init` — see "Dynamic kernel modules" below. What's genuinely still
 kernel-resident, deliberately *not* moved into `native_abi`, is the actual `sys_exit`/`sys_read`/
-`sys_write` *behavior*: `src/linux_syscall.rs` calls these same three functions directly (its own,
-separate `SYSCALL`/`SYSRET` mechanism, out of scope for modularization), so duplicating their logic
-into the module would either break those direct calls or require converting `linux_syscall.rs`
-too. `oxidebsd_sys_exit`/`oxidebsd_sys_read`/`oxidebsd_sys_write` (thin FFI adapters over them) are
-what the module actually calls through.
-
-- **The gate is installed via `set_handler_addr`, not `set_handler_fn`.** `syscall_entry` is a raw
-  symbol, not an `extern "x86-interrupt" fn` — that ABI doesn't expose general-purpose registers to
-  Rust code at all, only the hardware-pushed `InterruptStackFrame`, which is useless for a
-  register-based syscall convention. `set_handler_addr` (unsafe, but not gated behind
-  `HandlerFuncType`/`abi_x86_interrupt`) takes any `VirtAddr`.
-- **`SyscallFrame` spans both the pushed GPRs and the CPU's own interrupt frame** — this is how the
-  carry-flag trick actually works. The struct's first 15 fields are the stub's own pushed
-  registers; its last 5 fields are `InterruptStackFrame`'s fields (`rip`/`cs`/`rflags`/`rsp`/`ss`),
-  which the CPU already pushed *above* them in the same contiguous stack region before the stub
-  even started — no separate pointer needed to reach it. `syscall_dispatch` writes the return
-  value/errno into `frame.rax` *and* flips bit 0 (`CF`) of `frame.rflags` directly in that memory;
-  since it's the exact same memory `iretq` reads the frame back out of, nothing else needs to touch
-  it. Field order must match the stub's push order exactly (last pushed = lowest address = first
-  field) — same rule as `linux_syscall.rs`'s frame, just one struct larger here.
-- **The actual number→handler dispatch lives in a small, pure `dispatch` function**, deliberately
-  separated from `syscall_dispatch`'s raw-pointer/frame handling specifically so it stays directly
-  unit-testable (see `test_syscall_dispatch_rejects_unknown_number` and
-  `test_syscall_dispatch_routes_registered_handlers` in `src/lib.rs`, the latter registering a
-  throwaway handler directly — no module loading or interrupt machinery needed) without needing a
-  real `SyscallFrame`. It's now a lookup into `SYSCALL_TABLE` (an `alloc::collections::BTreeMap`,
-  guarded by a `spin::Mutex`), populated at runtime by `oxidebsd_register_syscall` — see this
-  file's module doc comment and "Dynamic kernel modules" below.
-- **A registered handler's own FFI convention (`SyscallHandler`) is a third, distinct wire
-  format** from either public syscall ABI: a plain `i64`, negative for `-errno`, non-negative for
-  a success value. Not the carry-flag convention this file's own ABI uses, not
-  `linux_syscall.rs`'s negative-`RAX` convention either — purely the internal shape of the
-  module↔kernel registration boundary, chosen because it's representable in a plain scalar return
-  without needing a `#[repr(C)]` result struct passed across a module-relocation boundary.
-- **The stub saves/restores every general-purpose register uniformly**, not just the System-V
-  caller-saved set (the callee-saved ones — `RBX`/`RBP`/`R12`-`R15` — are technically already
-  preserved across the `call` by the Rust ABI's own contract). Redundant for those five, but a
-  uniform save/restore is simpler to get right than relying on which specific registers a given
-  ABI happens to guarantee, and this is exactly the kind of place a subtle mistake shows up as
-  silent post-syscall register corruption in a user program, not a loud crash.
-- **Stack alignment was reasoned through, not just eyeballed, and needs no extra padding here**
-  (contrast `linux_syscall.rs`'s stub, which does): the CPU 16-byte-aligns `RSP` before pushing the
-  5-word interrupt frame (a value not itself a multiple of 16), and the stub then pushes exactly 15
-  general-purpose registers (also not a multiple of 16) — the two odd-alignment pushes cancel out,
-  landing exactly on the 16-byte boundary System V requires at the `call` instruction. If the
-  pushed-register count or the frame shape ever changes, redo this arithmetic; don't assume it
-  still lines up.
-- **`sys_exit` doesn't return control to anything — but this is now specifically the Linux path's
-  behavior, not the native ABI's.** `sys_exit` itself (this file) still just logs the code and
-  calls `hlt_loop()`, halting the whole system rather than resuming anything — but it's now used
-  *only* by `src/linux_syscall.rs`'s `exit`/`exit_group`, which stay out of scope for process/
-  scheduler support (see "Process abstraction, scheduler, and fork/exec/wait" below). The native
-  ABI's own exit path no longer goes through this function at all: `oxidebsd_sys_exit` (this
-  file's FFI adapter `modules/native_abi` actually calls) redirects straight to
-  `process::do_exit`, which does real per-process termination — only falling back to `hlt_loop()`
-  when nothing else is left runnable. `sys_exit` isn't represented as `Result` since exit can't
-  meaningfully fail; `do_exit` is `-> !` for the same reason.
-- **`sys_write`/`sys_exit` return `Result<u64, u64>`** (`Ok(value)` / `Err(positive errno)`) — the
-  shared, canonical representation both this module's own dispatcher *and*
-  `linux_syscall.rs`'s adapt into their own respective wire formats (carry flag here; negated into
-  `RAX` there).
-- **`sys_write`/`sys_read` do not validate `[ptr, ptr+len)`** before dereferencing it as user
-  memory — no check that the range is mapped, `USER_ACCESSIBLE`, or doesn't reach into kernel-only
-  mappings. A bad pointer page-faults, which `page_fault_handler` already handles safely (log +
-  `reboot()`) rather than corrupting kernel state, so this is a missing safety net for user
-  programs, not a kernel soundness hole — but real validation (walking the active page table to
-  confirm the range) is a natural follow-up, not yet implemented.
-- **`sys_read` is non-blocking — a deliberate simplification, not (yet) converted to use the real
-  scheduler that now exists.** A real `read` on an empty, non-`O_NONBLOCK` fd blocks the calling
-  process and reschedules another one; `process::do_wait4` (see "Process abstraction, scheduler,
-  and fork/exec/wait" below) proves this kernel can now do exactly that for a different syscall,
-  but `sys_read` itself hasn't been converted to follow the same pattern (block + `scheduler::
-  schedule()` on an empty stdin buffer instead of returning `Ok(0)` immediately) — real, separate
-  follow-up work. Returning `Ok(0)` immediately when the buffer is empty pushes the polling loop
-  into userland instead — see "Interactive shell" below for the caller side of that contract.
-  Native-ABI only for now;
-  `src/linux_syscall.rs` has no `read` equivalent yet. This non-blocking property is specific to
-  fd 0 (stdin) — a FAT32 file's `read`, routed through `crate::fd` below, always completes
-  immediately regardless (there's no "not ready yet" state for an in-memory file), so `cat` in
-  `stsh` doesn't need to busy-poll it the way reading from stdin does.
-- **`sys_read`/`sys_write`, for any `fd` other than stdin/stdout, delegate to `crate::fd`'s
-  registry** (`src/fd.rs`) rather than returning `EBADF` outright — the only channel two
-  independently loaded modules have to coordinate (`modules/fat32/`'s open files register their
-  read/write/close callbacks there; modules can't call each other directly, only module → kernel —
-  see "Dynamic kernel modules" below). `EBADF` is still what comes back if `fd` isn't stdin/stdout
-  *and* isn't registered in that table either.
-
-## Linux-compatible syscall mechanism (`src/linux_syscall.rs`)
-
-A second, independent syscall entry point from `src/syscall.rs` — aimed at compatibility with
-*real* x86_64 Linux binaries (which is what an unmodified musl/BusyBox userland actually is)
-rather than this kernel's own ABI. Real x86_64 Linux binaries never use `int 0x80` — that's the
-32-bit legacy path, and musl's x86_64 target has no fallback to it at all — they use the dedicated
-`SYSCALL`/`SYSRETQ` instruction pair: number in `RAX`, up to six arguments in
-`RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9` (`R10`, not `RCX`, for the 4th argument, specifically because
-`SYSCALL` itself clobbers `RCX`/`R11` to save `RIP`/`RFLAGS`), return value in `RAX`, and Linux's
-own syscall numbers (`write` = 1, `exit` = 60, `exit_group` = 231 — the only three implemented so
-far; verified against the real kernel headers' well-known values, not guessed).
-
-**Explicitly out of scope here:** an actual musl or BusyBox binary running. musl's startup reads
-the auxiliary vector off the initial stack (this kernel's ELF loader/`jump_to_usermode` don't set
-one up), needs `arch_prctl` for TLS, needs `mmap`/`brk` for its allocator, and calls a number of
-other syscalls only really discoverable by trying and watching what fails — real, substantial
-follow-up work, not attempted yet. Verification here is a hand-written raw-assembly test program
-(`userland/linux-syscall-smoke/`, no libc at all) that calls `write` then `exit` directly, proving
-the *mechanism* in isolation first.
+`sys_write`/etc. *behavior*. `oxidebsd_sys_exit`/`oxidebsd_sys_read`/`oxidebsd_sys_write`/etc.
+(thin FFI adapters over them) are what the module actually calls through.
 
 - **`SYSRETQ`'s segment-selector scheme forced a GDT reorder.** `SYSRETQ` reconstructs target
   `CS`/`SS` from `IA32_STAR` bits `[63:48]` (call it `X`) as `SS = X+8`, `CS = X+16` — user *data*
@@ -422,53 +351,274 @@ the *mechanism* in isolation first.
   latent gap. Use `x86_64::registers::model_specific::Star::write` (not hand-rolled offset math)
   to program `IA32_STAR` — it validates the selectors' offsets and privilege levels against exactly
   this scheme and fails loudly (a `panic!`, not silent misprogramming) if the GDT ever regresses.
-- **No automatic stack switch, and no per-CPU `swapgs` — single-core simplification.** Unlike an
-  interrupt gate + TSS `RSP0`, `SYSCALL` does not switch stacks: control arrives at
-  `linux_syscall_entry` still on the *user's own* stack (now at CPL 0). Real kernels use `swapgs` +
-  a per-CPU `IA32_KERNEL_GS_BASE`-anchored structure to safely find a kernel stack; this kernel has
-  no SMP/APIC multi-processor support at all yet, so a single global scratch stack
-  (`KERNEL_RSP_TOP`/`USER_RSP_SCRATCH`) swapped in by the entry stub is legitimate for now —
-  revisit if multiple cores ever show up.
-- **The entry stub passes a frame pointer, not loose arguments — Linux's argument registers don't
-  line up with System V's.** `src/syscall.rs`'s `int 0x80` stub can `call` straight into Rust
-  because its *own* convention was chosen to match System V exactly. Linux's real convention can't:
-  its 4th argument is `R10`, System V's 4th parameter register is `RCX`. Rather than shuffle
-  registers by hand, `linux_syscall_entry` pushes all saved registers to its stack and passes a
-  single pointer (`&mut SyscallFrame`, matching System V's first argument register, `RDI`) to
-  `linux_syscall_dispatch`, which reads/writes fields on it directly (`frame.rax` doubles as both
-  the incoming syscall number and the outgoing return value slot). `SyscallFrame`'s field order
-  must match the stub's push order exactly (last pushed = lowest address = first field).
-- **Stack alignment needed explicit padding here, unlike `src/syscall.rs`'s stub.** There, the
-  CPU's own 40-byte interrupt-frame push left `RSP` off by 8 before the stub's 15 register pushes,
-  and the two odd offsets canceled out. Here, `SYSCALL` doesn't push anything, so `RSP` starts
-  exactly 16-aligned at `KERNEL_RSP_TOP`; 15 pushes (120 bytes, not a multiple of 16) alone would
-  leave `RSP` misaligned for `call linux_syscall_dispatch`. The stub does an explicit `sub rsp, 8`
-  before the pushes (and matching `add rsp, 8` after) to compensate. If the register set or push
-  count changes, redo this arithmetic — it's specific to this stub's exact shape, not a general
-  rule.
-- **`ScratchStack` is `#[repr(align(16))]`**, not a bare `[u8; N]` (which only guarantees 1-byte
-  alignment) — needed so its computed top is guaranteed 16-aligned for the reason above. (The
-  older RSP0/IST stacks in `src/gdt.rs` aren't similarly annotated and have worked fine in
-  practice, but that's not a *guarantee* — worth tightening if they ever become a problem.)
-- **Unrecognized syscall numbers return `-ENOSYS`** (Linux's real value, 38, negated into `RAX`),
-  and log the number — that log line is the intended tool for iteratively discovering what musl's
-  startup needs in the follow-up milestone. Like `write`/`exit`, this adapts from the shared
-  `Result<u64, u64>` `src/syscall.rs`'s `sys_write`/`sys_exit` return (positive errno in) into
-  Linux's own negative-`RAX` wire format — the same underlying functions feed both this module and
-  `src/syscall.rs`'s own carry-flag-based dispatcher, each converting `Err(errno)` differently.
+- **No automatic stack switch on `SYSCALL` entry, fixed via a per-process `CURRENT_RSP0` mirror,
+  not a single global scratch stack.** Unlike an interrupt gate + TSS `RSP0`, `SYSCALL` does not
+  switch stacks: control arrives at `syscall_entry` still on the *user's own* stack (now at CPL 0).
+  An early design (inherited from `linux_syscall.rs`'s original one-shot-demo-only mechanism) used
+  a single fixed global kernel scratch stack for this — *wrong* for the native ABI specifically,
+  because `do_wait4` already blocks and reschedules mid-syscall (see "Process abstraction,
+  scheduler, and fork/exec/wait" below), so a second process could enter its own syscall before
+  the first one returns, corrupting a shared global stack. The fix: `gdt::CURRENT_RSP0` (a plain,
+  directly asm-readable `static mut`, kept in sync by `gdt::set_kernel_stack` on every context
+  switch, right alongside the real `TSS.RSP0` it mirrors) always names the *current* process's own
+  kernel stack. The entry stub stashes the user's `RSP` in a transient global slot just long enough
+  to `mov rsp, [CURRENT_RSP0]` and push it as the first field of *that process's own* `SyscallFrame`
+  — from that point on it's exactly as per-process-safe as every other field already is, and the
+  transient global slot is provably safe for that brief window since `SFMASK` keeps interrupts off
+  for the whole entry sequence on this single-core kernel (at most one syscall can be *entering* at
+  once). No per-CPU `swapgs`/`IA32_KERNEL_GS_BASE` (the real-kernel mechanism for finding a kernel
+  stack under `SYSCALL`) — this kernel has no SMP/APIC multi-processor support at all yet; revisit
+  if multiple cores ever show up.
+- **`SyscallFrame` spans the pushed GPRs plus one new field, `user_rsp`, replacing what an
+  interrupt gate's automatic frame push used to provide.** The first 15 fields are the stub's own
+  pushed registers, same shape as the old `int 0x80` stub's; there's no separate `_rip`/`_cs`/
+  `rflags`/`_rsp`/`_ss` block anymore since `SYSCALL`/`SYSRETQ` don't work that way. Two fields do
+  double duty instead, both forced by `SYSCALL`'s own hardware contract: `rcx` holds the user `RIP`
+  to resume at (`SYSCALL` clobbers real `RCX` with it on entry), and `r11` holds the user `RFLAGS`
+  (same story) — `SYSRETQ` reads both back directly from registers, so `syscall_dispatch` flips bit
+  0 of the saved `r11` to signal `CF`, the same trick that used to flip a dedicated `rflags` field
+  for `iretq`. `user_rsp` is the one genuinely new field, needed because `SYSCALL` doesn't switch
+  stacks the way an interrupt gate does (see above) — there's no GPR slot already carrying it, so
+  the entry stub pushes it first (ends up as the *last* field/highest address, popped last via a
+  literal `pop rsp` right before `sysretq`). Field order otherwise matches the stub's push order
+  exactly (last pushed = lowest address = first field).
+- **The actual number→handler dispatch lives in a small, pure `dispatch` function**, deliberately
+  separated from `syscall_dispatch`'s raw-pointer/frame handling specifically so it stays directly
+  unit-testable (see `test_syscall_dispatch_rejects_unknown_number` and
+  `test_syscall_dispatch_routes_registered_handlers` in `src/lib.rs`, the latter registering a
+  throwaway handler directly — no module loading or interrupt machinery needed) without needing a
+  real `SyscallFrame`. It's now a lookup into `SYSCALL_TABLE` (an `alloc::collections::BTreeMap`,
+  guarded by a `spin::Mutex`), populated at runtime by `oxidebsd_register_syscall` — see this
+  file's module doc comment and "Dynamic kernel modules" below. An unregistered number logs
+  `[boot] unrecognized syscall number N` before returning `ENOSYS` — the intended tool for
+  iteratively discovering what a program's startup still needs (see "musl port" below).
+- **A registered handler's own FFI convention (`SyscallHandler`) is a distinct wire format** from
+  the public syscall ABI: a plain `i64`, negative for `-errno`, non-negative for a success value.
+  Not the carry-flag convention this file's own ABI uses — purely the internal shape of the
+  module↔kernel registration boundary, chosen because it's representable in a plain scalar return
+  without needing a `#[repr(C)]` result struct passed across a module-relocation boundary.
+- **The stub saves/restores every general-purpose register uniformly**, not just the System-V
+  caller-saved set (the callee-saved ones — `RBX`/`RBP`/`R12`-`R15` — are technically already
+  preserved across the `call` by the Rust ABI's own contract). Redundant for those five, but a
+  uniform save/restore is simpler to get right than relying on which specific registers a given
+  ABI happens to guarantee, and this is exactly the kind of place a subtle mistake shows up as
+  silent post-syscall register corruption in a user program, not a loud crash.
+- **`oxidebsd_sys_exit` goes through `process::do_exit`** — real, per-process termination that
+  hands control to whatever the scheduler picks next, only falling back to a full `hlt_loop()` when
+  nothing else is runnable.
+- **`sys_write`/`sys_read`/`sys_writev` return `Result<u64, u64>`** (`Ok(value)` /
+  `Err(positive errno)`) — the shared, canonical representation `syscall_dispatch` adapts into the
+  carry-flag wire format.
+- **`sys_write`/`sys_read` do not validate `[ptr, ptr+len)`** before dereferencing it as user
+  memory — no check that the range is mapped, `USER_ACCESSIBLE`, or doesn't reach into kernel-only
+  mappings. A bad pointer page-faults, which `page_fault_handler` already handles safely (log +
+  `reboot()`) rather than corrupting kernel state, so this is a missing safety net for user
+  programs, not a kernel soundness hole — but real validation (walking the active page table to
+  confirm the range) is a natural follow-up, not yet implemented.
+- **`sys_read` is non-blocking — a deliberate simplification, not (yet) converted to use the real
+  scheduler that now exists.** A real `read` on an empty, non-`O_NONBLOCK` fd blocks the calling
+  process and reschedules another one; `process::do_wait4` (see "Process abstraction, scheduler,
+  and fork/exec/wait" below) proves this kernel can now do exactly that for a different syscall,
+  but `sys_read` itself hasn't been converted to follow the same pattern (block + `scheduler::
+  schedule()` on an empty stdin buffer instead of returning `Ok(0)` immediately) — real, separate
+  follow-up work. Returning `Ok(0)` immediately when the buffer is empty pushes the polling loop
+  into userland instead — see "Interactive shell" below for the caller side of that contract. This
+  non-blocking property is specific to fd 0 (stdin) — a FAT32 file's `read`, routed through
+  `crate::fd` below, always completes immediately regardless (there's no "not ready yet" state for
+  an in-memory file), so `cat` in `stsh` doesn't need to busy-poll it the way reading from stdin
+  does.
+- **`sys_read`/`sys_write`, for any `fd` other than stdin/stdout, delegate to `crate::fd`'s
+  registry** (`src/fd.rs`) rather than returning `EBADF` outright — the only channel two
+  independently loaded modules have to coordinate (`modules/fat32/`'s open files register their
+  read/write/close callbacks there; modules can't call each other directly, only module → kernel —
+  see "Dynamic kernel modules" below). `EBADF` is still what comes back if `fd` isn't stdin/stdout
+  *and* isn't registered in that table either.
+
+## musl port (`third_party/musl`, `userland/musl-smoke/`, `src/user_stack.rs`, `src/fpu.rs`)
+
+Rather than making the kernel Linux-syscall-compatible enough to run an unmodified musl/BusyBox
+binary (the original plan — see "Syscall ABI" above for why that changed), musl itself is being
+patched to speak OxideBSD's own native ABI directly. `userland/musl-smoke/main.c` — a real,
+`printf`-using static musl binary, otherwise unmodified above the syscall layer — runs end to end:
+`execve`'d by `stsh` (as `musl.elf`/`MUSL.ELF`, embedded in the FAT32 image exactly like
+`SMOKE.ELF`), it prints its message and exits cleanly, and `stsh` regains control via `wait4`. musl
+is explicitly a temporary/placeholder libc choice for this phase, not a long-term commitment.
+
+- **`third_party/musl` is a git submodule pointing at a personal fork, not the canonical repo
+  directly** — musl isn't hosted on GitHub at all (canonical is `git.musl-libc.org`), so the fork
+  is of `ifduyue/musl` (an active, up-to-date unofficial GitHub mirror — confirmed to match the
+  real `v1.2.6` tag's commit hash before forking it). OxideBSD's patches live on that fork's own
+  `oxidebsd` branch, based on the `v1.2.6` tag — **not** on the fork's `master`, which tracks
+  upstream. Pin/update the submodule by committing on that branch, pushing, then `git add
+  third_party/musl` in this repo to move the tracked commit.
+- **The entire patch surface is three small, targeted changes** — this is a syscall-layer port,
+  not a from-scratch libc port; everything above `arch/x86_64/` is stock, unmodified musl:
+  - `arch/x86_64/syscall_arch.h`: musl's `__syscallN` wrappers already emit a plain `syscall`
+    instruction with the right argument registers (Linux and OxideBSD's own ABI happen to agree on
+    register placement) — the only real difference is error signaling. A `jnc 1%=f; neg %%rax;
+    1%=:` sequence right after `syscall` converts OxideBSD's carry-flag convention into the small-
+    negative-value shape musl's `__syscall_ret` already expects, without touching anything above
+    the trap site. `%=` (not a bare numeric label) is required since these are `static __inline`
+    functions inlined at every call site within one translation unit — a bare label would collide.
+  - `arch/x86_64/bits/syscall.h.in`: only the `__NR_*` entries musl's own startup/malloc/stdio path
+    for a *static* binary can actually reach are remapped to OxideBSD's real registered numbers
+    (`read`/`write`/`open`(*)/`close`/`getpid`/`fork`/`execve`(*)/`exit`/`exit_group`/`wait4`/
+    `mmap`/`munmap`/`brk`/`writev` — see below); everything else keeps its original, inert Linux
+    value until something actually needs it (reached, it cleanly `ENOSYS`s and logs the number —
+    see "Syscall ABI" above — rather than silently miscompiling). (*) `open`/`execve` are
+    deliberately **not** remapped despite OxideBSD registering `SYS_OPEN`/`SYS_EXECVE` under those
+    same names — see the argument-convention mismatch note below; remapping just the number without
+    fixing the arguments would be worse than leaving it unmapped.
+  - `src/thread/x86_64/__set_thread_area.s`: real Linux sets the TLS base via
+    `arch_prctl(ARCH_SET_FS, addr)` (syscall 158, subcommand `0x1002`); OxideBSD has no
+    `arch_prctl` at all. This hand-written asm stub (bypasses the C wrappers above entirely, so it
+    needs its own `jnc`/`neg` adaptation) now just does `movl $103, %eax` (`SYS_SET_FS_BASE`) —
+    simpler than upstream's version even, since OxideBSD's invented call takes the base address
+    directly with no subcommand to select.
+- **New syscalls, all OxideBSD's own invention** (see "Syscall ABI" above for why these don't chase
+  FreeBSD/Linux authenticity the way the pre-existing numbers do) — registered by
+  `modules/native_abi/`, implemented in `src/syscall.rs`/`src/process.rs`:
+  - **`SYS_SET_FS_BASE = 103`**: 1 arg, the TLS base address value itself (`x86_64::registers::
+    model_specific::FsBase::write`, gated behind the already-enabled `"instructions"` `x86_64`
+    crate feature — writes `IA32_FS_BASE` via `wrmsr`, no `FSGSBASE` CPU feature needed). Always
+    succeeds.
+  - **`SYS_MMAP = 100`**: `(addr_hint, len, prot)` — **not** `(len, prot, flags)` as an earlier
+    design pass assumed. musl's `mmap()` always calls `__syscall6(SYS_mmap, addr, len, prot, flags,
+    fd, off)`, so `addr`/`len`/`prot` land in `RDI`/`RSI`/`RDX` regardless of what this ABI itself
+    would prefer — matching *musl's actual call site*, not an invented layout, was the only way to
+    make this work at all. `addr_hint`/`prot` are read but ignored (OxideBSD always picks the
+    address and always maps `PRESENT | WRITABLE | USER_ACCESSIBLE`, the same "every page writable
+    regardless" simplification `src/module.rs`'s own loader already applies); `flags`/`fd`/`offset`
+    (`R10`/`R8`/`R9`) aren't even readable at this ABI's 3-argument width, so every mapping is
+    unconditionally anonymous+private — the only case musl's allocator needs. `do_mmap`
+    (`src/process.rs`) bump-allocates from a fixed, never-reclaimed VA window
+    (`0x_2000_0000_0000..0x_3000_0000_0000`, same idiom as `module::NEXT_MODULE_PAGE`), building a
+    mapper over the *calling* process's own (currently active) address space.
+  - **`SYS_MUNMAP = 101`**: `(addr, len)` — a no-op success, consistent with this codebase having
+    no `FrameDeallocator` anywhere yet.
+  - **`SYS_BRK = 102`**: `(addr)`, `0` = query without changing. `do_brk` grows a per-process heap
+    region (`Process.brk`, starting at `Elf::highest_loaded_address()`) by mapping freshly zeroed
+    pages from the first not-yet-mapped page onward (`me.brk` isn't necessarily page-aligned after
+    a partial grow, so re-mapping the page it falls on must be skipped, not attempted again);
+    shrinking just lowers the stored value, same no-reclaim simplification as `munmap`. Ceiling
+    fixed at `0x_1000_0000` (matches `module::MODULE_VA_BASE`) so a growing heap can never collide
+    with the kernel-mapped module region every address space shares.
+  - **`SYS_WRITEV = 104`**: `(fd, iov_ptr, iovcnt)` — added only after a real, confusing bug (see
+    below) revealed it was load-bearing, not optional. Reads real C `struct iovec` entries (16
+    bytes each: `void *iov_base`, `size_t iov_len`) and calls `sys_write` once per entry,
+    accumulating the total; matches real `writev`'s partial-write semantics (a failure after at
+    least one successful entry returns the partial total, not an error — only the very first
+    entry's failure propagates).
+- **A real, previously-latent bug, found only by actually running the thing: `writev`/`getpid`
+  numbering collision silently discarded all of `musl-smoke`'s output.** musl's *entire* stdio
+  write path (`src/stdio/__stdio_write.c`) goes through `writev`, never plain `write` — a fact not
+  obvious from reading musl's public API. `__NR_writev`'s original Linux value is `20`, which
+  happens to be OxideBSD's own `SYS_GETPID`. Left unmapped, every `printf` silently invoked
+  `getpid()` instead of ever writing — no crash, no error, `musl-smoke` still exited cleanly with
+  code `0`, just with **zero** actual output. `cargo test`/`clippy`/`fmt` all stayed green through
+  this; only booting in QEMU and looking at the serial log surfaced it. The general lesson (already
+  called out elsewhere in this file, worth restating): passing tests are not the same as the
+  feature working, especially across a port boundary where numbers can collide by coincidence
+  rather than fail loudly.
+- **`src/fpu.rs` (new): SSE was never actually enabled at the hardware level, and nothing noticed
+  until now.** This kernel's own build target (`x86_64-oxidebsd.json`) disables SSE/MMX in its own
+  codegen, so every userland crate written *for* that target (`ring3-smoke`, `stsh`,
+  `fork-exec-smoke`) never emits an SSE instruction — but `CR0.EM`/`CR4.OSFXSR`/
+  `CR4.OSXMMEXCPT_ENABLE` (the actual hardware switches that make SSE legal to execute *at all*,
+  independent of what any given compilation target chooses to emit) were never touched anywhere in
+  this codebase either. `musl-smoke`, built with an ordinary host `gcc` targeting plain x86_64
+  (SSE2 baseline, per the standard ABI), is the first userland binary this kernel has ever run that
+  wasn't built against its own no-SSE target — and it `#UD`'d on its very first `pxor` (inside
+  musl's stdio buffer init) before this fix. `fpu::init()` (called from `lib.rs::init`, right after
+  `gdt::init`) sets the standard "enable SSE" `CR0`/`CR4` sequence once, globally, at boot.
+  Deliberately **not** paired with lazy save/restore (`CR0.TS` + `#NM`-triggered `fxsave`/
+  `fxrstor`) or even eager save/restore: `context_switch::switch_context` still doesn't touch
+  `XMM`/`x87` state at all across a context switch, which is fine only as long as at most one
+  SSE-using process is ever actually mid-computation at a time — true today (no preemption, and
+  only one process at a time genuinely exercises SSE), a real gap the moment two could interleave.
+- **`src/user_stack.rs` (new): builds a real System V AMD64 initial-process stack** (argc, argv[] +
+  NULL, envp[] + NULL, then auxv `(tag, value)` pairs terminated by `AT_NULL`, string bytes below
+  all of that) — musl's `crt1`/`_start` reads this directly off the stack before `main` ever runs;
+  nothing before this existed at all (`process::map_user_stack` just mapped bare pages). Wired into
+  both `process::spawn` and `process::do_execve` (see "Process abstraction, scheduler, and
+  fork/exec/wait" above) — safe for every *existing* binary too, since none of them (`stsh`,
+  `ring3-smoke`, `fork-exec-smoke`) ever read their own stack for arguments.
+  - **`AT_PHDR`'s "standard" derivation had to be made robust against this codebase's *own*
+    minimal linker scripts, not just musl's.** The textbook formula is `(load bias) + e_phoff`,
+    where load bias is the vaddr that file offset `0` maps to — normally the `p_vaddr` of whichever
+    `PT_LOAD` segment has `p_offset == 0` (the segment containing the ELF header itself). But this
+    codebase's own `userland/*/linker.ld` scripts (unlike an ordinary linker's default script)
+    don't map the ELF header into any `PT_LOAD` segment at all — their first segment typically
+    starts at file offset `0x1000`, not `0` — so requiring `p_offset == 0` exactly panicked the
+    first time this was wired up (against `fork-exec-smoke`). Fixed by computing the load bias
+    (`p_vaddr - p_offset`, constant across every well-formed `PT_LOAD` segment of one ELF) from
+    whichever segment has the *smallest* `p_offset` instead — for musl-smoke (an ordinary linker
+    script, headers included in the first segment) this is the same value as the textbook formula;
+    for this codebase's own hand-linked binaries it computes a value that happens to point at
+    unmapped memory, which is fine, since none of them ever read `AT_PHDR` anyway (see `elf.rs`'s
+    `Elf::phdr_vaddr`).
+  - **`AT_RANDOM`'s 16 bytes are a fixed placeholder, not real entropy** — this kernel has no
+    entropy source at all yet; musl only requires the bytes be *present* (it uses them for the
+    stack-protector canary and as an `arc4random` seed), not unpredictable, for now.
+- **Two known real argument-convention mismatches, deliberately left unfixed rather than silently
+  half-fixed:**
+  - **`open`**: real `open()`/musl's own `__syscall3(SYS_open, path, flags, mode)` passes a
+    null-terminated C string pointer plus `(flags, mode)`. OxideBSD's `SYS_OPEN`
+    (`modules/fat32/fat32_open`) takes `(path_ptr, path_len, flags)` — a length-prefixed pointer,
+    no null-terminator requirement, no `mode` argument at all. Fixing this needs either a musl-side
+    `open()` override or an OxideBSD-side argument-convention change; neither done yet, so
+    `__NR_open` stays unmapped (see above) — `musl-smoke` doesn't call `open()`, so this hasn't
+    blocked anything yet.
+  - **`execve`**: numerically unchanged from upstream (`59` happens to already be OxideBSD's real
+    `SYS_EXECVE`), but not actually argument-compatible: musl's `execve()` passes `(path, argv,
+    envp)` in `RDI`/`RSI`/`RDX`; OxideBSD's `SYS_EXECVE` (`process::do_execve`) expects `(path_ptr,
+    path_len)` — no `argv`/`envp` support at all. Unreachable so far since nothing in this port's
+    own test programs calls `execve()` on itself (only `stsh`, over the native ABI it already
+    speaks correctly, `execve`'s *other* programs).
+- **Two syscalls musl's startup reaches but this kernel doesn't implement, left unmapped
+  (their original Linux numbers) rather than stubbed — both confirmed harmless for `musl-smoke`
+  specifically, not fixed just because they were seen:** `set_tid_address` (`__init_tp`, right
+  after TLS setup — failing just leaves an unused `tid` field with a bogus value) and `ioctl`
+  (`__stdout_write`'s `TIOCGWINSZ` probe — failing just makes musl correctly conclude stdout isn't
+  a sized terminal and proceed to the real write anyway). Both log `[boot] unrecognized syscall
+  number N` (218 and 16 respectively) every run; a future binary that actually depends on either
+  succeeding would need them implemented for real.
+- **`userland/musl-smoke/main.c` and its build are unlike every other `userland/*` entry** — see
+  "User-mode execution" above for the load-base/linker-flag side of this; on the build-system side,
+  `build.rs`'s `build_musl_sysroot` runs musl's *own* build system directly (`configure`/`make`/
+  `make install` into `target/musl-sysroot`, no Cargo/Rust involved), then `build_musl_smoke` shells
+  out to the resulting `musl-gcc` for `main.c` — mirroring `build_userland_crate`/
+  `build_module_crate`'s existing "no manual pre-step" philosophy, just against a different
+  toolchain. **A real gotcha in invoking musl's `configure` from a build script**: musl's script
+  derives its own source directory from `${0%/configure}` — invoking it as `sh configure ...`
+  (rather than a path that itself literally ends in `/configure`, like `./configure`) leaves `$0`
+  as the bare string `"configure"`, which the suffix-strip is a no-op on, so it then tries (and
+  fails) to `cd` into a directory named `configure`. `Command::new("./configure")` (not
+  `Command::new("sh").arg("configure")`) is the invocation shape that actually works.
+  `build_musl_sysroot` skips re-running `configure` if `config.mak` already exists (it re-probes
+  the host compiler from scratch every time otherwise, several seconds each `cargo build`); `make`/
+  `make install` are already fast, idempotent no-ops when nothing changed.
+- **`modules/fat32`'s `MAX_FILE_BUFFER` raised `16384` → `65536`** for the same reason it was
+  raised once before (`4096` → `16384` for `SMOKE.ELF`): `musl-smoke`, a real compiled C binary
+  against a real libc, is bigger (~23 KiB) than any hand-written demo binary this codebase had
+  embedded before.
+- **What's explicitly still out of scope, the same way real musl/BusyBox running was flagged
+  out of scope before this port started:** a real, general-purpose libc-on-OxideBSD story (this is
+  one hand-picked static binary exercising `printf`, not a validated general surface), `envp`
+  passthrough across `execve`, fixing the `open`/`execve` argument mismatches above, and anything
+  resembling BusyBox itself — real, substantial follow-up work, not attempted yet.
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 
-The first genuinely interactive userland program: unlike every earlier demo (`ring3-smoke`,
-`linux-syscall-smoke`), which print a message and exit, `stsh` ("stupidshell") loops forever,
-reading a line at a time from the keyboard and dispatching a small set of built-ins (`help`, `echo
-<text>`, `exit`, `cat <name>`, `write <name> <text>`, `cd [path]`, `ls [path]`, `mkdir <name>`) —
-anything else is treated as a real program to run (`fork`+`execve`+`wait`, see "Process
-abstraction, scheduler, and fork/exec/wait" below) — until told to exit. It's wired up by default
-— see "User-mode execution" above — and runs entirely over OxideBSD's own native `int 0x80` ABI; it
-has no equivalent on the Linux-compatible path yet. `cat`/`write`/`cd`/`ls`/`mkdir` exercise
-`modules/fat32/`'s `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` end to end — see "Dynamic kernel
-modules" and "FAT32 filesystem module" below.
+The first genuinely interactive userland program: unlike `ring3-smoke`, which prints a message and
+exits, `stsh` ("stupidshell") loops forever, reading a line at a time from the keyboard and
+dispatching a small set of built-ins (`help`, `echo <text>`, `exit`, `cat <name>`, `write <name>
+<text>`, `cd [path]`, `ls [path]`, `mkdir <name>`) — anything else is treated as a real program to
+run (`fork`+`execve`+`wait`, see "Process abstraction, scheduler, and fork/exec/wait" below) —
+until told to exit. It's wired up by default — see "User-mode execution" above — and runs entirely
+over OxideBSD's own native ABI. `cat`/`write`/`cd`/`ls`/`mkdir` exercise `modules/fat32/`'s
+`SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` end to end — see "Dynamic kernel modules" and "FAT32
+filesystem module" below.
 
 - **`cd`/`ls`/`mkdir` are still built-in commands, not separate programs `stsh` loads and execs —
   but not because `exec` doesn't exist anymore.** Now that real `fork`/`execve`/`wait` exist (see
@@ -512,8 +662,8 @@ modules" and "FAT32 filesystem module" below.
   sidestepping the question is simpler than answering it. When full, `push_byte` drops the newest
   incoming byte rather than growing or overwriting unread data.
 - **The shared `spin::Mutex` around the ring buffer can't deadlock, despite being touched from both
-  the keyboard IRQ and syscall code**, because `int 0x80` is an interrupt gate like every other
-  handler in this kernel, so `IF` is already clear for the entire duration of any syscall — the
+  the keyboard IRQ and syscall code**, because `IA32_SFMASK` clears `IF` on every `SYSCALL` entry
+  (see "Syscall ABI" above), so it's already clear for the entire duration of any syscall — the
   keyboard IRQ can never preempt a syscall in progress on this single core. The two sides of the
   buffer are mutually exclusive by construction, not because the lock itself provides it; this
   reasoning breaks if the kernel ever gains SMP, at which point the buffer needs a real
@@ -549,12 +699,13 @@ new native-ABI syscalls (real FreeBSD numbers: `SYS_FORK = 2`, `SYS_WAIT4 = 7`, 
 `SYS_EXECVE = 59`), registered by `modules/native_abi/` the same way `SYS_EXIT`/`SYS_READ`/
 `SYS_WRITE` already were. `stsh` uses all of this for real now — see "Interactive shell" above.
 
-Native-ABI (`int 0x80`) only; `src/linux_syscall.rs` has no process/scheduler support at all and is
-explicitly out of scope here. No preemption (cooperative only — see the scheduler doc comment for
-the deliberate, deferred seam), no copy-on-write fork (full eager copy), no SMP, no argv/envp to
-`execve`, and no frame deallocation anywhere (reaping a zombie frees its Rust-heap PCB state
-correctly but leaks the physical frames backing its page tables/user pages — consistent with this
-codebase's existing total lack of a `FrameDeallocator`, not a new regression).
+No preemption (cooperative only — see the scheduler doc comment for the deliberate, deferred seam),
+no copy-on-write fork (full eager copy), no SMP, no `envp` passthrough across `execve` (`argv` *is*
+now real — see "musl port" below for `src/user_stack.rs`, which builds a real initial
+argc/argv/envp/auxv stack for every process, added after this subsystem's first pass), and no
+frame deallocation anywhere (reaping a zombie frees its Rust-heap PCB state correctly but leaks the
+physical frames backing its page tables/user pages — consistent with this codebase's existing
+total lack of a `FrameDeallocator`, not a new regression).
 
 - **The process table (`process::Process`, `process::table()`) is a `Mutex<BTreeMap<Pid,
   Box<Process>>>`, `Box`-wrapped deliberately.** Letting a caller pull a raw `*mut Process` (or copy
@@ -580,20 +731,21 @@ codebase's existing total lack of a `FrameDeallocator`, not a new regression).
   `call`ing into real Rust code, sidestepping hand-deriving the exact stack offset that would
   satisfy System V's call-entry alignment (easy to get subtly wrong, painful to debug).
   `fork_trampoline_asm` (forked children only) jumps straight into `syscall_entry`'s own
-  GPR-pop-and-`iretq` tail (labeled `syscall_return_tail` specifically so this can reach it) with
+  GPR-pop-and-`sysretq` tail (labeled `syscall_return_tail` specifically so this can reach it) with
   **no** realignment at all — `seed_fork_frame` places a copy of the parent's `SyscallFrame`
   immediately below the fake register-save frame, so after `switch_context`'s pops and `ret`, `RSP`
   already points exactly where that tail expects it. Counter-intuitively the fork path needs *less*
   defensive code than the spawn path.
 - **`fork` resumes the child as if returning from its own `fork()` call with `0`, by copying the
   parent's live `SyscallFrame` onto the child's fresh kernel stack.** `syscall::copy_frame_for_fork`
-  does the copy, then explicitly forces both `rax = 0` **and clears the copy's `CARRY_FLAG` bit** —
-  a real bug caught before it shipped: at the moment of copying, the parent's frame's `rflags` still
-  holds whatever `CF` happened to be *before* the parent ever executed `int 0x80` for this call
-  (ordinary instructions like `mov` don't touch `EFLAGS`, so it's just leftover state, not anything
-  this syscall itself set yet — `syscall_dispatch`'s own CF-clearing for the *parent's* return
-  happens later and only touches the parent's own live frame). Without the explicit clear, the
-  child could spuriously see `Err` from a stale bit that predates the call entirely.
+  does the copy, then explicitly forces both `rax = 0` **and clears the copy's `CARRY_FLAG` bit
+  (in `r11`, which doubles as the saved `RFLAGS` — see "Syscall ABI" above)** — a real bug caught
+  before it shipped: at the moment of copying, the parent's frame's `r11` still holds whatever `CF`
+  happened to be *before* the parent ever executed `SYSCALL` for this call (ordinary instructions
+  like `mov` don't touch `EFLAGS`, so it's just leftover state, not anything this syscall itself set
+  yet — `syscall_dispatch`'s own CF-clearing for the *parent's* return happens later and only
+  touches the parent's own live frame). Without the explicit clear, the child could spuriously see
+  `Err` from a stale bit that predates the call entirely.
 - **`SyscallFrame`'s fields are private to `src/syscall.rs`; `fork`/`execve` reach it through two
   narrow, explicitly-added accessors instead** (`copy_frame_for_fork`, `redirect_frame`), plus one
   `AtomicPtr<SyscallFrame>` (`CURRENT_FRAME`, set at the top of `syscall_dispatch`) exposed via
@@ -615,9 +767,15 @@ codebase's existing total lack of a `FrameDeallocator`, not a new regression).
 - **`do_execve` reuses `syscall::dispatch` directly** to drive an internal open/read-loop/close
   against the same fd/fat32 machinery `stsh`'s `cat` already exercises through the public syscall
   path — no separate file-loading code. Every fallible step (open, each read, close, `Elf::parse`,
-  the new `AddressSpace`, `elf::load`, mapping the user stack) completes *before* any mutation of
-  the live syscall frame, `CR3`, or the process's stored `AddressSpace` — real `execve(2)`
-  semantics: a failure at any point must leave the calling program completely untouched.
+  the new `AddressSpace`, `elf::load`, mapping the user stack, building the initial argv/envp/auxv
+  image — see "musl port" below for `src/user_stack.rs`) completes *before* any mutation of the
+  live syscall frame, `CR3`, or the process's stored `AddressSpace` — real `execve(2)` semantics: a
+  failure at any point must leave the calling program completely untouched. `Process.user_stack_top`
+  — despite the name — now holds the *computed initial `RSP`* `user_stack::build` returns (the
+  address of the argc/argv/envp/auxv image itself), not the bare top of the mapped stack region;
+  `Process` also gained a `brk: VirtAddr` field (the current top of the `SYS_BRK`-managed heap
+  region, initialized from `Elf::highest_loaded_address()`, copied — not reset — into a forked
+  child, since the underlying pages are already deep-copied by `AddressSpace::fork`).
 - **`do_exit` replaces `sys_exit` for the native ABI only** (see "Syscall ABI" above for the split
   from the Linux path's own, unconverted `sys_exit`): marks the caller `Zombie(code)`, wakes its
   parent if blocked waiting on it (or on any child), then yields to the scheduler — guaranteed to
@@ -857,15 +1015,17 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
   Generating it with own code rather than shelling out to `mkfs.fat` also keeps the build hermetic
   — no new required host tool, consistent with `cargo build` needing no manual pre-step anywhere
   else in this repo.
-- **Three files ship in the image**, embedded via the generator: `HELLO.TXT` (a short, single-
+- **Four files ship in the image**, embedded via the generator: `HELLO.TXT` (a short, single-
   cluster message), `BIG.TXT` (1224 bytes spanning 3 clusters, content generated by a formula —
   `b'A' + index % 26` — rather than a literal, so `modules/fat32/`'s own self-check can
   independently recompute the expected bytes instead of keeping a second copy of a large literal in
-  sync by hand; specifically exercises cluster-chain-following, not just single-cluster reads), and
+  sync by hand; specifically exercises cluster-chain-following, not just single-cluster reads),
   `SMOKE.ELF` (the built `userland/ring3-smoke/` binary, embedded at build time — see "Process
-  abstraction, scheduler, and fork/exec/wait" below — so `stsh`'s `execve` support has a real,
-  already-working file to run, chained across as many clusters as its actual built size needs
-  rather than a fixed cluster count like `BIG.TXT`'s).
+  abstraction, scheduler, and fork/exec/wait" above — so `stsh`'s `execve` support has a real,
+  already-working file to run), and `MUSL.ELF` (the built `userland/musl-smoke/` binary — see
+  "musl port" above). Both ELF files are chained across as many clusters as their actual built size
+  needs (computed at image-generation time, `MUSL.ELF`'s first cluster chained right after however
+  many `SMOKE.ELF` itself ends up needing) rather than a fixed cluster count like `BIG.TXT`'s.
 - **Deliberate simplifications, all documented in the module's own doc comment rather than
   accidental:** 8.3 short names only (no VFAT/long-filename entries); no directory's own cluster
   chain is ever extended once full (`create_file`/`sys_mkdir` return `DirectoryFull`/`ENOSPC`
@@ -912,10 +1072,12 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
   another exported function that itself touches `DISK`, stop using your own outstanding reference
   to it, don't just assume "I'm not writing through it right now" is enough.
 - **Writes are all-at-once-on-`close`, not incremental per `write` call.** `open(..., O_CREAT)` on
-  a new name allocates an `OpenFile::Write` slot with a fixed `[u8; MAX_FILE_BUFFER]` (`16384`
-  bytes — raised from an original `4096` once `execve` support needed to read `SMOKE.ELF`'s few-KB
-  debug build back whole; see "Process abstraction, scheduler, and fork/exec/wait" below)
-  accumulator; each `SYS_WRITE` call appends into it; the file is only actually committed to
+  a new name allocates an `OpenFile::Write` slot with a fixed `[u8; MAX_FILE_BUFFER]` (`65536`
+  bytes — raised twice now: `4096` → `16384` once `execve` support needed to read `SMOKE.ELF`'s
+  few-KB debug build back whole, then `16384` → `65536` for `MUSL.ELF` (~23 KiB, a real compiled C
+  binary against a real libc — see "musl port" above); see "Process abstraction, scheduler, and
+  fork/exec/wait" above) accumulator; each `SYS_WRITE` call appends into it; the file is only
+  actually committed to
   `DISK` (cluster allocation, FAT chaining, directory-entry creation, all via `create_file`) at
   `close` time. A file opened for reading instead caches its *entire* contents into a same-sized
   fixed buffer at `open` time (rather than walking the cluster chain incrementally per `read`
