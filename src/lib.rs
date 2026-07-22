@@ -9,19 +9,22 @@ extern crate alloc;
 
 pub mod address_space;
 pub mod allocator;
+pub mod context_switch;
 pub mod elf;
 pub mod fd;
 pub mod gdt;
 pub mod interrupts;
-pub mod linux_syscall;
 pub mod memory;
 pub mod module;
 pub mod pic;
+pub mod process;
 pub mod qemu;
 pub mod reboot;
+pub mod scheduler;
 pub mod serial;
 pub mod stdin;
 pub mod syscall;
+pub mod user_stack;
 pub mod usermode;
 pub mod vga;
 
@@ -49,7 +52,7 @@ pub fn init(
     gdt::init();
     interrupts::init_idt();
     interrupts::init_pics();
-    linux_syscall::init();
+    syscall::init();
 
     serial_println!("[boot] enabling interrupts");
     x86_64::instructions::interrupts::enable();
@@ -59,7 +62,9 @@ pub fn init(
     let mut frame_allocator =
         unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
 
-    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    let heap_size = allocator::compute_heap_size(memory::usable_ram_bytes());
+    allocator::init_heap(&mut mapper, &mut frame_allocator, heap_size)
+        .expect("heap initialization failed");
 
     serial_println!("[boot] kernel initialization complete");
 

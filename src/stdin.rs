@@ -7,10 +7,10 @@
 //! is simpler than reasoning about it.
 //!
 //! **Why the shared `spin::Mutex` can't deadlock, even though it's touched from both the keyboard
-//! IRQ handler and syscall code:** `int 0x80` is an *interrupt* gate (like every other handler in
-//! this kernel), so `IF` is already clear for the entire duration of any syscall. The keyboard IRQ
-//! can never preempt a syscall in progress on this single core — the two sides of this buffer are
-//! mutually exclusive by construction, not by anything the lock itself provides.
+//! IRQ handler and syscall code:** `IA32_SFMASK` (see `src/syscall.rs::init`) clears `IF` on every
+//! `SYSCALL` entry, so interrupts are already disabled for the entire duration of any syscall. The
+//! keyboard IRQ can never preempt a syscall in progress on this single core — the two sides of
+//! this buffer are mutually exclusive by construction, not by anything the lock itself provides.
 
 use spin::Mutex;
 

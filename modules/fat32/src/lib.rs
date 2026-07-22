@@ -105,8 +105,11 @@ const EINVAL: i64 = 22;
 /// Per-open-file content buffer capacity, for both directions -- read caches a whole file's (or
 /// directory listing's) contents at `open` time (see `OpenFile::Read`'s doc comment for why),
 /// write accumulates a whole file's contents across possibly-multiple `write` calls until `close`.
-/// Comfortably larger than every file/listing this module's own demo/self-check content produces.
-const MAX_FILE_BUFFER: usize = 4096;
+/// Comfortably larger than every file/listing this module's own demo/self-check content produces,
+/// and than `SMOKE.ELF` (the embedded `ring3-smoke` binary `stsh`'s `execve` support -- see
+/// `src/process.rs`'s `do_execve` -- exercises end to end; a debug build of it is a few KB, larger
+/// than the original 4096-byte cap this constant used to have).
+const MAX_FILE_BUFFER: usize = 16384;
 const MAX_OPEN_FILES: usize = 8;
 
 /// An open file's own state, keyed by fd in `OPEN_FILES` below.

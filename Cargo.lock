@@ -31,6 +31,10 @@ name = "fat32"
 version = "0.1.0"
 
 [[package]]
+name = "fork-exec-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 
@@ -39,10 +43,6 @@ name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
-
-[[package]]
-name = "linux-syscall-smoke"
-version = "0.1.0"
 
 [[package]]
 name = "lock_api"

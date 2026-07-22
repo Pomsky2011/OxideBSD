@@ -573,6 +573,16 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_exit" => Some(crate::syscall::oxidebsd_sys_exit as *const () as u64),
         "oxidebsd_sys_read" => Some(crate::syscall::oxidebsd_sys_read as *const () as u64),
         "oxidebsd_sys_write" => Some(crate::syscall::oxidebsd_sys_write as *const () as u64),
+        "oxidebsd_sys_fork" => Some(crate::syscall::oxidebsd_sys_fork as *const () as u64),
+        "oxidebsd_sys_wait4" => Some(crate::syscall::oxidebsd_sys_wait4 as *const () as u64),
+        "oxidebsd_sys_execve" => Some(crate::syscall::oxidebsd_sys_execve as *const () as u64),
+        "oxidebsd_sys_getpid" => Some(crate::syscall::oxidebsd_sys_getpid as *const () as u64),
+        "oxidebsd_sys_mmap" => Some(crate::syscall::oxidebsd_sys_mmap as *const () as u64),
+        "oxidebsd_sys_munmap" => Some(crate::syscall::oxidebsd_sys_munmap as *const () as u64),
+        "oxidebsd_sys_brk" => Some(crate::syscall::oxidebsd_sys_brk as *const () as u64),
+        "oxidebsd_sys_set_fs_base" => {
+            Some(crate::syscall::oxidebsd_sys_set_fs_base as *const () as u64)
+        }
         "oxidebsd_alloc_fd" => Some(crate::fd::oxidebsd_alloc_fd as *const () as u64),
         "oxidebsd_register_fd_ops" => Some(crate::fd::oxidebsd_register_fd_ops as *const () as u64),
         "oxidebsd_close_fd" => Some(crate::fd::oxidebsd_close_fd as *const () as u64),

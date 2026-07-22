@@ -10,7 +10,6 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::pic::{self, PIC_1_OFFSET, PIC_2_OFFSET};
 use crate::reboot::reboot;
-use crate::syscall;
 use crate::{serial_print, serial_println};
 
 #[derive(Debug, Clone, Copy)]
@@ -65,28 +64,15 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
 
-    unsafe {
-        // set_handler_addr, not set_handler_fn: syscall_entry is a hand-written asm symbol (it
-        // saves/restores raw GPRs around the actual Rust dispatcher), not an
-        // `extern "x86-interrupt" fn`. DPL 3 for the same reason as the breakpoint gate above —
-        // `int 0x80` is software-invoked, so ring-3 code needs CPL <= gate DPL to reach it at all.
-        idt[syscall::SYSCALL_VECTOR]
-            .set_handler_addr(x86_64::VirtAddr::new(
-                syscall::syscall_entry as *const () as u64,
-            ))
-            .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
-    }
-
     idt
 });
 
 pub fn init_idt() {
     serial_println!(
         "[boot] loading IDT: breakpoint, invalid_opcode, general_protection_fault, page_fault, \
-         double_fault, timer (vector {:#x}), keyboard (vector {:#x}), syscall (vector {:#x})",
+         double_fault, timer (vector {:#x}), keyboard (vector {:#x})",
         InterruptIndex::Timer.as_u8(),
         InterruptIndex::Keyboard.as_u8(),
-        syscall::SYSCALL_VECTOR
     );
     IDT.load();
     serial_println!("[boot] IDT loaded");

@@ -1,6 +1,6 @@
-/* A distinct load base from userland/ring3-smoke/ (0x400000) and
- * userland/linux-syscall-smoke/ (0x500000) -- not currently required since only one userland
- * demo is ever loaded at a time, but keeps them from colliding if that changes. */
+/* A distinct load base from userland/ring3-smoke/ (0x800000) and userland/fork-exec-smoke/
+ * (0x700000) -- not currently required since only one userland demo is ever loaded at a time, but
+ * keeps them from colliding if that changes. */
 ENTRY(_start)
 
 SECTIONS

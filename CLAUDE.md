@@ -31,16 +31,25 @@ subdirectories), registering `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` and,
 kernel-owned fd registry (`src/fd.rs`), extending `SYS_READ`/`SYS_WRITE` to real files. `stsh`'s
 `cat`/`write`/`cd`/`ls`/`mkdir` commands exercise this end to end.
 
+There is now a real **process abstraction and cooperative scheduler** too (`src/process.rs`,
+`src/scheduler.rs`, `src/context_switch.rs` — see "Process abstraction, scheduler, and
+fork/exec/wait" below): a dynamically-allocated process table, kernel-thread-style context
+switching between per-process kernel stacks, and `fork`/`execve`/`wait4`/`getpid` over the native
+`int 0x80` ABI. `stsh` now genuinely runs other programs — any command that isn't a recognized
+built-in is `fork`+`execve`+`wait`ed as a real child process, resolved through the same FAT32
+filesystem `cat`/`write` already use.
+
 See "User-mode execution", "Syscall ABI", "Linux-compatible syscall mechanism", "Interactive
-shell", "Dynamic kernel modules", and "FAT32 filesystem module" below for the current, deliberate
-limits (no process abstraction/scheduler, one demo binary at a time, `sys_write`/`sys_read` don't
-validate their pointers, no line editing in the shell, no module unload/reload, FAT32 writes don't
-persist across reboot, and — for the Linux path — only `write`/`exit`/`exit_group` are implemented;
-musl's actual startup needs many more syscalls and is real follow-up work, not done). Scheduling
-and a real process abstraction do not exist yet; a *real* filesystem (backed by an actual block
-device, not an embedded image) doesn't either. Architecture decisions for those remaining
-subsystems have not been made and should be discussed with the user before large structural
-commitments are made.
+shell", "Dynamic kernel modules", "FAT32 filesystem module", and "Process abstraction, scheduler,
+and fork/exec/wait" below for the current, deliberate limits (`sys_write`/`sys_read` don't validate
+their pointers, no line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/
+reload, FAT32 writes don't persist across reboot, no preemptive scheduling, no copy-on-write fork,
+no frame deallocation anywhere, and — for the Linux path — only `write`/`exit`/`exit_group` are
+implemented and no process/scheduler support exists there at all; musl's actual startup needs many
+more syscalls and is real follow-up work, not done). A *real* filesystem (backed by an actual block
+device, not an embedded image) doesn't exist yet. Architecture decisions for remaining subsystems
+have not been made and should be discussed with the user before large structural commitments are
+made.
 
 Target architecture is x86_64 only for now.
 
@@ -108,6 +117,14 @@ under, so tests instead boot in QEMU and self-report:
   gotcha that cost real debugging time. Files under `tests/` must instead define their own
   `fn main()` (via `entry_point!`) that runs assertions directly and calls `exit_qemu(...)` itself,
   rather than trying to reuse the `#[test_case]`/`test_runner` pattern from `lib.rs`.
+- `tests/fork_wait.rs`: a second `harness = false` integration test (see "Process abstraction,
+  scheduler, and fork/exec/wait" below for the full design) that boots the kernel, spawns a
+  dedicated `userland/fork-exec-smoke/` binary as pid 1, and verifies a real `fork`/`wait4`/`exit`
+  round trip. Since `scheduler::start`/`process::do_exit` never return control to a test's own
+  `main` the way `basic_boot.rs`'s straight-line assertions do, it registers a test-only syscall
+  number directly against `oxidebsd::syscall::oxidebsd_register_syscall` (`pub`, not `pub(crate)`,
+  specifically so an external test crate can reach it) whose handler calls `exit_qemu` from that
+  syscall-handling context instead.
 
 ## Custom target spec (`x86_64-oxidebsd.json`)
 
@@ -139,9 +156,28 @@ physical memory at `BootInfo::physical_memory_offset`:
   `BootInfo::memory_map`'s `Usable` regions in order and never reusing one — there's no
   deallocation path yet, so freed frames currently just leak. Fine for a single heap-mapping call
   at boot; will need revisiting once anything frees frames at runtime.
-- The heap lives at a fixed virtual range (`allocator::HEAP_START`/`HEAP_SIZE`, currently 100 KiB
-  at `0x_4444_4444_0000`) chosen to be far from anything else mapped; `allocator::init_heap` maps
+- The heap lives at a fixed virtual address (`allocator::HEAP_START`, `0x_4444_4444_0000`) chosen
+  to be far from anything else mapped, but its *size* is no longer a fixed constant:
+  `allocator::compute_heap_size` scales it to whatever RAM this particular boot actually reports
+  (`memory::usable_ram_bytes()`, itself populated by `memory::BootInfoFrameAllocator::init` from
+  `BootInfo::memory_map` — see "Scaling to detected RAM" below), clamped between a proven-sufficient
+  floor (4 MiB, the old fixed value) and a ceiling (128 MiB) that just bounds one-time boot mapping
+  cost on a RAM-rich host. `allocator::init_heap` takes the computed size as a parameter and maps
   that range page-by-page before handing it to the global allocator.
+- **Sizing that scales with detected RAM, and sizing that deliberately doesn't.** Besides the heap
+  above, `process::kernel_stack_size()`/`process::user_stack_pages()` (see "Process abstraction,
+  scheduler, and fork/exec/wait" below) scale the same way — each a `spin::Lazy` reading
+  `memory::usable_ram_bytes()` once, clamped between the old fixed value (kept as a floor, since
+  it's already proven sufficient) and a ceiling that just bounds how generous a RAM-rich boot gets
+  for free. This exists because the only thing that used to actually read real hardware's RAM size
+  was `BootInfoFrameAllocator` itself — everything downstream (heap, per-process stacks) was a
+  constant tuned against whatever RAM happened to be in the one test VM used during development,
+  which wouldn't necessarily suit a much smaller or much larger target machine. Deliberately *not*
+  scaled: `modules/fat32`'s embedded disk image size (fixed at build time, before any target
+  machine's actual RAM is known — nothing at runtime could inform it) and `module::MODULE_VA_BASE`/
+  `MODULE_REGION_CEILING` (a virtual-address-range limit forced by the module loader's
+  relocation-model choice — see "Dynamic kernel modules" below — not a physical-RAM quantity, so
+  more RAM wouldn't let it grow even in principle).
 - The `#[global_allocator]` is `linked_list_allocator`'s `Heap` wrapped in a project-local
   `Locked<T>` (a thin `spin::Mutex` newtype), not the crate's own `LockedHeap` — see Dependency
   notes below for why.
@@ -153,42 +189,66 @@ physical memory at `BootInfo::physical_memory_offset`:
 ## User-mode execution (`src/address_space.rs`, `src/elf.rs`, `src/usermode.rs`)
 
 Proves paging beyond the kernel's own address space, address-space separation, and ELF loading all
-work, by loading a tiny embedded userland binary and jumping into ring 3. `src/main.rs`'s
-`run_userland_demo` is generic over which binary — `kernel_main` currently points it at
-`userland/stsh/` (see "Interactive shell" below); `userland/ring3-smoke/` and
-`userland/linux-syscall-smoke/` (OxideBSD's own native `int 0x80` ABI and the Linux-compatible
+work, by loading an embedded userland binary and jumping into ring 3. `src/process.rs`'s `spawn`
+builds the first process (`stsh`, pid 1 — see "Interactive shell" below) this way at boot, and
+`src/process.rs`'s `do_execve` builds every subsequent one the same way, just later and mid-syscall
+— see "Process abstraction, scheduler, and fork/exec/wait" below for how control actually reaches
+ring 3 now (through the scheduler's own trampolines, not a direct call). `userland/ring3-smoke/`
+and `userland/linux-syscall-smoke/` (OxideBSD's own native `int 0x80` ABI and the Linux-compatible
 `SYSCALL`/`SYSRET` path respectively — see "Syscall ABI" and "Linux-compatible syscall mechanism"
-below) still work, they're just not what's wired up by default at the moment, since only one demo
-can run per boot (`SYS_EXIT` idles the whole system — there's no scheduler to hand control to
-something else afterward). Whichever binary runs, the pattern is the same: it does something
-observable (prints a message and exits with a distinctive code, or — for `stsh` — runs an
-interactive read/dispatch loop), and that output over serial/VGA is the actual end-to-end proof
-paging/ELF-loading/ring-3/syscalls all work together.
+below) aren't spawned directly at boot; `ring3-smoke` is instead embedded into the FAT32 image (see
+"FAT32 filesystem module" below) as `SMOKE.ELF` so `stsh` can genuinely `execve` it as a real file.
+Whichever binary runs, the pattern is the same: it does something observable (prints a message and
+exits with a distinctive code, or — for `stsh` — runs an interactive read/dispatch loop), and that
+output over serial/VGA is the actual end-to-end proof paging/ELF-loading/ring-3/syscalls all work
+together.
 
-- **The userland demo build.** `userland/ring3-smoke/`, `userland/linux-syscall-smoke/`, and
-  `userland/stsh/` are separate workspace members (root `Cargo.toml` gained a `[workspace]` table;
-  the root package is still its own workspace member, same as before). The root package's
-  `build.rs` cross-builds all three (via a shared `build_userland_crate` helper) into
-  `target/userland/` — a **separate** target directory from the outer build's own `target/`, not
-  the shared one: invoking a nested `cargo build` against the *same* target directory a
-  still-running outer cargo invocation already holds a lock on (build scripts run as part of that
-  outer build) can deadlock. Each resulting ELF's path is exposed via
-  `cargo:rustc-env=<NAME>_ELF_PATH=...`, so `src/main.rs` can `include_bytes!(env!("..._ELF_PATH"))`
-  — this keeps `cargo build`/`cargo run`/`cargo test` working with no manual pre-step. Each
-  userland crate's `linker.ld` forces its own distinct load base (`0x400000` for `ring3-smoke`,
-  `0x500000` for `linux-syscall-smoke`, `0x600000` for `stsh` — not currently required since only
-  one demo loads at a time, but keeps them from colliding if that changes), clear of the kernel's
-  own image, heap, and phys-memory-offset window (see below); each crate's own tiny `build.rs`
-  passes its script as a link arg to just its own binary, not via `RUSTFLAGS`, which would apply to
-  (and force a rebuild of) the `-Z build-std`-compiled core/alloc/compiler_builtins shared with the
-  outer build.
-- **Address spaces are a shallow copy.** `AddressSpace::new` allocates a fresh frame for a new
-  level 4 table and copies all 512 entries from the kernel's currently-active one into it — not a
-  "higher half only" split, and not a deep clone: the copy is just raw entries (pointers to
-  lower-level tables), so the new address space shares the kernel's code, heap, stacks, and
-  phys-memory-offset window with the original. This is deliberate: interrupt/exception handlers
-  always run in the kernel's context, regardless of which address space was active when they
-  fired, so the kernel must stay identically mapped and reachable no matter what.
+- **The userland demo build.** `userland/ring3-smoke/`, `userland/linux-syscall-smoke/`,
+  `userland/stsh/`, and `userland/fork-exec-smoke/` (a minimal fork/wait-only smoke test purpose-
+  built for `tests/fork_wait.rs` — see "Process abstraction, scheduler, and fork/exec/wait" below)
+  are separate workspace members (root `Cargo.toml` gained a `[workspace]` table; the root package
+  is still its own workspace member, same as before). The root package's `build.rs` cross-builds
+  all of them (via a shared `build_userland_crate` helper) into `target/userland/` — a **separate**
+  target directory from the outer build's own `target/`, not the shared one: invoking a nested
+  `cargo build` against the *same* target directory a still-running outer cargo invocation already
+  holds a lock on (build scripts run as part of that outer build) can deadlock. Each resulting
+  ELF's path is exposed via `cargo:rustc-env=<NAME>_ELF_PATH=...`, so `src/main.rs`/`tests/*.rs` can
+  `include_bytes!(env!("..._ELF_PATH"))` — this keeps `cargo build`/`cargo run`/`cargo test` working
+  with no manual pre-step. Each userland crate's `linker.ld` forces its own distinct load base
+  (`0x800000` for `ring3-smoke`, `0x900000` for `linux-syscall-smoke`, `0x600000` for `stsh`,
+  `0x700000` for `fork-exec-smoke`) clear of the kernel's own image, heap, and phys-memory-offset
+  window (see below) — genuinely required now, not just future-proofing, since `execve` can load a
+  binary into a running system rather than only at a one-binary-per-boot demo; each crate's own
+  tiny `build.rs` passes its script as a link arg to just its own binary, not via `RUSTFLAGS`, which
+  would apply to (and force a rebuild of) the `-Z build-std`-compiled core/alloc/compiler_builtins
+  shared with the outer build.
+  - **These load bases must also stay clear of the `bootloader` crate's own identity-mapped
+    low-memory region** — a real bug, found and fixed: `bootloader` (v0.9) identity-maps roughly
+    the first 6 MiB of physical memory (kernel-only, not `USER_ACCESSIBLE`) as part of its own
+    bootstrap, independent of and larger than the kernel's own image, confirmed empirically (PD
+    entries 0–2 present at boot, entry 3+ not). Since every fresh address space
+    shares/aliases whatever's kernel-only in the currently active table (see `AddressSpace::fork`/
+    `new_excluding_user` below), a user ELF loaded inside that identity-mapped range collides with
+    it (`MapToError::PageAlreadyMapped`) — `ring3-smoke` originally sat at `0x400000`, squarely
+    inside it, and this only surfaced once `execve` started actually exercising the path (a
+    one-demo-per-boot `spawn` at boot never collided by coincidence). `0x600000` and up are
+    confirmed clear.
+- **Address spaces are a shallow copy — except when they can't be.** `AddressSpace::new` allocates
+  a fresh frame for a new level 4 table and copies all 512 entries from the *currently active* one
+  into it — not a "higher half only" split (this kernel has no such split at all: kernel code, the
+  heap, the phys-mem-offset window, and every user ELF's load address all coexist in the low
+  canonical range at different indices, not in any clean high/low half), and not a deep clone: the
+  copy is just raw entries (pointers to lower-level tables), so the new address space shares
+  whatever's active with the original. Deliberate for the kernel-mapping side: interrupt/exception
+  handlers always run in the kernel's context regardless of which address space was active when
+  they fired, so the kernel must stay identically mapped and reachable no matter what. **Only
+  safe to call while the active table's user-space content is empty** (true for `process::spawn`,
+  called only against the kernel's own address space at boot) — calling it from an
+  already-running process (as an early, broken version of `fork` did) silently aliases that
+  process's *user* mappings into the "new" table too. `AddressSpace::fork`/`new_excluding_user`
+  (see "Process abstraction, scheduler, and fork/exec/wait" below) exist specifically for the
+  from-inside-a-running-process case, using a recursive, `USER_ACCESSIBLE`-flag-driven walk instead
+  of a flat copy.
 - **RSP0 must actually be writable — `static`, not `static mut`, silently isn't.** `gdt.rs`'s
   ring-0 stacks (both the double-fault IST stack and the new RSP0 stack for ring-3-triggered
   interrupts) are declared `static mut STACK: [u8; N]`, not `static STACK: [u8; N]`. This is
@@ -289,10 +349,16 @@ what the module actually calls through.
   landing exactly on the 16-byte boundary System V requires at the `call` instruction. If the
   pushed-register count or the frame shape ever changes, redo this arithmetic; don't assume it
   still lines up.
-- **`sys_exit` doesn't return control to anything.** There's no process abstraction or scheduler,
-  so "exiting" means the kernel logs the code and calls `hlt_loop()` — it's the whole system's
-  stopping point, not a per-process one. Not represented as `Result` since exit can't meaningfully
-  fail.
+- **`sys_exit` doesn't return control to anything — but this is now specifically the Linux path's
+  behavior, not the native ABI's.** `sys_exit` itself (this file) still just logs the code and
+  calls `hlt_loop()`, halting the whole system rather than resuming anything — but it's now used
+  *only* by `src/linux_syscall.rs`'s `exit`/`exit_group`, which stay out of scope for process/
+  scheduler support (see "Process abstraction, scheduler, and fork/exec/wait" below). The native
+  ABI's own exit path no longer goes through this function at all: `oxidebsd_sys_exit` (this
+  file's FFI adapter `modules/native_abi` actually calls) redirects straight to
+  `process::do_exit`, which does real per-process termination — only falling back to `hlt_loop()`
+  when nothing else is left runnable. `sys_exit` isn't represented as `Result` since exit can't
+  meaningfully fail; `do_exit` is `-> !` for the same reason.
 - **`sys_write`/`sys_exit` return `Result<u64, u64>`** (`Ok(value)` / `Err(positive errno)`) — the
   shared, canonical representation both this module's own dispatcher *and*
   `linux_syscall.rs`'s adapt into their own respective wire formats (carry flag here; negated into
@@ -303,12 +369,15 @@ what the module actually calls through.
   `reboot()`) rather than corrupting kernel state, so this is a missing safety net for user
   programs, not a kernel soundness hole — but real validation (walking the active page table to
   confirm the range) is a natural follow-up, not yet implemented.
-- **`sys_read` is non-blocking, not a limitation but a deliberate simplification that follows from
-  having no scheduler.** A real `read` on an empty, non-`O_NONBLOCK` fd blocks the calling process
-  and reschedules another one; this kernel has no process abstraction to switch away to, so
-  blocking in `sys_read` would just halt the entire machine until a key is pressed. Returning
-  `Ok(0)` immediately when the buffer is empty pushes the polling loop into userland instead — see
-  "Interactive shell" below for the caller side of that contract. Native-ABI only for now;
+- **`sys_read` is non-blocking — a deliberate simplification, not (yet) converted to use the real
+  scheduler that now exists.** A real `read` on an empty, non-`O_NONBLOCK` fd blocks the calling
+  process and reschedules another one; `process::do_wait4` (see "Process abstraction, scheduler,
+  and fork/exec/wait" below) proves this kernel can now do exactly that for a different syscall,
+  but `sys_read` itself hasn't been converted to follow the same pattern (block + `scheduler::
+  schedule()` on an empty stdin buffer instead of returning `Ok(0)` immediately) — real, separate
+  follow-up work. Returning `Ok(0)` immediately when the buffer is empty pushes the polling loop
+  into userland instead — see "Interactive shell" below for the caller side of that contract.
+  Native-ABI only for now;
   `src/linux_syscall.rs` has no `read` equivalent yet. This non-blocking property is specific to
   fd 0 (stdin) — a FAT32 file's `read`, routed through `crate::fd` below, always completes
   immediately regardless (there's no "not ready yet" state for an in-memory file), so `cat` in
@@ -393,20 +462,22 @@ the *mechanism* in isolation first.
 The first genuinely interactive userland program: unlike every earlier demo (`ring3-smoke`,
 `linux-syscall-smoke`), which print a message and exit, `stsh` ("stupidshell") loops forever,
 reading a line at a time from the keyboard and dispatching a small set of built-ins (`help`, `echo
-<text>`, `exit`, `cat <name>`, `write <name> <text>`, `cd [path]`, `ls [path]`, `mkdir <name>`)
-until told to exit. It's wired up by default — see "User-mode execution" above — and runs entirely
-over OxideBSD's own native `int 0x80` ABI; it has no equivalent on the Linux-compatible path yet.
-`cat`/`write`/`cd`/`ls`/`mkdir` exercise `modules/fat32/`'s `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/
-`SYS_MKDIR` end to end — see "Dynamic kernel modules" and "FAT32 filesystem module" below.
+<text>`, `exit`, `cat <name>`, `write <name> <text>`, `cd [path]`, `ls [path]`, `mkdir <name>`) —
+anything else is treated as a real program to run (`fork`+`execve`+`wait`, see "Process
+abstraction, scheduler, and fork/exec/wait" below) — until told to exit. It's wired up by default
+— see "User-mode execution" above — and runs entirely over OxideBSD's own native `int 0x80` ABI; it
+has no equivalent on the Linux-compatible path yet. `cat`/`write`/`cd`/`ls`/`mkdir` exercise
+`modules/fat32/`'s `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` end to end — see "Dynamic kernel
+modules" and "FAT32 filesystem module" below.
 
-- **`cd`/`ls`/`mkdir` are built-in commands, not separate programs `stsh` loads and execs** — a
-  deliberate scope decision, not an oversight. A real `exec` would need a new syscall *and* some
-  way to return control to the shell once the child exits; today `sys_exit` halts the whole
-  machine, since there's no process abstraction or scheduler at all yet (exactly the kind of
-  structural commitment `CLAUDE.md`'s "Project" section flags as needing a real discussion first).
-  `cd` specifically has to be a built-in regardless of that constraint, for the same reason it
-  always is in a real shell: a child process changing its own working directory can never affect
-  its parent's, so "changing directory" only means anything if the shell does it to itself.
+- **`cd`/`ls`/`mkdir` are still built-in commands, not separate programs `stsh` loads and execs —
+  but not because `exec` doesn't exist anymore.** Now that real `fork`/`execve`/`wait` exist (see
+  below), the original reason these were built-ins (no way for a child to return control to the
+  shell) no longer applies — but `cd` specifically still has to be a built-in regardless, for the
+  same reason it always is in a real shell: a child process changing its own working directory can
+  never affect its parent's, so "changing directory" only means anything if the shell does it to
+  itself. `ls`/`mkdir` stayed built-ins too simply because nothing has motivated splitting them out
+  into separate exec'd programs yet, not because of any remaining structural blocker.
 - **`ls` needed no new syscall** — `modules/fat32/`'s `fat32_open`, when the resolved target is a
   directory, hands back a formatted listing through the exact same `OpenFile::Read`/`SYS_READ`
   path a real file's content would use, so `ls` is implemented identically to `cat` on the `stsh`
@@ -447,10 +518,13 @@ over OxideBSD's own native `int 0x80` ABI; it has no equivalent on the Linux-com
   buffer are mutually exclusive by construction, not because the lock itself provides it; this
   reasoning breaks if the kernel ever gains SMP, at which point the buffer needs a real
   cross-core-safe lock.
-- **`sys_read` is non-blocking** (see "Syscall ABI" above for why: no scheduler to block against),
-  so `stsh` busy-polls it one byte at a time in a `spin_loop()` until a byte arrives. This is a
-  userland concern, not a kernel one — a future blocking-capable `read` would still need this same
-  polling shim until there's a scheduler to actually block against.
+- **`sys_read` is non-blocking** (see "Syscall ABI" above for why it still is, even though a real
+  scheduler now exists to block against — it just hasn't been converted yet), so `stsh` busy-polls
+  it one byte at a time in a `spin_loop()` until a byte arrives. This is a
+  userland concern, not a kernel one — a real scheduler now exists (see "Process abstraction,
+  scheduler, and fork/exec/wait" below) and `process::do_wait4` already proves this kernel can
+  block+reschedule for a different syscall, but `sys_read` itself hasn't been converted to follow
+  suit yet, so this polling shim is still what `stsh` relies on today.
 - **Basic line editing exists, but it's still not full readline** — no cursor movement (arrow
   keys) and no history; `read_line` silently discards bytes past its 128-byte `LINE_CAPACITY`
   rather than growing or erroring. What it does handle: Backspace (`0x08`) and Delete (`0x7f`)
@@ -464,6 +538,142 @@ over OxideBSD's own native `int 0x80` ABI; it has no equivalent on the Linux-com
   byte is dropped rather than inserted literally into the line. This relies on the keyboard
   handler's `HandleControl::MapLettersToUnicode` setting (see above) to actually produce the
   Ctrl+C/Ctrl+D bytes in the first place.
+
+## Process abstraction, scheduler, and fork/exec/wait (`src/process.rs`, `src/scheduler.rs`, `src/context_switch.rs`)
+
+Adds real multi-process support to what used to be a one-binary-per-boot kernel: a dynamically
+allocated process table (`src/process.rs`), a cooperative round-robin scheduler
+(`src/scheduler.rs`), and the low-level kernel-thread-style context switch that moves execution
+between per-process kernel stacks (`src/context_switch.rs`). `fork`/`execve`/`wait4`/`getpid` are
+new native-ABI syscalls (real FreeBSD numbers: `SYS_FORK = 2`, `SYS_WAIT4 = 7`, `SYS_GETPID = 20`,
+`SYS_EXECVE = 59`), registered by `modules/native_abi/` the same way `SYS_EXIT`/`SYS_READ`/
+`SYS_WRITE` already were. `stsh` uses all of this for real now — see "Interactive shell" above.
+
+Native-ABI (`int 0x80`) only; `src/linux_syscall.rs` has no process/scheduler support at all and is
+explicitly out of scope here. No preemption (cooperative only — see the scheduler doc comment for
+the deliberate, deferred seam), no copy-on-write fork (full eager copy), no SMP, no argv/envp to
+`execve`, and no frame deallocation anywhere (reaping a zombie frees its Rust-heap PCB state
+correctly but leaks the physical frames backing its page tables/user pages — consistent with this
+codebase's existing total lack of a `FrameDeallocator`, not a new regression).
+
+- **The process table (`process::Process`, `process::table()`) is a `Mutex<BTreeMap<Pid,
+  Box<Process>>>`, `Box`-wrapped deliberately.** Letting a caller pull a raw `*mut Process` (or copy
+  needed fields) out from under a short-held lock and drop that lock *before* doing anything that
+  might call `scheduler::schedule()` is load-bearing, not a style choice: the `BTreeMap`'s internal
+  tree nodes can move on insert/remove, but a `Box`'s own heap allocation never does. Holding this
+  lock across a context switch would only ever get released whenever that exact stack next
+  resumes — a real deadlock if the switched-to process needs the same lock, which it always will.
+  Every function in `process.rs` that touches both the table and `scheduler::schedule()` follows
+  this discipline explicitly.
+- **The context switch (`context_switch::switch_context`) is a classic kernel-thread `swtch`, not a
+  full GPR save** — only System V's callee-saved registers (`rbp`, `rbx`, `r12`-`r15`) plus `RSP`
+  itself, via the ordinary `call`/`ret` mechanism. Everything else is either caller-saved (already
+  safe on the Rust call stack of whichever function called `schedule()`) or, for a process's ring-3
+  register state, already saved by `syscall_entry`'s own pushes on *that process's own* kernel
+  stack (see "Syscall ABI" above). The restore side is exactly symmetric with the save side — that
+  symmetry is what lets one primitive handle both "resume a process that yielded mid-syscall" (the
+  final `ret` lands back inside `schedule()`'s own call site) and "start a process that's never run
+  at all" (a hand-seeded fake stack frame with the same shape makes the final `ret` land in a
+  trampoline instead).
+- **Two first-run trampolines, deliberately asymmetric.** `spawn_trampoline_asm` (a process that's
+  never run at all — pid 1, or any future non-forked `spawn`) defensively `and rsp, -16` before
+  `call`ing into real Rust code, sidestepping hand-deriving the exact stack offset that would
+  satisfy System V's call-entry alignment (easy to get subtly wrong, painful to debug).
+  `fork_trampoline_asm` (forked children only) jumps straight into `syscall_entry`'s own
+  GPR-pop-and-`iretq` tail (labeled `syscall_return_tail` specifically so this can reach it) with
+  **no** realignment at all — `seed_fork_frame` places a copy of the parent's `SyscallFrame`
+  immediately below the fake register-save frame, so after `switch_context`'s pops and `ret`, `RSP`
+  already points exactly where that tail expects it. Counter-intuitively the fork path needs *less*
+  defensive code than the spawn path.
+- **`fork` resumes the child as if returning from its own `fork()` call with `0`, by copying the
+  parent's live `SyscallFrame` onto the child's fresh kernel stack.** `syscall::copy_frame_for_fork`
+  does the copy, then explicitly forces both `rax = 0` **and clears the copy's `CARRY_FLAG` bit** —
+  a real bug caught before it shipped: at the moment of copying, the parent's frame's `rflags` still
+  holds whatever `CF` happened to be *before* the parent ever executed `int 0x80` for this call
+  (ordinary instructions like `mov` don't touch `EFLAGS`, so it's just leftover state, not anything
+  this syscall itself set yet — `syscall_dispatch`'s own CF-clearing for the *parent's* return
+  happens later and only touches the parent's own live frame). Without the explicit clear, the
+  child could spuriously see `Err` from a stale bit that predates the call entirely.
+- **`SyscallFrame`'s fields are private to `src/syscall.rs`; `fork`/`execve` reach it through two
+  narrow, explicitly-added accessors instead** (`copy_frame_for_fork`, `redirect_frame`), plus one
+  `AtomicPtr<SyscallFrame>` (`CURRENT_FRAME`, set at the top of `syscall_dispatch`) exposed via
+  `syscall::current_frame()`. `SyscallHandler`'s `(u64, u64, u64) -> i64` shape can't carry a frame
+  pointer, but these two syscalls specifically need raw access to the live frame that no other
+  syscall does — a deliberate, narrowly-scoped exception rather than changing every syscall's
+  signature.
+- **`AddressSpace::fork`/`AddressSpace::new_excluding_user` replace a naive "clone everything, then
+  try to zero out the low addresses" approach that seemed obviously right and was completely wrong**
+  — see "User-mode execution" above for the full story: this kernel has no higher-half split at
+  all, so a PML4-index-based cut can't distinguish kernel from user content. Both instead
+  recursively walk the currently active table (`address_space.rs`'s `copy_table_level`), using the
+  `USER_ACCESSIBLE` flag itself as the only reliable signal at *any* level (the MMU's own
+  hierarchical walk requires every level down to a user page to carry it, so a clear bit anywhere
+  guarantees nothing user-facing exists beneath it, safe to alias as-is without recursing further).
+  `fork` copies user leaves fresh (byte-for-byte, via the phys-mem-offset window, the same
+  technique `elf::load` already uses); `new_excluding_user` (used by `execve`, which needs a wholly
+  clean user address space, not the calling process's inherited one) just skips them.
+- **`do_execve` reuses `syscall::dispatch` directly** to drive an internal open/read-loop/close
+  against the same fd/fat32 machinery `stsh`'s `cat` already exercises through the public syscall
+  path — no separate file-loading code. Every fallible step (open, each read, close, `Elf::parse`,
+  the new `AddressSpace`, `elf::load`, mapping the user stack) completes *before* any mutation of
+  the live syscall frame, `CR3`, or the process's stored `AddressSpace` — real `execve(2)`
+  semantics: a failure at any point must leave the calling program completely untouched.
+- **`do_exit` replaces `sys_exit` for the native ABI only** (see "Syscall ABI" above for the split
+  from the Linux path's own, unconverted `sys_exit`): marks the caller `Zombie(code)`, wakes its
+  parent if blocked waiting on it (or on any child), then yields to the scheduler — guaranteed to
+  either switch to something else or `hlt_loop()` if nothing else is runnable, since a `Zombie` is
+  never re-enqueued. Orphaned grandchildren are **not** reparented to a pid-1 "init" this pass —
+  an accepted simplification, not required for fork/exec/wait correctness.
+- **`do_wait4` blocks by looping**: find a `Zombie` child matching the requested pid (`-1` = any)
+  and reap it immediately if one exists; if the caller has no matching child at all, `ECHILD`;
+  otherwise mark the caller `Blocked` and call `scheduler::schedule()` (dropping the table lock
+  first). `do_exit` only *wakes* the parent — it doesn't hand the reaped child's info across
+  directly — so on resume the loop just re-checks from the top.
+- **Kernel stack size needed real, empirically-found margin, not just "enough for the common
+  case," and that margin is now a floor, not a bare constant.** `128` KiB was found the hard way,
+  twice: `16` KiB overflowed on `ls` (`SYS_OPEN` on a directory is a deeper call chain than plain
+  `SYS_READ`/`SYS_WRITE`); `32` KiB then overflowed on `fork` itself (`AddressSpace::fork`'s
+  page-table walk → `AddressSpace::new`'s `PageTable::clone()` has a surprisingly large unoptimized
+  stack frame in a **debug** build). There's no guard page (heap-allocated, not a dedicated
+  mapped-with-a-gap region like `gdt.rs`'s own stacks), so overflow corrupts silently or
+  double-faults rather than failing cleanly — this needs real headroom for debug builds
+  specifically. `process::kernel_stack_size()` (a `spin::Lazy<usize>`, not `pub const
+  KERNEL_STACK_SIZE` anymore) scales this up on RAM-rich boots but never below the `128` KiB floor,
+  for the same reason `process::user_stack_pages()` never drops below its own old fixed value (4
+  pages) — see "Memory management" above for the general RAM-scaling design shared by all three.
+  `allocator`'s heap floor was
+  raised in step (`100` KiB → `4` MiB, now itself just the floor of a RAM-scaled size) since every
+  process's kernel stack, plus the process table itself, plus `execve`'s internal `Vec<u8>`, all
+  come from this same heap.
+- **`gdt::set_kernel_stack`** repoints `TSS.RSP0` — the stack the CPU auto-switches to on the next
+  ring-3→ring-0 transition — on every context switch, right before `switch_context`. Since `spin::
+  Lazy` has no `DerefMut`, this writes through a raw pointer derived from `TSS`'s own fixed address
+  (never moves once forced) rather than trying to get a real `&mut` — sound because nothing else
+  ever holds a live `&TaskStateSegment` across the call (single-core; the scheduler only calls this
+  with interrupts disabled).
+- **`memory::install_global_memory_state`/`with_frame_allocator`/`phys_mem_offset`** promote the
+  frame allocator and `physical_memory_offset` from local `main.rs` variables to global state,
+  since `spawn`/`fork`/`execve` all need them from arbitrary syscall contexts, not just at boot.
+  Populated exactly once, right after module loading finishes and before `stsh` is spawned — the
+  frame allocator is *moved* in, never cloned, since `BootInfoFrameAllocator`'s own bump-allocation
+  state must stay singular.
+- **Boot wiring**: `main.rs`'s `kernel_main` now calls `process::spawn` (building `stsh` as pid 1,
+  same `AddressSpace::new` + `elf::load` + user-stack-mapping sequence the old one-shot demo path
+  used) then `scheduler::start(pid1)` — never returns, the same one-way shape `jump_to_usermode`
+  always had, just reached through the scheduler's own trampoline now instead of a direct call.
+- **`tests/fork_wait.rs` + `userland/fork-exec-smoke/`**: an automated integration test for exactly
+  this subsystem, since driving the real interactive shell through a keyboard-injected `fork`+
+  `execve`+`wait` round trip isn't something `cargo test` can do. `fork-exec-smoke` is a minimal
+  freestanding binary that forks, has its child write a marker and exit with a distinctive code
+  (`77`), has its parent `wait4` and verify both the reaped pid and exit code, then reports
+  pass/fail through a syscall number no real ABI uses (`9999`) — `tests/fork_wait.rs` registers a
+  handler for that number directly against `oxidebsd::syscall::oxidebsd_register_syscall` (made
+  `pub`, not `pub(crate)`, specifically so an external test crate can do this) that calls
+  `qemu::exit_qemu`, sidestepping the fact that `scheduler::start`/`process::do_exit` never return
+  control to a test's own `main` the way a normal QEMU-exit-based test does. Deliberately narrower
+  than a full `stsh`-driven test: no `execve`, no filesystem, isolating the process/scheduler/
+  context-switch machinery itself from FAT32/ELF-loading concerns. This test is exactly what
+  caught the `PageAlreadyMapped` bug in an early, broken `AddressSpace::fork` before it shipped.
 
 ## Dynamic kernel modules (`src/module.rs`, `modules/*`)
 
@@ -647,12 +857,15 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
   Generating it with own code rather than shelling out to `mkfs.fat` also keeps the build hermetic
   — no new required host tool, consistent with `cargo build` needing no manual pre-step anywhere
   else in this repo.
-- **Two demo files ship in the image**, embedded via the generator: `HELLO.TXT` (a short, single-
-  cluster message) and `BIG.TXT` (1224 bytes spanning 3 clusters, content generated by a formula
-  — `b'A' + index % 26` — rather than a literal, so `modules/fat32/`'s own self-check can
+- **Three files ship in the image**, embedded via the generator: `HELLO.TXT` (a short, single-
+  cluster message), `BIG.TXT` (1224 bytes spanning 3 clusters, content generated by a formula —
+  `b'A' + index % 26` — rather than a literal, so `modules/fat32/`'s own self-check can
   independently recompute the expected bytes instead of keeping a second copy of a large literal in
-  sync by hand). `BIG.TXT` specifically exercises cluster-chain-following, not just single-cluster
-  reads.
+  sync by hand; specifically exercises cluster-chain-following, not just single-cluster reads), and
+  `SMOKE.ELF` (the built `userland/ring3-smoke/` binary, embedded at build time — see "Process
+  abstraction, scheduler, and fork/exec/wait" below — so `stsh`'s `execve` support has a real,
+  already-working file to run, chained across as many clusters as its actual built size needs
+  rather than a fixed cluster count like `BIG.TXT`'s).
 - **Deliberate simplifications, all documented in the module's own doc comment rather than
   accidental:** 8.3 short names only (no VFAT/long-filename entries); no directory's own cluster
   chain is ever extended once full (`create_file`/`sys_mkdir` return `DirectoryFull`/`ENOSPC`
@@ -674,11 +887,15 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
   actual cluster number — `parent_of` translates that back on read, `sys_mkdir` writes it correctly
   on create.
 - **There is exactly one, kernel-wide "current directory" (`CURRENT_DIR_CLUSTER`), not a
-  per-process one** — this kernel has no process abstraction at all yet, so there's nothing to
-  scope it to; fine for a single interactive shell, would need real per-process state once more
-  than one thing can be "current" at once. `static mut` for the same reason `DISK`/`OPEN_FILES`
-  are (see below): every read of it happens from within this module's own exported,
-  syscall-reachable functions, so the optimizer can't prove a write to it unobservable.
+  per-process one — a real, now-live limitation, not just a hypothetical.** Real processes exist
+  now (see "Process abstraction, scheduler, and fork/exec/wait" below), so this is no longer "there
+  was nothing to scope it to": one process's `cd` genuinely does affect every other process's
+  relative paths today, kernel-wide global state shared across `fork`ed/`execve`d children exactly
+  like it's shared with the shell itself. Not fixed this pass — flagged as a known limitation, not
+  required for fork/exec/wait correctness, but a real gap for any future multi-process filesystem
+  use beyond a single interactive shell. `static mut` for the same reason `DISK`/`OPEN_FILES` are
+  (see below): every read of it happens from within this module's own exported, syscall-reachable
+  functions, so the optimizer can't prove a write to it unobservable.
 - **A real aliasing bug, found and fixed before it shipped: `module_init`'s own self-check must
   never call `sys_mkdir`/`sys_chdir` while its own `&mut DISK` reference is still "live" in the
   compiler's sense (i.e., used again afterward).** Both functions independently derive their own
@@ -695,14 +912,18 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
   another exported function that itself touches `DISK`, stop using your own outstanding reference
   to it, don't just assume "I'm not writing through it right now" is enough.
 - **Writes are all-at-once-on-`close`, not incremental per `write` call.** `open(..., O_CREAT)` on
-  a new name allocates an `OpenFile::Write` slot with a fixed `[u8; MAX_FILE_BUFFER]` (4096 bytes)
+  a new name allocates an `OpenFile::Write` slot with a fixed `[u8; MAX_FILE_BUFFER]` (`16384`
+  bytes — raised from an original `4096` once `execve` support needed to read `SMOKE.ELF`'s few-KB
+  debug build back whole; see "Process abstraction, scheduler, and fork/exec/wait" below)
   accumulator; each `SYS_WRITE` call appends into it; the file is only actually committed to
   `DISK` (cluster allocation, FAT chaining, directory-entry creation, all via `create_file`) at
   `close` time. A file opened for reading instead caches its *entire* contents into a same-sized
   fixed buffer at `open` time (rather than walking the cluster chain incrementally per `read`
   call) — simpler, and reuses the same "whole file into a fixed buffer" shape already established
   by this module's self-check, at the cost of capping both readable and writable file size at
-  `MAX_FILE_BUFFER` (`open` returns `EFBIG` past that on the read side).
+  `MAX_FILE_BUFFER` (`open` returns `EFBIG` past that on the read side) — `execve`-ing something
+  the size of `stsh` itself (tens of KB) would still need either a larger cap or a streaming read
+  path, real follow-up work, not attempted here.
 - **Testing note: no `#[test_case]` unit tests exist for this module's parsing logic, by
   necessity, not oversight.** `modules/fat32/` is compiled entirely independently of the kernel
   (see "Dynamic kernel modules" above) and only ever runs as relocated, loaded module code — the

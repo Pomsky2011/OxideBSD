@@ -11,14 +11,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    build_userland_crate("ring3-smoke", "RING3_SMOKE_ELF_PATH");
-    build_userland_crate("linux-syscall-smoke", "LINUX_SYSCALL_SMOKE_ELF_PATH");
+    let ring3_smoke_elf_path = build_userland_crate("ring3-smoke", "RING3_SMOKE_ELF_PATH");
     build_userland_crate("stsh", "STSH_ELF_PATH");
+    build_userland_crate("fork-exec-smoke", "FORK_EXEC_SMOKE_ELF_PATH");
 
     build_module_crate("hello", "HELLO", &[]);
     build_module_crate("native_abi", "NATIVE_ABI", &[]);
 
-    let fat32_image_path = write_fat32_image();
+    // ring3-smoke is embedded into the FAT32 image below (as SMOKE.ELF) so stsh's fork+execve+wait
+    // path has a real, already-working target it can run as an actual file, not just another
+    // include_bytes!'d demo -- see CLAUDE.md's process/scheduler section.
+    let ring3_smoke_elf = std::fs::read(&ring3_smoke_elf_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ring3_smoke_elf_path.display()));
+
+    let fat32_image_path = write_fat32_image(&ring3_smoke_elf);
     build_module_crate(
         "fat32",
         "FAT32",
@@ -27,8 +33,10 @@ fn main() {
 }
 
 /// Cross-builds the userland crate at `userland/<crate_name>/` and exposes its resulting ELF's
-/// path via `cargo:rustc-env=<env_var>=<path>`.
-fn build_userland_crate(crate_name: &str, env_var: &str) {
+/// path via `cargo:rustc-env=<env_var>=<path>`, and returns that same path so callers that need
+/// the raw bytes on the host side (`main`, for embedding `ring3-smoke` into the FAT32 image) don't
+/// have to re-derive it.
+fn build_userland_crate(crate_name: &str, env_var: &str) -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let userland_dir = Path::new(manifest_dir).join("userland").join(crate_name);
     let target_dir = Path::new(manifest_dir).join("target/userland");
@@ -80,6 +88,7 @@ fn build_userland_crate(crate_name: &str, env_var: &str) {
         elf_path.display()
     );
     println!("cargo:rustc-env={env_var}={}", elf_path.display());
+    elf_path
 }
 
 /// Cross-builds the kernel module crate at `modules/<crate_name>/` into a single relocatable
@@ -291,8 +300,8 @@ fn discover_panic_symbol(llvm_bin: &Path, object: &Path) -> Option<String> {
 /// root directory as a proper cluster chain (not FAT16's fixed region) -- only this kernel's own
 /// hand-rolled parser (`modules/fat32/`) ever needs to read it, so the "real minimum size" rule is
 /// safe to deliberately violate.
-fn write_fat32_image() -> PathBuf {
-    let image = generate_fat32_image();
+fn write_fat32_image(smoke_elf_bytes: &[u8]) -> PathBuf {
+    let image = generate_fat32_image(smoke_elf_bytes);
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let target_dir = Path::new(manifest_dir).join("target/modules");
     std::fs::create_dir_all(&target_dir).expect("failed to create target/modules");
@@ -314,6 +323,9 @@ const FAT32_ROOT_CLUSTER: u32 = 2;
 const FAT32_HELLO_CLUSTER: u32 = 3;
 const FAT32_BIG_FIRST_CLUSTER: u32 = 4;
 const FAT32_BIG_CLUSTER_COUNT: u32 = 3;
+/// SMOKE.ELF's cluster count isn't a fixed constant like BIG.TXT's -- it depends on the built
+/// `ring3-smoke` ELF's actual size, computed at image-generation time from `smoke_elf_bytes.len()`.
+const FAT32_SMOKE_FIRST_CLUSTER: u32 = FAT32_BIG_FIRST_CLUSTER + FAT32_BIG_CLUSTER_COUNT;
 const FAT32_EOC: u32 = 0x0FFF_FFFF;
 
 const FAT32_HELLO_CONTENTS: &[u8] = b"Hello from FAT32!\n";
@@ -326,7 +338,10 @@ fn fat32_big_file_byte(index: usize) -> u8 {
     b'A' + (index % 26) as u8
 }
 
-fn generate_fat32_image() -> Vec<u8> {
+fn generate_fat32_image(smoke_elf_bytes: &[u8]) -> Vec<u8> {
+    let smoke_cluster_count =
+        (smoke_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
+
     // Solve for the FAT size (in sectors) that exactly covers the clusters left over once that
     // same FAT size is reserved -- a small fixed-point iteration, since the FAT's own size is
     // tiny relative to the volume and converges in only a couple of passes.
@@ -339,6 +354,17 @@ fn generate_fat32_image() -> Vec<u8> {
         fat_size_sectors = fat_bytes_needed.div_ceil(FAT32_BYTES_PER_SECTOR as u32);
     }
     let data_start_sector = FAT32_RESERVED_SECTORS + FAT32_NUM_FATS * fat_size_sectors;
+
+    let highest_cluster_used = FAT32_SMOKE_FIRST_CLUSTER + smoke_cluster_count - 1;
+    let data_clusters =
+        (FAT32_TOTAL_SECTORS - data_start_sector) / FAT32_SECTORS_PER_CLUSTER as u32;
+    assert!(
+        highest_cluster_used < 2 + data_clusters,
+        "ring3-smoke ({} bytes) no longer fits in the embedded FAT32 image ({} total bytes) -- \
+         raise FAT32_TOTAL_SECTORS",
+        smoke_elf_bytes.len(),
+        FAT32_TOTAL_SECTORS as usize * FAT32_BYTES_PER_SECTOR
+    );
 
     let mut image = vec![0u8; FAT32_TOTAL_SECTORS as usize * FAT32_BYTES_PER_SECTOR];
 
@@ -415,6 +441,15 @@ fn generate_fat32_image() -> Vec<u8> {
             };
             write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
         }
+        for i in 0..smoke_cluster_count {
+            let cluster = FAT32_SMOKE_FIRST_CLUSTER + i;
+            let value = if i + 1 == smoke_cluster_count {
+                FAT32_EOC
+            } else {
+                cluster + 1
+            };
+            write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
+        }
     }
 
     let cluster_offset = |cluster: u32| -> usize {
@@ -422,7 +457,7 @@ fn generate_fat32_image() -> Vec<u8> {
             * FAT32_BYTES_PER_SECTOR
     };
 
-    // --- Root directory (cluster 2): volume label + two file entries ---
+    // --- Root directory (cluster 2): volume label + three file entries ---
     {
         let root_offset = cluster_offset(FAT32_ROOT_CLUSTER);
         let mut entry_offset = root_offset;
@@ -444,6 +479,15 @@ fn generate_fat32_image() -> Vec<u8> {
             0x20,
             FAT32_BIG_FIRST_CLUSTER,
             FAT32_BIG_FILE_LEN as u32,
+        );
+        entry_offset += 32;
+        write_dir_entry(
+            &mut image,
+            entry_offset,
+            b"SMOKE   ELF",
+            0x20,
+            FAT32_SMOKE_FIRST_CLUSTER,
+            smoke_elf_bytes.len() as u32,
         );
         // No further entries -- the byte after this one is already 0 (image starts zeroed),
         // which is the FAT directory end-of-listing marker.
@@ -468,6 +512,16 @@ fn generate_fat32_image() -> Vec<u8> {
             }
             written += chunk_len;
             remaining -= chunk_len;
+        }
+    }
+
+    // --- SMOKE.ELF contents (the built ring3-smoke binary, chunked across smoke_cluster_count
+    // clusters exactly like BIG.TXT's chain above, generalized for an arbitrary byte length) ---
+    {
+        for (i, chunk) in smoke_elf_bytes.chunks(FAT32_BYTES_PER_SECTOR).enumerate() {
+            let cluster = FAT32_SMOKE_FIRST_CLUSTER + i as u32;
+            let offset = cluster_offset(cluster);
+            image[offset..offset + chunk.len()].copy_from_slice(chunk);
         }
     }
 

@@ -110,6 +110,57 @@ impl<'a> Elf<'a> {
         VirtAddr::new(self.entry)
     }
 
+    /// The raw `e_phoff`/`e_phnum`/`e_phentsize` header fields — needed for `AT_PHDR`/`AT_PHENT`/
+    /// `AT_PHNUM` in a musl-compatible initial stack (see `src/user_stack.rs`), which musl's own
+    /// `__init_tls` walks to find the `PT_TLS` segment. Exposed as plain accessors rather than one
+    /// struct: `user_stack.rs` needs all three independently, and none of them are sensitive
+    /// internal state the way `bytes`/`phoff` staying private otherwise protects.
+    pub fn phoff(&self) -> u64 {
+        self.phoff as u64
+    }
+
+    pub fn phnum(&self) -> u64 {
+        self.phnum as u64
+    }
+
+    pub fn phentsize(&self) -> u64 {
+        self.phentsize as u64
+    }
+
+    /// The runtime virtual address of the program header table itself (`AT_PHDR`) — the standard
+    /// derivation is `(load bias) + e_phoff`, where "load bias" is the virtual address that file
+    /// offset `0` would map to (`p_vaddr - p_offset`, constant across every `PT_LOAD` segment of a
+    /// well-formed ELF, so any one of them gives the same answer). Computed from the segment with
+    /// the *smallest* `p_offset` rather than requiring one with `p_offset == 0` exactly: this
+    /// codebase's own minimal `userland/*/linker.ld` scripts (unlike a normal linker's default
+    /// script) don't map the ELF header/program header table into any `PT_LOAD` segment at all —
+    /// their first segment typically starts at file offset `0x1000`, not `0` — so the computed
+    /// value there points at memory that was never actually mapped. That's fine: `ring3-smoke`/
+    /// `stsh`/`fork-exec-smoke` never read `AT_PHDR` (they're hand-written `_start` functions that
+    /// ignore the whole initial stack) — only a real libc (musl) built with an ordinary linker
+    /// script, which *does* map the headers, ever dereferences this. `0` if there are no `PT_LOAD`
+    /// segments at all (degenerate; `elf::load` itself would have mapped nothing).
+    pub fn phdr_vaddr(&self) -> u64 {
+        self.program_headers()
+            .filter(|h| h.p_type == PT_LOAD)
+            .min_by_key(|h| h.p_offset)
+            .map(|h| (h.p_vaddr - h.p_offset) + self.phoff as u64)
+            .unwrap_or(0)
+    }
+
+    /// The highest virtual address any `PT_LOAD` segment reaches (`p_vaddr + p_memsz`, page-aligned
+    /// up) — where a fresh heap should start growing from. `0` if there are no `PT_LOAD` segments
+    /// at all (never true in practice for a real `ET_EXEC`, but a harmless base case).
+    pub fn highest_loaded_address(&self) -> u64 {
+        let highest = self
+            .program_headers()
+            .filter(|h| h.p_type == PT_LOAD)
+            .map(|h| h.p_vaddr + h.p_memsz)
+            .max()
+            .unwrap_or(0);
+        highest.div_ceil(PAGE_SIZE) * PAGE_SIZE
+    }
+
     fn program_headers(&self) -> impl Iterator<Item = ProgramHeader> + '_ {
         (0..self.phnum).map(move |i| {
             let offset = self.phoff + i * self.phentsize;

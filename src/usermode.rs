@@ -8,8 +8,12 @@ use crate::gdt::{user_code_selector, user_data_selector};
 
 /// RFLAGS value used for the jump: bit 1 is a reserved bit that must always read as 1, and
 /// `INTERRUPT_FLAG` (bit 9) keeps interrupts enabled in user mode — otherwise the timer could
-/// never preempt a runaway user program, and `int 0x80` (syscalls) would be the only way in.
-const USER_RFLAGS: u64 = 0x202;
+/// never preempt a runaway user program, and `SYSCALL` would be the only way back into the kernel.
+///
+/// `pub(crate)`, not private: `src/syscall.rs`'s `redirect_frame` (used by `sys_execve`) reuses
+/// this exact value when handing a process a fresh program image, rather than trusting whatever
+/// flags (direction flag, debug flags, ...) the old program happened to leave behind.
+pub(crate) const USER_RFLAGS: u64 = 0x202;
 
 /// Jumps into ring 3 at `entry`, running on `user_stack_top`, by hand-building an `iretq` frame.
 ///

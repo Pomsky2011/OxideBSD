@@ -50,7 +50,7 @@ struct Selectors {
 
 static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
-    // Order matters: SYSCALL/SYSRETQ (see src/linux_syscall.rs) reconstruct target segment
+    // Order matters: SYSCALL/SYSRETQ (see src/syscall.rs) reconstruct target segment
     // selectors from IA32_STAR using fixed offsets from two base values, which only works if
     // kernel_code/kernel_data/[placeholder]/user_data/user_code stay in exactly this order and
     // adjacency. `Descriptor::user_*_segment` are already tagged Ring 3 (DPL 3), and
@@ -104,12 +104,54 @@ pub fn user_data_selector() -> SegmentSelector {
     GDT.1.user_data_selector
 }
 
-/// The ring 0 code segment selector — needed by `src/linux_syscall.rs` to program `IA32_STAR`.
+/// The ring 0 code segment selector — needed by `src/syscall.rs` to program `IA32_STAR`.
 pub fn kernel_code_selector() -> SegmentSelector {
     GDT.1.kernel_code_selector
 }
 
-/// The ring 0 data segment selector — needed by `src/linux_syscall.rs` to program `IA32_STAR`.
+/// The ring 0 data segment selector — needed by `src/syscall.rs` to program `IA32_STAR`.
 pub fn kernel_data_selector() -> SegmentSelector {
     GDT.1.kernel_data_selector
+}
+
+/// Mirrors `TSS.privilege_stack_table[0]` (see `set_kernel_stack` below) in a plain, directly
+/// asm-readable location. `SYSCALL` — unlike an interrupt gate + TSS `RSP0` — does **not**
+/// automatically switch onto the kernel stack named there; `src/syscall.rs`'s entry stub has to
+/// do that switch itself, in raw assembly, before it can push anything. It can't read the TSS
+/// directly (`TSS` is a private `spin::Lazy`, and dereferencing a `Lazy` runs its own
+/// initialization logic — not something raw asm can do), so this `static` exists purely to give
+/// that stub a fixed, flat memory location to `mov rsp, [CURRENT_RSP0]` from — same idiom as the
+/// old `src/linux_syscall.rs`'s (now-retired) `KERNEL_RSP_TOP`/`USER_RSP_SCRATCH` no-mangle
+/// statics. `static mut`, not `static`, for the same reason as `TSS`'s own stacks above: it's
+/// written here from ordinary Rust code (visible to the optimizer) but only ever *read* from
+/// asm — the risk isn't "interned into .rodata" here, it's the opposite one documented on
+/// `modules/fat32`'s `DISK`/`CURRENT_DIR_CLUSTER` (a write with no Rust-visible read can be
+/// proven dead) — but `syscall.rs`'s `global_asm!` reading it is invisible to that analysis too,
+/// so it gets the same `static mut` treatment defensively.
+#[unsafe(no_mangle)]
+static mut CURRENT_RSP0: u64 = 0;
+
+/// Repoints `TSS`'s RSP0 (`privilege_stack_table[0]`) at `rsp0` — the stack the CPU automatically
+/// switches to on the *next* ring-3→ring-0 transition caused by an interrupt or exception (and,
+/// via the `CURRENT_RSP0` mirror above, the stack `src/syscall.rs`'s own entry stub manually
+/// switches to for a `SYSCALL`-triggered entry, which gets no automatic switch at all). The
+/// scheduler (`src/scheduler.rs`) calls this on every context switch, right before
+/// `switch_context`, so that a trap or syscall firing while the incoming process runs in ring 3
+/// lands on *its* kernel stack, not whichever process's stack happened to be running previously.
+///
+/// # Safety requirements satisfied here, not by the caller
+///
+/// `Lazy<TaskStateSegment>::deref` only hands out `&TaskStateSegment`, not `&mut` — `spin::Lazy`
+/// has no `DerefMut`. This takes `TSS`'s address (fixed for the process's lifetime: `Lazy` never
+/// moves its storage once forced, and the GDT's TSS descriptor bakes that fixed linear address in
+/// at `init` time, so mutating this field in place is picked up by the CPU with no `ltr`
+/// re-execution needed) and writes through a raw pointer instead. Sound because nothing else ever
+/// holds a live `&TaskStateSegment` across this call: the scheduler only calls this with
+/// interrupts disabled, and this is a single-core kernel.
+pub fn set_kernel_stack(rsp0: VirtAddr) {
+    let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
+    unsafe {
+        (*tss_ptr).privilege_stack_table[0] = rsp0;
+        CURRENT_RSP0 = rsp0.as_u64();
+    }
 }

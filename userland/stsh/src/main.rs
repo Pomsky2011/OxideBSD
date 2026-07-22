@@ -1,8 +1,8 @@
 //! stsh ("stupidshell") — a genuinely minimal interactive shell for OxideBSD.
 //!
 //! Not part of the kernel — this is a standalone ELF binary, built by the kernel's `build.rs` and
-//! embedded via `include_bytes!`, that the kernel loads and jumps into. Unlike every earlier
-//! userland demo (`ring3-smoke`, `linux-syscall-smoke`), this one doesn't print a message and
+//! embedded via `include_bytes!`, that the kernel loads and jumps into. Unlike the earlier
+//! userland demo (`ring3-smoke`), this one doesn't print a message and
 //! exit — it loops forever, reading a line at a time from the keyboard (via `SYS_READ`, busy-polled
 //! since reads are non-blocking — see `CLAUDE.md`'s shell section for why) and dispatching a
 //! small set of built-in commands, until `exit` is typed.
@@ -20,17 +20,22 @@
 //! actually commits the file to the fat32 module's in-memory disk — see that module's own doc
 //! comment on why writes are all-at-once-on-close, not incremental).
 //!
-//! `cd`/`ls`/`mkdir` are also just built-in commands here, dispatched the same way as `cat`/
-//! `write` — not separate programs `stsh` loads and execs (this kernel has no process abstraction
-//! or scheduler, so there's nowhere for a real `exec` to return control to afterward; adding one
-//! is real, separate follow-up work, not attempted here). `cd` has to be a shell built-in in any
-//! case, for the same reason it always is in a real shell: changing the *shell's own* notion of
-//! "current directory" from a separate child process is impossible, since a child can't reach
-//! back into its parent's state. `ls` reuses the exact same `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE`
-//! sequence as `cat` — `modules/fat32/`'s `fat32_open` recognizes a directory target and hands
-//! back a formatted listing instead of file content, so no separate syscall was needed for it.
+//! `cd`/`ls`/`mkdir` are still just built-in commands here, dispatched the same way as `cat`/
+//! `write` — not separate programs. `cd` has to be a shell built-in regardless of process support:
+//! changing the *shell's own* notion of "current directory" from a separate child process is
+//! impossible, since a child can't reach back into its parent's state. `ls` reuses the exact same
+//! `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE` sequence as `cat` — `modules/fat32/`'s `fat32_open` recognizes
+//! a directory target and hands back a formatted listing instead of file content, so no separate
+//! syscall was needed for it.
 //!
-//! The syscall numbers/vector/register convention here must match `src/syscall.rs` in the kernel
+//! Any other command name is treated as a real program to run: `run_command` `fork`s, the child
+//! `execve`s the typed word as a path (against the same FAT32-backed filesystem `cat`/`write`
+//! already use — see `build.rs`'s embedded `SMOKE.ELF`, a copy of `userland/ring3-smoke/`, for a
+//! ready-made target), and the parent `wait4`s for it. If `execve` fails (e.g. the name doesn't
+//! exist — `ENOENT`), the child itself prints "unknown command" and exits `127`, matching real
+//! shell behavior; the parent's `wait4` always runs either way, so the prompt reliably comes back.
+//!
+//! The syscall numbers/register convention here must match `src/syscall.rs` in the kernel
 //! exactly — there's no shared crate between the two, this is the ABI boundary itself.
 #![no_std]
 #![no_main]
@@ -39,38 +44,43 @@ use core::arch::asm;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
 
-const SYSCALL_VECTOR: u32 = 0x80;
 const SYS_EXIT: u64 = 1;
+const SYS_FORK: u64 = 2;
 const SYS_READ: u64 = 3;
 const SYS_WRITE: u64 = 4;
 const SYS_OPEN: u64 = 5;
 const SYS_CLOSE: u64 = 6;
+const SYS_WAIT4: u64 = 7;
 const SYS_CHDIR: u64 = 12;
 const SYS_MKDIR: u64 = 136;
+const SYS_EXECVE: u64 = 59;
 const STDIN: u64 = 0;
 const STDOUT: u64 = 1;
 const O_CREAT: u64 = 1;
 
 const LINE_CAPACITY: usize = 128;
 
-/// Issues a syscall: number in `rax`, up to three arguments in `rdi`/`rsi`/`rdx`. Success/failure
-/// comes back via the carry flag (OxideBSD's native, BSD-style convention) — `Ok(value)` if `CF`
-/// came back clear, `Err(errno)` if it came back set. The kernel's `syscall_entry` preserves every
-/// other register, so nothing here needs to be marked clobbered.
+/// Issues a syscall via `SYSCALL`: number in `rax`, up to three arguments in `rdi`/`rsi`/`rdx`.
+/// Success/failure comes back via the carry flag (OxideBSD's native, BSD-style convention) —
+/// `Ok(value)` if `CF` came back clear, `Err(errno)` if it came back set. `rcx`/`r11` must be
+/// declared clobbered: `SYSCALL` itself overwrites them (to save `RIP`/`RFLAGS` on entry), so
+/// whatever this program had in them beforehand doesn't survive the call — the kernel's
+/// `syscall_entry` preserves every other register.
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
     let ret: u64;
     let failed: u8;
     unsafe {
         asm!(
-            "int {vector}",
+            "syscall",
             "setc {failed}",
-            vector = const SYSCALL_VECTOR,
             inlateout("rax") number => ret,
             in("rdi") arg0,
             in("rsi") arg1,
             in("rdx") arg2,
             failed = out(reg_byte) failed,
+            lateout("rcx") _,
+            lateout("r11") _,
         );
     }
     if failed != 0 { Err(ret) } else { Ok(ret) }
@@ -197,7 +207,7 @@ fn run_command(line: &[u8]) {
     match command {
         b"help" => write_bytes(
             b"commands: help, echo <text>, exit, cat <name>, write <name> <text>, cd [path], \
-              ls [path], mkdir <name>\n",
+              ls [path], mkdir <name>; anything else is run as a program (e.g. smoke.elf)\n",
         ),
         b"echo" => {
             write_bytes(trim(rest));
@@ -211,9 +221,49 @@ fn run_command(line: &[u8]) {
         b"cd" => cd(trim(rest)),
         b"ls" => ls(trim(rest)),
         b"mkdir" => mkdir(trim(rest)),
-        _ => {
-            write_bytes(b"unknown command: ");
-            write_bytes(command);
+        _ => run_program(command),
+    }
+}
+
+/// `fork`/`wait4`/`execve` wrappers -- same generic `syscall()` helper every other command here
+/// already uses, no new inline asm needed.
+fn fork() -> Result<u64, u64> {
+    unsafe { syscall(SYS_FORK, 0, 0, 0) }
+}
+
+fn wait4(pid: u64, status: &mut i32, options: u64) -> Result<u64, u64> {
+    unsafe { syscall(SYS_WAIT4, pid, status as *mut i32 as u64, options) }
+}
+
+fn execve(path: &[u8]) -> Result<u64, u64> {
+    unsafe { syscall(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64, 0) }
+}
+
+/// Anything that isn't a recognized built-in is treated as a real program to run: `fork`, `execve`
+/// the typed word as a path in the child, `wait4` in the parent. `execve` only ever "returns" here
+/// on failure -- on success the kernel redirects the child's own execution directly, so the
+/// `is_err()` check below is the only path that can run afterward.
+fn run_program(name: &[u8]) {
+    match fork() {
+        Ok(0) => {
+            if execve(name).is_err() {
+                write_bytes(b"unknown command: ");
+                write_bytes(name);
+                write_bytes(b"\n");
+            }
+            unsafe {
+                let _ = syscall(SYS_EXIT, 127, 0, 0);
+            }
+        }
+        Ok(child_pid) => {
+            // Parent: always wait, regardless of how the child fared, so the prompt reliably
+            // comes back.
+            let mut status: i32 = 0;
+            let _ = wait4(child_pid, &mut status, 0);
+        }
+        Err(errno) => {
+            write_bytes(b"fork failed, errno ");
+            write_decimal(errno);
             write_bytes(b"\n");
         }
     }

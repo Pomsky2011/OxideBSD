@@ -1,8 +1,8 @@
 [workspace]
 members = [
   "userland/ring3-smoke",
-  "userland/linux-syscall-smoke",
   "userland/stsh",
+  "userland/fork-exec-smoke",
   "modules/hello",
   "modules/native_abi",
   "modules/fat32",
@@ -23,6 +23,10 @@ x86_64 = { version = "0.15", default-features = false, features = ["instructions
 
 [[test]]
 name = "basic_boot"
+harness = false
+
+[[test]]
+name = "fork_wait"
 harness = false
 
 [package.metadata.bootimage]

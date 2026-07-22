@@ -8,7 +8,7 @@
 //! error convention in *both* directions (not just the happy path), then terminates via `SYS_EXIT`
 //! with the computed checksum as its exit code.
 //!
-//! The syscall numbers/vector/register convention here must match `src/syscall.rs` in the kernel
+//! The syscall numbers/register convention here must match `src/syscall.rs` in the kernel
 //! exactly — there's no shared crate between the two, this is the ABI boundary itself.
 #![no_std]
 #![no_main]
@@ -17,32 +17,33 @@ use core::arch::asm;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
 
-const SYSCALL_VECTOR: u32 = 0x80;
 const SYS_EXIT: u64 = 1;
 const SYS_WRITE: u64 = 4;
 const STDOUT: u64 = 1;
 const INVALID_FD: u64 = 42;
 const EBADF: u64 = 9;
 
-/// Issues a syscall: number in `rax`, up to three arguments in `rdi`/`rsi`/`rdx`. Success/failure
-/// comes back via the carry flag (OxideBSD's native, BSD-style convention, distinct from Linux's
-/// negative-`RAX` one) — `Ok(value)` if `CF` came back clear, `Err(errno)` if it came back set.
-/// The kernel's `syscall_entry` preserves every other register, so nothing here needs to be marked
-/// clobbered.
+/// Issues a syscall via `SYSCALL`: number in `rax`, up to three arguments in `rdi`/`rsi`/`rdx`.
+/// Success/failure comes back via the carry flag (OxideBSD's native, BSD-style convention) —
+/// `Ok(value)` if `CF` came back clear, `Err(errno)` if it came back set. `rcx`/`r11` must be
+/// declared clobbered: `SYSCALL` itself overwrites them (to save `RIP`/`RFLAGS` on entry), so
+/// whatever this program had in them beforehand doesn't survive the call — the kernel's
+/// `syscall_entry` preserves every other register.
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
     let ret: u64;
     let failed: u8;
     unsafe {
         asm!(
-            "int {vector}",
+            "syscall",
             "setc {failed}",
-            vector = const SYSCALL_VECTOR,
             inlateout("rax") number => ret,
             in("rdi") arg0,
             in("rsi") arg1,
             in("rdx") arg2,
             failed = out(reg_byte) failed,
+            lateout("rcx") _,
+            lateout("r11") _,
         );
     }
     if failed != 0 { Err(ret) } else { Ok(ret) }
