@@ -56,7 +56,9 @@ const SYS_MKDIR: u64 = 136;
 const SYS_EXECVE: u64 = 59;
 const STDIN: u64 = 0;
 const STDOUT: u64 = 1;
-const O_CREAT: u64 = 1;
+/// Real POSIX `O_CREAT`'s value, not an arbitrary bit -- see `modules/fat32/src/lib.rs`'s own
+/// `O_CREAT` doc comment for why this constant must match `fat32_open`'s exactly.
+const O_CREAT: u64 = 0o100;
 
 const LINE_CAPACITY: usize = 128;
 /// Bounds how many words past the command name `execve`'s argv[1..] can carry -- a sanity cap,

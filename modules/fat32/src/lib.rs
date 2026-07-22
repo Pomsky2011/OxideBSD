@@ -87,10 +87,16 @@ const SYS_CLOSE: u64 = 6;
 const SYS_CHDIR: u64 = 12;
 const SYS_MKDIR: u64 = 136;
 
-/// `open`'s `flags` bit 0: create the file if it doesn't already exist. No other flag bits are
-/// interpreted -- not a claim of compatibility with real BSD/POSIX `open` flag values, same
-/// "authenticity nod, not compatibility" spirit as this module's syscall numbers.
-const O_CREAT: u64 = 1;
+/// `open`'s `flags`: create the file if it doesn't already exist. No other flag bits are
+/// interpreted. Deliberately the *real* POSIX `O_CREAT` value (`0o100`), not an arbitrary
+/// OxideBSD-invented bit like this module's syscall numbers otherwise use -- this one used to be
+/// bit 0 (`1`), which happens to collide with real POSIX's `O_WRONLY`. Harmless as long as only
+/// `stsh`'s own native-ABI caller (which never sets that bit) constructs flags, but musl's real
+/// `open()` (patched to speak this module's wire format directly -- see CLAUDE.md's musl-port
+/// section) passes real POSIX flag values, where a plain `O_WRONLY` open with no `O_CREAT` would
+/// otherwise be silently misread as "create". Matching the real bit sidesteps the collision
+/// entirely rather than working around it.
+const O_CREAT: u64 = 0o100;
 
 const EBADF: i64 = 9;
 const ENOENT: i64 = 2;
@@ -198,7 +204,8 @@ fn to_short_name(input: &[u8]) -> Option<[u8; 11]> {
 }
 
 /// Registered for `SYS_OPEN`. `path_ptr`/`path_len` name the target (converted via
-/// `to_short_name`, see the module doc comment for the path grammar); `flags` bit 0 is `O_CREAT`.
+/// `to_short_name`, see the module doc comment for the path grammar); `flags & O_CREAT` requests
+/// creation (see `O_CREAT`'s own doc comment for its real POSIX value and why that matters now).
 /// If the resolved name is a directory (or the path names the current directory itself, or root),
 /// this "opens" a formatted listing rather than file content -- see the module doc comment's note
 /// on `ls`. Returns a new fd on success, or a negative `-errno` (`ENOENT` if a file doesn't exist

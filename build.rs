@@ -33,24 +33,39 @@ fn main() {
     let musl_smoke_elf = std::fs::read(&musl_smoke_elf_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", musl_smoke_elf_path.display()));
 
-    // The first two BusyBox applets ported to OxideBSD -- see CLAUDE.md's BusyBox section. Each is
-    // its own genuinely standalone, single-applet static binary (not a multi-call `busybox` binary
+    // BusyBox applets ported to OxideBSD -- see CLAUDE.md's BusyBox section. Each is its own
+    // genuinely standalone, single-applet static binary (not a multi-call `busybox` binary
     // dispatching on argv[0], which this codebase's execve doesn't support -- see
-    // build_busybox_applet's own doc comment), embedded into the FAT32 image below as TRUE.ELF/
-    // ECHO.ELF the same way SMOKE.ELF/MUSL.ELF already are.
-    let busybox_true_elf_path = build_busybox_applet("TRUE", "true", 0xb00000, &musl_sysroot);
-    let busybox_true_elf = std::fs::read(&busybox_true_elf_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", busybox_true_elf_path.display()));
-    let busybox_echo_elf_path = build_busybox_applet("ECHO", "echo", 0xc00000, &musl_sysroot);
-    let busybox_echo_elf = std::fs::read(&busybox_echo_elf_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", busybox_echo_elf_path.display()));
+    // build_busybox_applet's own doc comment), embedded into the FAT32 image below as
+    // <NAME>.ELF the same way SMOKE.ELF/MUSL.ELF already are. Data-driven (a plain list, not one
+    // hand-duplicated block of variables per applet like the original TRUE/ECHO-only version of
+    // this function) specifically so adding the next applet is a one-line addition here, not a
+    // matching set of edits scattered across this function and generate_fat32_image below. Load
+    // addresses continue the existing `0x<b|c|d...>00000` sequence every prior userland/BusyBox
+    // binary in this codebase already claimed one of (see CLAUDE.md's "User-mode execution"
+    // section) -- each must stay clear of every other one already in use.
+    //
+    // `cat` is the first applet added after `true`/`echo` that actually calls `open()` on a real
+    // path -- see CLAUDE.md's musl-port section for the open()/SYS_OPEN argument-convention fix
+    // (musl's `open()` is now patched to speak fat32_open's own (path_ptr, path_len, flags) wire
+    // format directly) that had to land before this could work at all.
+    const BUSYBOX_APPLETS: &[(&str, &str, u64)] = &[
+        ("TRUE", "true", 0xb00000),
+        ("ECHO", "echo", 0xc00000),
+        ("CAT", "cat", 0xd00000),
+    ];
+    let busybox_applet_elfs: Vec<(&str, Vec<u8>)> = BUSYBOX_APPLETS
+        .iter()
+        .map(|&(applet_symbol, out_name, load_addr)| {
+            let elf_path = build_busybox_applet(applet_symbol, out_name, load_addr, &musl_sysroot);
+            let elf_bytes = std::fs::read(&elf_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", elf_path.display()));
+            (out_name, elf_bytes)
+        })
+        .collect();
 
-    let fat32_image_path = write_fat32_image(
-        &ring3_smoke_elf,
-        &musl_smoke_elf,
-        &busybox_true_elf,
-        &busybox_echo_elf,
-    );
+    let fat32_image_path =
+        write_fat32_image(&ring3_smoke_elf, &musl_smoke_elf, &busybox_applet_elfs);
     build_module_crate(
         "fat32",
         "FAT32",
@@ -561,15 +576,9 @@ fn discover_panic_symbol(llvm_bin: &Path, object: &Path) -> Option<String> {
 fn write_fat32_image(
     smoke_elf_bytes: &[u8],
     musl_elf_bytes: &[u8],
-    busybox_true_elf_bytes: &[u8],
-    busybox_echo_elf_bytes: &[u8],
+    busybox_applet_elfs: &[(&str, Vec<u8>)],
 ) -> PathBuf {
-    let image = generate_fat32_image(
-        smoke_elf_bytes,
-        musl_elf_bytes,
-        busybox_true_elf_bytes,
-        busybox_echo_elf_bytes,
-    );
+    let image = generate_fat32_image(smoke_elf_bytes, musl_elf_bytes, busybox_applet_elfs);
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let target_dir = Path::new(manifest_dir).join("target/modules");
     std::fs::create_dir_all(&target_dir).expect("failed to create target/modules");
@@ -609,29 +618,58 @@ fn fat32_big_file_byte(index: usize) -> u8 {
     b'A' + (index % 26) as u8
 }
 
+/// One BusyBox applet's placement in the image, computed by `generate_fat32_image` by folding
+/// over `busybox_applet_elfs` in order -- each applet's first cluster starts right after the
+/// previous one's chain ends, the same "chain on after whatever came before" pattern MUSL.ELF
+/// itself already uses to chain on after SMOKE.ELF.
+struct PlacedApplet<'a> {
+    short_name: [u8; 11],
+    bytes: &'a [u8],
+    first_cluster: u32,
+    cluster_count: u32,
+}
+
+/// Builds a FAT 8.3 short name (`"NAME    ELF"`) from an applet's lowercase `out_name` (e.g.
+/// `"true"`) -- uppercased, space-padded to 8 characters, `ELF` extension. Panics if `out_name` is
+/// too long for an 8.3 basename; every applet name this codebase embeds is short enough that this
+/// is a real assertion, not defensive dead code.
+fn busybox_short_name(out_name: &str) -> [u8; 11] {
+    assert!(
+        out_name.len() <= 8 && out_name.is_ascii(),
+        "BusyBox applet name {out_name:?} doesn't fit an 8.3 short name"
+    );
+    let mut name = [b' '; 11];
+    for (i, b) in out_name.bytes().enumerate() {
+        name[i] = b.to_ascii_uppercase();
+    }
+    name[8..11].copy_from_slice(b"ELF");
+    name
+}
+
 fn generate_fat32_image(
     smoke_elf_bytes: &[u8],
     musl_elf_bytes: &[u8],
-    busybox_true_elf_bytes: &[u8],
-    busybox_echo_elf_bytes: &[u8],
+    busybox_applet_elfs: &[(&str, Vec<u8>)],
 ) -> Vec<u8> {
     let smoke_cluster_count =
         (smoke_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
     let musl_first_cluster = FAT32_SMOKE_FIRST_CLUSTER + smoke_cluster_count;
     let musl_cluster_count = (musl_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
-    // TRUE.ELF/ECHO.ELF (the first two BusyBox applets ported to OxideBSD -- see CLAUDE.md's
-    // BusyBox section) chain on after MUSL.ELF exactly the way MUSL.ELF itself chains on after
-    // SMOKE.ELF above -- same pattern, just two files further down the chain.
-    let busybox_true_first_cluster = musl_first_cluster + musl_cluster_count;
-    let busybox_true_cluster_count = (busybox_true_elf_bytes
-        .len()
-        .div_ceil(FAT32_BYTES_PER_SECTOR) as u32)
-        .max(1);
-    let busybox_echo_first_cluster = busybox_true_first_cluster + busybox_true_cluster_count;
-    let busybox_echo_cluster_count = (busybox_echo_elf_bytes
-        .len()
-        .div_ceil(FAT32_BYTES_PER_SECTOR) as u32)
-        .max(1);
+
+    // Each BusyBox applet (see CLAUDE.md's BusyBox section) chains on after the previous one --
+    // MUSL.ELF for the first applet, the previous applet for every one after that.
+    let mut placed_applets: Vec<PlacedApplet> = Vec::new();
+    let mut next_free_cluster = musl_first_cluster + musl_cluster_count;
+    for (out_name, elf_bytes) in busybox_applet_elfs {
+        let cluster_count = (elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
+        placed_applets.push(PlacedApplet {
+            short_name: busybox_short_name(out_name),
+            bytes: elf_bytes,
+            first_cluster: next_free_cluster,
+            cluster_count,
+        });
+        next_free_cluster += cluster_count;
+    }
 
     // Solve for the FAT size (in sectors) that exactly covers the clusters left over once that
     // same FAT size is reserved -- a small fixed-point iteration, since the FAT's own size is
@@ -646,18 +684,17 @@ fn generate_fat32_image(
     }
     let data_start_sector = FAT32_RESERVED_SECTORS + FAT32_NUM_FATS * fat_size_sectors;
 
-    let highest_cluster_used = busybox_echo_first_cluster + busybox_echo_cluster_count - 1;
+    let highest_cluster_used = next_free_cluster - 1;
     let data_clusters =
         (FAT32_TOTAL_SECTORS - data_start_sector) / FAT32_SECTORS_PER_CLUSTER as u32;
     assert!(
         highest_cluster_used < 2 + data_clusters,
-        "ring3-smoke ({} bytes) + musl-smoke ({} bytes) + busybox true ({} bytes) + busybox echo \
-         ({} bytes) no longer fit in the embedded FAT32 image ({} total bytes) -- raise \
-         FAT32_TOTAL_SECTORS",
+        "ring3-smoke ({} bytes) + musl-smoke ({} bytes) + {} BusyBox applet(s) ({} bytes total) \
+         no longer fit in the embedded FAT32 image ({} total bytes) -- raise FAT32_TOTAL_SECTORS",
         smoke_elf_bytes.len(),
         musl_elf_bytes.len(),
-        busybox_true_elf_bytes.len(),
-        busybox_echo_elf_bytes.len(),
+        placed_applets.len(),
+        placed_applets.iter().map(|a| a.bytes.len()).sum::<usize>(),
         FAT32_TOTAL_SECTORS as usize * FAT32_BYTES_PER_SECTOR
     );
 
@@ -754,23 +791,16 @@ fn generate_fat32_image(
             };
             write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
         }
-        for i in 0..busybox_true_cluster_count {
-            let cluster = busybox_true_first_cluster + i;
-            let value = if i + 1 == busybox_true_cluster_count {
-                FAT32_EOC
-            } else {
-                cluster + 1
-            };
-            write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
-        }
-        for i in 0..busybox_echo_cluster_count {
-            let cluster = busybox_echo_first_cluster + i;
-            let value = if i + 1 == busybox_echo_cluster_count {
-                FAT32_EOC
-            } else {
-                cluster + 1
-            };
-            write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
+        for applet in &placed_applets {
+            for i in 0..applet.cluster_count {
+                let cluster = applet.first_cluster + i;
+                let value = if i + 1 == applet.cluster_count {
+                    FAT32_EOC
+                } else {
+                    cluster + 1
+                };
+                write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
+            }
         }
     }
 
@@ -820,24 +850,17 @@ fn generate_fat32_image(
             musl_first_cluster,
             musl_elf_bytes.len() as u32,
         );
-        entry_offset += 32;
-        write_dir_entry(
-            &mut image,
-            entry_offset,
-            b"TRUE    ELF",
-            0x20,
-            busybox_true_first_cluster,
-            busybox_true_elf_bytes.len() as u32,
-        );
-        entry_offset += 32;
-        write_dir_entry(
-            &mut image,
-            entry_offset,
-            b"ECHO    ELF",
-            0x20,
-            busybox_echo_first_cluster,
-            busybox_echo_elf_bytes.len() as u32,
-        );
+        for applet in &placed_applets {
+            entry_offset += 32;
+            write_dir_entry(
+                &mut image,
+                entry_offset,
+                &applet.short_name,
+                0x20,
+                applet.first_cluster,
+                applet.bytes.len() as u32,
+            );
+        }
         // No further entries -- the byte after this one is already 0 (image starts zeroed),
         // which is the FAT directory end-of-listing marker.
     }
@@ -884,22 +907,11 @@ fn generate_fat32_image(
         }
     }
 
-    // --- TRUE.ELF / ECHO.ELF contents (the built standalone BusyBox applets -- see CLAUDE.md's
-    // BusyBox section -- chunked the same way SMOKE.ELF/MUSL.ELF's own bytes are above) ---
-    {
-        for (i, chunk) in busybox_true_elf_bytes
-            .chunks(FAT32_BYTES_PER_SECTOR)
-            .enumerate()
-        {
-            let cluster = busybox_true_first_cluster + i as u32;
-            let offset = cluster_offset(cluster);
-            image[offset..offset + chunk.len()].copy_from_slice(chunk);
-        }
-        for (i, chunk) in busybox_echo_elf_bytes
-            .chunks(FAT32_BYTES_PER_SECTOR)
-            .enumerate()
-        {
-            let cluster = busybox_echo_first_cluster + i as u32;
+    // --- BusyBox applet contents (see CLAUDE.md's BusyBox section -- chunked the same way
+    // SMOKE.ELF/MUSL.ELF's own bytes are above) ---
+    for applet in &placed_applets {
+        for (i, chunk) in applet.bytes.chunks(FAT32_BYTES_PER_SECTOR).enumerate() {
+            let cluster = applet.first_cluster + i as u32;
             let offset = cluster_offset(cluster);
             image[offset..offset + chunk.len()].copy_from_slice(chunk);
         }

@@ -56,14 +56,17 @@ the hardware level at all (`src/fpu.rs`, new); and a new `SYS_WRITEV` syscall wa
 musl's entire stdio write path goes through `writev`, not plain `write` — see "musl port" for the
 full story of each.
 
-**The first two BusyBox applets now run on top of that same musl** (see "BusyBox port" below):
-`true`/`echo`, each its own genuinely standalone, single-applet static binary (not a multi-call
+**Three BusyBox applets now run on top of that same musl** (see "BusyBox port" below): `true`/
+`echo`/`cat`, each its own genuinely standalone, single-applet static binary (not a multi-call
 `busybox` binary dispatching on argv[0], which this codebase's `execve` doesn't support),
-`execve`'d by `stsh` as `TRUE.ELF`/`ECHO.ELF` exactly like `MUSL.ELF`. Unlike the musl port, this
+`execve`'d by `stsh` as `TRUE.ELF`/`ECHO.ELF`/`CAT.ELF` exactly like `MUSL.ELF`. `true`/`echo`
 needed no new kernel syscalls at all — both ran cleanly the first time they were booted, modulo the
-same already-known-harmless `set_tid_address` gap musl's own startup already has. New syscalls
-BusyBox's *later* applets need will be registered by a new, deliberately separate module,
-`modules/posix_compat/` (currently empty), rather than growing `modules/native_abi/` further.
+same already-known-harmless `set_tid_address` gap musl's own startup already has. `cat` needed one
+real fix: real `open()`'s argument convention didn't match OxideBSD's `SYS_OPEN` at all (a gap
+`musl-smoke` itself never exercised, since it never calls `open()`) — now fixed on the musl side,
+see "BusyBox port" below. New syscalls a future applet needs will be registered by a new,
+deliberately separate module, `modules/posix_compat/` (currently empty), rather than growing
+`modules/native_abi/` further.
 
 See "User-mode execution", "Syscall ABI", "musl port", "BusyBox port", "Interactive shell",
 "Dynamic kernel modules", "FAT32 filesystem module", and "Process abstraction, scheduler, and
@@ -569,15 +572,18 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
   - **`AT_RANDOM`'s 16 bytes are a fixed placeholder, not real entropy** — this kernel has no
     entropy source at all yet; musl only requires the bytes be *present* (it uses them for the
     stack-protector canary and as an `arc4random` seed), not unpredictable, for now.
-- **Two known real argument-convention mismatches, deliberately left unfixed rather than silently
-  half-fixed:**
-  - **`open`**: real `open()`/musl's own `__syscall3(SYS_open, path, flags, mode)` passes a
-    null-terminated C string pointer plus `(flags, mode)`. OxideBSD's `SYS_OPEN`
-    (`modules/fat32/fat32_open`) takes `(path_ptr, path_len, flags)` — a length-prefixed pointer,
-    no null-terminator requirement, no `mode` argument at all. Fixing this needs either a musl-side
-    `open()` override or an OxideBSD-side argument-convention change; neither done yet, so
-    `__NR_open` stays unmapped (see above) — `musl-smoke` doesn't call `open()`, so this hasn't
-    blocked anything yet.
+- **Two known real argument-convention mismatches; `open`'s is now fixed, `execve`'s still isn't:**
+  - **`open`** — **fixed, on the musl side** (see CLAUDE.md's BusyBox section for the full story;
+    `cat`, not anything in the musl-smoke pass itself, is what forced this). Real `open()`/musl's
+    own generic `__syscall3(SYS_open, path, flags, mode)` passes a null-terminated C string pointer
+    plus `(flags, mode)`; OxideBSD's `SYS_OPEN` (`modules/fat32/fat32_open`) takes `(path_ptr,
+    path_len, flags)` — a length-prefixed pointer, no null-terminator requirement, no `mode`
+    argument at all. `third_party/musl`'s `src/fcntl/open.c` (on the fork's `oxidebsd` branch) now
+    builds that shape directly (`path_len` via `strlen()`, `mode` discarded) instead of going
+    through the generic macros, and `bits/syscall.h.in`'s `SYS_open` is remapped to the real
+    `SYS_OPEN = 5` so the call actually reaches `fat32_open`. `musl-smoke` itself still never calls
+    `open()`, so this was untested by the original musl-port pass — `cat.elf hello.txt` (BusyBox
+    section) is the actual end-to-end proof.
   - **`execve`**: numerically unchanged from upstream (`59` happens to already be OxideBSD's real
     `SYS_EXECVE`), but not actually argument-compatible: musl's `execve()` passes `(path, argv,
     envp)` in `RDI`/`RSI`/`RDX`; OxideBSD's `SYS_EXECVE` (`process::do_execve`) expects `(path_ptr,
@@ -617,16 +623,18 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
 - **What's explicitly still out of scope, the same way real BusyBox running was flagged out of
   scope before that port started (see "BusyBox port" below for where it actually started)**: a
   real, general-purpose libc-on-OxideBSD story (this is one hand-picked static binary exercising
-  `printf`, not a validated general surface), `envp` passthrough across `execve`, and fixing the
-  `open`/`execve` argument mismatches above — real, substantial follow-up work, not attempted yet.
+  `printf`, not a validated general surface), `envp` passthrough across `execve`, and `execve`'s
+  own argument mismatch above (`open`'s twin mismatch was fixed later, by the BusyBox `cat` pass —
+  see "BusyBox port" below) — real, substantial follow-up work, not attempted yet.
 
 ## BusyBox port (`third_party/busybox`, `modules/posix_compat/`)
 
 The natural next step once a real musl static binary ran end to end (see "musl port" above):
 BusyBox applets, built against that same patched musl, `execve`'d by `stsh` exactly like
-`MUSL.ELF`. Scoped deliberately narrowly for this first pass — just `true` and `echo` — to prove
+`MUSL.ELF`. Scoped deliberately narrowly for the first pass — just `true` and `echo` — to prove
 the mechanism (a real BusyBox build, cross-compiled and embedded) before attempting anything
-resembling a shell or a real toolbox.
+resembling a shell or a real toolbox. A second pass added `cat` — see the `open()`-argument-
+convention-fix bullet below, since `cat` is the first applet that actually needs it.
 
 - **Vendored as a submodule pointing at a personal GitHub fork** (`third_party/busybox`, pinned to
   release tag `1_36_1`), mirroring `third_party/musl`'s own setup exactly — a parking spot for
@@ -714,15 +722,56 @@ resembling a shell or a real toolbox.
   empty (registers nothing) — `true`/`echo` didn't need it — but wired into the boot sequence
   (`src/main.rs`, loaded right after `native_abi`) and the workspace already, so the next syscall a
   future applet needs is a one-line addition to its `module_init`, not new scaffolding.
-- **What's explicitly still out of scope for this pass**: the `sh` applet (needs real process
-  spawning/piping from *inside* a BusyBox process, a much bigger undertaking than a `NOFORK`
-  applet like `true`/`echo`), multi-applet dispatch in a single binary (still blocked — `argv[0]`
-  itself is still always the `execve` path, never caller-chosen; only `argv[1..]` is real now, see
-  above), `envp` passthrough through `execve` (`argv[1..]` is real now, `envp` still isn't), the
-  `open`/`execve` argument-convention mismatches "musl port" above already flags (still
-  not needed — neither `true` nor `echo` calls `open()` or re-`execve`s itself), persistence, and
-  any automated integration test (verified manually via QEMU + injected keystrokes instead, the
-  same method every interactive `stsh` feature already uses — see "FAT32 filesystem module" below).
+- **`open()`'s argument-convention mismatch (see "musl port" above) is fixed, on the musl side —
+  `cat` is the applet that needed it.** `true`/`echo` never touch the filesystem; `cat` is the
+  first applet ported that does, so it's what actually forced this. `third_party/musl`'s
+  `src/fcntl/open.c` (on the fork's `oxidebsd` branch) no longer goes through the generic
+  `__sys_open_cp`/`__syscall3(SYS_open, path, flags, mode)` macros bits/syscall.h.in defines for
+  every other architecture-independent caller — it now calls `__syscall3(SYS_open, filename,
+  strlen(filename), flags)` directly: OxideBSD's own wire format (`path_ptr`, `path_len`, `flags`),
+  computing `path_len` from the NUL-terminated string real callers always pass, dropping `mode`
+  entirely (`fat32_open` doesn't model permissions). `bits/syscall.h.in`'s `SYS_open` is now
+  remapped to the real `SYS_OPEN = 5` (previously deliberately left unmapped — see "musl port"
+  above for why) so the call actually reaches `fat32_open` at all. **A real, if latent, numeric
+  collision this remap exposes**: `SYS_fstat`'s own untouched-from-Linux value is also `5` — no
+  static binary run through this port so far calls `fstat()` (confirmed for musl's own startup,
+  `true`/`echo`, and `cat`'s plain read path), so this hasn't bitten anything yet, but the moment
+  one does, it'll silently reach `fat32_open` with a small integer fd reinterpreted as a `path_ptr`
+  instead of cleanly `ENOSYS`ing — flagged in `bits/syscall.h.in`'s own comment, not fixed there
+  since nothing reaches it yet. **A second, independent bug found and fixed alongside this**:
+  `modules/fat32/`'s own `O_CREAT` constant used to be an arbitrary bit-0 value (`1`), which
+  happens to collide with real POSIX's `O_WRONLY` (also `1`) — harmless while only `stsh`'s own
+  native-ABI `write` built-in (which never sets that bit) constructed `flags`, but a real bug once
+  musl's real `open()` flags started flowing through unmodified: a plain `O_WRONLY`-with-no-
+  `O_CREAT` open would've been silently misread as "create". Fixed by giving `O_CREAT` the real
+  POSIX value (`0o100`) instead of working around the collision — `modules/fat32/src/lib.rs` and
+  `userland/stsh/src/main.rs` both updated in lockstep, the only two places that constant is
+  defined. `execve`'s own, separate argument-convention mismatch (real `execve(path, argv, envp)`
+  vs. OxideBSD's `(path_ptr, path_len, argv_ptr)`) is untouched — still nothing in this port calls
+  `execve()` on itself, so it remains genuinely out of scope, unlike `open()` now.
+- **`build.rs`'s BusyBox-applet and FAT32-embedding code is now data-driven, not hand-duplicated
+  per applet.** The original `true`/`echo`-only version had a separate set of variables and a
+  separate hand-written block (build call, FAT chain math, directory entry, content copy) for each
+  applet — fine for two, but adding `cat` as a third copy-pasted block was the point where it
+  stopped scaling. `main()`'s `BUSYBOX_APPLETS` is now a plain `&[(symbol, out_name, load_addr)]`
+  list folded over to build each applet and collect `(out_name, elf_bytes)` pairs;
+  `generate_fat32_image` takes that same list and computes each applet's `PlacedApplet` (short
+  name, first cluster, cluster count) by folding over it in order, chaining each one after the
+  last exactly the way `MUSL.ELF` already chained after `SMOKE.ELF`. Adding the next applet is now
+  a one-line addition to `BUSYBOX_APPLETS`, not matching edits scattered across four different
+  spots in this file.
+- **What's explicitly still out of scope**: the `sh` applet (needs real process spawning/piping
+  from *inside* a BusyBox process, a much bigger undertaking than a `NOFORK` applet like
+  `true`/`echo`/`cat`), multi-applet dispatch in a single binary (still blocked — `argv[0]` itself
+  is still always the `execve` path, never caller-chosen; only `argv[1..]` is real now, see above),
+  `envp` passthrough through `execve` (`argv[1..]` is real now, `envp` still isn't), `execve`'s own
+  argument-convention mismatch (see above — genuinely untouched, unlike `open()`), a real `fstat`
+  implementation (see the numeric-collision note above), stderr/fd 2 (not wired up at all — a real
+  BusyBox error message, e.g. `cat`'s own `ENOENT` diagnostic, is silently dropped rather than
+  printed; confirmed via `cat.elf nonexistent.txt`, which exits `1` correctly but prints nothing),
+  persistence, and any automated integration test (verified manually via QEMU + injected
+  keystrokes instead, the same method every interactive `stsh` feature already uses — see "FAT32
+  filesystem module" below).
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 
