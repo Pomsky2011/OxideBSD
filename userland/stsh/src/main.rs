@@ -201,16 +201,30 @@ fn split_first_word(s: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// Splits `s` into up to `MAX_ARGV` single-space-delimited words (repeated `split_first_word`,
-/// same no-quoting parsing this shell already uses everywhere else) -- these become `execve`'s
-/// argv[1..] in `run_program`/`execve` below. Words past `MAX_ARGV` are silently dropped, not
-/// buffered or erred on, same "quietly bounded, not unbounded" choice `read_line`'s own
-/// `LINE_CAPACITY` overflow handling already makes.
+/// Splits one word off the front of `s`: a leading `"` starts a quoted word running up to the next
+/// `"` (quotes stripped from the result, not included as literal characters -- an unterminated
+/// quote just takes the rest of `s` as the word rather than erroring); otherwise, splits on the
+/// next space exactly like `split_first_word`. No escaping, no single-quote support, no nesting --
+/// just enough to let `"two words"` become one `execve` argument instead of two.
+fn split_word_maybe_quoted(s: &[u8]) -> (&[u8], &[u8]) {
+    match s {
+        [b'"', rest @ ..] => match rest.iter().position(|&b| b == b'"') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, &rest[rest.len()..]),
+        },
+        _ => split_first_word(s),
+    }
+}
+
+/// Splits `s` into up to `MAX_ARGV` words (via `split_word_maybe_quoted`, so `"..."` groups count
+/// as one word) -- these become `execve`'s argv[1..] in `run_program`/`execve` below. Words past
+/// `MAX_ARGV` are silently dropped, not buffered or erred on, same "quietly bounded, not unbounded"
+/// choice `read_line`'s own `LINE_CAPACITY` overflow handling already makes.
 fn split_words<'a>(s: &'a [u8], out: &mut [&'a [u8]; MAX_ARGV]) -> usize {
     let mut count = 0;
     let mut rest = trim(s);
     while !rest.is_empty() && count < out.len() {
-        let (word, tail) = split_first_word(rest);
+        let (word, tail) = split_word_maybe_quoted(rest);
         out[count] = word;
         count += 1;
         rest = trim(tail);

@@ -689,10 +689,15 @@ resembling a shell or a real toolbox.
   terminated by a `ptr == 0` entry. `argv[0]` is still always the `execve` path itself
   (`path_bytes`), unchanged; `argv_ptr` only ever supplies `argv[1..]`, and `argv_ptr == 0` (every
   pre-existing caller) means "no extra arguments," so this is fully backward compatible. `stsh`'s
-  own `execve` wrapper (`userland/stsh/`) builds this via a new `split_words` helper — the same
-  single-space, no-quoting word splitting `split_first_word` already did once, just repeated up to
-  `MAX_ARGV` (`16`) times — so `run_program` now carries the typed line's remaining words through to
-  the child instead of discarding them.
+  own `execve` wrapper (`userland/stsh/`) builds this via a new `split_words` helper, repeated up to
+  `MAX_ARGV` (`16`) times, so `run_program` now carries the typed line's remaining words through to
+  the child instead of discarding them. `split_words` gained basic double-quote support
+  (`split_word_maybe_quoted`) right after landing, once `echo.elf "hello, world"` turned out to
+  split on the space *inside* the quotes and print the literal quote characters back — a real,
+  if small, usability gap in the first cut, not a hypothetical one. `"..."` groups become one word
+  with the quotes stripped; no escaping, no single-quote support, no nesting, an unterminated quote
+  just takes the rest of the line as one word rather than erroring — enough to make `"two words"`
+  work as one `execve` argument, nothing more.
 - **`echo.elf --help` printing the literal text `--help`, not a help page, is correct BusyBox
   behavior, not a leftover bug in the `argv` work above** — confirmed both by reading the source
   (`libbb/appletlib.c`'s `show_usage_if_dash_dash_help` explicitly excludes `echo`/`true`/`false`/
