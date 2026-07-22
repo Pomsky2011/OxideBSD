@@ -12,6 +12,7 @@ pub mod allocator;
 pub mod context_switch;
 pub mod elf;
 pub mod fd;
+pub mod fpu;
 pub mod gdt;
 pub mod interrupts;
 pub mod memory;
@@ -50,6 +51,7 @@ pub fn init(
     serial_println!("[boot] kernel initialization starting");
 
     gdt::init();
+    fpu::init();
     interrupts::init_idt();
     interrupts::init_pics();
     syscall::init();

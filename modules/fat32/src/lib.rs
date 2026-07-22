@@ -106,10 +106,12 @@ const EINVAL: i64 = 22;
 /// directory listing's) contents at `open` time (see `OpenFile::Read`'s doc comment for why),
 /// write accumulates a whole file's contents across possibly-multiple `write` calls until `close`.
 /// Comfortably larger than every file/listing this module's own demo/self-check content produces,
-/// and than `SMOKE.ELF` (the embedded `ring3-smoke` binary `stsh`'s `execve` support -- see
-/// `src/process.rs`'s `do_execve` -- exercises end to end; a debug build of it is a few KB, larger
-/// than the original 4096-byte cap this constant used to have).
-const MAX_FILE_BUFFER: usize = 16384;
+/// and than `SMOKE.ELF`/`MUSL.ELF` (the embedded `ring3-smoke`/`musl-smoke` binaries `stsh`'s
+/// `execve` support -- see `src/process.rs`'s `do_execve` -- exercises end to end). Raised twice
+/// now: 4096 -> 16384 for `SMOKE.ELF`'s debug build, then 16384 -> 65536 here for `musl-smoke`
+/// (~23 KB once statically linked against a real libc -- meaningfully bigger than a bare
+/// hand-written demo binary, being real compiled C plus musl's crt/malloc/stdio).
+const MAX_FILE_BUFFER: usize = 65536;
 const MAX_OPEN_FILES: usize = 8;
 
 /// An open file's own state, keyed by fd in `OPEN_FILES` below.

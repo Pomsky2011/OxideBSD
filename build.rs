@@ -24,12 +24,115 @@ fn main() {
     let ring3_smoke_elf = std::fs::read(&ring3_smoke_elf_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", ring3_smoke_elf_path.display()));
 
-    let fat32_image_path = write_fat32_image(&ring3_smoke_elf);
+    // musl-smoke is a first real (patched) musl static binary -- see CLAUDE.md's musl section --
+    // embedded into the FAT32 image below (as MUSL.ELF) the same way ring3-smoke is, so stsh's
+    // existing fork+execve+wait path can run it as a real file with no separate boot-time wiring.
+    let musl_sysroot = build_musl_sysroot();
+    let musl_smoke_elf_path = build_musl_smoke(&musl_sysroot);
+    let musl_smoke_elf = std::fs::read(&musl_smoke_elf_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", musl_smoke_elf_path.display()));
+
+    let fat32_image_path = write_fat32_image(&ring3_smoke_elf, &musl_smoke_elf);
     build_module_crate(
         "fat32",
         "FAT32",
         &[("FAT32_IMAGE_PATH", fat32_image_path.to_str().unwrap())],
     );
+}
+
+/// Configures, builds, and installs the vendored, OxideBSD-patched musl (`third_party/musl` -- a
+/// submodule pointing at a personal fork, patched on its own `oxidebsd` branch to speak this
+/// kernel's native ABI directly -- see `CLAUDE.md`'s musl section) into `target/musl-sysroot`,
+/// producing a `musl-gcc`-style wrapper this build script can shell out to for
+/// `userland/musl-smoke/`. Uses musl's own build system directly (`configure`/`make`/
+/// `make install`) -- there's no Cargo/Rust involved at all, it's a plain C library. Skips
+/// `./configure` if a `config.mak` already exists (configure itself takes several seconds
+/// re-probing the host compiler on every run; `make`/`make install` are already fast, idempotent
+/// no-ops when nothing changed, so only configure needs this guard).
+fn build_musl_sysroot() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let musl_dir = Path::new(manifest_dir).join("third_party/musl");
+    let sysroot = Path::new(manifest_dir).join("target/musl-sysroot");
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        musl_dir.join("arch/x86_64").display()
+    );
+    println!("cargo:rerun-if-changed={}", musl_dir.join("src").display());
+
+    if !musl_dir.join("config.mak").exists() {
+        // Run via its own path (not `sh configure`, and not a bare relative "configure"): the
+        // script derives its own source directory from `${0%/configure}` (build.rs:201 in
+        // musl's own configure) -- given anything that doesn't literally end in "/configure",
+        // that substitution is a no-op and it tries to `cd` into a nonexistent directory named
+        // after whatever `$0` was. `./configure` (a real, executable path ending in "/configure")
+        // is the one invocation shape that satisfies its own self-location logic.
+        let status = Command::new("./configure")
+            .current_dir(&musl_dir)
+            .args([
+                "--disable-shared",
+                &format!("--prefix={}", sysroot.display()),
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run musl's configure: {e}"));
+        if !status.success() {
+            panic!("musl configure failed: {status}");
+        }
+    }
+
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let status = Command::new("make")
+        .current_dir(&musl_dir)
+        .args(["-j", &jobs.to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make for musl: {e}"));
+    if !status.success() {
+        panic!("musl build failed: {status}");
+    }
+
+    let status = Command::new("make")
+        .current_dir(&musl_dir)
+        .arg("install")
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make install for musl: {e}"));
+    if !status.success() {
+        panic!("musl install failed: {status}");
+    }
+
+    sysroot
+}
+
+/// Cross-builds `userland/musl-smoke/main.c` against `sysroot` (see `build_musl_sysroot` above),
+/// at a load address (`0xa00000`) clear of both the bootloader's own ~6 MiB identity-mapped
+/// low-memory region and every other userland crate's load base (`0x600000`-`0x900000`) --
+/// confirmed empirically via `readelf -hl` before this was written, the same discipline
+/// CLAUDE.md's own `ring3-smoke` load-address collision story already established. Unlike every
+/// other `userland/*` crate this isn't a Rust crate at all -- musl-smoke exists specifically to
+/// exercise a real musl static binary, so it's built with `musl-gcc` directly, no cargo involved.
+fn build_musl_smoke(sysroot: &Path) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest_dir).join("userland/musl-smoke/main.c");
+    let target_dir = Path::new(manifest_dir).join("target/musl-smoke");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/musl-smoke");
+    let out = target_dir.join("musl-smoke");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let musl_gcc = sysroot.join("bin/musl-gcc");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg("-Wl,-Ttext-segment=0xa00000")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for musl-smoke: {e}"));
+    if !status.success() {
+        panic!("building musl-smoke failed: {status}");
+    }
+    out
 }
 
 /// Cross-builds the userland crate at `userland/<crate_name>/` and exposes its resulting ELF's
@@ -300,8 +403,8 @@ fn discover_panic_symbol(llvm_bin: &Path, object: &Path) -> Option<String> {
 /// root directory as a proper cluster chain (not FAT16's fixed region) -- only this kernel's own
 /// hand-rolled parser (`modules/fat32/`) ever needs to read it, so the "real minimum size" rule is
 /// safe to deliberately violate.
-fn write_fat32_image(smoke_elf_bytes: &[u8]) -> PathBuf {
-    let image = generate_fat32_image(smoke_elf_bytes);
+fn write_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> PathBuf {
+    let image = generate_fat32_image(smoke_elf_bytes, musl_elf_bytes);
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let target_dir = Path::new(manifest_dir).join("target/modules");
     std::fs::create_dir_all(&target_dir).expect("failed to create target/modules");
@@ -326,6 +429,9 @@ const FAT32_BIG_CLUSTER_COUNT: u32 = 3;
 /// SMOKE.ELF's cluster count isn't a fixed constant like BIG.TXT's -- it depends on the built
 /// `ring3-smoke` ELF's actual size, computed at image-generation time from `smoke_elf_bytes.len()`.
 const FAT32_SMOKE_FIRST_CLUSTER: u32 = FAT32_BIG_FIRST_CLUSTER + FAT32_BIG_CLUSTER_COUNT;
+/// MUSL.ELF's own first cluster isn't a fixed constant either -- it starts right after however
+/// many clusters SMOKE.ELF ends up needing, computed at image-generation time just like
+/// `FAT32_SMOKE_FIRST_CLUSTER`'s own runtime-computed cluster count is chained onto BIG.TXT's.
 const FAT32_EOC: u32 = 0x0FFF_FFFF;
 
 const FAT32_HELLO_CONTENTS: &[u8] = b"Hello from FAT32!\n";
@@ -338,9 +444,11 @@ fn fat32_big_file_byte(index: usize) -> u8 {
     b'A' + (index % 26) as u8
 }
 
-fn generate_fat32_image(smoke_elf_bytes: &[u8]) -> Vec<u8> {
+fn generate_fat32_image(smoke_elf_bytes: &[u8], musl_elf_bytes: &[u8]) -> Vec<u8> {
     let smoke_cluster_count =
         (smoke_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
+    let musl_first_cluster = FAT32_SMOKE_FIRST_CLUSTER + smoke_cluster_count;
+    let musl_cluster_count = (musl_elf_bytes.len().div_ceil(FAT32_BYTES_PER_SECTOR) as u32).max(1);
 
     // Solve for the FAT size (in sectors) that exactly covers the clusters left over once that
     // same FAT size is reserved -- a small fixed-point iteration, since the FAT's own size is
@@ -355,14 +463,15 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8]) -> Vec<u8> {
     }
     let data_start_sector = FAT32_RESERVED_SECTORS + FAT32_NUM_FATS * fat_size_sectors;
 
-    let highest_cluster_used = FAT32_SMOKE_FIRST_CLUSTER + smoke_cluster_count - 1;
+    let highest_cluster_used = musl_first_cluster + musl_cluster_count - 1;
     let data_clusters =
         (FAT32_TOTAL_SECTORS - data_start_sector) / FAT32_SECTORS_PER_CLUSTER as u32;
     assert!(
         highest_cluster_used < 2 + data_clusters,
-        "ring3-smoke ({} bytes) no longer fits in the embedded FAT32 image ({} total bytes) -- \
-         raise FAT32_TOTAL_SECTORS",
+        "ring3-smoke ({} bytes) + musl-smoke ({} bytes) no longer fit in the embedded FAT32 image \
+         ({} total bytes) -- raise FAT32_TOTAL_SECTORS",
         smoke_elf_bytes.len(),
+        musl_elf_bytes.len(),
         FAT32_TOTAL_SECTORS as usize * FAT32_BYTES_PER_SECTOR
     );
 
@@ -450,6 +559,15 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8]) -> Vec<u8> {
             };
             write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
         }
+        for i in 0..musl_cluster_count {
+            let cluster = musl_first_cluster + i;
+            let value = if i + 1 == musl_cluster_count {
+                FAT32_EOC
+            } else {
+                cluster + 1
+            };
+            write_fat_entry(&mut image, fat_index, fat_size_sectors, cluster, value);
+        }
     }
 
     let cluster_offset = |cluster: u32| -> usize {
@@ -489,6 +607,15 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8]) -> Vec<u8> {
             FAT32_SMOKE_FIRST_CLUSTER,
             smoke_elf_bytes.len() as u32,
         );
+        entry_offset += 32;
+        write_dir_entry(
+            &mut image,
+            entry_offset,
+            b"MUSL    ELF",
+            0x20,
+            musl_first_cluster,
+            musl_elf_bytes.len() as u32,
+        );
         // No further entries -- the byte after this one is already 0 (image starts zeroed),
         // which is the FAT directory end-of-listing marker.
     }
@@ -520,6 +647,16 @@ fn generate_fat32_image(smoke_elf_bytes: &[u8]) -> Vec<u8> {
     {
         for (i, chunk) in smoke_elf_bytes.chunks(FAT32_BYTES_PER_SECTOR).enumerate() {
             let cluster = FAT32_SMOKE_FIRST_CLUSTER + i as u32;
+            let offset = cluster_offset(cluster);
+            image[offset..offset + chunk.len()].copy_from_slice(chunk);
+        }
+    }
+
+    // --- MUSL.ELF contents (the built musl-smoke binary -- see CLAUDE.md's musl section --
+    // chunked the same way SMOKE.ELF's own bytes are above) ---
+    {
+        for (i, chunk) in musl_elf_bytes.chunks(FAT32_BYTES_PER_SECTOR).enumerate() {
+            let cluster = musl_first_cluster + i as u32;
             let offset = cluster_offset(cluster);
             image[offset..offset + chunk.len()].copy_from_slice(chunk);
         }

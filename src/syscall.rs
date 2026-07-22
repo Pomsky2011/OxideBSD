@@ -339,6 +339,36 @@ pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
     }
 }
 
+/// `SYS_WRITEV = 104` — OxideBSD's own invention, added specifically because musl's *entire*
+/// stdio write path goes through `writev`, never plain `write` (see `third_party/musl`'s
+/// `src/stdio/__stdio_write.c`) — without this, `printf` et al. silently produce no output at all.
+/// `(fd, iov_ptr, iovcnt)` matches real `writev`'s own argument positions exactly (unlike
+/// `SYS_MMAP`, nothing here needs to be dropped to fit this ABI's 3-argument width). Reads
+/// `iovcnt` real C `struct iovec { void *iov_base; size_t iov_len; }` entries (16 bytes each,
+/// standard layout) from `iov_ptr`, and calls `sys_write` once per entry, accumulating the total.
+/// Matches real `writev`'s partial-write semantics: if an entry fails after at least one earlier
+/// entry already succeeded, returns `Ok(total so far)` rather than propagating the failure (a
+/// later `write` call surfaces it instead); only propagates `Err` if the very first entry fails.
+pub(crate) fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64> {
+    #[repr(C)]
+    struct IoVec {
+        base: u64,
+        len: u64,
+    }
+
+    let mut total: u64 = 0;
+    for i in 0..iovcnt {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document -- iov_ptr
+        // isn't checked against the caller's actual mappings before it's dereferenced.
+        let iov = unsafe { &*(iov_ptr as *const IoVec).add(i as usize) };
+        match sys_write(fd, iov.base, iov.len) {
+            Ok(n) => total += n,
+            Err(errno) => return if total > 0 { Ok(total) } else { Err(errno) },
+        }
+    }
+    Ok(total)
+}
+
 /// `SYS_SET_FS_BASE` (`103`) — OxideBSD's own invention, not modeled on any real OS's syscall (see
 /// `modules/native_abi/`'s doc comment for why new syscalls this ABI adds don't chase FreeBSD
 /// authenticity the way the pre-existing ones do). musl's x86_64 port needs a way to point `FS`
@@ -370,6 +400,10 @@ pub(crate) extern "C" fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
     result_to_ffi(sys_write(fd, ptr, len))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
+    result_to_ffi(sys_writev(fd, iov_ptr, iovcnt))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_set_fs_base(base: u64) -> i64 {

@@ -33,6 +33,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_munmap(addr: u64, len: u64) -> i64;
     fn oxidebsd_sys_brk(addr: u64) -> i64;
     fn oxidebsd_sys_set_fs_base(base: u64) -> i64;
+    fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
 }
 
 const SYS_EXIT: u64 = 1;
@@ -46,6 +47,7 @@ const SYS_MMAP: u64 = 100;
 const SYS_MUNMAP: u64 = 101;
 const SYS_BRK: u64 = 102;
 const SYS_SET_FS_BASE: u64 = 103;
+const SYS_WRITEV: u64 = 104;
 
 extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
@@ -91,6 +93,10 @@ extern "C" fn handle_set_fs_base(base: u64, _arg1: u64, _arg2: u64) -> i64 {
     unsafe { oxidebsd_sys_set_fs_base(base) }
 }
 
+extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
+    unsafe { oxidebsd_sys_writev(fd, iov_ptr, iovcnt) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -105,6 +111,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MUNMAP, handle_munmap);
         oxidebsd_register_syscall(SYS_BRK, handle_brk);
         oxidebsd_register_syscall(SYS_SET_FS_BASE, handle_set_fs_base);
+        oxidebsd_register_syscall(SYS_WRITEV, handle_writev);
     }
     0
 }

@@ -583,6 +583,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_set_fs_base" => {
             Some(crate::syscall::oxidebsd_sys_set_fs_base as *const () as u64)
         }
+        "oxidebsd_sys_writev" => Some(crate::syscall::oxidebsd_sys_writev as *const () as u64),
         "oxidebsd_alloc_fd" => Some(crate::fd::oxidebsd_alloc_fd as *const () as u64),
         "oxidebsd_register_fd_ops" => Some(crate::fd::oxidebsd_register_fd_ops as *const () as u64),
         "oxidebsd_close_fd" => Some(crate::fd::oxidebsd_close_fd as *const () as u64),
