@@ -21,13 +21,16 @@
 #![no_std]
 
 unsafe extern "C" {
-    fn oxidebsd_register_syscall(number: u64, handler: extern "C" fn(u64, u64, u64) -> i64) -> i32;
+    fn oxidebsd_register_syscall(
+        number: u64,
+        handler: extern "C" fn(u64, u64, u64, u64) -> i64,
+    ) -> i32;
     fn oxidebsd_sys_exit(code: u64) -> !;
     fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_fork() -> i64;
     fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: u64) -> i64;
-    fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64) -> i64;
+    fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64;
     fn oxidebsd_sys_getpid() -> i64;
     fn oxidebsd_sys_mmap(addr_hint: u64, len: u64, prot: u64) -> i64;
     fn oxidebsd_sys_munmap(addr: u64, len: u64) -> i64;
@@ -49,51 +52,54 @@ const SYS_BRK: u64 = 102;
 const SYS_SET_FS_BASE: u64 = 103;
 const SYS_WRITEV: u64 = 104;
 
-extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
 }
 
-extern "C" fn handle_read(fd: u64, ptr: u64, len: u64) -> i64 {
+extern "C" fn handle_read(fd: u64, ptr: u64, len: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_read(fd, ptr, len) }
 }
 
-extern "C" fn handle_write(fd: u64, ptr: u64, len: u64) -> i64 {
+extern "C" fn handle_write(fd: u64, ptr: u64, len: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_write(fd, ptr, len) }
 }
 
-extern "C" fn handle_fork(_arg0: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn handle_fork(_arg0: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_fork() }
 }
 
-extern "C" fn handle_wait4(pid: u64, status_ptr: u64, options: u64) -> i64 {
+extern "C" fn handle_wait4(pid: u64, status_ptr: u64, options: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_wait4(pid, status_ptr, options) }
 }
 
-extern "C" fn handle_execve(path_ptr: u64, path_len: u64, argv_ptr: u64) -> i64 {
-    unsafe { oxidebsd_sys_execve(path_ptr, path_len, argv_ptr) }
+/// The one handler that actually reads its 4th argument (`envp_ptr`, via `R10`) -- see
+/// `src/syscall.rs`'s module doc comment for why `R10` only became a real, read argument once
+/// `execve` needed real `envp` passthrough.
+extern "C" fn handle_execve(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_execve(path_ptr, path_len, argv_ptr, envp_ptr) }
 }
 
-extern "C" fn handle_getpid(_arg0: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn handle_getpid(_arg0: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_getpid() }
 }
 
-extern "C" fn handle_mmap(addr_hint: u64, len: u64, prot: u64) -> i64 {
+extern "C" fn handle_mmap(addr_hint: u64, len: u64, prot: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_mmap(addr_hint, len, prot) }
 }
 
-extern "C" fn handle_munmap(addr: u64, len: u64, _arg2: u64) -> i64 {
+extern "C" fn handle_munmap(addr: u64, len: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_munmap(addr, len) }
 }
 
-extern "C" fn handle_brk(addr: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn handle_brk(addr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_brk(addr) }
 }
 
-extern "C" fn handle_set_fs_base(base: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn handle_set_fs_base(base: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_set_fs_base(base) }
 }
 
-extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
+extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_writev(fd, iov_ptr, iovcnt) }
 }
 

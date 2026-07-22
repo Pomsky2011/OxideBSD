@@ -373,68 +373,86 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
 /// `AddressSpace`, `elf::load`, mapping the user stack) completes *before* any mutation of the
 /// live syscall frame, `CR3`, or the process's stored `AddressSpace` — real `execve(2)` semantics:
 /// a failure at any point must leave the calling program completely untouched.
-/// Wire format for `SYS_EXECVE`'s optional third argument (`argv_ptr`) -- OxideBSD's own
-/// invention, not modeled on real `execve`'s NUL-terminated `char **argv` (this ABI's syscalls are
-/// length-prefixed throughout instead -- see CLAUDE.md's syscall ABI section). A sequence of these
-/// structs, terminated by a `ptr == 0` entry, describes argv[1..]; argv[0] is always `path_bytes`
-/// itself (unchanged from before this existed), so a caller that only wants argv[0] just passes
-/// `argv_ptr == 0` -- every caller before `stsh`'s own execve wrapper grew argument support did
-/// exactly that, and keeps doing so unaffected.
+/// Wire format for `SYS_EXECVE`'s optional third and fourth arguments (`argv_ptr`/`envp_ptr`) --
+/// OxideBSD's own invention, not modeled on real `execve`'s NUL-terminated `char **argv`/`char
+/// **envp` (this ABI's syscalls are length-prefixed throughout instead -- see CLAUDE.md's syscall
+/// ABI section). A sequence of these structs, terminated by a `ptr == 0` entry, describes either
+/// argv[1..] or envp[] (same shape, read the same way -- see `read_ptr_len_array` below); argv[0]
+/// is always `path_bytes` itself (unchanged from before `argv_ptr` existed), so a caller that only
+/// wants argv[0] and no environment just passes `argv_ptr == 0`/`envp_ptr == 0` -- every caller
+/// before `stsh`'s own execve wrapper grew argument support did exactly that, and keeps doing so
+/// unaffected. `envp_ptr` is `R10`, the ABI's 4th argument -- see `src/syscall.rs`'s module doc
+/// comment for why that register only became a real, read argument once this needed it.
 #[repr(C)]
 struct RawArgvEntry {
     ptr: u64,
     len: u64,
 }
 
-/// Bounded as a sanity cap against a runaway/garbage `argv_ptr`, not a deliberate
-/// shell-argument-count limit -- `stsh`'s own 128-byte line buffer can't produce anywhere near
-/// this many words anyway.
-const MAX_EXTRA_ARGV: usize = 32;
+/// Bounded as a sanity cap against a runaway/garbage `argv_ptr`/`envp_ptr`, not a deliberate
+/// argument/environment-count limit -- `stsh`'s own 128-byte line buffer can't produce anywhere
+/// near this many words anyway, and no `envp` this codebase builds today comes close either.
+const MAX_PTR_LEN_ENTRIES: usize = 32;
 
-/// Reads the extra arguments (argv[1..]) `argv_ptr` describes, if any -- see `RawArgvEntry`.
-fn read_extra_argv(argv_ptr: u64) -> Vec<Vec<u8>> {
-    let mut args = Vec::new();
-    if argv_ptr == 0 {
-        return args;
+/// Reads the `RawArgvEntry` array `ptr` describes, if any -- shared by `argv_ptr` (argv[1..]) and
+/// `envp_ptr` (envp[]), which use the exact same wire format (see `RawArgvEntry`'s own doc
+/// comment).
+fn read_ptr_len_array(ptr: u64) -> Vec<Vec<u8>> {
+    let mut entries_out = Vec::new();
+    if ptr == 0 {
+        return entries_out;
     }
-    for i in 0..MAX_EXTRA_ARGV {
+    for i in 0..MAX_PTR_LEN_ENTRIES {
         // SAFETY: same known pointer-validation gap every other user-memory read in this file
-        // already has -- argv_ptr isn't checked against the caller's actual mappings before use.
-        let entry = unsafe { &*(argv_ptr as *const RawArgvEntry).add(i) };
+        // already has -- ptr isn't checked against the caller's actual mappings before use.
+        let entry = unsafe { &*(ptr as *const RawArgvEntry).add(i) };
         if entry.ptr == 0 {
             break;
         }
         let bytes =
             unsafe { core::slice::from_raw_parts(entry.ptr as *const u8, entry.len as usize) };
-        args.push(bytes.to_vec());
+        entries_out.push(bytes.to_vec());
     }
-    args
+    entries_out
 }
 
-pub fn do_execve(caller_pid: Pid, path_ptr: u64, path_len: u64, argv_ptr: u64) -> Result<u64, u64> {
-    // Copied out now, while the caller's own address space (where path_ptr/argv_ptr are valid) is
-    // still active -- used for the new program's initial stack, built further down, by which point
-    // a fresh (as-yet-unactivated) address space is what's live instead. Same known
+pub fn do_execve(
+    caller_pid: Pid,
+    path_ptr: u64,
+    path_len: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> Result<u64, u64> {
+    // Copied out now, while the caller's own address space (where path_ptr/argv_ptr/envp_ptr are
+    // valid) is still active -- used for the new program's initial stack, built further down, by
+    // which point a fresh (as-yet-unactivated) address space is what's live instead. Same known
     // pointer-validation gap sys_write/sys_read already have for user pointers.
     let path_bytes: Vec<u8> =
         unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) }.to_vec();
-    let extra_argv = read_extra_argv(argv_ptr);
+    let extra_argv = read_ptr_len_array(argv_ptr);
+    let envp = read_ptr_len_array(envp_ptr);
 
-    let fd = syscall::dispatch(SYS_OPEN, path_ptr, path_len, 0)?;
+    let fd = syscall::dispatch(SYS_OPEN, path_ptr, path_len, 0, 0)?;
 
     let mut elf_bytes: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
-        match syscall::dispatch(SYS_READ, fd, chunk.as_mut_ptr() as u64, chunk.len() as u64) {
+        match syscall::dispatch(
+            SYS_READ,
+            fd,
+            chunk.as_mut_ptr() as u64,
+            chunk.len() as u64,
+            0,
+        ) {
             Ok(0) => break,
             Ok(n) => elf_bytes.extend_from_slice(&chunk[..n as usize]),
             Err(errno) => {
-                let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0);
+                let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0, 0);
                 return Err(errno);
             }
         }
     }
-    let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0);
+    let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0, 0);
 
     let elf = Elf::parse(&elf_bytes).map_err(|_| ENOEXEC)?;
 
@@ -453,16 +471,17 @@ pub fn do_execve(caller_pid: Pid, path_ptr: u64, path_len: u64, argv_ptr: u64) -
     let stack_top = VirtAddr::new(USER_STACK_TOP);
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
     // argv[0] is always path_bytes itself; argv[1..] is whatever extra_argv (read above, while the
-    // caller's own address space was still active) supplied. No envp passthrough across execve yet
-    // -- a known limitation, not required for fork/exec/wait correctness (see CLAUDE.md's
-    // process/scheduler section for the general pattern of what's deliberately deferred here).
+    // caller's own address space was still active) supplied. envp is real now too -- whatever the
+    // caller's own envp_ptr described, or empty if it passed 0 (every caller before this existed
+    // did exactly that, and keeps doing so unaffected -- see RawArgvEntry's own doc comment).
     let mut argv: Vec<&[u8]> = Vec::with_capacity(1 + extra_argv.len());
     argv.push(&path_bytes);
     argv.extend(extra_argv.iter().map(Vec::as_slice));
+    let envp_refs: Vec<&[u8]> = envp.iter().map(Vec::as_slice).collect();
     let initial_rsp = crate::user_stack::build(
         &elf,
         &argv,
-        &[],
+        &envp_refs,
         stack_top,
         user_stack_bottom(stack_top),
         &mapped_pages,

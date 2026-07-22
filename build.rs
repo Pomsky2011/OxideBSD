@@ -293,6 +293,21 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
             "# CONFIG_SH_IS_NONE is not set".to_string(),
             "CONFIG_SH_IS_NONE=y".to_string(),
         ),
+        // Real usage text for `--help` (e.g. `cat`'s own "Usage: cat [FILE]... Concatenate
+        // FILEs..."), not the generic "No help available." `bb_show_usage` falls back to when
+        // this is off -- `allnoconfig` disables both despite their own `default y`, the same way
+        // it disables everything else this function already has to flip back on. Discovered as a
+        // real gap, not preemptively enabled: `cat.elf --help` printed nothing at all until
+        // src/syscall.rs's stderr fix (fd 2) landed, and even with that fix would have only shown
+        // the generic fallback without this -- see CLAUDE.md's BusyBox section.
+        (
+            "# CONFIG_SHOW_USAGE is not set".to_string(),
+            "CONFIG_SHOW_USAGE=y".to_string(),
+        ),
+        (
+            "# CONFIG_FEATURE_VERBOSE_USAGE is not set".to_string(),
+            "CONFIG_FEATURE_VERBOSE_USAGE=y".to_string(),
+        ),
     ] {
         assert!(
             config.contains(&from),

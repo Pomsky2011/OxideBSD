@@ -142,15 +142,15 @@ fn test_syscall_dispatch_rejects_unknown_number() {
     // Nothing registers a number anywhere near this one -- `dispatch`'s table starts empty in
     // this test binary regardless, since module loading only happens in src/main.rs's non-test
     // kernel_main, never in this crate's own #[cfg(test)] entry point.
-    assert_eq!(syscall::dispatch(0xFFFF, 0, 0, 0), Err(syscall::ENOSYS));
+    assert_eq!(syscall::dispatch(0xFFFF, 0, 0, 0, 0), Err(syscall::ENOSYS));
 }
 
 #[test_case]
 fn test_syscall_dispatch_routes_registered_handlers() {
-    extern "C" fn ok_handler(a0: u64, a1: u64, a2: u64) -> i64 {
-        (a0 + a1 + a2) as i64
+    extern "C" fn ok_handler(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+        (a0 + a1 + a2 + a3) as i64
     }
-    extern "C" fn err_handler(_a0: u64, _a1: u64, _a2: u64) -> i64 {
+    extern "C" fn err_handler(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
         -5
     }
 
@@ -170,8 +170,8 @@ fn test_syscall_dispatch_routes_registered_handlers() {
         -1
     );
 
-    assert_eq!(syscall::dispatch(TEST_OK_NUMBER, 1, 2, 3), Ok(6));
-    assert_eq!(syscall::dispatch(TEST_ERR_NUMBER, 0, 0, 0), Err(5));
+    assert_eq!(syscall::dispatch(TEST_OK_NUMBER, 1, 2, 3, 4), Ok(10));
+    assert_eq!(syscall::dispatch(TEST_ERR_NUMBER, 0, 0, 0, 0), Err(5));
 }
 
 #[test_case]

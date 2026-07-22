@@ -26,7 +26,7 @@ entry_point!(main);
 /// crate across this ABI boundary, same convention every other userland/kernel pair here uses.
 const SYS_TEST_EXIT: u64 = 9999;
 
-extern "C" fn test_exit_handler(code: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn test_exit_handler(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     serial_println!(
         "fork_wait: fork-exec-smoke reported {}",
         if code == 0 { "PASS" } else { "FAIL" }

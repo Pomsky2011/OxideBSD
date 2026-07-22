@@ -71,9 +71,21 @@ const MAX_ARGV: usize = 16;
 /// `Ok(value)` if `CF` came back clear, `Err(errno)` if it came back set. `rcx`/`r11` must be
 /// declared clobbered: `SYSCALL` itself overwrites them (to save `RIP`/`RFLAGS` on entry), so
 /// whatever this program had in them beforehand doesn't survive the call — the kernel's
-/// `syscall_entry` preserves every other register.
+/// `syscall_entry` preserves every other register. Delegates to `syscall4` with a zeroed 4th
+/// argument — every existing call site here predates the ABI's 4th argument (`r10`) becoming a
+/// real, read one (see `src/syscall.rs`'s module doc comment in the kernel tree), and none of them
+/// need it.
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
+    unsafe { syscall4(number, arg0, arg1, arg2, 0) }
+}
+
+/// Like `syscall`, but with a real 4th argument in `r10` — needed by `execve`'s own wrapper below
+/// to pass `envp_ptr` explicitly (leaving `r10` unset would leak whatever garbage happened to be
+/// in it, which the kernel's `do_execve` would then misread as a bogus `envp_ptr` and dereference
+/// — not hypothetical, since every handler that reads a 4th argument at all now expects one).
+#[inline(always)]
+unsafe fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> Result<u64, u64> {
     let ret: u64;
     let failed: u8;
     unsafe {
@@ -84,6 +96,7 @@ unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u
             in("rdi") arg0,
             in("rsi") arg1,
             in("rdx") arg2,
+            in("r10") arg3,
             failed = out(reg_byte) failed,
             lateout("rcx") _,
             lateout("r11") _,
@@ -301,12 +314,16 @@ fn execve(path: &[u8], extra_args: &[&[u8]]) -> Result<u64, u64> {
     } else {
         entries.as_ptr() as u64
     };
+    // envp_ptr = 0: stsh has no real environment of its own to forward (it's the top of this
+    // system's process tree, not spawned by any shell that gave it one) -- explicit 0, not a
+    // stray/uninitialized r10, which do_execve would otherwise try to read as a real envp array.
     unsafe {
-        syscall(
+        syscall4(
             SYS_EXECVE,
             path.as_ptr() as u64,
             path.len() as u64,
             argv_ptr,
+            0,
         )
     }
 }

@@ -73,9 +73,11 @@ See "User-mode execution", "Syscall ABI", "musl port", "BusyBox port", "Interact
 fork/exec/wait" below for the current, deliberate limits (`sys_write`/`sys_read` don't validate
 their pointers, no line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/
 reload, FAT32 writes don't persist across reboot, no preemptive scheduling, no copy-on-write fork,
-no frame deallocation anywhere, and — for the musl port — no `envp` passthrough across `execve`,
-`open`/`execve`'s argument-convention mismatches with real musl calls of the same name, and several
-syscalls musl's fuller startup would need still unimplemented). A *real* filesystem (backed by an
+no frame deallocation anywhere, and — for the musl port — `execve` can't give a process a different
+`argv[0]` than its own exec path, and several syscalls musl's fuller startup would need still
+unimplemented (`open`'s and `execve`'s own argument-convention mismatches with real musl calls of
+the same name, and `envp` passthrough across `execve`, are both fixed now — see "musl port" and
+"BusyBox port" below). A *real* filesystem (backed by an
 actual block device, not an embedded image) doesn't exist yet. Architecture decisions for
 remaining subsystems have not been made and should be discussed with the user before large
 structural commitments are made.
@@ -317,9 +319,19 @@ end-to-end proof paging/ELF-loading/ring-3/syscalls all work together.
 ## Syscall ABI (`src/syscall.rs`)
 
 OxideBSD's own, native ABI — deliberately BSD-flavored, not Linux-flavored. `SYSCALL`/`SYSRETQ`;
-syscall number in `RAX`, up to three arguments in `RDI`/`RSI`/`RDX` (`R10` reserved in the layout
-for a future 4th argument, avoiding `RCX`/`R11` since `SYSCALL` itself clobbers them to save
-`RIP`/`RFLAGS`). Success/failure is signaled via the **carry flag** — the traditional BSD/x86 Unix
+syscall number in `RAX`, up to four arguments in `RDI`/`RSI`/`RDX`/`R10` (avoiding `RCX`/`R11`
+since `SYSCALL` itself clobbers them to save `RIP`/`RFLAGS`). **`R10` used to be reserved but
+unread** — `syscall_entry`'s stub always pushed it (uniform GPR save/restore, see `SyscallFrame`'s
+own doc comment below), but `dispatch` only ever forwarded `RDI`/`RSI`/`RDX` to a handler. Wired up
+for real once `SYS_EXECVE` needed a genuine 4th argument (`envp_ptr`) for real `envp` passthrough
+— see "musl port" and "BusyBox port" below. `SyscallHandler` is now a 4-argument function pointer;
+every registered handler across every module (`native_abi`, `fat32`) gained a 4th parameter
+(ignored by every syscall except `execve`) — a real 4th argument is now a permanent part of this
+ABI, not a one-off special case threaded through only where `execve` needed it. Any userland caller
+that doesn't explicitly zero `R10` (or doesn't go through a wrapper that does) leaves whatever
+garbage was already in the register — harmless for every syscall except `execve`, which reads it as
+a real pointer (see `stsh`'s own `syscall4` helper, added specifically to make this safe).
+Success/failure is signaled via the **carry flag** — the traditional BSD/x86 Unix
 convention: `CF = 0` on success with the return value in `RAX`, `CF = 1` on failure with the
 *positive* `errno` in `RAX`. Syscall numbers for calls implemented before the musl port (`SYS_EXIT
 = 1`, `SYS_READ = 3`, `SYS_WRITE = 4`, `SYS_OPEN = 5`, `SYS_CLOSE = 6`) match real FreeBSD's
@@ -439,12 +451,20 @@ kernel-resident, deliberately *not* moved into `native_abi`, is the actual `sys_
   `crate::fd` below, always completes immediately regardless (there's no "not ready yet" state for
   an in-memory file), so `cat` in `stsh` doesn't need to busy-poll it the way reading from stdin
   does.
-- **`sys_read`/`sys_write`, for any `fd` other than stdin/stdout, delegate to `crate::fd`'s
+- **`sys_read`/`sys_write`, for any `fd` other than stdin/stdout/stderr, delegate to `crate::fd`'s
   registry** (`src/fd.rs`) rather than returning `EBADF` outright — the only channel two
   independently loaded modules have to coordinate (`modules/fat32/`'s open files register their
   read/write/close callbacks there; modules can't call each other directly, only module → kernel —
-  see "Dynamic kernel modules" below). `EBADF` is still what comes back if `fd` isn't stdin/stdout
-  *and* isn't registered in that table either.
+  see "Dynamic kernel modules" below). `EBADF` is still what comes back if `fd` isn't
+  stdin/stdout/stderr *and* isn't registered in that table either.
+- **`sys_write`'s `fd == 2` ("stderr") is an alias for `fd == 1` ("stdout"), not a real second
+  destination.** This kernel has no terminal/multiplexing concept that would give stderr a
+  genuinely separate sink, so both go through the same `serial_print!` path. Fixed after a real,
+  user-visible gap: before this, fd 2 fell through to `crate::fd`'s registry (never has fd 2
+  registered) and always came back `EBADF`, so every BusyBox diagnostic written to stderr —
+  concretely, `cat`'s own `ENOENT` message — was silently dropped; `cat.elf nonexistent.txt` used
+  to exit `1` with zero output, confusing to debug against. See "BusyBox port" below for the
+  before/after behavior confirmed in QEMU.
 
 ## musl port (`third_party/musl`, `userland/musl-smoke/`, `src/user_stack.rs`, `src/fpu.rs`)
 
@@ -500,9 +520,12 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
     would prefer — matching *musl's actual call site*, not an invented layout, was the only way to
     make this work at all. `addr_hint`/`prot` are read but ignored (OxideBSD always picks the
     address and always maps `PRESENT | WRITABLE | USER_ACCESSIBLE`, the same "every page writable
-    regardless" simplification `src/module.rs`'s own loader already applies); `flags`/`fd`/`offset`
-    (`R10`/`R8`/`R9`) aren't even readable at this ABI's 3-argument width, so every mapping is
-    unconditionally anonymous+private — the only case musl's allocator needs. `do_mmap`
+    regardless" simplification `src/module.rs`'s own loader already applies); `fd`/`offset`
+    (`R8`/`R9`) still aren't readable at all (this ABI only carries 4 arguments — see "Syscall ABI"
+    above — `R10` became a real one once `execve` needed it, but `R8`/`R9` never have), and
+    `flags` (`R10`, now technically readable) still isn't — `handle_mmap`'s own registered handler
+    signature simply doesn't read its own 4th parameter — so every mapping stays unconditionally
+    anonymous+private regardless, the only case musl's allocator needs. `do_mmap`
     (`src/process.rs`) bump-allocates from a fixed, never-reclaimed VA window
     (`0x_2000_0000_0000..0x_3000_0000_0000`, same idiom as `module::NEXT_MODULE_PAGE`), building a
     mapper over the *calling* process's own (currently active) address space.
@@ -572,27 +595,31 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
   - **`AT_RANDOM`'s 16 bytes are a fixed placeholder, not real entropy** — this kernel has no
     entropy source at all yet; musl only requires the bytes be *present* (it uses them for the
     stack-protector canary and as an `arc4random` seed), not unpredictable, for now.
-- **Two known real argument-convention mismatches; `open`'s is now fixed, `execve`'s still isn't:**
-  - **`open`** — **fixed, on the musl side** (see CLAUDE.md's BusyBox section for the full story;
-    `cat`, not anything in the musl-smoke pass itself, is what forced this). Real `open()`/musl's
-    own generic `__syscall3(SYS_open, path, flags, mode)` passes a null-terminated C string pointer
-    plus `(flags, mode)`; OxideBSD's `SYS_OPEN` (`modules/fat32/fat32_open`) takes `(path_ptr,
-    path_len, flags)` — a length-prefixed pointer, no null-terminator requirement, no `mode`
-    argument at all. `third_party/musl`'s `src/fcntl/open.c` (on the fork's `oxidebsd` branch) now
-    builds that shape directly (`path_len` via `strlen()`, `mode` discarded) instead of going
-    through the generic macros, and `bits/syscall.h.in`'s `SYS_open` is remapped to the real
-    `SYS_OPEN = 5` so the call actually reaches `fat32_open`. `musl-smoke` itself still never calls
-    `open()`, so this was untested by the original musl-port pass — `cat.elf hello.txt` (BusyBox
-    section) is the actual end-to-end proof.
-  - **`execve`**: numerically unchanged from upstream (`59` happens to already be OxideBSD's real
-    `SYS_EXECVE`), but not actually argument-compatible: musl's `execve()` passes `(path, argv,
-    envp)` in `RDI`/`RSI`/`RDX`; OxideBSD's `SYS_EXECVE` (`process::do_execve`) expects `(path_ptr,
-    path_len, argv_ptr)` — a completely different shape in `RSI` (a length, not the real `argv`
-    pointer) and no `envp` support at all (see "BusyBox port" below for `argv_ptr`'s own,
-    unrelated-to-real-`execve` wire format, added for `stsh`'s own direct native-ABI callers, not
-    for musl-compatibility). Still unreachable so far since nothing in this port's own test programs
-    calls `execve()` on itself (only `stsh`, over the native ABI it already speaks correctly,
-    `execve`'s *other* programs).
+- **Two known real argument-convention mismatches — both now fixed, on the musl side, in two
+  separate passes:**
+  - **`open`** — fixed first (see CLAUDE.md's BusyBox section for the full story; `cat`, not
+    anything in the musl-smoke pass itself, is what forced this). Real `open()`/musl's own generic
+    `__syscall3(SYS_open, path, flags, mode)` passes a null-terminated C string pointer plus
+    `(flags, mode)`; OxideBSD's `SYS_OPEN` (`modules/fat32/fat32_open`) takes `(path_ptr, path_len,
+    flags)` — a length-prefixed pointer, no null-terminator requirement, no `mode` argument at all.
+    `third_party/musl`'s `src/fcntl/open.c` (on the fork's `oxidebsd` branch) now builds that shape
+    directly (`path_len` via `strlen()`, `mode` discarded) instead of going through the generic
+    macros, and `bits/syscall.h.in`'s `SYS_open` is remapped to the real `SYS_OPEN = 5` so the call
+    actually reaches `fat32_open`. `musl-smoke` itself still never calls `open()`, so this was
+    untested by the original musl-port pass — `cat.elf hello.txt` (BusyBox section) is the actual
+    end-to-end proof.
+  - **`execve`** — fixed second, alongside real `envp` passthrough (see "BusyBox port" below).
+    Numerically unchanged from upstream (`59` happens to already be OxideBSD's real `SYS_EXECVE`),
+    but wasn't argument-compatible: musl's `execve()` passes `(path, argv, envp)` in
+    `RDI`/`RSI`/`RDX`; OxideBSD's `SYS_EXECVE` (`process::do_execve`) expects `(path_ptr, path_len,
+    argv_ptr, envp_ptr)` — a completely different shape in `RSI` (a length, not the real `argv`
+    pointer). `third_party/musl`'s `src/process/execve.c` now builds `argv_ptr`/`envp_ptr` as real
+    `RawArgvEntry`-shaped arrays (see "BusyBox port" below) from the real `argv[1..]`/`envp[]` it
+    was given, on the caller's own stack, and issues a real 4-argument `__syscall4` — needed the
+    ABI's `R10` register to become a genuine 4th argument first (see "Syscall ABI" above). **Still
+    not fixed**: real `argv[0]` is silently dropped (OxideBSD's `execve` always supplies `argv[0]`
+    from `path_ptr`/`path_len` itself — no way to give a process a different one under this ABI) —
+    a known, separate, smaller limitation, not attempted here.
 - **Two syscalls musl's startup reaches but this kernel doesn't implement, left unmapped
   (their original Linux numbers) rather than stubbed — both confirmed harmless for `musl-smoke`
   specifically, not fixed just because they were seen:** `set_tid_address` (`__init_tp`, right
@@ -623,9 +650,9 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
 - **What's explicitly still out of scope, the same way real BusyBox running was flagged out of
   scope before that port started (see "BusyBox port" below for where it actually started)**: a
   real, general-purpose libc-on-OxideBSD story (this is one hand-picked static binary exercising
-  `printf`, not a validated general surface), `envp` passthrough across `execve`, and `execve`'s
-  own argument mismatch above (`open`'s twin mismatch was fixed later, by the BusyBox `cat` pass —
-  see "BusyBox port" below) — real, substantial follow-up work, not attempted yet.
+  `printf`, not a validated general surface) — `open`'s own argument mismatch was fixed later, by
+  the BusyBox `cat` pass, and `execve`'s (plus real `envp` passthrough) by a follow-up pass right
+  after it (see "BusyBox port" below for both).
 
 ## BusyBox port (`third_party/busybox`, `modules/posix_compat/`)
 
@@ -746,9 +773,52 @@ convention-fix bullet below, since `cat` is the first applet that actually needs
   `O_CREAT` open would've been silently misread as "create". Fixed by giving `O_CREAT` the real
   POSIX value (`0o100`) instead of working around the collision — `modules/fat32/src/lib.rs` and
   `userland/stsh/src/main.rs` both updated in lockstep, the only two places that constant is
-  defined. `execve`'s own, separate argument-convention mismatch (real `execve(path, argv, envp)`
-  vs. OxideBSD's `(path_ptr, path_len, argv_ptr)`) is untouched — still nothing in this port calls
-  `execve()` on itself, so it remains genuinely out of scope, unlike `open()` now.
+  defined.
+- **`execve`'s own argument-convention mismatch is fixed too, in a follow-up pass right after
+  `cat`** — alongside real `envp` passthrough, and a real stderr, and BusyBox's own usage-text
+  feature. Four fixes landed together because the first three all fed into being able to verify the
+  fourth (`cat.elf --help`) actually worked end to end:
+  - **A real 4th syscall argument.** `SYS_EXECVE` needed a 4th argument (`envp_ptr`) it didn't have
+    room for — `RDI`/`RSI`/`RDX` were already spoken for by `path_ptr`/`path_len`/`argv_ptr`. `R10`
+    was already pushed by `syscall_entry`'s stub (uniform GPR save/restore) but never read past
+    that — `dispatch`/`SyscallHandler` are now 4-argument throughout (see "Syscall ABI" above),
+    with every existing handler across `modules/native_abi`/`modules/fat32` gaining an ignored 4th
+    parameter. **A real, easy-to-miss hazard this exposed**: any userland caller that doesn't
+    explicitly set `R10` leaves whatever garbage was already in the register there — harmless for
+    every syscall except `execve`, which now reads it as a real pointer. `stsh`'s own `syscall()`
+    helper (`userland/stsh/src/main.rs`) now delegates to a new `syscall4` that always sets `R10`
+    explicitly (`0` for every existing call site, a real `envp_ptr` for `execve`'s own wrapper) —
+    the fix isn't just "add a parameter," it's "make sure nothing leaves that register to chance."
+  - **`execve` itself.** `third_party/musl`'s `src/process/execve.c` (on the fork's `oxidebsd`
+    branch) now builds real `argv_ptr`/`envp_ptr` arrays from the real `argv[1..]`/`envp[]` it was
+    given (as `RawArgvEntry`-shaped `{ptr, len}` pairs on the caller's own stack, terminated by a
+    `{0, 0}` entry — the exact wire format `stsh`'s own execve wrapper already used for `argv_ptr`,
+    see below), then issues a real `__syscall4`. `src/process.rs`'s `do_execve` gained an `envp_ptr`
+    parameter and a generalized `read_ptr_len_array` helper (renamed from the old, argv-only
+    `read_extra_argv` — same wire format, now shared by both `argv_ptr` and `envp_ptr`); the real
+    `envp` it reads now actually reaches `user_stack::build` (see "musl port" above), instead of
+    that call's `envp` argument always being `&[]`. **Still not fixed**: real `argv[0]` is silently
+    dropped — OxideBSD's `execve` always supplies `argv[0]` from `path_ptr`/`path_len` itself, with
+    no way for a caller to override it, a known, smaller, separate limitation.
+  - **stderr (`fd == 2`)** — see "Syscall ABI" above for the fix itself (an alias for stdout, not a
+    real second destination). Found by testing `cat.elf --help`/`cat.elf nonexistent.txt`: neither
+    printed anything at all before this, since every BusyBox diagnostic goes to stderr and this
+    kernel silently `EBADF`'d it.
+  - **BusyBox's own usage-text feature** (`SHOW_USAGE`/`FEATURE_VERBOSE_USAGE`, both `default y`
+    upstream but disabled like everything else under `allnoconfig` — `build.rs`'s
+    `configure_busybox_single_applet` now flips both on, the same pattern it already uses for
+    `CONFIG_STATIC`/the `SH_IS_*` choice). Without this, `--help` would print BusyBox's generic
+    `No help available` fallback instead of real per-applet usage text, even with stderr fixed.
+  - **A real finding, not a bug: `cat.elf --help` prints usage text and exits `1`, without the
+    `BusyBox vX.Y.Z ... multi-call binary.` banner a real installed `cat --help` shows** —
+    confirmed correct by reading `libbb/appletlib.c`, not assumed. The banner and the "exit 0 on
+    `--help`" behavior both come from `show_usage_if_dash_dash_help`, called only from
+    `run_applet_no_and_exit` — the *multi-call* dispatch path. A `SINGLE_APPLET_MAIN` build's own
+    `main()` calls `cat_main()` directly, bypassing that dispatcher entirely (see
+    `libbb/appletlib.c`'s own `#if defined(SINGLE_APPLET_MAIN)` branch), so `--help` just reaches
+    `cat`'s own `getopt32()` as an unrecognized option — real BusyBox's own "individual/standalone
+    binary" build mode (`make individual`) behaves identically, so this matches genuine BusyBox
+    behavior for this build mode, not a shortcut this port's own single-applet mechanism cut.
 - **`build.rs`'s BusyBox-applet and FAT32-embedding code is now data-driven, not hand-duplicated
   per applet.** The original `true`/`echo`-only version had a separate set of variables and a
   separate hand-written block (build call, FAT chain math, directory entry, content copy) for each
@@ -763,15 +833,11 @@ convention-fix bullet below, since `cat` is the first applet that actually needs
 - **What's explicitly still out of scope**: the `sh` applet (needs real process spawning/piping
   from *inside* a BusyBox process, a much bigger undertaking than a `NOFORK` applet like
   `true`/`echo`/`cat`), multi-applet dispatch in a single binary (still blocked — `argv[0]` itself
-  is still always the `execve` path, never caller-chosen; only `argv[1..]` is real now, see above),
-  `envp` passthrough through `execve` (`argv[1..]` is real now, `envp` still isn't), `execve`'s own
-  argument-convention mismatch (see above — genuinely untouched, unlike `open()`), a real `fstat`
-  implementation (see the numeric-collision note above), stderr/fd 2 (not wired up at all — a real
-  BusyBox error message, e.g. `cat`'s own `ENOENT` diagnostic, is silently dropped rather than
-  printed; confirmed via `cat.elf nonexistent.txt`, which exits `1` correctly but prints nothing),
-  persistence, and any automated integration test (verified manually via QEMU + injected
-  keystrokes instead, the same method every interactive `stsh` feature already uses — see "FAT32
-  filesystem module" below).
+  is still always the `execve` path, never caller-chosen, even now that `envp` is real — see
+  above), overriding `argv[0]` to anything other than the `execve` path (same underlying cause), a
+  real `fstat` implementation (see the numeric-collision note above), persistence, and any
+  automated integration test (verified manually via QEMU + injected keystrokes instead, the same
+  method every interactive `stsh` feature already uses — see "FAT32 filesystem module" below).
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 
@@ -865,12 +931,13 @@ new native-ABI syscalls (real FreeBSD numbers: `SYS_FORK = 2`, `SYS_WAIT4 = 7`, 
 `SYS_WRITE` already were. `stsh` uses all of this for real now — see "Interactive shell" above.
 
 No preemption (cooperative only — see the scheduler doc comment for the deliberate, deferred seam),
-no copy-on-write fork (full eager copy), no SMP, no `envp` passthrough across `execve` (`argv` *is*
-now real — see "musl port" below for `src/user_stack.rs`, which builds a real initial
-argc/argv/envp/auxv stack for every process, added after this subsystem's first pass), and no
-frame deallocation anywhere (reaping a zombie frees its Rust-heap PCB state correctly but leaks the
-physical frames backing its page tables/user pages — consistent with this codebase's existing
-total lack of a `FrameDeallocator`, not a new regression).
+no copy-on-write fork (full eager copy), no SMP, and no frame deallocation anywhere (reaping a
+zombie frees its Rust-heap PCB state correctly but leaks the physical frames backing its page
+tables/user pages — consistent with this codebase's existing total lack of a `FrameDeallocator`,
+not a new regression). `argv`/`envp` are both real now — see "musl port" below for
+`src/user_stack.rs`, which builds a real initial argc/argv/envp/auxv stack for every process, and
+"BusyBox port" below for how `envp` itself actually reaches `execve` (added well after this
+subsystem's first pass, once a 4th syscall argument existed to carry it).
 
 - **The process table (`process::Process`, `process::table()`) is a `Mutex<BTreeMap<Pid,
   Box<Process>>>`, `Box`-wrapped deliberately.** Letting a caller pull a raw `*mut Process` (or copy

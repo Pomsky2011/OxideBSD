@@ -1,12 +1,21 @@
-//! OxideBSD's native syscall ABI: `SYSCALL`/`SYSRETQ`, syscall number in `RAX`, up to three
-//! arguments in `RDI`/`RSI`/`RDX`, success/failure signaled via the **carry flag** — the
+//! OxideBSD's native syscall ABI: `SYSCALL`/`SYSRETQ`, syscall number in `RAX`, up to four
+//! arguments in `RDI`/`RSI`/`RDX`/`R10`, success/failure signaled via the **carry flag** — the
 //! traditional BSD (and general historical x86 Unix) convention, layered on top of the modern
 //! fast-syscall instruction pair instead of the legacy `int 0x80` software-interrupt gate this
 //! kernel used up through its first process/scheduler milestone. On success, `CF = 0` and `RAX`
 //! holds the return value; on failure, `CF = 1` and `RAX` holds the *positive* `errno`. Register
-//! placement (`RDI`/`RSI`/`RDX`/reserving `R10` for a future 4th argument, avoiding `RCX`/`R11`
-//! since `SYSCALL` itself clobbers them to save `RIP`/`RFLAGS`) mirrors real BSD's own
-//! `SYSCALL`-based convention.
+//! placement (`RDI`/`RSI`/`RDX`/`R10`, avoiding `RCX`/`R11` since `SYSCALL` itself clobbers them
+//! to save `RIP`/`RFLAGS`) mirrors real BSD's own `SYSCALL`-based convention.
+//!
+//! **`R10` used to be reserved but unread** — the entry stub always pushed it (uniform GPR
+//! save/restore, see `SyscallFrame`'s own doc comment), but `syscall_dispatch`/`dispatch` only
+//! ever forwarded `RDI`/`RSI`/`RDX` to a handler. Wired up for real once `SYS_EXECVE` needed a 4th
+//! argument (`envp_ptr`, alongside the existing `path_ptr`/`path_len`/`argv_ptr`) to support real
+//! `envp` passthrough — see `CLAUDE.md`'s BusyBox section. `SyscallHandler` is now a 4-argument
+//! function pointer; every registered handler across every module gained a 4th parameter (ignored
+//! by every syscall except `execve`), not just `execve`'s own — a real 4th argument is now a
+//! permanent part of this ABI, available to any future syscall that needs one, not a one-off
+//! special case threaded through only where `execve` needed it.
 //!
 //! **This mechanism used to be split across two files**: this module's own `int 0x80` gate, and a
 //! separate `src/linux_syscall.rs` that proved the `SYSCALL`/`SYSRETQ` mechanism in isolation
@@ -62,7 +71,7 @@ pub(crate) const ENOMEM: u64 = 12;
 /// convention (see this file's module doc comment) — it's purely this internal module↔kernel
 /// registration boundary's own shape, chosen because it's representable in a plain scalar FFI
 /// return without a `#[repr(C)]` result struct.
-pub type SyscallHandler = extern "C" fn(u64, u64, u64) -> i64;
+pub type SyscallHandler = extern "C" fn(u64, u64, u64, u64) -> i64;
 
 static SYSCALL_TABLE: Mutex<BTreeMap<u64, SyscallHandler>> = Mutex::new(BTreeMap::new());
 
@@ -254,7 +263,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     let frame = unsafe { &mut *frame };
 
     CURRENT_FRAME.store(frame as *mut SyscallFrame, Ordering::Relaxed);
-    let result = dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx);
+    let result = dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx, frame.r10);
     match result {
         Ok(value) => {
             frame.rax = value;
@@ -272,10 +281,16 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
 /// so it's directly unit-testable (see the `test_syscall_dispatch_*` tests in `src/lib.rs`). A
 /// pure lookup into `SYSCALL_TABLE` — no number is special-cased here anymore, they're all
 /// registered externally by whatever module chose to claim them.
-pub(crate) fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
+pub(crate) fn dispatch(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> Result<u64, u64> {
     let handler = SYSCALL_TABLE.lock().get(&number).copied();
     match handler {
-        Some(handler) => ffi_result_to_result(handler(arg0, arg1, arg2)),
+        Some(handler) => ffi_result_to_result(handler(arg0, arg1, arg2, arg3)),
         None => {
             serial_println!("[boot] unrecognized syscall number {}", number);
             Err(ENOSYS)
@@ -311,14 +326,20 @@ pub(crate) fn sys_read(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
     }
 }
 
-/// Writes `len` bytes at `ptr` to `fd`. `fd == 1` ("stdout") is routed through `serial_print!`
-/// (which already mirrors to VGA), returning `EINVAL` if the bytes aren't valid UTF-8 (real
-/// `write` doesn't care about UTF-8 at all; this is a self-imposed restriction of piping to a
-/// text-mode console). Any other `fd` is looked up in `crate::fd`'s registry and delegated;
-/// `EBADF` if nothing has registered it.
+/// Writes `len` bytes at `ptr` to `fd`. `fd == 1` ("stdout") *and* `fd == 2` ("stderr") are both
+/// routed through `serial_print!` (which already mirrors to VGA) — this kernel has no real
+/// terminal/multiplexing concept to give stderr a genuinely separate destination, so it's treated
+/// as an alias for stdout rather than the previous behavior (falling through to `crate::fd`'s
+/// registry, which never has fd 2 registered, so it always came back `EBADF` and every BusyBox
+/// diagnostic written to stderr — e.g. `cat`'s own `ENOENT` message — was silently dropped; see
+/// CLAUDE.md's BusyBox section for how this was found). Returns `EINVAL` if the bytes aren't valid
+/// UTF-8 (real `write` doesn't care about UTF-8 at all; this is a self-imposed restriction of
+/// piping to a text-mode console). Any other `fd` is looked up in `crate::fd`'s registry and
+/// delegated; `EBADF` if nothing has registered it.
 pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
     const STDOUT: u64 = 1;
-    if fd == STDOUT {
+    const STDERR: u64 = 2;
+    if fd == STDOUT || fd == STDERR {
         // SAFETY: this does not validate that [ptr, ptr+len) is actually mapped and user-
         // accessible before dereferencing it -- see CLAUDE.md's syscall ABI section. A bad
         // pointer page-faults, which the existing page_fault_handler already handles safely (log
@@ -427,12 +448,18 @@ pub(crate) extern "C" fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: 
     ))
 }
 
-pub(crate) extern "C" fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64) -> i64 {
+pub(crate) extern "C" fn oxidebsd_sys_execve(
+    path_ptr: u64,
+    path_len: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> i64 {
     result_to_ffi(crate::process::do_execve(
         crate::scheduler::current_pid(),
         path_ptr,
         path_len,
         argv_ptr,
+        envp_ptr,
     ))
 }
 

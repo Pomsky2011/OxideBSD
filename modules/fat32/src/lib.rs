@@ -71,7 +71,10 @@
 
 unsafe extern "C" {
     fn oxidebsd_log(ptr: *const u8, len: u64);
-    fn oxidebsd_register_syscall(number: u64, handler: extern "C" fn(u64, u64, u64) -> i64) -> i32;
+    fn oxidebsd_register_syscall(
+        number: u64,
+        handler: extern "C" fn(u64, u64, u64, u64) -> i64,
+    ) -> i32;
     fn oxidebsd_alloc_fd() -> u64;
     fn oxidebsd_register_fd_ops(
         fd: u64,
@@ -211,7 +214,7 @@ fn to_short_name(input: &[u8]) -> Option<[u8; 11]> {
 /// on `ls`. Returns a new fd on success, or a negative `-errno` (`ENOENT` if a file doesn't exist
 /// and `O_CREAT` wasn't set, `EFBIG` if an existing file is too large for `MAX_FILE_BUFFER`,
 /// `EMFILE` if `OPEN_FILES` is full, `EINVAL` for a malformed/multi-component path).
-extern "C" fn fat32_open(path_ptr: u64, path_len: u64, flags: u64) -> i64 {
+extern "C" fn fat32_open(path_ptr: u64, path_len: u64, flags: u64, _arg3: u64) -> i64 {
     // SAFETY: same trust boundary as sys_write's own documented pointer-validation gap in
     // src/syscall.rs -- the caller (ultimately userland, via SYS_OPEN) owns this pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -417,7 +420,7 @@ extern "C" fn fat32_close(fd: u64) -> i64 {
 /// Registered for `SYS_CLOSE`. Delegates to the kernel's own `oxidebsd_close_fd`, which removes
 /// `fd` from its registry and invokes `fat32_close` above -- not a direct call to `fat32_close`,
 /// so a closed fd is also no longer reachable via `SYS_READ`/`SYS_WRITE` afterward.
-extern "C" fn sys_close(fd: u64, _arg1: u64, _arg2: u64) -> i64 {
+extern "C" fn sys_close(fd: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
     unsafe { oxidebsd_close_fd(fd) as i64 }
 }
@@ -426,7 +429,7 @@ extern "C" fn sys_close(fd: u64, _arg1: u64, _arg2: u64) -> i64 {
 /// against the current directory and, if it names a directory, makes it the new current
 /// directory. `ENOTDIR` covers both "doesn't exist" and "exists but isn't a directory" -- kept
 /// simple rather than distinguishing them.
-extern "C" fn sys_chdir(path_ptr: u64, path_len: u64, _arg2: u64) -> i64 {
+extern "C" fn sys_chdir(path_ptr: u64, path_len: u64, _arg2: u64, _arg3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let disk: &[u8; DISK_SIZE] = unsafe { &*core::ptr::addr_of!(DISK) };
@@ -445,7 +448,7 @@ extern "C" fn sys_chdir(path_ptr: u64, path_len: u64, _arg2: u64) -> i64 {
 /// directory. Initializes the new subdirectory's own `.`/`..` entries (per FAT32 convention, a
 /// `..` whose parent is root stores cluster `0`, not root's real cluster number -- `parent_of`
 /// undoes the same translation when reading it back).
-extern "C" fn sys_mkdir(path_ptr: u64, path_len: u64, _arg2: u64) -> i64 {
+extern "C" fn sys_mkdir(path_ptr: u64, path_len: u64, _arg2: u64, _arg3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Some(short) = to_short_name(path) else {
@@ -1014,10 +1017,10 @@ pub extern "C" fn module_init() -> i32 {
 
     // --- Subdirectory self-check: mkdir, cd into it, create a file there, cd back, confirm the
     // file is reachable via an absolute path and invisible from root's own listing. ---
-    match sys_mkdir(b"SUB".as_ptr() as u64, 3, 0) {
+    match sys_mkdir(b"SUB".as_ptr() as u64, 3, 0, 0) {
         0 => {
             let cwd_before = current_dir_cluster();
-            if sys_chdir(b"SUB".as_ptr() as u64, 3, 0) != 0 {
+            if sys_chdir(b"SUB".as_ptr() as u64, 3, 0, 0) != 0 {
                 ok = false;
                 log("[fat32] self-check FAILED: chdir into SUB failed\n");
             } else {
