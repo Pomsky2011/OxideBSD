@@ -226,19 +226,38 @@ pub(crate) fn dup2(oldfd: u64, newfd: u64) -> Result<u64, ()> {
 /// `real_fd`, not `fd` — see this file's module doc comment). `None` (not any particular error
 /// value) means the calling process has no such `fd` registered — `syscall::sys_read` treats that
 /// as `EBADF`.
+/// `len == 0` short-circuits *before* reaching any registered callback, for every fd alike — a
+/// real, previously-latent bug, found only by running BusyBox's `hush` as pid 1 long enough for
+/// its own stdio layer to flush an empty buffer: real `write(fd, buf, 0)`/`read(fd, buf, 0)` is
+/// POSIX-guaranteed not to touch `buf` at all and to return `0` immediately, regardless of whether
+/// `buf` is even a valid pointer — musl's own stdio does call `write()` this way (an `fflush()` on
+/// an empty buffer, seen in practice as `write(1, NULL, 0)`). Every registered callback
+/// (`stdin_read`, `stdout_write`, `modules/oxfs`'s file read/write, `src/pipe.rs`'s pipe ends) used
+/// to construct a slice via `core::slice::from_raw_parts(_mut)` unconditionally, which Rust's own
+/// safety contract requires a non-null, aligned pointer for even at length `0` — a real, not just
+/// theoretical, panic once a null pointer actually reached one. Guarding once here, centrally,
+/// covers every one of them without touching each callback individually, since `sys_read`/
+/// `sys_write` (`src/syscall.rs`) route every fd through these two functions unconditionally.
 pub(crate) fn read(fd: u64, ptr: u64, len: u64) -> Option<i64> {
     let ops = *TABLE.lock().get(&(scheduler::current_pid(), fd))?;
+    if len == 0 {
+        return Some(0);
+    }
     Some((ops.read)(ops.real_fd, ptr, len))
 }
 
 pub(crate) fn write(fd: u64, ptr: u64, len: u64) -> Option<i64> {
     let ops = *TABLE.lock().get(&(scheduler::current_pid(), fd))?;
+    if len == 0 {
+        return Some(0);
+    }
     Some((ops.write)(ops.real_fd, ptr, len))
 }
 
 extern "C" fn stdin_read(_real_fd: u64, ptr: u64, len: u64) -> i64 {
     // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
     // already has -- [ptr, ptr+len) isn't checked against the caller's actual mappings first.
+    // len == 0 is already handled by this file's own read() above, never reaching here.
     let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
     crate::stdin::read(buf) as i64
 }
@@ -255,6 +274,7 @@ extern "C" fn read_not_permitted(_real_fd: u64, _ptr: u64, _len: u64) -> i64 {
 /// doc comment for why stderr isn't a genuinely separate destination.
 extern "C" fn stdout_write(_real_fd: u64, ptr: u64, len: u64) -> i64 {
     // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+    // len == 0 is already handled by this file's own write() above, never reaching here.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     match core::str::from_utf8(bytes) {
         Ok(s) => {

@@ -590,6 +590,8 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_alloc_fd" => Some(crate::fd::oxidebsd_alloc_fd as *const () as u64),
         "oxidebsd_register_fd_ops" => Some(crate::fd::oxidebsd_register_fd_ops as *const () as u64),
         "oxidebsd_close_fd" => Some(crate::fd::oxidebsd_close_fd as *const () as u64),
+        "oxidebsd_get_cwd" => Some(crate::process::oxidebsd_get_cwd as *const () as u64),
+        "oxidebsd_set_cwd" => Some(crate::process::oxidebsd_set_cwd as *const () as u64),
         _ => None,
     }
 }

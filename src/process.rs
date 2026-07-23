@@ -200,6 +200,15 @@ pub struct Process {
     /// `0` for a freshly spawned/`execve`'d process (no TLS set up yet); a forked child inherits the
     /// parent's live value (real `fork()` semantics — TLS state is copied, not reset).
     pub fs_base: u64,
+    /// This process's current-working-directory, as an opaque inode number `modules/oxfs` (not the
+    /// kernel) assigns meaning to — the kernel never interprets it, just persists/restores it per
+    /// process on `fork`/`spawn` exactly like `brk`/`fs_base` already do. `0` is oxfs's own root
+    /// inode number, which conveniently doubles as "unset" for a freshly spawned process. Fixes the
+    /// "one, kernel-wide current directory" limitation `modules/fat32` had (see CLAUDE.md) — now
+    /// that real processes exist, cwd is genuinely per-process. `do_execve` deliberately leaves
+    /// this untouched (real `execve()` preserves the caller's cwd, unlike `fs_base`, which an
+    /// exec'd program's own TLS layout makes meaningless to keep).
+    pub cwd: u64,
     /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
     #[allow(dead_code)]
     pub priority: u8,
@@ -249,13 +258,18 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
     // spawn() has no real invocation path to use as argv[0] (unlike do_execve, which knows exactly
     // what path it opened) -- this is only ever pid 1, built directly from an embedded ELF at
-    // boot, so a fixed placeholder is all there is to give. Neither of spawn()'s two current
-    // callers (stsh, tests/fork_wait.rs's fork-exec-smoke) reads its own argv, so this is inert
-    // until a real libc (musl) is what's spawned this way.
+    // boot, so a fixed placeholder is all there is to give. `stsh`/`fork-exec-smoke` (this
+    // function's other historical callers) never read their own argv/envp, but pid 1 is a real
+    // musl-linked binary (BusyBox's `hush`) now -- `envp` carries the same one-entry `PATH=`
+    // `stsh`'s own execve wrapper already passes to every child it runs, for the identical reason
+    // (see CLAUDE.md's BusyBox section): an empty, but *present*, `$PATH` short-circuits musl's
+    // `__execvpe` into trying exactly one root-relative candidate per name
+    // (`/<name>`), the one shape `modules/oxfs`'s flat root layout actually resolves, instead of
+    // musl's own hardcoded `/usr/local/bin:/bin:/usr/bin` fallback when `$PATH` is unset entirely.
     let initial_rsp = crate::user_stack::build(
         &elf,
         &[b"(init)"],
-        &[],
+        &[b"PATH="],
         stack_top,
         user_stack_bottom(stack_top),
         &mapped_pages,
@@ -280,6 +294,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         user_stack_top: initial_rsp,
         brk: VirtAddr::new(elf.highest_loaded_address()),
         fs_base: 0,
+        cwd: 0,
         priority: 0,
     };
 
@@ -357,7 +372,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
     let phys_offset = memory::phys_mem_offset();
 
     let child_pid = alloc_pid();
-    let (child_address_space, parent_brk, parent_fs_base) = {
+    let (child_address_space, parent_brk, parent_fs_base, parent_cwd) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
             .get_mut(&caller_pid)
@@ -367,7 +382,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // with its own CR3 still live.
         let child_address_space =
             with_frame_allocator(|fa| parent.address_space.fork(phys_offset, fa));
-        (child_address_space, parent.brk, parent.fs_base)
+        (child_address_space, parent.brk, parent.fs_base, parent.cwd)
     };
 
     let kernel_stack = KernelStack::new();
@@ -389,6 +404,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         user_stack_top: VirtAddr::zero(),
         brk: parent_brk,
         fs_base: parent_fs_base,
+        cwd: parent_cwd,
         priority: 0,
     };
 
@@ -692,6 +708,38 @@ pub fn do_getppid() -> u64 {
         .get(&scheduler::current_pid())
         .and_then(|p| p.parent)
         .unwrap_or(0)
+}
+
+/// Backing store for `oxidebsd_get_cwd`/`oxidebsd_set_cwd` while `scheduler::current_pid() == 0`
+/// -- i.e. only during boot, before `scheduler::start` ever runs a real process (pid 1 onward).
+/// `modules/oxfs`'s own `module_init` self-check calls `chdir`/`mkdir`/etc. directly at exactly
+/// this point, with no `Process` yet in `PROCESS_TABLE` for pid 0 to store a cwd in -- mirrors
+/// `src/fd.rs`'s own `BOOTSTRAP_PID` idiom for the identical "boot-time, no real process exists
+/// yet" problem. Never touched again once a real process is running, since `current_pid()` is
+/// never `0` again after that.
+static BOOT_CWD: AtomicU64 = AtomicU64::new(0);
+
+/// Exposed to modules (see `src/module.rs`'s `resolve_external_symbol`) so a filesystem module can
+/// track cwd per-process without the kernel needing to interpret what the value means -- see
+/// `Process::cwd`'s own doc comment. No pid crosses the module boundary; the kernel resolves
+/// `scheduler::current_pid()` itself, the same way `src/fd.rs` already does for the fd table.
+pub(crate) extern "C" fn oxidebsd_get_cwd() -> u64 {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        return BOOT_CWD.load(Ordering::Relaxed);
+    }
+    table().lock().get(&pid).map(|p| p.cwd).unwrap_or(0)
+}
+
+pub(crate) extern "C" fn oxidebsd_set_cwd(inode: u64) {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        BOOT_CWD.store(inode, Ordering::Relaxed);
+        return;
+    }
+    if let Some(p) = table().lock().get_mut(&pid) {
+        p.cwd = inode;
+    }
 }
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from

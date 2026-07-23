@@ -14,8 +14,10 @@ allocator backed by bootloader-provided paging. Phase 2 is well underway: the ke
 (`src/elf.rs`), jump into ring 3 (`src/usermode.rs`), and user-mode code can call back into the
 kernel via a single native, BSD-style syscall ABI (`src/syscall.rs`: `SYSCALL`/`SYSRETQ`,
 carry-flag error signaling, the traditional BSD/x86-Unix convention). A first genuinely interactive
-userland program, `userland/stsh/` ("stupidshell"), now runs by default — see "Interactive shell"
-below.
+userland program, `userland/stsh/` ("stupidshell"), used to run by default — see "Interactive
+shell" below for its own design, still real and still buildable — but pid 1 today is BusyBox's
+`hush` instead (see "oxfs filesystem module" below), a real shell over a real filesystem rather
+than a purpose-built demo.
 
 **This ABI used to be two independent, deliberately different mechanisms**: this native one over
 `int 0x80`, and a separate Linux-compatible `SYSCALL`/`SYSRET` path (`src/linux_syscall.rs`,
@@ -31,19 +33,23 @@ modules" below): it relocates independently-compiled `#![no_std]` code into the 
 boot, resolves the handful of symbols that code references against a small hand-curated kernel API,
 and calls the module's `module_init`. The native ABI's syscall-number → handler dispatch table
 (`src/syscall.rs`) is no longer a hardcoded `match` — it's populated by one such module,
-`modules/native_abi/`. A second module, `modules/fat32/` (see "FAT32 filesystem module" below),
-implements a basic FAT32 filesystem — parsed from a build-time-generated, embedded in-memory disk
-image, since no real block device driver exists yet — with read and write support (including
-subdirectories), registering `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/`SYS_MKDIR` and, via a small
-kernel-owned fd registry (`src/fd.rs`), extending `SYS_READ`/`SYS_WRITE` to real files. `stsh`'s
-`cat`/`write`/`cd`/`ls`/`mkdir` commands exercise this end to end.
+`modules/native_abi/`. The live filesystem module is `modules/oxfs/` (see "oxfs filesystem module"
+below) — a small, real Unix-shaped inode/block filesystem, in-memory only (no real block device
+driver exists yet), with real multi-component path resolution, real per-process current-working-
+directory, and no fixed per-file size cap. It registers `SYS_OPEN`/`SYS_CLOSE`/`SYS_CHDIR`/
+`SYS_MKDIR`/`SYS_GETCWD`/`SYS_UNLINK`/`SYS_RMDIR`/`SYS_RENAME` and, via a small kernel-owned fd
+registry (`src/fd.rs`), extends `SYS_READ`/`SYS_WRITE` to real files. `stsh`'s
+`cat`/`write`/`cd`/`ls`/`mkdir` commands exercise this end to end. `modules/oxfs/` replaced an
+earlier module, `modules/fat32/` (see "FAT32 filesystem module" below for its own design and why
+it's now superseded) — `modules/fat32/` is kept in the workspace and still builds/self-checks on
+every `cargo build`, but is no longer loaded at boot.
 
 There is also a real **process abstraction and cooperative scheduler** (`src/process.rs`,
 `src/scheduler.rs`, `src/context_switch.rs` — see "Process abstraction, scheduler, and
 fork/exec/wait" below): a dynamically-allocated process table, kernel-thread-style context
 switching between per-process kernel stacks, and `fork`/`execve`/`wait4`/`getpid` over the native
 ABI. `stsh` genuinely runs other programs — any command that isn't a recognized built-in is
-`fork`+`execve`+`wait`ed as a real child process, resolved through the same FAT32 filesystem
+`fork`+`execve`+`wait`ed as a real child process, resolved through the same filesystem
 `cat`/`write` already use.
 
 **A real, unmodified-above-the-syscall-layer musl static binary now runs** (see "musl port"
@@ -56,20 +62,33 @@ the hardware level at all (`src/fpu.rs`, new); and a new `SYS_WRITEV` syscall wa
 musl's entire stdio write path goes through `writev`, not plain `write` — see "musl port" for the
 full story of each.
 
-**Four BusyBox applets now run on top of that same musl** (see "BusyBox port" below): `true`/
-`echo`/`cat`/`sh` (BusyBox's `hush`), each its own genuinely standalone, single-applet static
-binary (not a multi-call `busybox` binary dispatching on argv[0], which this codebase's `execve`
-doesn't support), `execve`'d by `stsh` as `TRUE.ELF`/`ECHO.ELF`/`CAT.ELF`/`SH.ELF` exactly like
-`MUSL.ELF`. `true`/`echo` needed no new kernel syscalls at all; `cat` needed `open()`'s argument
+**Seven BusyBox applets now run on top of that same musl** (see "BusyBox port" below): `true`/
+`echo`/`cat`/`sh` (BusyBox's `hush`)/`false`/`yes`/`more`, each its own genuinely standalone,
+single-applet static binary (not a multi-call `busybox` binary dispatching on argv[0], which this
+codebase's `execve` doesn't support), `execve`'d by `stsh` as `true.elf`/`echo.elf`/`cat.elf`/
+`sh.elf`/`false.elf`/`yes.elf`/`more.elf` (embedded in `modules/oxfs/`'s filesystem, lowercase —
+see "oxfs filesystem module" below) exactly like `musl.elf`. `false`/`yes` needed nothing new
+either (`false` just exits `1`; `yes` loops writing `"y\n"` forever — there's no signal-delivery
+mechanism in this kernel at all yet, so once started it can only be stopped by killing the whole
+VM, a real, inherent gap worth knowing before running it interactively). `more`, given a filename
+argument, hits the same already-documented, confirmed-harmless `ioctl`/`TIOCGWINSZ` gap `cat`'s own
+stdout path already exercises (no real terminal to query size from) and falls back to dumping the
+whole file, same as `cat`. `true`/`echo` needed no new kernel syscalls at all; `cat` needed `open()`'s argument
 convention fixed (musl-side); `sh` needed the most by far — a real 4th syscall argument (`R10`,
 for `envp` passthrough across `execve`), real `pipe(2)`/`dup2(2)` with a genuinely blocking pipe
 read (`src/pipe.rs`), a per-process (not kernel-wide) file-descriptor table (`src/fd.rs`), and a
 real, previously-latent kernel bug found only by running it: `IA32_FS_BASE` (TLS) is a single
 global MSR that context switches never saved/restored per-process, so any musl-linked parent that
 resumed after a musl-linked child exited would silently run with the dead child's own TLS base —
-see "BusyBox port" below for the full story, including what still doesn't work (`sh.elf -c
-"command"` runs real pipelines correctly; plain interactive `sh.elf`, reading commands from the
-keyboard, does not — a separate, harder problem, see below). New syscalls a future applet needs
+see "BusyBox port" below for the full story, including what used to not work (`sh.elf -c
+"command"` running real pipelines was the original limit — plain interactive `sh.elf`, reading
+commands from the keyboard, didn't work at all at the time, a separate, harder problem). Genuine
+interactive `sh.elf` — typing it bare at `stsh`'s prompt and then typing further commands straight
+into `hush` itself (`pwd`, `cat.elf hello.txt`, `echo.elf hi`, all verified) — now works, once a
+separate, already-in-flight "blocking stdin read" pass (real interrupts-enabled idle wait,
+`scheduler::wait_for_ready`) landed and the oxfs pass gave it real syscalls
+(`getcwd`/`chdir`/`open`) to actually exercise; see "BusyBox port" below for the historical
+"doesn't work yet" account of why, which this supersedes. New syscalls a future applet needs
 are registered by a new, deliberately separate module, `modules/posix_compat/` (`pipe`/`dup2` so
 far), rather than growing `modules/native_abi/` further.
 
@@ -670,7 +689,10 @@ resembling a shell or a real toolbox. A second pass added `cat` — see the `ope
 convention-fix bullet below, since `cat` is the first applet that actually needs it. A third pass
 added `sh` (BusyBox's `hush`) — by far the largest of the four, needing a real 4th syscall
 argument, real `pipe(2)`/`dup2(2)`, a per-process fd table, and a real, previously-latent
-`IA32_FS_BASE` bug fixed — see the dedicated bullets below.
+`IA32_FS_BASE` bug fixed — see the dedicated bullets below. A later pass, once `modules/oxfs`
+replaced `modules/fat32` as the live filesystem (see "oxfs filesystem module" below), added three
+more in one go — `false`/`yes`/`more` — needing no new kernel work at all, the same
+nothing-new-needed shape `true`/`echo` originally had.
 
 - **Vendored as a submodule pointing at a personal GitHub fork** (`third_party/busybox`, pinned to
   release tag `1_36_1`), mirroring `third_party/musl`'s own setup exactly — a parking spot for
@@ -703,7 +725,8 @@ argument, real `pipe(2)`/`dup2(2)`, a per-process fd table, and a real, previous
   comment about this exact same trap). The build asserts `NUM_APPLETS == 1` via
   `include/NUM_APPLETS.h` before returning, rather than trusting the config silently produced what
   was asked for. Each applet gets its own load address (`0xb00000` for `true`, `0xc00000` for
-  `echo`, `0xd00000` for `cat`, `0xe00000` for `sh`), following the same clear-of-everything-else
+  `echo`, `0xd00000` for `cat`, `0xe00000` for `sh`, `0xf00000` for `false`, `0x1000000` for `yes`,
+  `0x1100000` for `more`), following the same clear-of-everything-else
   discipline every prior userland load address in this codebase already needed (see "User-mode
   execution" above).
 - **Embedded into the FAT32 image as `TRUE.ELF`/`ECHO.ELF`, deliberately with an extension** —
@@ -976,35 +999,35 @@ argument, real `pipe(2)`/`dup2(2)`, a per-process fd table, and a real, previous
     throwaway directory `modules/fat32`'s own self-check creates at boot): prints `/SUB` and exits
     with code `1` (`stsh`'s own pid, `hush`'s real parent) — `cd`/`pwd`/`$PPID` all correct
     together in one real `hush` process, not just individually.
-- **A separate, pre-existing bug, found while verifying the fix above, not caused by it: typing
-  `ls` at `stsh`'s own prompt (not through `hush` at all) double-faults and reboots the machine.**
-  Confirmed via git-stash bisection to already reproduce on a clean checkout of this repository's
-  current HEAD commit, with *zero* of this pass's changes applied — it lives in the separate,
-  already-uncommitted, in-progress "blocking stdin read" work spanning `src/process.rs`/
-  `src/scheduler.rs`/`src/stdin.rs` (a new `BlockReason::WaitingForStdin` and a real
-  interrupts-enabled idle wait, `scheduler::wait_for_ready` — exactly the "real fix" the
-  `sh.elf`-interactive-mode limitation above describes as future work, apparently already
-  mid-flight) that predates this session and was already sitting uncommitted in the working tree
-  before this pass started. Not investigated or fixed here — flagged for a separate pass, since
-  it's a different subsystem's bug, not a "syscalls `hush` needs" problem.
-- **What's explicitly still out of scope**: real interactive `sh` (typing `sh.elf` alone and
-  getting a live prompt) — `sh.elf -c "command"` works, including real pipelines, but plain
-  `sh.elf` reading commands from the keyboard does not, and confirmed *why* it can't just be turned
-  on: `sys_read` on stdin is non-blocking by design (`Ok(0)` immediately whenever the ring buffer
-  is empty, which is nearly always — see "Syscall ABI"/"Interactive shell" — `stsh`'s own read loop
-  busy-polls around this), so `hush`, reading in ordinary blocking mode, sees an instant 0-byte
-  read as genuine EOF and exits before a human can type anything. A real fix would need `sys_read`
-  to actually block *and* interrupts re-enabled while blocked (unlike `wait4`/pipe blocking, which
-  only need cooperation between already-scheduled processes, stdin can only ever be woken by the
-  keyboard IRQ — impossible while `SFMASK` keeps interrupts masked for the whole syscall, the
-  current invariant every blocking syscall today relies on) — real, substantial follow-up work,
-  deliberately not attempted in this pass. Also still out of scope: multi-applet dispatch in a
-  single binary (still blocked — `argv[0]` itself is still always the `execve` path, never
-  caller-chosen, even now that `envp` is real), overriding `argv[0]` to anything other than the
-  `execve` path (same underlying cause), a real `fstat` implementation (see the numeric-collision
-  note above), persistence, and any automated integration test (verified manually via QEMU +
-  injected keystrokes instead, the same method every interactive `stsh` feature already uses — see
-  "FAT32 filesystem module" below).
+- **A separate, pre-existing bug, found while verifying the fix above at the time, not caused by
+  it: typing `ls` at `stsh`'s own prompt (not through `hush` at all) used to double-fault and
+  reboot the machine.** Confirmed via git-stash bisection to already reproduce on a clean checkout
+  of this repository's HEAD at the time, with *zero* of this BusyBox pass's changes applied — it
+  lived in the separate, then-uncommitted, in-progress "blocking stdin read" work spanning
+  `src/process.rs`/`src/scheduler.rs`/`src/stdin.rs` (a new `BlockReason::WaitingForStdin` and a
+  real interrupts-enabled idle wait, `scheduler::wait_for_ready`). **Confirmed fixed since**, once
+  that work landed and was verified (via QEMU + injected keystrokes) during the oxfs pass: `ls` at
+  `stsh`'s own prompt now returns a clean listing and control returns to the prompt, no fault.
+- **Real interactive `sh` now works — verified during the oxfs pass, superseding the "still out of
+  scope" account below this bullet used to be.** Typing `sh.elf` bare at `stsh`'s prompt, then
+  typing further commands straight into `hush` itself (`pwd` → `/`; `cat.elf hello.txt` → real
+  file contents; `echo.elf hi` → `hi`), all worked end to end once two separate pieces landed
+  together: the "blocking stdin read" pass mentioned above (so `hush`'s own blocking `read()`
+  genuinely waits for a keystroke instead of seeing an instant 0-byte EOF and exiting), and oxfs's
+  own `getcwd`/`chdir`/`open` syscalls for it to actually exercise once it *can* wait. `hush`
+  prints no visible prompt of its own (`CONFIG_HUSH_INTERACTIVE` is still off — see above), so a
+  freshly typed `sh.elf` looks idle/stuck for a moment; it isn't, it's genuinely blocked waiting
+  for the next line. What was actually verified: ordinary commands and `cwd`/file reads through
+  `hush` interactively; *not* re-verified here: job control, `Ctrl+C`/`Ctrl+D` inside `hush`
+  itself, or anything `CONFIG_HUSH_INTERACTIVE` would add.
+- **What's still out of scope**: multi-applet dispatch in a single binary (still blocked —
+  `argv[0]` itself is still always the `execve` path, never caller-chosen, even now that `envp` is
+  real), overriding `argv[0]` to anything other than the `execve` path (same underlying cause), a
+  real `fstat` implementation (see the numeric-collision note above — still not implemented; see
+  "oxfs filesystem module" below for why this pass didn't attempt it either), persistence, and any
+  automated integration test (verified manually via QEMU + injected keystrokes instead, the same
+  method every interactive `stsh`/`hush` feature already uses — see "oxfs filesystem module"
+  below).
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 
@@ -1415,6 +1438,15 @@ combined).
 
 ## FAT32 filesystem module (`modules/fat32/`, `src/fd.rs`)
 
+**Superseded — kept in the workspace, unused, not loaded at boot.** See "oxfs filesystem module"
+below for the module actually running today (`modules/oxfs/`, registering the same syscall numbers
+this section describes plus a few new ones). `modules/fat32/` still builds and self-checks on every
+`cargo build` (`build.rs`'s own FAT32 pipeline is untouched) — a still-working format-correctness
+proof, just no longer wired into `src/main.rs`'s boot sequence. Every mention below of "the embedded
+FAT32 image"/`SMOKE.ELF`/`MUSL.ELF`/etc. (here and in the musl-port/BusyBox-port sections further
+down, which narrate work done *against this module* at the time) describes that historical state
+accurately; the live copies of those same files now live in `modules/oxfs/`'s own image instead.
+
 A basic FAT32 filesystem, loaded as a dynamic kernel module (see above) and backed by a small,
 build-time-generated, embedded in-memory disk image — there's no real block device driver yet, so
 this is squarely a filesystem-*format* proof, not a storage-*driver* one. Read and write are both
@@ -1555,6 +1587,161 @@ implemented; writes mutate the in-memory working copy only and **do not persist 
   directory, not an alias for root); `write notes hi there` inside it, followed by `ls`, shows
   `NOTES` there and *not* back in root's own listing after `cd ..`; `cat /hello.txt` from inside
   `projects` (root-relative, despite the current directory) still finds the original demo file.
+
+## oxfs filesystem module (`modules/oxfs/`, `src/fd.rs`, `src/process.rs`'s `Process::cwd`)
+
+The live filesystem, replacing `modules/fat32/` (see that section above for what this fixes and
+why FAT32 was replaced rather than extended — no real block device driver exists to make a real
+on-disk format worth keeping, and FAT32's own limitations were starting to actively block further
+BusyBox work: 8.3 names, one path component per syscall call, a directory that can never grow past
+its first cluster, a fixed per-open-file read cap, one kernel-wide current directory, and no
+`unlink`/`rmdir`/`rename` at all). Still in-memory only, same as FAT32 — nothing persists across
+reboot.
+
+- **A small, real Unix-shaped inode/block filesystem, not another disk format.** A flat pool of
+  `NUM_BLOCKS = 1024` `BLOCK_SIZE = 4096`-byte blocks and a flat table of `MAX_INODES = 64` inodes,
+  all fixed-size `static mut` arrays (modules can't use `alloc`/`Vec`/`BTreeMap` — see "Dynamic
+  kernel modules" above). Each inode holds up to `DIRECT_BLOCKS = 12` block numbers directly plus
+  one single-indirect block (another `BLOCK_SIZE / 4 = 1024` pointers) — max file size is bounded
+  only by the block pool itself (~4 MiB), not by an arbitrary per-file cap the way FAT32's
+  `MAX_FILE_BUFFER` was (raised three times just to fit bigger BusyBox applets). `NO_BLOCK =
+  u32::MAX` is the "no block allocated here yet" sentinel — block numbers are plain `0`-based
+  indices into the pool, unlike FAT32's cluster numbering (which reserves `0`/`1`), so `0` itself
+  can't double as the sentinel the way it does there. A freshly allocated *indirect* block is
+  explicitly filled with `0xFF` bytes, not zeroed — a zeroed block would decode every 4-byte slot
+  as block `0` (a real, valid block), not `NO_BLOCK`.
+- **Directories are ordinary inodes**, not a separate on-disk structure — their data blocks hold
+  fixed 32-byte records (`{ used: u8, name_len: u8, inode: u32, name: [u8; NAME_MAX] }`,
+  `NAME_MAX = 26`, `RECORDS_PER_BLOCK = 128`). Real names, not FAT32's 8.3 short names. A directory
+  that fills its current blocks grows another one via the same `inode_ensure_block_at` every other
+  file write uses — no `DirectoryFull`/`ENOSPC` dead end. `unlink`/`rmdir` only clear a record's
+  `used` byte; the underlying inode/blocks are never freed, matching this codebase's blanket "no
+  deallocation anywhere" policy (`do_munmap`, module unload, `BootInfoFrameAllocator`, etc.).
+- **Root is a fixed inode number, `ROOT_INODE = 0`**, self-referencing `.`/`..` (root's `..` points
+  at itself) — no FAT32-style "`0` means root" special-casing needed, since there's no on-disk
+  format to stay compatible with. `ROOT_INODE`'s value deliberately coincides with `Process::cwd`'s
+  own default (`0`, "unset") — a freshly spawned process's cwd is root with no translation needed.
+- **Real multi-component path resolution — the actual "unix-ish" fix.** `resolve_path` splits a
+  path on `/` and walks it component by component (from root, on a leading `/`, or from the
+  caller's cwd otherwise), handling `.`/`..`/empty components along the way — `a/b/c`, `../x`,
+  `/a/b` all resolve in one call, replacing FAT32's `to_short_name`, which flatly rejected any
+  embedded `/`. `resolve_parent` (used by every operation that creates, removes, or renames a name)
+  is layered on top: it splits off the final path component as a raw name and resolves everything
+  before it as a directory via `resolve_path` — so `mkdir sub/nested`, `unlink /a/b/c`, etc. all
+  work as long as the parent path already exists, not just a bare name in the current directory.
+- **Real per-process current-working-directory**, fixing FAT32's "one, kernel-wide current
+  directory" limitation (a real, now-live gap once real processes existed — see that section
+  above). `src/process.rs`'s `Process` gained a `cwd: u64` field — an opaque inode number the
+  kernel itself never interprets, just persists/restores per process on `fork`/`spawn` exactly like
+  `brk`/`fs_base` already do. Two new kernel functions, `oxidebsd_get_cwd`/`oxidebsd_set_cwd`
+  (`src/process.rs`, added to `src/module.rs`'s `resolve_external_symbol` table), resolve
+  `scheduler::current_pid()` themselves — no pid crosses the module boundary, the same pattern
+  `src/fd.rs` already established for the per-process fd table. `do_fork_from_current` copies the
+  parent's `cwd` (real `fork()` semantics); `do_execve` deliberately leaves it untouched (real
+  `execve()` preserves cwd, unlike `fs_base`, which an exec'd program's own TLS layout makes
+  meaningless to keep). **A real wrinkle this exposed**: `oxfs`'s own `module_init` self-check
+  calls `chdir`/`mkdir` directly at boot, before any real process exists (`scheduler::current_pid()`
+  is `0` at that point, and `Process::cwd` needs an actual `Process` in the table to live in, which
+  pid `0` never has) — `oxidebsd_get_cwd`/`oxidebsd_set_cwd` fall back to a small dedicated
+  `BOOT_CWD` static for exactly `pid == 0`, mirroring `src/fd.rs`'s own `BOOTSTRAP_PID` idiom for
+  the identical "boot-time, no real process yet" problem. Never touched again once a real process
+  is running.
+- **Open files stream real files straight from their block chain, rather than caching a whole file
+  at `open` time the way FAT32's own `OpenFile::Read` did.** `OpenFile::FileRead { inode, position
+  }` just tracks a cursor; each `read()` call walks `inode`'s block chain via `read_inode_at`
+  starting from `position` — no per-fd buffer at all, so file size is bounded only by the block
+  pool. Directory listings (`OpenFile::DirListing`) stay cached in a small fixed buffer at `open`
+  time, same as FAT32's own `ls`-via-`open` trick, since listings are small regardless. A file
+  opened for writing (`OpenFile::Write`) still accumulates into a fixed buffer across possibly-
+  multiple `write` calls, committed to a real inode only at `close` — same all-at-once-on-close
+  model FAT32 already used, sized (`MAX_WRITE_BUFFER = 131072`) to match FAT32's own final,
+  proven-sufficient `MAX_FILE_BUFFER` value. `OpenFile` needs `#[allow(clippy::large_enum_variant)]`
+  since `Write`'s buffer dwarfs the other two variants — deliberate, not overlooked: without
+  `alloc`/`Box`, every `OPEN_FILES` slot has to be sized for the worst case regardless.
+- **Syscalls registered at the exact numbers `modules/fat32` used** (so nothing else in the ABI
+  changes): `SYS_OPEN = 5`, `SYS_CLOSE = 6`, `SYS_CHDIR = 12`, `SYS_MKDIR = 136`,
+  `SYS_GETCWD = 108`. Plus three new ones — OxideBSD-own-invented numbers continuing from `108`,
+  per this project's established convention that syscalls added after the musl/BusyBox port invent
+  their own numbers rather than copying FreeBSD's (see `SYS_GETPPID`/`SYS_GETCWD`/`SYS_PIPE`/
+  `SYS_DUP2`): `SYS_UNLINK = 109` (refuses a directory, `EISDIR` — use `SYS_RMDIR` instead),
+  `SYS_RMDIR = 110` (only succeeds on an empty directory, `.`/`..` excepted), and
+  `SYS_RENAME = 111` (`(old_ptr, old_len, new_ptr, new_len)` — uses all four of this ABI's argument
+  registers, the same precedent `execve`'s `envp_ptr` set for needing `R10`). `stat`/`fstat` is
+  deliberately **not** attempted here — it needs a byte-exact musl `struct stat` layout, separate
+  follow-up work, needed once `ls -l`/`test -f`-style applets show up.
+- **musl-side patches**, on `third_party/musl`'s fork's `oxidebsd` branch, mirroring `open.c`'s
+  existing argument-convention-fix pattern: real `unlink(path)`/`rmdir(path)`/`rename(old, new)`
+  pass plain NUL-terminated pointers with no length, so `src/unistd/unlink.c`/`src/unistd/rmdir.c`
+  compute `path_len` via `strlen()` and issue the syscall directly; `src/stdio/rename.c` issues a
+  real 4-argument `__syscall4` carrying both paths' lengths (mirroring `execve.c`'s own precedent
+  for needing `R10`). `bits/syscall.h.in` remaps `__NR_unlink`/`__NR_rmdir`/`__NR_rename` (Linux's
+  original values, never reachable before now) to `109`/`110`/`111`. No changes needed for
+  `open`/`chdir`/`mkdir`/`getcwd` — already patched from the FAT32 pass, numbers unchanged.
+- **No on-disk image to generate at build time, unlike FAT32.** `build.rs` gained a new
+  `build_module_crate("oxfs", "OXFS", &[...])` call passing each already-built embed target's path
+  straight through as its own env var (`OXFS_SMOKE_ELF_PATH`, `OXFS_MUSL_ELF_PATH`,
+  `OXFS_TRUE_ELF_PATH`, `OXFS_ECHO_ELF_PATH`, `OXFS_CAT_ELF_PATH`, `OXFS_HUSH_ELF_PATH`) — the same
+  `extra_env` mechanism `FAT32_IMAGE_PATH` already used, just handing over a real ELF's path
+  directly instead of a path to a generated binary disk image. `modules/oxfs/src/lib.rs`'s
+  `module_init` calls `include_bytes!(env!(...))` for each and seeds it via `seed_file` (the
+  `module_init`-time equivalent of `open(O_CREAT)` + `write` + `close`) directly into the inode
+  table — no seed-image format to design. `hello.txt`/`big.txt` don't need `build.rs` at all: a
+  string literal and the same `b'A' + i % 26` formula FAT32's own self-check already used,
+  generated in Rust at `module_init` time. Every seeded file uses lowercase names (`hello.txt`,
+  `smoke.elf`, `sh.elf`, ...) matching exactly what every `stsh`/`hush` command shown throughout
+  this document actually types — unlike FAT32, oxfs is genuinely case-sensitive (real names, not
+  8.3 uppercase-folded ones), so this isn't cosmetic.
+- **Testing note, same philosophy as FAT32's own**: no `#[test_case]` unit tests (this module is
+  compiled entirely independently of the kernel and only ever runs as relocated module code — see
+  "Dynamic kernel modules" above). `module_init` instead runs a self-check against its own
+  real, loaded code and logs `[oxfs] self-check passed`/a specific `FAILED` reason: `hello.txt`/
+  `big.txt` round-trip (the latter spanning multiple blocks, exercising chain-following the same
+  way FAT32's own `BIG.TXT` did); `mkdir`/`chdir`/`open(O_CREAT)`/`write`/`close`/`read` through the
+  real registered handlers, not internal calls directly; `getcwd` inside the new subdirectory
+  (`/sub`); a genuine multi-component open (`/sub/in.txt`) from a *different* cwd than `sub`
+  itself, proving multi-component resolution actually works, not just single-component lookups
+  chained through `cd`; `rename` (old name no longer openable, new name is); `unlink`; a
+  multi-component `mkdir` (`/sub/nested`); and `rmdir` failing with `ENOTEMPTY` on a non-empty
+  directory before succeeding once it's actually empty. Verified booting in QEMU (headless,
+  `-display none`): `[oxfs] self-check passed`, followed by a clean `stsh` prompt with no faults.
+- **BusyBox's `hush` replaced `stsh` as pid 1**, once oxfs made a real filesystem (and its own
+  `getcwd`/`chdir`) available for it to actually use. `src/main.rs` now spawns the built `sh.elf`
+  directly (`HUSH_ELF_PATH`, a new `build.rs`-emitted env var pointing at the same built binary
+  `OXFS_HUSH_ELF_PATH` already embeds into the filesystem) instead of `STSH_ELF_PATH`. `stsh`
+  itself is untouched and still built by `build.rs` (`STSH_ELF_PATH` just has no reader left in
+  `src/main.rs` now) and, unlike `modules/fat32`, isn't even embedded into oxfs's own filesystem —
+  nothing `execve`'s it anymore. `process::spawn`'s hardcoded `envp` changed from empty to a single
+  `PATH=` entry (same reasoning as `stsh`'s own execve wrapper — see "BusyBox port" above: an
+  empty-but-present `$PATH` short-circuits musl's `__execvpe` into trying exactly one
+  root-relative candidate per name, matching oxfs's flat root layout, instead of falling back to a
+  multi-component hardcoded search path). `hush` still prints no prompt of its own
+  (`CONFIG_HUSH_INTERACTIVE` is off), so a freshly booted kernel looks idle for a moment before the
+  first typed line's output appears — confirmed not stuck via QEMU + injected keystrokes, same as
+  every other "is it actually blocked or just quiet" case in this document.
+- **The BusyBox applet roster grew from four to twenty-three in the same pass** (see "BusyBox
+  port" above for the specific list and why `ls`/`find`/`ps`/etc. were deliberately left out) —
+  `mkdir`/`rmdir`/`rm`/`mv` directly exercise oxfs's own `mkdir`/`rmdir`/`unlink`/`rename`
+  syscalls; `cp`/`touch`/`head`/`tail`/`wc`/`basename`/`dirname`/`printf`/`seq`/`cut`/`sort`/`uniq`
+  round out a broader (if not exhaustive) coreutils set, each needing nothing beyond
+  `open`/`read`/`write`/`close`/`fork`/`execve`.
+- **A real, previously-latent kernel bug, found only by running `hush` as pid 1 long enough for
+  its own stdio layer to actually flush an empty buffer: `write(fd, buf, 0)`/`read(fd, buf, 0)`
+  with a null/garbage `buf` crashed instead of returning `0`.** Real Unix `read`/`write` are
+  POSIX-guaranteed not to touch `buf` at all when the requested length is `0`, regardless of
+  whether `buf` is even a valid pointer — musl's own stdio genuinely calls `write()` this way (an
+  `fflush()` on an empty buffer manifests as `write(1, NULL, 0)`). Every registered fd callback
+  (`stdin_read`/`stdout_write` in `src/fd.rs`, oxfs's own file read/write, `src/pipe.rs`'s pipe
+  ends) used to construct a slice via `core::slice::from_raw_parts(_mut)` unconditionally — Rust's
+  own safety contract requires a non-null, aligned pointer even for a zero-length slice, so a null
+  `buf` at length `0` panicked (`unsafe precondition(s) violated`) instead of being the harmless
+  no-op every kernel treats it as. Reproduced via QEMU + injected keystrokes: a `pwd` immediately
+  after another `pwd` (`hush`'s own `pwd` builtin caches the path in a global and only re-`getcwd`s
+  when the shell's own state changes, so the *second* call's `puts()` is what happened to trip
+  musl's stdio into a flush-then-empty-flush sequence) crashed every time before this fix. Fixed
+  centrally in `src/fd.rs`'s `read`/`write` — the two funnel functions every fd's callback is
+  reached through (`sys_read`/`sys_write` in `src/syscall.rs` route every fd via these
+  unconditionally) — rather than patching each individual callback, so `stdin`/`stdout`/oxfs
+  files/pipes are all covered by the one guard.
 
 ## Dependency notes
 

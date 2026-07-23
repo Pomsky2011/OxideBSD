@@ -58,11 +58,55 @@ fn main() {
     // section for what this needed: real pipe(2)/dup2(2) (modules/posix_compat, src/pipe.rs,
     // src/fd.rs), discovered the same iterative "boot and see what's unrecognized" way musl/cat's
     // own new syscalls were.
+    // "FALSE"/"YES"/"MORE" continue the same load-address sequence right past HUSH's own
+    // 0xe00000. `more`'s own isatty()/TIOCGWINSZ probe hits the same already-documented,
+    // confirmed-harmless ioctl gap `cat`'s stdout write path already exercises (see the musl-port
+    // section) -- without a real terminal, it just falls back to dumping the whole file, the same
+    // shape `cat` already has.
+    //
+    // The next batch (`mkdir` through `uniq`) directly exercises the syscalls `modules/oxfs` added
+    // over `modules/fat32` -- `mkdir`/`rmdir`/`rm`/`mv` map straight onto
+    // `mkdir`/`rmdir`/`unlink`/`rename`, all real (`rm`'s directory-recursion mode, `-r`, isn't
+    // exercised or expected to work -- it needs `lstat`/`readdir`, neither implemented). `cp`/
+    // `touch` may call `fstat`/`utimensat`-family syscalls this kernel doesn't implement at all
+    // (unmapped, so a real ENOSYS -- see CLAUDE.md's oxfs section on why `stat`/`fstat` was
+    // deliberately skipped) and could misbehave or fail outright depending on how gracefully
+    // BusyBox's own code tolerates that; not pre-verified line-by-line, same "boot it and see"
+    // discovery process every applet before it went through. `head`/`tail`/`wc`/`cut`/`sort`/
+    // `uniq` are plain stdin/stdout/file text tools needing nothing beyond `open`/`read`/`write`/
+    // `close`; `basename`/`dirname`/`printf`/`seq` do no filesystem I/O at all beyond `write`ing
+    // their result, the same shape `echo`/`true`/`false` already have. Deliberately **not**
+    // included this round: `ls`/`find` (BusyBox's own implementation goes through
+    // `opendir`/`readdir`, i.e. a real `getdents` syscall -- `modules/oxfs` doesn't implement one at
+    // all, unlike `stsh`'s own built-in `ls`, which only ever worked by piggybacking on
+    // `fat32`/`oxfs`'s own "open a directory, get back a formatted listing" convention, not real
+    // POSIX directory-reading); `ps`/`date`/`sleep`/`id`/`uname`/`kill`/`chmod`/`chown` (each needs
+    // a kernel facility that plain doesn't exist yet -- `/proc`, a real-time clock, process
+    // signaling, or a permissions model).
     const BUSYBOX_APPLETS: &[(&str, &str, u64)] = &[
         ("TRUE", "true", 0xb00000),
         ("ECHO", "echo", 0xc00000),
         ("CAT", "cat", 0xd00000),
         ("HUSH", "sh", 0xe00000),
+        ("FALSE", "false", 0xf00000),
+        ("YES", "yes", 0x1000000),
+        ("MORE", "more", 0x1100000),
+        ("MKDIR", "mkdir", 0x1200000),
+        ("RMDIR", "rmdir", 0x1300000),
+        ("RM", "rm", 0x1400000),
+        ("MV", "mv", 0x1500000),
+        ("CP", "cp", 0x1600000),
+        ("TOUCH", "touch", 0x1700000),
+        ("HEAD", "head", 0x1800000),
+        ("TAIL", "tail", 0x1900000),
+        ("WC", "wc", 0x1a00000),
+        ("BASENAME", "basename", 0x1b00000),
+        ("DIRNAME", "dirname", 0x1c00000),
+        ("PRINTF", "printf", 0x1d00000),
+        ("SEQ", "seq", 0x1e00000),
+        ("CUT", "cut", 0x1f00000),
+        ("SORT", "sort", 0x2000000),
+        ("UNIQ", "uniq", 0x2100000),
     ];
     let busybox_applet_elfs: Vec<(&str, Vec<u8>)> = BUSYBOX_APPLETS
         .iter()
@@ -74,6 +118,9 @@ fn main() {
         })
         .collect();
 
+    // modules/fat32 is kept in the workspace but no longer loaded at boot (see CLAUDE.md's oxfs
+    // section) -- still built here unmodified so it keeps compiling and self-checking on every
+    // `cargo build`, a still-working format-correctness proof, just not the live filesystem.
     let fat32_image_path =
         write_fat32_image(&ring3_smoke_elf, &musl_smoke_elf, &busybox_applet_elfs);
     build_module_crate(
@@ -81,6 +128,65 @@ fn main() {
         "FAT32",
         &[("FAT32_IMAGE_PATH", fat32_image_path.to_str().unwrap())],
     );
+
+    // oxfs: the real, live filesystem now (see CLAUDE.md's oxfs section). Unlike FAT32, there's no
+    // on-disk image format to generate -- oxfs's own module_init populates its inode table directly
+    // via ordinary function calls, using each already-built ELF's path passed straight through as
+    // its own env var (the same extra_env mechanism FAT32_IMAGE_PATH above already uses). Built
+    // from BUSYBOX_APPLETS itself (not one hand-written `let ..._elf_path = ...` line per applet)
+    // so the next applet added there doesn't need a matching edit here too -- `oxfs_env_var_name`
+    // derives each one's `OXFS_<NAME>_ELF_PATH` env var straight from its own `out_name`, with one
+    // explicit exception ("sh" -> "HUSH", matching `modules/oxfs/src/lib.rs`'s existing
+    // `OXFS_HUSH_ELF_PATH`/`seed_file(root, b"sh.elf", ...)` naming, itself inherited from this
+    // applet's own Kconfig symbol `HUSH`, not its embedded filename).
+    let hush_elf_path_for_main = target_dir_busybox_elf("sh");
+    println!("cargo:rustc-env=HUSH_ELF_PATH={hush_elf_path_for_main}");
+    let oxfs_applet_paths: Vec<(String, String)> = BUSYBOX_APPLETS
+        .iter()
+        .map(|&(_, out_name, _)| {
+            (
+                oxfs_env_var_name(out_name),
+                target_dir_busybox_elf(out_name),
+            )
+        })
+        .collect();
+    let mut oxfs_extra_env: Vec<(&str, &str)> = vec![
+        (
+            "OXFS_SMOKE_ELF_PATH",
+            ring3_smoke_elf_path.to_str().unwrap(),
+        ),
+        ("OXFS_MUSL_ELF_PATH", musl_smoke_elf_path.to_str().unwrap()),
+    ];
+    oxfs_extra_env.extend(
+        oxfs_applet_paths
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    build_module_crate("oxfs", "OXFS", &oxfs_extra_env);
+}
+
+fn oxfs_env_var_name(out_name: &str) -> String {
+    let suffix = if out_name == "sh" {
+        "HUSH".to_string()
+    } else {
+        out_name.to_uppercase()
+    };
+    format!("OXFS_{suffix}_ELF_PATH")
+}
+
+/// Each `BUSYBOX_APPLETS` entry's own out-of-tree build directory follows a fixed, predictable
+/// shape (`target/busybox-<out_name>/busybox`, `build_busybox_applet`'s own `out_dir.join("busybox")`
+/// return value) -- re-derived here rather than plumbed through as a second return value, since
+/// `busybox_applet_elfs` (built above) only kept the *bytes*, not the path, and oxfs's own
+/// `extra_env` needs a path string, not bytes.
+fn target_dir_busybox_elf(out_name: &str) -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Path::new(manifest_dir)
+        .join(format!("target/busybox-{out_name}"))
+        .join("busybox")
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Configures, builds, and installs the vendored, OxideBSD-patched musl (`third_party/musl` -- a
@@ -617,9 +723,12 @@ const FAT32_BYTES_PER_SECTOR: usize = 512;
 const FAT32_SECTORS_PER_CLUSTER: u8 = 1;
 const FAT32_RESERVED_SECTORS: u32 = 32;
 const FAT32_NUM_FATS: u32 = 2;
-/// 2 MiB total -- far below the ~65525-cluster count real FAT32 volumes are conventionally
-/// expected to have, deliberately (see this function's caller's doc comment).
-const FAT32_TOTAL_SECTORS: u32 = 4096;
+/// 8 MiB total (raised from 2 MiB once `BUSYBOX_APPLETS` grew past its original four entries --
+/// this image still embeds every one of them, even applets never actually loaded/used at boot,
+/// see this constant's own module-level context) -- still far below the ~65525-cluster count real
+/// FAT32 volumes are conventionally expected to have, deliberately (see this function's caller's
+/// doc comment).
+const FAT32_TOTAL_SECTORS: u32 = 16384;
 
 const FAT32_ROOT_CLUSTER: u32 = 2;
 const FAT32_HELLO_CLUSTER: u32 = 3;

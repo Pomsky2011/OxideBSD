@@ -87,16 +87,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     )
     .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
 
-    const FAT32_MOD: &[u8] = include_bytes!(env!("FAT32_MOD_PATH"));
-    const FAT32_PANIC_SYMBOL: &str = env!("FAT32_MOD_PANIC_SYMBOL");
+    // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
+    // (still built and self-checked by build.rs on every `cargo build`) but deliberately not
+    // loaded here anymore.
+    const OXFS_MOD: &[u8] = include_bytes!(env!("OXFS_MOD_PATH"));
+    const OXFS_PANIC_SYMBOL: &str = env!("OXFS_MOD_PANIC_SYMBOL");
     oxidebsd::module::load(
-        "fat32",
-        FAT32_MOD,
-        FAT32_PANIC_SYMBOL,
+        "oxfs",
+        OXFS_MOD,
+        OXFS_PANIC_SYMBOL,
         &mut mapper,
         &mut frame_allocator,
     )
-    .unwrap_or_else(|e| panic!("failed to load the fat32 module: {e:?}"));
+    .unwrap_or_else(|e| panic!("failed to load the oxfs module: {e:?}"));
 
     // Modules are loaded; nothing else needs `frame_allocator`/`physical_memory_offset` as local
     // values from here on -- hand them over to memory's global state (moving frame_allocator by
@@ -110,13 +113,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // must happen before any process (starting with pid 1 below) can issue its first read/write.
     oxidebsd::fd::init();
 
-    const STSH_ELF: &[u8] = include_bytes!(env!("STSH_ELF_PATH"));
+    // BusyBox's `hush` (see CLAUDE.md's BusyBox/oxfs sections) replaces `stsh` as pid 1 -- a real
+    // shell over a real filesystem, not a purpose-built demo. `stsh` (`userland/stsh/`) stays in
+    // the workspace, still built by build.rs, but is no longer spawned here; unlike
+    // `modules/fat32`, it isn't even embedded into oxfs's filesystem (nothing execve's it, so
+    // there's no reason to). `hush` prints no prompt of its own (`CONFIG_HUSH_INTERACTIVE` is off
+    // -- see CLAUDE.md's BusyBox section) -- it silently blocks reading the first line, which is
+    // correct, not stuck (confirmed via QEMU + injected keystrokes: ordinary commands, `cd`/`pwd`,
+    // and piping all work).
+    const HUSH_ELF: &[u8] = include_bytes!(env!("HUSH_ELF_PATH"));
     serial_println!(
-        "[boot] spawning stsh as pid 1 ({} byte ELF)",
-        STSH_ELF.len()
+        "[boot] spawning hush (BusyBox sh) as pid 1 ({} byte ELF)",
+        HUSH_ELF.len()
     );
-    let pid1 = oxidebsd::process::spawn(STSH_ELF, None)
-        .unwrap_or_else(|e| panic!("failed to spawn stsh: {e:?}"));
+    let pid1 = oxidebsd::process::spawn(HUSH_ELF, None)
+        .unwrap_or_else(|e| panic!("failed to spawn hush: {e:?}"));
 
     oxidebsd::scheduler::start(pid1)
 }
