@@ -1743,6 +1743,107 @@ reboot.
   unconditionally) — rather than patching each individual callback, so `stdin`/`stdout`/oxfs
   files/pipes are all covered by the one guard.
 
+## BusyBox gap analysis: what's needed for more applets
+
+Twenty-three applets run today (see "BusyBox port" above). Getting meaningfully further isn't
+really an "add one more applet" problem anymore — almost everything left over needs one of a
+small number of kernel capabilities this codebase doesn't have at all, and each of those unlocks a
+whole cluster of applets at once rather than just one. This section is a forward-looking gap
+analysis, not a description of anything implemented — nothing below exists yet. Syscall numbers
+proposed here continue the existing invented-number sequence from `SYS_RENAME = 111` onward
+(`112`+), per this project's established convention that new syscalls invent their own numbers
+rather than copying FreeBSD/Linux (see `SYS_GETPPID`/`SYS_GETCWD`/`SYS_PIPE`/`SYS_DUP2`/
+`SYS_UNLINK`/`SYS_RMDIR`/`SYS_RENAME`) — pick the next free number at implementation time rather
+than trusting these exact values if other work has landed in between.
+
+- **Real `argv[0]` passthrough in `execve` — arguably the single highest-leverage change on this
+  list.** Every applet today is its own standalone single-applet static binary specifically
+  *because* `do_execve` always supplies `argv[0]` from the exec path itself, with no way for a
+  caller to override it (see "Process abstraction, scheduler, and fork/exec/wait" and "BusyBox
+  port" above) — real BusyBox's own space-saving trick, one `busybox` binary dispatching on
+  `argv[0]`/basename to pick an applet, is unreachable without this. Fixing it would let a
+  *single* embedded `busybox` build provide dozens of applets at once, instead of one full
+  cross-compiled BusyBox build (and one claimed load address) per applet. Needed: extend
+  `RawArgvEntry`'s wire format (or add a distinct argument) so a caller can supply a real,
+  different `argv[0]` — `hush`'s own `execvp()`/`execve()` already pass a real `argv[0]` from
+  userspace today, `do_execve` just discards it and substitutes the exec path instead. Complexity:
+  low-medium — a bounded, well-scoped change to `do_execve` and `RawArgvEntry` handling, not a new
+  subsystem.
+- **`stat`/`fstat`/`lstat`.** Unlocks: `ls -l`, `test -f`/`-d`/`-e`, `cp`/`mv` (mode/size checks),
+  `du`, `find` (needs a `stat` per visited entry), and any script doing existence/type checks.
+  Needed: a byte-exact musl/Linux `struct stat` layout on x86_64 (`st_dev`, `st_ino`, `st_nlink`,
+  `st_mode`, `st_uid`, `st_gid`, `st_rdev`, `st_size`, `st_blksize`, `st_blocks`, `st_atim`/
+  `st_mtim`/`st_ctim`, reserved padding) filled from `oxfs`'s own inode (`size`, `kind` ->
+  `st_mode`'s file-type bits); no real timestamps exist anywhere in this kernel, so `st_*tim`
+  needs a placeholder (`0`, or a fake monotonic counter — see the clock gap below) rather than
+  anything real. New syscalls: `SYS_FSTAT`/`SYS_STAT`/`SYS_LSTAT` (`lstat` can just alias `stat`,
+  no symlinks exist). Also fixes a real, already-flagged latent landmine: musl's own
+  `bits/syscall.h.in` leaves `SYS_fstat` at its inert Linux value (`5`), which numerically
+  collides with OxideBSD's own `SYS_OPEN = 5` — harmless only because nothing has called real
+  `fstat()` yet (see "oxfs filesystem module" above). Complexity: medium.
+- **`getdents`/`getdents64` (real directory reading).** Unlocks: a real `ls` (not `stsh`'s own
+  built-in, which only works by piggybacking on `oxfs`'s "open a directory, get a formatted
+  listing" convention, not real POSIX `opendir`/`readdir`), `find`, `du`, `cp -r`/`rm -r`/`tar`
+  across directories, and — notably — **glob (`*`/`?`) expansion inside `hush` itself**, which
+  also depends on real directory reading and today doesn't work at all. Needed: a new syscall
+  returning a sequence of real `struct dirent64`-shaped records (`d_ino`, `d_off`, `d_reclen`,
+  `d_type`, `d_name`) from an open directory fd; `oxfs` already has the raw name/inode data
+  (`dir_record_name`/`dir_record_inode` in `modules/oxfs/src/lib.rs`), this is mostly a
+  reformatting problem plus a new `OpenFile` variant that tracks a directory-read cursor instead
+  of (or alongside) the existing formatted-listing trick. Complexity: medium.
+- **Real signals — the biggest lift on this list.** Unlocks: `kill`, stopping a runaway process
+  cleanly (`yes.elf` today can only be stopped by killing the whole VM), Ctrl+C actually
+  interrupting a *running child* (today Ctrl+C is only handled inside `stsh`'s own `read_line`,
+  intercepting byte `0x03` after a blocking read — not a real `SIGINT` delivered by the kernel),
+  `trap`, timeout-style tools, and job control's own underlying mechanism (`SIGTSTP`/`SIGCONT`).
+  Needed: a per-process signal mask and pending-signal set, a delivery point (checked on the
+  return-to-userspace path out of `syscall_dispatch`/after a blocking wakeup), default
+  dispositions (terminate/ignore/stop/continue), new syscalls (`SYS_KILL`, `SYS_SIGACTION`,
+  `SYS_SIGPROCMASK`, `SYS_SIGRETURN` — the last needing its own trampoline/frame-construction
+  work, similar in spirit to `context_switch`'s existing fork/spawn trampolines but for "resume
+  into a signal handler, then return to the interrupted point"), and wiring the keyboard IRQ's
+  own Ctrl+C handling to actually send `SIGINT` to whatever process is in the foreground, not just
+  to `stsh`'s own read loop. Complexity: high — touches syscall entry/exit, `Process`, and the
+  scheduler all at once, unlike everything else on this list, which is additive.
+- **A clock and `nanosleep`.** Unlocks: `sleep`, `date`, `time`, any timeout-based tool. A
+  monotonic-only clock (ticks-since-boot, from the timer IRQ handler that already exists — see
+  "Project"/interrupts above — just never exposed to userland) is enough for `sleep` and relative
+  timing; a real wall clock for `date` to report something meaningful needs an actual RTC
+  (CMOS real-time-clock chip) driver, a new hardware driver this codebase doesn't have at all.
+  `nanosleep` additionally needs the calling process to genuinely block (a new
+  `BlockReason::Sleeping(wake_tick)`, woken by the timer IRQ incrementing a counter and checking
+  sleepers — the same shape `src/pipe.rs`/`src/stdin.rs`'s existing blocking already established,
+  not a new blocking mechanism). Complexity: medium for monotonic/`sleep`; higher for a real wall
+  clock.
+- **Termios/`ioctl` + a minimal pty concept.** Unlocks: `CONFIG_HUSH_INTERACTIVE` (a real prompt,
+  line editing, and history *inside* `hush` itself, rather than only via `stsh`'s own hand-rolled
+  `read_line` — see "Interactive shell" above), `stty`, and full-screen tools (`vi`, `less`).
+  `TCGETS`/`TCSETS`/`TIOCGWINSZ` are all currently unmapped, silently `ENOSYS` (confirmed harmless
+  so far only because BusyBox degrades gracefully when `isatty()` comes back false — see the
+  musl-port/oxfs sections above). A fake but consistent winsize (e.g. `80x24`) and a minimal
+  termios struct honoring canonical-vs-raw mode would cover most tools; the harder part isn't the
+  syscall itself but making a raw-mode switch actually change how `src/stdin.rs`'s ring buffer
+  behaves (echo, line buffering are currently hardcoded kernel-side, not mode-dependent).
+  Complexity: medium.
+- **Process groups (`setpgid`/`getpgid`/`tcsetpgrp`).** Unlocks: `bg`/`fg`, Ctrl+Z, `jobs` — real
+  job control. Needs a `pgid` field on `Process` and a "foreground process group" concept tied to
+  the (still-nonexistent) tty abstraction above; only actually valuable bundled with real signals
+  (`SIGTSTP`/`SIGCONT`), so treat this as an extension of that work, not standalone. Complexity:
+  medium, but low value in isolation.
+- **A permissions/uid model — low value unless it's real, but trivial to stub.** `chmod`/`chown`
+  as unconditional no-op successes (matching `mkdir`'s own already-established "mode is read but
+  discarded" precedent) and `id`/`whoami` always reporting a fixed `uid 0` would make those
+  applets *run* without lying about anything meaningfully — there's no real multi-user story
+  worth building without actual users/permissions enforcement, which is a much bigger, separate
+  investment than anything else on this list. Complexity: low (as stubs); high (if done for real).
+- **`uname`/`gethostname`.** Unlocks: `uname -a`, `hostname`. Trivial — a fixed string and a new
+  syscall number, no real design work. Complexity: low.
+
+Not applet-specific, but adjacent: a real block device driver and on-disk persistence (`oxfs` is
+still in-memory only, same as `modules/fat32` before it) would matter for actually *using* this as
+a system rather than a demo, but doesn't by itself unlock any additional applet the way each gap
+above does.
+
 ## Dependency notes
 
 - `x86_64` crate is pinned with `default-features = false, features = ["instructions",
