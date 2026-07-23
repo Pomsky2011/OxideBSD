@@ -61,6 +61,18 @@
 //! loaded modules can't call each other directly (only module → kernel, via each module's own
 //! resolved symbol table) -- it's the only coordination point available.
 //!
+//! **`SYS_GETCWD = 108`** is a later, OxideBSD-own-invented addition (not a FreeBSD-authentic
+//! number -- added well after the syscalls above, once porting `sh` (BusyBox's `hush`) surfaced it
+//! as unrecognized: `hush`'s own `cd`/prompt logic calls real `getcwd()`). Reconstructs an absolute
+//! path string for `CURRENT_DIR_CLUSTER` by walking `..` links up to root (`parent_of`, already
+//! used by `sys_chdir`) and, at each level, searching that level's own parent directory for the
+//! entry whose `first_cluster` matches the child -- there's no stored path anywhere, only cluster
+//! numbers, so the path has to be re-derived on every call. Matches real `getcwd(buf, size)`'s
+//! wire format and return convention (a NUL-terminated string written into `buf`, the byte count
+//! including the NUL returned on success, `-ERANGE` if `size` is too small) since musl's own
+//! `getcwd()` wrapper (`src/unistd/getcwd.c`, unpatched) checks `buf[0] == '/'` and calls
+//! `strlen(buf)` on the assumption the kernel already NUL-terminated it.
+//!
 //! **`ls` reuses `open`/`read`/`close` rather than a dedicated syscall.** `fat32_open`, when the
 //! resolved name is a directory (or when the path names the current directory itself), doesn't
 //! read file content -- it formats a listing into the very same `OpenFile::Read` buffer a real
@@ -89,6 +101,7 @@ const SYS_OPEN: u64 = 5;
 const SYS_CLOSE: u64 = 6;
 const SYS_CHDIR: u64 = 12;
 const SYS_MKDIR: u64 = 136;
+const SYS_GETCWD: u64 = 108;
 
 /// `open`'s `flags`: create the file if it doesn't already exist. No other flag bits are
 /// interpreted. Deliberately the *real* POSIX `O_CREAT` value (`0o100`), not an arbitrary
@@ -110,6 +123,7 @@ const ENOSPC: i64 = 28;
 const EIO: i64 = 5;
 const EFBIG: i64 = 27;
 const EINVAL: i64 = 22;
+const ERANGE: i64 = 34;
 
 /// Per-open-file content buffer capacity, for both directions -- read caches a whole file's (or
 /// directory listing's) contents at `open` time (see `OpenFile::Read`'s doc comment for why),
@@ -444,6 +458,28 @@ extern "C" fn sys_chdir(path_ptr: u64, path_len: u64, _arg2: u64, _arg3: u64) ->
     }
 }
 
+/// Registered for `SYS_GETCWD`. Writes a NUL-terminated absolute path for the current directory
+/// into `buf_ptr` (see the module doc comment for the full wire-format story). `-ERANGE` if
+/// `buf_len` (including the NUL) isn't big enough -- matching real `getcwd(2)`'s own convention,
+/// which is what tells musl's libc wrapper to retry with a bigger buffer.
+extern "C" fn sys_getcwd(buf_ptr: u64, buf_len: u64, _arg2: u64, _arg3: u64) -> i64 {
+    let disk: &[u8; DISK_SIZE] = unsafe { &*core::ptr::addr_of!(DISK) };
+    let bpb = Bpb::parse(disk);
+
+    let mut path = [0u8; MAX_CWD_PATH];
+    let len = build_cwd_path(disk, &bpb, current_dir_cluster(), &mut path);
+
+    if buf_len == 0 || (len as u64) + 1 > buf_len {
+        return -ERANGE;
+    }
+
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
+    out[..len].copy_from_slice(&path[..len]);
+    out[len] = 0;
+    (len + 1) as i64
+}
+
 /// Registered for `SYS_MKDIR`. `path` must be a single plain component (no `/` prefix, no `..`,
 /// no multi-level path -- see the module doc comment) naming a new subdirectory of the current
 /// directory. Initializes the new subdirectory's own `.`/`..` entries (per FAT32 convention, a
@@ -726,6 +762,100 @@ fn parent_of(disk: &[u8], bpb: &Bpb, dir_cluster: u32) -> Option<u32> {
     } else {
         parent
     })
+}
+
+/// Maximum absolute path `build_cwd_path` can produce, and the deepest `..` chain it will walk to
+/// get there -- generous for this module's own tiny demo-scale directory trees (see the module doc
+/// comment); a tree nested deeper than this just gets a truncated path rather than a real error,
+/// the same "bound it and move on" simplification `MAX_DIR_ENTRIES`/`MAX_FILE_BUFFER` already use.
+const MAX_CWD_PATH: usize = 256;
+const MAX_CWD_DEPTH: usize = 32;
+
+/// Searches `parent_cluster`'s own listing for the subdirectory entry naming `target_cluster`,
+/// returning that entry's raw 8.3 name. Used by `build_cwd_path` to recover a name for a cluster
+/// number that, by itself, carries no name at all -- FAT32 only stores names in the *parent*'s
+/// directory entries, never inside the child directory's own data.
+fn find_name_of_cluster_in_dir(
+    disk: &[u8],
+    bpb: &Bpb,
+    parent_cluster: u32,
+    target_cluster: u32,
+) -> Option<[u8; 11]> {
+    let mut entries = [DirEntry::EMPTY; MAX_DIR_ENTRIES];
+    let count = list_dir(disk, bpb, parent_cluster, &mut entries);
+    entries[..count]
+        .iter()
+        .find(|e| {
+            e.attr & ATTR_DIRECTORY != 0 && e.name[0] != b'.' && e.first_cluster == target_cluster
+        })
+        .map(|e| e.name)
+}
+
+/// Converts a raw, space-padded 8.3 directory-entry name into its displayed form (trailing spaces
+/// trimmed from both the base and extension, joined by `.` only if an extension is actually
+/// present) and appends it to `out`. Returns the number of bytes written.
+fn write_short_name_display(name: &[u8; 11], out: &mut [u8]) -> usize {
+    let base_len = name[..8]
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |i| i + 1);
+    let ext_len = name[8..11]
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |i| i + 1);
+
+    let mut len = 0;
+    out[..base_len].copy_from_slice(&name[..base_len]);
+    len += base_len;
+    if ext_len > 0 {
+        out[len] = b'.';
+        len += 1;
+        out[len..len + ext_len].copy_from_slice(&name[8..8 + ext_len]);
+        len += ext_len;
+    }
+    len
+}
+
+/// Reconstructs an absolute path for `cluster` by walking `..` links up to root (`parent_of`) and,
+/// at each level, recovering that level's own name from its parent's directory listing
+/// (`find_name_of_cluster_in_dir`) -- there is no stored path anywhere to read back, only cluster
+/// numbers, so every call re-derives it from scratch. Writes into `out` and returns the length
+/// (not including a NUL terminator, which callers add themselves -- see `sys_getcwd`). Root itself
+/// is `"/"`; deeper paths are `/`-joined components with no trailing slash.
+fn build_cwd_path(disk: &[u8], bpb: &Bpb, cluster: u32, out: &mut [u8; MAX_CWD_PATH]) -> usize {
+    let mut chain = [0u32; MAX_CWD_DEPTH];
+    let mut depth = 0;
+    let mut cur = cluster;
+    while cur != bpb.root_cluster && depth < MAX_CWD_DEPTH {
+        chain[depth] = cur;
+        depth += 1;
+        match parent_of(disk, bpb, cur) {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+
+    if depth == 0 {
+        out[0] = b'/';
+        return 1;
+    }
+
+    let mut len = 0;
+    for i in (0..depth).rev() {
+        let child = chain[i];
+        let parent = if i + 1 < depth {
+            chain[i + 1]
+        } else {
+            bpb.root_cluster
+        };
+        let Some(name) = find_name_of_cluster_in_dir(disk, bpb, parent, child) else {
+            break;
+        };
+        out[len] = b'/';
+        len += 1;
+        len += write_short_name_display(&name, &mut out[len..]);
+    }
+    len
 }
 
 /// Resolves `path` to a directory cluster -- see the module doc comment for the (deliberately
@@ -1016,6 +1146,16 @@ pub extern "C" fn module_init() -> i32 {
         }
     }
 
+    // --- getcwd self-check (root): confirm the reconstructed path for root itself is "/". ---
+    {
+        let mut buf = [0u8; 64];
+        let n = sys_getcwd(buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
+        if n != 2 || &buf[..1] != b"/" {
+            ok = false;
+            log("[fat32] self-check FAILED: getcwd at root mismatch\n");
+        }
+    }
+
     // --- Subdirectory self-check: mkdir, cd into it, create a file there, cd back, confirm the
     // file is reachable via an absolute path and invisible from root's own listing. ---
     match sys_mkdir(b"SUB".as_ptr() as u64, 3, 0, 0) {
@@ -1069,6 +1209,16 @@ pub extern "C" fn module_init() -> i32 {
                         log("[fat32] self-check FAILED: create_file inside SUB errored\n");
                     }
                 }
+
+                // --- getcwd self-check (subdirectory): confirm the reconstructed path is
+                // "/SUB", not just root's own trivial "/" case above. ---
+                let mut cwd_buf = [0u8; 64];
+                let n = sys_getcwd(cwd_buf.as_mut_ptr() as u64, cwd_buf.len() as u64, 0, 0);
+                if n <= 0 || &cwd_buf[..(n as usize - 1)] != b"/SUB" {
+                    ok = false;
+                    log("[fat32] self-check FAILED: getcwd inside SUB mismatch\n");
+                }
+
                 set_current_dir_cluster(cwd_before);
             }
         }
@@ -1084,6 +1234,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_CLOSE, sys_close);
         oxidebsd_register_syscall(SYS_CHDIR, sys_chdir);
         oxidebsd_register_syscall(SYS_MKDIR, sys_mkdir);
+        oxidebsd_register_syscall(SYS_GETCWD, sys_getcwd);
     }
 
     if ok {

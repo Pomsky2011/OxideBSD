@@ -514,6 +514,10 @@ pub(crate) extern "C" fn oxidebsd_sys_getpid() -> i64 {
     crate::process::do_getpid() as i64
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_getppid() -> i64 {
+    crate::process::do_getppid() as i64
+}
+
 fn result_to_ffi(result: Result<u64, u64>) -> i64 {
     match result {
         Ok(value) => value as i64,

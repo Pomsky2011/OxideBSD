@@ -684,6 +684,16 @@ pub fn do_getpid() -> u64 {
     scheduler::current_pid()
 }
 
+/// `0` for a process with no parent (pid 1 itself), matching real `getppid()`'s convention for
+/// the boot/init process — every other process always has one, set at `fork`/`spawn` time.
+pub fn do_getppid() -> u64 {
+    let table = table().lock();
+    table
+        .get(&scheduler::current_pid())
+        .and_then(|p| p.parent)
+        .unwrap_or(0)
+}
+
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
 /// `module::MODULE_VA_BASE` (that one's kernel-mapped and shared across every address space; an
 /// mmap region has to be per-process, mapped `USER_ACCESSIBLE` only in the calling process's own

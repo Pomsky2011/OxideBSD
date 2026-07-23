@@ -926,6 +926,67 @@ argument, real `pipe(2)`/`dup2(2)`, a per-process fd table, and a real, previous
   `do_execve` resets it to `0` (and writes the MSR immediately, since `execve` keeps running as the
   same process/kernel stack with no context switch in between) since the old program's TLS layout
   means nothing to the new one.
+- **`getcwd`/`getppid`/`chdir`/`mkdir` — a second wave of unrecognized-syscall discovery, this time
+  from actually running `hush` and typing real commands at it (`help`, `ls`, `cat`, `cd`,
+  `cd ..`, `cd /`) rather than just `-c "true.elf"`-style smoke tests.** `hush`'s own startup path
+  calls `getcwd()` (to seed `$PWD`) and `getppid()` (to seed `$PPID`), and its `cd` builtin calls
+  `chdir()` then `getcwd()` again to refresh `$PWD` — none of these were ever reached by the
+  narrower `sh.elf -c "cmd"` cases the original BusyBox-port pass tried, so they surfaced only now.
+  - **`SYS_GETPPID = 107`** (`modules/native_abi/`, OxideBSD's own invention, not FreeBSD-authentic
+    — same reasoning as `SYS_MMAP`/etc.): `do_getppid` (`src/process.rs`) just reads back
+    `Process.parent` (already tracked for `wait4`'s reparenting logic), returning `0` for a
+    parentless process (matching real `getppid()`'s convention for the boot/init process).
+  - **`SYS_GETCWD = 108`** (`modules/fat32/`, also OxideBSD's own invention): there is no stored
+    path anywhere in this module, only `CURRENT_DIR_CLUSTER` — `build_cwd_path` reconstructs one
+    on every call by walking `..` links up to root (`parent_of`, already used by `sys_chdir`) and,
+    at each level, searching that level's own parent directory for the entry whose `first_cluster`
+    matches the child (`find_name_of_cluster_in_dir` — a directory's data never stores its own
+    name, only its parent's listing does). Matches real `getcwd(buf, size)`'s wire format and
+    return convention (NUL-terminated string written into `buf`, byte count including the NUL
+    returned on success, `-ERANGE` if `size` is too small) since musl's own `getcwd()` wrapper is
+    unpatched and trusts the kernel already NUL-terminated the buffer.
+  - **`SYS_CHDIR`/`SYS_MKDIR` needed the exact same argument-convention fix `open()` already got in
+    the first BusyBox pass, and it had been missed until now.** `chdir(2)`/`mkdir(2)` were already
+    implemented and registered (`SYS_CHDIR = 12`, `SYS_MKDIR = 136`, both pre-dating the musl/
+    BusyBox ports — see "Interactive shell" above) and their numbers were remapped in
+    `bits/syscall.h.in`, but real `chdir()`/`mkdir()` pass only `(path)`/`(path, mode)` — a plain
+    null-terminated string, no length — while OxideBSD's own `sys_chdir`/`sys_mkdir` expect
+    `(path_ptr, path_len)`. Remapping the *number* alone (as was done) left `path_len` (`RSI`)
+    carrying whatever garbage happened to already be in that register, since real `chdir()`/
+    `mkdir()` never set it — the same class of bug `open()`'s own argument-convention mismatch was
+    (see "musl port" above), just not caught in the same pass because nothing had exercised real
+    `chdir()`/`mkdir()` through musl yet. Symptom: `cd SUB` inside `hush` appeared to succeed (no
+    error — the garbage `path_len` still happened to resolve to *something*, sometimes even the
+    right directory by coincidence) but `pwd` afterward printed stale/wrong output. Fixed on the
+    musl fork exactly like `open.c` was: `src/unistd/chdir.c` and `src/stat/mkdir.c` now compute
+    `path_len` via `strlen()` and call `__syscall2`/`syscall(SYS_chdir/SYS_mkdir, path,
+    strlen(path))` directly, discarding `mkdir`'s `mode` argument (this filesystem doesn't model
+    permissions, same as `open`'s own `O_CREAT`-only handling).
+  - **A real, if minor, staleness trap in this codebase's own nested build caching, hit while
+    iterating on this fix**: after `git stash`/`git stash pop` round-tripped the edited module
+    source files back to byte-identical content, `cargo build` reported success but silently kept
+    running *previously cached* module objects (verified by comparing logged object byte sizes
+    before/after) — `modules/*`'s own `build_module_crate` nested `cargo rustc` invocation didn't
+    detect anything needed rebuilding. `touch`-ing the affected source files (forcing an
+    unambiguous fresh mtime) before rebuilding fixed it. Not investigated further since it was a
+    self-inflicted artifact of manually stashing/restoring files mid-session, not a normal
+    edit-and-rebuild workflow, but worth remembering if a rebuilt-looking `cargo build` ever
+    doesn't reflect an edit that definitely happened.
+  - **Verified working end to end** via `sh.elf -c "cd SUB && pwd && exit $PPID"` (`SUB` is the
+    throwaway directory `modules/fat32`'s own self-check creates at boot): prints `/SUB` and exits
+    with code `1` (`stsh`'s own pid, `hush`'s real parent) — `cd`/`pwd`/`$PPID` all correct
+    together in one real `hush` process, not just individually.
+- **A separate, pre-existing bug, found while verifying the fix above, not caused by it: typing
+  `ls` at `stsh`'s own prompt (not through `hush` at all) double-faults and reboots the machine.**
+  Confirmed via git-stash bisection to already reproduce on a clean checkout of this repository's
+  current HEAD commit, with *zero* of this pass's changes applied — it lives in the separate,
+  already-uncommitted, in-progress "blocking stdin read" work spanning `src/process.rs`/
+  `src/scheduler.rs`/`src/stdin.rs` (a new `BlockReason::WaitingForStdin` and a real
+  interrupts-enabled idle wait, `scheduler::wait_for_ready` — exactly the "real fix" the
+  `sh.elf`-interactive-mode limitation above describes as future work, apparently already
+  mid-flight) that predates this session and was already sitting uncommitted in the working tree
+  before this pass started. Not investigated or fixed here — flagged for a separate pass, since
+  it's a different subsystem's bug, not a "syscalls `hush` needs" problem.
 - **What's explicitly still out of scope**: real interactive `sh` (typing `sh.elf` alone and
   getting a live prompt) — `sh.elf -c "command"` works, including real pipelines, but plain
   `sh.elf` reading commands from the keyboard does not, and confirmed *why* it can't just be turned
