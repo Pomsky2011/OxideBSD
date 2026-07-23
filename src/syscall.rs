@@ -44,7 +44,7 @@
 //! `oxidebsd_sys_read`/`oxidebsd_sys_write` near the bottom of this file are the thin FFI adapters
 //! the module actually calls through.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -279,6 +279,14 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     CURRENT_FRAME.store(core::ptr::null_mut(), Ordering::Relaxed);
 }
 
+/// Numbers `dispatch` has already logged an "unrecognized syscall" line for — see `dispatch`'s own
+/// doc comment for why this exists: a real interactive session (`sh.elf` with no `-c`, run for
+/// real rather than as a single smoke-tested command) calls the *same* missing syscall repeatedly
+/// (concretely, `hush` re-issues `rt_sigaction`/`rt_sigprocmask` around every command it runs), and
+/// logging it every single time drowns out the actual command output on the same serial console —
+/// discovered by actually using this interactively, not by inspection.
+static LOGGED_UNRECOGNIZED: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
 /// The actual dispatch logic, kept separate from `syscall_dispatch`'s raw pointer/frame handling
 /// so it's directly unit-testable (see the `test_syscall_dispatch_*` tests in `src/lib.rs`). A
 /// pure lookup into `SYSCALL_TABLE` — no number is special-cased here anymore, they're all
@@ -294,7 +302,13 @@ pub(crate) fn dispatch(
     match handler {
         Some(handler) => ffi_result_to_result(handler(arg0, arg1, arg2, arg3)),
         None => {
-            serial_println!("[boot] unrecognized syscall number {}", number);
+            // Only the first occurrence of a given number is logged -- see LOGGED_UNRECOGNIZED's
+            // own doc comment. Still the intended tool for discovering what a program's startup
+            // needs (every *distinct* unimplemented number still gets one line), just no longer at
+            // the cost of spamming every repeat once real interactive use started producing many.
+            if LOGGED_UNRECOGNIZED.lock().insert(number) {
+                serial_println!("[boot] unrecognized syscall number {}", number);
+            }
             Err(ENOSYS)
         }
     }

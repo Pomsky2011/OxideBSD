@@ -112,6 +112,15 @@ pub enum BlockReason {
     /// genuinely block (not just return `Ok(0)`/`EAGAIN`) for a pipeline to work at all on this
     /// single-core, cooperatively-scheduled kernel.
     WaitingForPipeData(u64),
+    /// Blocked in `crate::stdin::read` on an empty keyboard ring buffer. Unlike every other
+    /// `BlockReason`, nothing *schedulable* ever wakes this one — the only thing that ever will is
+    /// the keyboard IRQ handler itself, which is why `scheduler::schedule()`'s own "nothing
+    /// runnable" fallback had to grow a real interrupts-enabled idle wait (`wait_for_ready`)
+    /// instead of spinning forever with interrupts masked. See `crate::stdin`'s module doc comment
+    /// for the full story — this is what makes `sh.elf` (BusyBox's `hush`), run with no `-c`
+    /// argument, able to actually block reading a line from the keyboard instead of seeing an
+    /// instant EOF.
+    WaitingForStdin,
 }
 
 /// A process's own kernel stack: heap-allocated (not a fixed-size `static`/`static mut` array like

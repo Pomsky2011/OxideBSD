@@ -9,6 +9,25 @@
 //! would need converting from an `extern "x86-interrupt" fn` to a raw asm entry point (the same
 //! way `syscall::syscall_entry` already is) so it can hand off full GPR state before deciding to
 //! switch — not implemented here.
+//!
+//! **"Nothing runnable" no longer means "spin forever with interrupts masked."** `schedule()`'s
+//! own fallback used to be `crate::hlt_loop()` — a deliberate, permanent dead end, safe only
+//! because until `sh` (BusyBox's `hush`) needed a real blocking stdin read (`crate::stdin`'s own
+//! module doc comment, `process::BlockReason::WaitingForStdin`), *every* blocked process was woken
+//! by another *schedulable* process's own syscall (`do_exit` waking a `wait4`er, `pipe_write`
+//! waking a pipe reader) — something always eventually ran to do the waking, so an empty ready
+//! queue genuinely meant "stuck forever" and burning a core spinning was an acceptable (if wasteful)
+//! way to make that visible. A blocked stdin read breaks that assumption: the *only* thing that can
+//! ever wake it is a hardware keyboard IRQ, which can't fire at all while `IA32_SFMASK`-cleared
+//! `IF` (or a permanently spinning `hlt_loop` that never bothered to `sti` first) keeps interrupts
+//! masked. `wait_for_ready` below replaces that fallback with a real idle wait: enable interrupts
+//! just long enough to let a hardware interrupt land (the standard `sti; hlt` atomic idiom, so a
+//! wakeup racing the check is never lost), then re-disable and re-check. Safe to do here
+//! specifically because, by construction, nothing in `schedule()`'s own call path still holds
+//! `process::table()`/`READY_QUEUE` at this point (every caller that blocks — `do_wait4`,
+//! `pipe_read`, `stdin::read` — drops its locks before ever calling `schedule()`) — the keyboard
+//! IRQ handler's own locking of those same structures (to wake a blocked reader) can't deadlock
+//! against a lock this code is still holding, because it isn't holding any.
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +36,6 @@ use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::context_switch::switch_context;
-use crate::hlt_loop;
 use crate::process::{self, Pid, ProcState};
 use crate::{gdt, serial_println};
 
@@ -45,9 +63,9 @@ pub fn enqueue_ready(pid: Pid) {
 /// block or exit), it's re-enqueued so it gets another turn later — a caller that transitioned to
 /// `Blocked`/`Zombie` just before calling this is deliberately *not* re-enqueued, which is how
 /// `process::do_wait4`/`do_exit` actually suspend/terminate. Picks the next `Ready` process and
-/// switches to it; falls back to `hlt_loop()` only if nothing is runnable at all. Returns once
-/// this exact call site is switched back into — for a caller that just blocked, that means "a
-/// later event woke it back to `Ready` and the scheduler picked it again."
+/// switches to it; falls back to `wait_for_ready`'s real idle wait only if nothing is runnable at
+/// all. Returns once this exact call site is switched back into — for a caller that just blocked,
+/// that means "a later event woke it back to `Ready` and the scheduler picked it again."
 pub fn schedule() {
     without_interrupts(|| {
         let prev_pid = current_pid();
@@ -65,10 +83,11 @@ pub fn schedule() {
             }
         }
 
-        // Nothing runnable at all: if the caller itself were still Ready/Running it would have
-        // just been popped back out above, so reaching None here means the system is genuinely
-        // idle.
-        let next_pid = READY_QUEUE.lock().pop_front().unwrap_or_else(|| hlt_loop());
+        // If the caller itself were still Ready/Running it would have just been popped back out
+        // above, so an empty queue here means the system is genuinely idle right now -- wait_for_ready
+        // blocks (with interrupts real-enabled, not spinning) until a hardware event makes that no
+        // longer true.
+        let next_pid = wait_for_ready();
 
         if has_prev && next_pid == prev_pid {
             process::table().lock().get_mut(&prev_pid).unwrap().state = ProcState::Running;
@@ -94,6 +113,42 @@ pub fn schedule() {
         // activate_and_prepare and switch_context actually moving execution onto the new stack.
         unsafe { switch_context(prev_rsp_slot, next_rsp) };
     });
+}
+
+/// Blocks (genuinely — not spinning) until `READY_QUEUE` has something in it, and returns that
+/// pid. See this module's own doc comment for why this exists at all (`hlt_loop()`'s old
+/// permanent-dead-end fallback can't work once a process can be blocked waiting on nothing but a
+/// hardware interrupt) and why it's safe to enable interrupts here specifically (every caller that
+/// blocks drops its own locks before ever reaching `schedule()`, so nothing this code's caller
+/// might be holding can be re-entered by the keyboard IRQ handler this is specifically waiting to
+/// let fire).
+///
+/// Only ever called from inside `schedule()`'s own `without_interrupts` critical section, but
+/// explicitly `disable()`s at the top of every loop iteration anyway (not just relying on that
+/// outer wrapper) — cheap, and makes this function's own precondition self-contained rather than
+/// relying on every future call site to remember it.
+fn wait_for_ready() -> Pid {
+    loop {
+        x86_64::instructions::interrupts::disable();
+        // Scoped so the READY_QUEUE guard is dropped before enable_and_hlt() below -- holding it
+        // across that would let the keyboard IRQ handler's own wake-up (which needs this same
+        // lock, see crate::stdin::push_byte) deadlock against itself on this single core.
+        let popped = { READY_QUEUE.lock().pop_front() };
+        if let Some(pid) = popped {
+            return pid;
+        }
+        // Nothing runnable anywhere. The only thing that can still change that is a hardware
+        // interrupt (concretely: the keyboard IRQ waking a process blocked on stdin) -- enable
+        // interrupts and halt right up to the point one arrives, rather than either burning a full
+        // core spinning forever or leaving interrupts masked forever (which would make that
+        // wakeup impossible in the first place). `sti; hlt` back to back is the standard atomic
+        // idiom for exactly this: x86 guarantees the very next instruction after `sti` (here,
+        // `hlt`) executes before any interrupt just unmasked is actually taken, so a wakeup that
+        // raced right up against the check above is never lost.
+        x86_64::instructions::interrupts::enable_and_hlt();
+        // Woken by *some* interrupt (timer or keyboard) -- loop back and re-check; only a keyboard
+        // IRQ that actually queued a reader will make the next pop_front() succeed.
+    }
 }
 
 /// The very first switch: boots the scheduler by "switching away" from the current boot stack
