@@ -434,12 +434,21 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
 /// OxideBSD's own invention, not modeled on real `execve`'s NUL-terminated `char **argv`/`char
 /// **envp` (this ABI's syscalls are length-prefixed throughout instead -- see CLAUDE.md's syscall
 /// ABI section). A sequence of these structs, terminated by a `ptr == 0` entry, describes either
-/// argv[1..] or envp[] (same shape, read the same way -- see `read_ptr_len_array` below); argv[0]
-/// is always `path_bytes` itself (unchanged from before `argv_ptr` existed), so a caller that only
-/// wants argv[0] and no environment just passes `argv_ptr == 0`/`envp_ptr == 0` -- every caller
-/// before `stsh`'s own execve wrapper grew argument support did exactly that, and keeps doing so
-/// unaffected. `envp_ptr` is `R10`, the ABI's 4th argument -- see `src/syscall.rs`'s module doc
-/// comment for why that register only became a real, read argument once this needed it.
+/// argv[] or envp[] (same shape, read the same way -- see `read_ptr_len_array` below).
+/// `argv_ptr == 0` (or a non-null `argv_ptr` whose very first entry is already the `{0, 0}`
+/// terminator) falls back to a synthesized one-element `argv = [path_bytes]`, matching real
+/// `execve`'s convention that `argv[0]` always exists even when the caller passes an empty/absent
+/// array -- every caller before `stsh`'s own execve wrapper grew argument support relied on
+/// exactly this fallback, and keeps doing so unaffected. **A non-empty `argv_ptr` supplies the
+/// *complete* array, including `argv[0]` -- it is no longer implicitly `path_bytes` glued onto
+/// `argv_ptr`'s own contents.** This matches real `execve(2)` semantics (the caller chooses
+/// `argv[0]`, which need not equal the path used to find the file at all -- e.g. a login shell's
+/// `argv[0]` of `-bash`) and is what makes real multi-call-binary dispatch (a `busybox`-style
+/// binary picking an applet by `argv[0]`/basename) possible at all; it used to be silently
+/// unreachable, since `do_execve` always overwrote `argv[0]` with the exec path itself regardless
+/// of what a real caller supplied. `envp_ptr` is `R10`, the ABI's 4th argument -- see
+/// `src/syscall.rs`'s module doc comment for why that register only became a real, read argument
+/// once this needed it.
 #[repr(C)]
 struct RawArgvEntry {
     ptr: u64,
@@ -486,7 +495,7 @@ pub fn do_execve(
     // pointer-validation gap sys_write/sys_read already have for user pointers.
     let path_bytes: Vec<u8> =
         unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) }.to_vec();
-    let extra_argv = read_ptr_len_array(argv_ptr);
+    let raw_argv = read_ptr_len_array(argv_ptr);
     let envp = read_ptr_len_array(envp_ptr);
 
     let fd = syscall::dispatch(SYS_OPEN, path_ptr, path_len, 0, 0)?;
@@ -527,13 +536,17 @@ pub fn do_execve(
         .map_err(|_| ENOEXEC)?;
     let stack_top = VirtAddr::new(USER_STACK_TOP);
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
-    // argv[0] is always path_bytes itself; argv[1..] is whatever extra_argv (read above, while the
-    // caller's own address space was still active) supplied. envp is real now too -- whatever the
-    // caller's own envp_ptr described, or empty if it passed 0 (every caller before this existed
-    // did exactly that, and keeps doing so unaffected -- see RawArgvEntry's own doc comment).
-    let mut argv: Vec<&[u8]> = Vec::with_capacity(1 + extra_argv.len());
-    argv.push(&path_bytes);
-    argv.extend(extra_argv.iter().map(Vec::as_slice));
+    // raw_argv (read above, while the caller's own address space was still active) is the caller's
+    // complete, real argv[] -- including a real, caller-chosen argv[0], which need not equal
+    // path_bytes (see RawArgvEntry's own doc comment). An empty raw_argv (argv_ptr == 0, or a
+    // present-but-immediately-terminated array) falls back to a synthesized single-element
+    // argv = [path_bytes], the same fallback every pre-existing caller already relies on. envp is
+    // real too -- whatever the caller's own envp_ptr described, or empty if it passed 0.
+    let argv: Vec<&[u8]> = if raw_argv.is_empty() {
+        core::iter::once(path_bytes.as_slice()).collect()
+    } else {
+        raw_argv.iter().map(Vec::as_slice).collect()
+    };
     let envp_refs: Vec<&[u8]> = envp.iter().map(Vec::as_slice).collect();
     let initial_rsp = crate::user_stack::build(
         &elf,

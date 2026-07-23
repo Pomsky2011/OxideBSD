@@ -287,8 +287,10 @@ fn wait4(pid: u64, status: &mut i32, options: u64) -> Result<u64, u64> {
 
 /// Wire format for `SYS_EXECVE`'s optional third argument -- see `src/process.rs`'s
 /// `RawArgvEntry` (the kernel-side counterpart this must match exactly: two `u64`s, `ptr` then
-/// `len`). A sequence of these describes argv[1..] (argv[0] is always the `path` `execve` itself
-/// was given), terminated by a `ptr == 0` entry.
+/// `len`). A sequence of these describes the *complete* argv[] array, starting at argv[0],
+/// terminated by a `ptr == 0` entry -- `do_execve` no longer supplies argv[0] on this shell's
+/// behalf once a non-empty array is given (see `RawArgvEntry`'s own doc comment in the kernel
+/// tree).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawArgvEntry {
@@ -314,24 +316,24 @@ struct RawArgvEntry {
 /// through `execvp`/care about `$PATH` at all.
 const ENVP: &[u8] = b"PATH=";
 
-/// `extra_args` becomes argv[1..] -- see `RawArgvEntry`. An empty `extra_args` passes `argv_ptr =
-/// 0`, the same "no extra args" wire value every pre-existing `execve` call site here already
-/// relied on before this parameter existed, so `cat`/`ls`/etc.'s internal machinery (none of which
-/// calls `execve`) and every other caller stay unaffected.
+/// Builds a real argv[] -- `path` as argv[0] (this shell has no concept of overriding it, unlike
+/// real `execve`'s callers, so it's always the same as the exec path), `extra_args` as argv[1..].
+/// `argv_ptr` is always non-null now that it always carries at least argv[0] -- see
+/// `RawArgvEntry`'s own doc comment above.
 fn execve(path: &[u8], extra_args: &[&[u8]]) -> Result<u64, u64> {
-    let mut entries = [RawArgvEntry { ptr: 0, len: 0 }; MAX_ARGV + 1];
+    let mut entries = [RawArgvEntry { ptr: 0, len: 0 }; MAX_ARGV + 2];
+    entries[0] = RawArgvEntry {
+        ptr: path.as_ptr() as u64,
+        len: path.len() as u64,
+    };
     for (i, arg) in extra_args.iter().enumerate() {
-        entries[i] = RawArgvEntry {
+        entries[1 + i] = RawArgvEntry {
             ptr: arg.as_ptr() as u64,
             len: arg.len() as u64,
         };
     }
-    // entries[extra_args.len()] is still the {0, 0} terminator from initialization above.
-    let argv_ptr = if extra_args.is_empty() {
-        0
-    } else {
-        entries.as_ptr() as u64
-    };
+    // entries[1 + extra_args.len()] is still the {0, 0} terminator from initialization above.
+    let argv_ptr = entries.as_ptr() as u64;
     let envp_entries = [
         RawArgvEntry {
             ptr: ENVP.as_ptr() as u64,

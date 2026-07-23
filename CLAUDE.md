@@ -1750,11 +1750,37 @@ really an "add one more applet" problem anymore — almost everything left over 
 small number of kernel capabilities this codebase doesn't have at all, and each of those unlocks a
 whole cluster of applets at once rather than just one. This section is a forward-looking gap
 analysis, not a description of anything implemented — nothing below exists yet. Syscall numbers
-proposed here continue the existing invented-number sequence from `SYS_RENAME = 111` onward
-(`112`+), per this project's established convention that new syscalls invent their own numbers
-rather than copying FreeBSD/Linux (see `SYS_GETPPID`/`SYS_GETCWD`/`SYS_PIPE`/`SYS_DUP2`/
-`SYS_UNLINK`/`SYS_RMDIR`/`SYS_RENAME`) — pick the next free number at implementation time rather
-than trusting these exact values if other work has landed in between.
+proposed here continue the existing invented-number sequence from `SYS_RENAME = 111` onward,
+assigned illustratively as `112`, `113`, ... within each gap below, per this project's established
+convention that new syscalls invent their own numbers rather than copying FreeBSD/Linux (see
+`SYS_GETPPID`/`SYS_GETCWD`/`SYS_PIPE`/`SYS_DUP2`/`SYS_UNLINK`/`SYS_RMDIR`/`SYS_RENAME`) — pick the
+next free number at implementation time rather than trusting these exact values if other work has
+landed in between.
+
+Every prior syscall addition in this codebase has followed one fixed shape (see "Dynamic kernel
+modules" and "Syscall ABI" above): the number → handler *registration* always happens from a
+module's `module_init` (a thin `SyscallHandler`-shaped FFI adapter, `(u64,u64,u64,u64) -> i64`),
+but the *behavior* only lives in that same module when the state it needs is itself module-owned
+(`oxfs`'s inode table, its own `OpenFile` slots) — the moment a syscall needs kernel-only state
+(`Process` fields, the live `SyscallFrame`, the scheduler, an interrupt handler's own buffers), the
+real logic stays kernel-resident (`src/*.rs`) and the module registration is just a call-through,
+exactly like `do_execve`/`do_wait4`/`do_fork_from_current` already are for `native_abi`, or
+`oxidebsd_get_cwd`/`oxidebsd_set_cwd` already are for `oxfs`'s cwd handling. Each gap below is
+broken down along that same line — **kernel-resident piece** (must live in `src/*.rs`, no module
+choice) vs. **module-able piece** (can live in an existing module or a small new one) — so the
+placement decision is a per-gap tradeoff, not one blanket answer. At a glance:
+
+| Gap | Placement |
+|---|---|
+| `argv[0]` passthrough | kernel-resident only (`process.rs`) |
+| `stat`/`fstat`/`lstat` | fully module-able (`modules/oxfs`) |
+| `getdents`/`getdents64` | fully module-able (`modules/oxfs`) |
+| signals | mixed — delivery/`sigreturn` kernel-resident, `kill`/`sigaction`/`sigprocmask` thin-module-over-kernel-function |
+| clock + `nanosleep` | mixed — monotonic read is a trivial module accessor, `nanosleep` blocking is kernel-resident, wall clock is a new kernel-resident driver |
+| termios/`ioctl` + pty | mixed — `TIOCGWINSZ` fully module-able, raw-mode switching is kernel-resident (`stdin.rs`) |
+| process groups | new kernel-resident `Process` field + narrow accessors, syscalls thin-module (same shape as `cwd`) |
+| uid/permissions stub | fully module-able, no kernel changes at all |
+| `uname`/`gethostname` | fully module-able, no kernel changes at all |
 
 - **Real `argv[0]` passthrough in `execve` — arguably the single highest-leverage change on this
   list.** Every applet today is its own standalone single-applet static binary specifically
@@ -1763,86 +1789,202 @@ than trusting these exact values if other work has landed in between.
   port" above) — real BusyBox's own space-saving trick, one `busybox` binary dispatching on
   `argv[0]`/basename to pick an applet, is unreachable without this. Fixing it would let a
   *single* embedded `busybox` build provide dozens of applets at once, instead of one full
-  cross-compiled BusyBox build (and one claimed load address) per applet. Needed: extend
-  `RawArgvEntry`'s wire format (or add a distinct argument) so a caller can supply a real,
-  different `argv[0]` — `hush`'s own `execvp()`/`execve()` already pass a real `argv[0]` from
-  userspace today, `do_execve` just discards it and substitutes the exec path instead. Complexity:
-  low-medium — a bounded, well-scoped change to `do_execve` and `RawArgvEntry` handling, not a new
-  subsystem.
+  cross-compiled BusyBox build (and one claimed load address) per applet.
+  - **Kernel-resident (only option — no module can own this).** `do_execve` (`src/process.rs`)
+    is the sole place `argv[0]` is ever assembled onto the new process's stack (via
+    `user_stack::build`, itself kernel-resident); there is no module-boundary crossing to route
+    around, unlike `stat`/`getdents` below. The change is narrowly scoped: either interpret a
+    `argv_ptr` entry index `0` specially as an `argv[0]` override, or add a fifth wire concept —
+    but this ABI's syscalls are hard-capped at four register-carried arguments
+    (`RDI`/`RSI`/`RDX`/`R10`, see "Syscall ABI" above), so a fifth logical value has to be encoded
+    within one of the existing four, not added as a new register. The lowest-friction option:
+    treat `argv_ptr`'s *first* `RawArgvEntry` as `argv[0]` itself (a real override) rather than
+    `argv[1]`, shifting what "extra args start at" means by one — a wire-format change, not an
+    ABI-width change, and backward compatible only if every existing caller (`stsh`'s `execve`
+    wrapper, musl's `execve.c`) is updated in lockstep, since both currently assume `argv_ptr`
+    starts at `argv[1]`.
+  - Needed: `RawArgvEntry` wire-format change (as above); `third_party/musl`'s
+    `src/process/execve.c` updated to place real `argv[0]` (not just `argv[1..]`) into that array,
+    matching real `execve()`'s actual semantics for the first time. New syscalls: none — reuses
+    `SYS_EXECVE = 59`. Complexity: low-medium — a bounded, well-scoped change to `do_execve`,
+    `RawArgvEntry` handling, and one musl file, not a new subsystem.
 - **`stat`/`fstat`/`lstat`.** Unlocks: `ls -l`, `test -f`/`-d`/`-e`, `cp`/`mv` (mode/size checks),
   `du`, `find` (needs a `stat` per visited entry), and any script doing existence/type checks.
-  Needed: a byte-exact musl/Linux `struct stat` layout on x86_64 (`st_dev`, `st_ino`, `st_nlink`,
-  `st_mode`, `st_uid`, `st_gid`, `st_rdev`, `st_size`, `st_blksize`, `st_blocks`, `st_atim`/
-  `st_mtim`/`st_ctim`, reserved padding) filled from `oxfs`'s own inode (`size`, `kind` ->
-  `st_mode`'s file-type bits); no real timestamps exist anywhere in this kernel, so `st_*tim`
-  needs a placeholder (`0`, or a fake monotonic counter — see the clock gap below) rather than
-  anything real. New syscalls: `SYS_FSTAT`/`SYS_STAT`/`SYS_LSTAT` (`lstat` can just alias `stat`,
-  no symlinks exist). Also fixes a real, already-flagged latent landmine: musl's own
-  `bits/syscall.h.in` leaves `SYS_fstat` at its inert Linux value (`5`), which numerically
-  collides with OxideBSD's own `SYS_OPEN = 5` — harmless only because nothing has called real
-  `fstat()` yet (see "oxfs filesystem module" above). Complexity: medium.
+  - **Fully module-able — the cleanest gap on this list.** Every input `stat` needs (path
+    resolution, inode `size`/`kind`) is already inside `modules/oxfs`'s own state (`resolve_path`,
+    the inode table); `fstat` needs only an fd → inode lookup, which `oxfs`'s own `OpenFile` table
+    already tracks per-fd. None of this touches `Process`, the scheduler, or `SyscallFrame` — the
+    entire handler (path/fd resolution, struct fill, write to the caller's buffer pointer) can live
+    in `modules/oxfs/src/lib.rs` next to `oxfs_open`/`oxfs_mkdir`, registered the same
+    `oxidebsd_register_syscall`-from-`module_init` way those already are. No kernel-resident
+    change is required at all beyond the registration mechanism that already exists.
+  - Needed: a byte-exact musl x86_64 `struct stat` (144 bytes total): `st_dev: u64` (offset 0),
+    `st_ino: u64` (8), `st_nlink: u64` (16), `st_mode: u32` (24), `st_uid: u32` (28),
+    `st_gid: u32` (32), `__pad0: u32` (36), `st_rdev: u64` (40), `st_size: i64` (48),
+    `st_blksize: i64` (56), `st_blocks: i64` (64), `st_atim`/`st_mtim`/`st_ctim`: 3×
+    `{tv_sec: i64, tv_nsec: i64}` (72, 88, 104), `__reserved: [i64; 3]` (120..144). `st_mode`'s
+    file-type bits (`S_IFREG = 0o100000`, `S_IFDIR = 0o040000`) come straight from `oxfs`'s own
+    inode `kind`; `st_size` from the inode's byte length; `st_nlink` can be a fixed `1`
+    (`oxfs` has no hard-link concept); `st_dev`/`st_rdev`/`st_uid`/`st_gid` are all fine as fixed
+    `0`s (no multi-device, no real uid/gid model — see the permissions gap below); no real
+    timestamps exist anywhere in this kernel, so `st_*tim` needs a placeholder (`0`, or the
+    monotonic tick counter from the clock gap below, cast into `tv_sec`) rather than anything real.
+    New syscalls (illustrative numbers): `SYS_FSTAT = 112`, `SYS_STAT = 113`, `SYS_LSTAT = 114`
+    (`lstat` can just alias `stat` — no symlinks exist, so there's never a distinct link to
+    report on). Also fixes a real, already-flagged latent landmine: musl's own
+    `bits/syscall.h.in` leaves `SYS_fstat` at its inert Linux value (`5`), which numerically
+    collides with OxideBSD's own `SYS_OPEN = 5` — harmless only because nothing has called real
+    `fstat()` yet (see "oxfs filesystem module" above); this remap is what actually closes it, the
+    same way `open`'s own remap was what closed a different collision earlier. Complexity: medium
+    (mostly "get the byte layout exactly right"), not architecturally hard.
 - **`getdents`/`getdents64` (real directory reading).** Unlocks: a real `ls` (not `stsh`'s own
   built-in, which only works by piggybacking on `oxfs`'s "open a directory, get a formatted
   listing" convention, not real POSIX `opendir`/`readdir`), `find`, `du`, `cp -r`/`rm -r`/`tar`
   across directories, and — notably — **glob (`*`/`?`) expansion inside `hush` itself**, which
-  also depends on real directory reading and today doesn't work at all. Needed: a new syscall
-  returning a sequence of real `struct dirent64`-shaped records (`d_ino`, `d_off`, `d_reclen`,
-  `d_type`, `d_name`) from an open directory fd; `oxfs` already has the raw name/inode data
-  (`dir_record_name`/`dir_record_inode` in `modules/oxfs/src/lib.rs`), this is mostly a
-  reformatting problem plus a new `OpenFile` variant that tracks a directory-read cursor instead
-  of (or alongside) the existing formatted-listing trick. Complexity: medium.
-- **Real signals — the biggest lift on this list.** Unlocks: `kill`, stopping a runaway process
-  cleanly (`yes.elf` today can only be stopped by killing the whole VM), Ctrl+C actually
-  interrupting a *running child* (today Ctrl+C is only handled inside `stsh`'s own `read_line`,
-  intercepting byte `0x03` after a blocking read — not a real `SIGINT` delivered by the kernel),
-  `trap`, timeout-style tools, and job control's own underlying mechanism (`SIGTSTP`/`SIGCONT`).
-  Needed: a per-process signal mask and pending-signal set, a delivery point (checked on the
-  return-to-userspace path out of `syscall_dispatch`/after a blocking wakeup), default
-  dispositions (terminate/ignore/stop/continue), new syscalls (`SYS_KILL`, `SYS_SIGACTION`,
-  `SYS_SIGPROCMASK`, `SYS_SIGRETURN` — the last needing its own trampoline/frame-construction
-  work, similar in spirit to `context_switch`'s existing fork/spawn trampolines but for "resume
-  into a signal handler, then return to the interrupted point"), and wiring the keyboard IRQ's
-  own Ctrl+C handling to actually send `SIGINT` to whatever process is in the foreground, not just
-  to `stsh`'s own read loop. Complexity: high — touches syscall entry/exit, `Process`, and the
-  scheduler all at once, unlike everything else on this list, which is additive.
-- **A clock and `nanosleep`.** Unlocks: `sleep`, `date`, `time`, any timeout-based tool. A
-  monotonic-only clock (ticks-since-boot, from the timer IRQ handler that already exists — see
-  "Project"/interrupts above — just never exposed to userland) is enough for `sleep` and relative
-  timing; a real wall clock for `date` to report something meaningful needs an actual RTC
-  (CMOS real-time-clock chip) driver, a new hardware driver this codebase doesn't have at all.
-  `nanosleep` additionally needs the calling process to genuinely block (a new
-  `BlockReason::Sleeping(wake_tick)`, woken by the timer IRQ incrementing a counter and checking
-  sleepers — the same shape `src/pipe.rs`/`src/stdin.rs`'s existing blocking already established,
-  not a new blocking mechanism). Complexity: medium for monotonic/`sleep`; higher for a real wall
-  clock.
+  also depends on real directory reading and today doesn't work at all.
+  - **Fully module-able, same reasoning as `stat` above.** `oxfs` already has the raw name/inode
+    data this needs (`dir_record_name`/`dir_record_inode` in `modules/oxfs/src/lib.rs`) and already
+    owns the `OpenFile` enum a new directory-cursor variant would extend — nothing here reaches
+    outside the module's own state. The only "new" mechanism is a `struct dirent64` writer, which
+    is pure data formatting, not kernel access.
+  - Needed: a new `OpenFile::DirEntries { inode, position }` variant (or extending the existing
+    `DirListing` cache) tracking a read cursor across possibly-multiple `getdents` calls (real
+    `getdents` is incremental, unlike `oxfs`'s current whole-listing-at-`open` trick); a
+    `struct dirent64` writer (`d_ino: u64`, `d_off: u64`, `d_reclen: u16`, `d_type: u8`,
+    `d_name: [u8]` NUL-terminated, each record padded to 8-byte alignment — real glibc/musl
+    convention, needed since musl's own `readdir()` walks these records by `d_reclen`, not a fixed
+    stride). New syscall: `SYS_GETDENTS64 = 115`. Complexity: medium — the record-packing/padding
+    logic needs care, but no new kernel-resident concept.
+- **Real signals — the biggest lift on this list, and the one gap that's genuinely split across
+  the kernel/module boundary rather than sitting cleanly on one side.** Unlocks: `kill`, stopping a
+  runaway process cleanly (`yes.elf` today can only be stopped by killing the whole VM), Ctrl+C
+  actually interrupting a *running child* (today Ctrl+C is only handled inside `stsh`'s own
+  `read_line`, intercepting byte `0x03` after a blocking read — not a real `SIGINT` delivered by
+  the kernel), `trap`, timeout-style tools, and job control's own underlying mechanism
+  (`SIGTSTP`/`SIGCONT`).
+  - **Kernel-resident, no choice about it: delivery and `sigreturn`.** The delivery check (is
+    there a pending, unmasked signal for this process?) has to run on the return-to-userspace path
+    out of `syscall_dispatch` and after every blocking wakeup (`do_wait4`, pipe reads, a future
+    `nanosleep`) — that path is `src/syscall.rs`/`src/scheduler.rs`, kernel-owned, not reachable
+    from module code. Actually invoking a handler means redirecting the live `SyscallFrame`'s
+    `rcx`/user-stack fields to jump into userspace at the handler address instead of resuming the
+    interrupted code — the exact same narrow-accessor pattern `fork`/`execve` already needed
+    (`copy_frame_for_fork`, `redirect_frame`, `CURRENT_FRAME` — see "Process abstraction..."
+    above), because `SyscallFrame`'s fields are deliberately private outside `src/syscall.rs`.
+    `SYS_SIGRETURN`'s own handler needs the same raw frame access in reverse (restore the
+    pre-signal frame it saved) — it's the closest thing to a new `context_switch` trampoline this
+    list has, in the same spirit as `spawn_trampoline_asm`/`fork_trampoline_asm`. A `SIGSTOP`
+    disposition also needs a new `BlockReason` variant (`process.rs`/`scheduler.rs`), the same
+    kernel-resident shape `WaitingForChild`/`WaitingForPipeData` already are.
+  - **Module-able piece: `kill`/`sigaction`/`sigprocmask` themselves.** None of these three need
+    live `SyscallFrame` access — they just read/write per-process signal state (mask, pending set,
+    handler table). If `Process` grows those fields (kernel-resident, `process.rs`, same as
+    `cwd`/`fs_base`/`brk` already are) with narrow accessor functions exposed to modules
+    (`oxidebsd_get_sigmask`/`oxidebsd_set_sigaction`-style, mirroring `oxidebsd_get_cwd`/
+    `oxidebsd_set_cwd`'s existing precedent), the three syscalls themselves can be thin handlers in
+    a module — either `native_abi` (they're process-management-adjacent, like `getpid`/`wait4`) or
+    a dedicated new `modules/signal`, whichever the user prefers once this is scoped for real; only
+    `SYS_SIGRETURN` is forced kernel-resident by the frame-manipulation requirement above, and even
+    that could be *registered* by a module while calling straight through to a kernel-resident
+    `do_sigreturn`, same as every other frame-touching syscall already does.
+  - **A real design fork, not just an implementation detail: sigaction's own wire format.**
+    Real POSIX `sigaction()` (and musl's own struct layout for it) isn't just a syscall
+    convention — it's real libc API surface a program calls directly, so — matching this project's
+    existing "own ABI, not a copycat" discipline (see `execve`/`open`'s own argument-convention
+    fixes) — `third_party/musl`'s `src/signal/sigaction.c` would need a patch analogous to
+    `execve.c`'s, translating real POSIX's `struct sigaction` into whatever wire shape
+    `do_sigaction` actually expects, rather than assuming Linux's on-the-wire layout works
+    unmodified.
+  - New syscalls (illustrative): `SYS_KILL = 116`, `SYS_SIGACTION = 117`, `SYS_SIGPROCMASK = 118`,
+    `SYS_SIGRETURN = 119`. Also needed: wiring the keyboard IRQ's own Ctrl+C handling
+    (`src/interrupts.rs`) to send a real `SIGINT` to whatever process is in the foreground, not
+    just to `stsh`'s own now-obsolete `read_line` interception — itself blocked on the (also
+    still-nonexistent) foreground-process-group concept from the process-groups gap below.
+    Complexity: high — the only gap here that genuinely touches syscall entry/exit, `Process`, and
+    the scheduler all at once, rather than being purely additive.
+- **A clock and `nanosleep`.** Unlocks: `sleep`, `date`, `time`, any timeout-based tool.
+  - **Module-able: reading the existing monotonic tick counter.** The timer IRQ handler
+    (`src/interrupts.rs`) already increments a tick count for scheduling purposes — it's just never
+    exposed to userland. A narrow kernel-exposed accessor (`oxidebsd_get_ticks`, same shape as
+    `oxidebsd_get_cwd`) would let a module register `SYS_CLOCK_GETTIME`/a simpler
+    `SYS_GETTICKS` entirely on its own, converting ticks → `{tv_sec, tv_nsec}` in module code.
+  - **Kernel-resident: `nanosleep`'s actual blocking, and a real wall clock.** Blocking needs a
+    new `BlockReason::Sleeping(wake_tick)` in `process.rs`/`scheduler.rs` — the calling process
+    must be marked blocked and the timer IRQ handler itself must check sleepers each tick and wake
+    any whose `wake_tick` has passed, the same block-then-`scheduler::schedule()` shape
+    `src/pipe.rs`/`src/stdin.rs`'s existing blocking already established, just with the IRQ handler
+    (not another syscall) as the waker this time — that coupling to the IRQ handler is what keeps
+    it kernel-resident rather than module code. A real wall clock for `date` to report something
+    meaningful needs an actual RTC (CMOS real-time-clock chip) driver — a new hardware driver this
+    codebase doesn't have at all, and, like `serial.rs`/`pic.rs`, a good candidate for staying
+    kernel-resident/hand-rolled rather than a module or a new dependency (see "Dependency notes"
+    below for why small, stable-protocol hardware drivers stay in-tree here) — modules have no
+    port-I/O (`outb`/`inb`) primitive exposed to them at all today, so an RTC driver *as* a module
+    would first need that gap closed in `src/module.rs`'s symbol-resolution table, a separate,
+    smaller prerequisite.
+  - New syscalls (illustrative): `SYS_CLOCK_GETTIME = 120`, `SYS_NANOSLEEP = 121`. Complexity:
+    medium for monotonic/`sleep` (mostly registration plumbing); higher for a real wall clock (a
+    genuinely new hardware driver).
 - **Termios/`ioctl` + a minimal pty concept.** Unlocks: `CONFIG_HUSH_INTERACTIVE` (a real prompt,
   line editing, and history *inside* `hush` itself, rather than only via `stsh`'s own hand-rolled
   `read_line` — see "Interactive shell" above), `stty`, and full-screen tools (`vi`, `less`).
   `TCGETS`/`TCSETS`/`TIOCGWINSZ` are all currently unmapped, silently `ENOSYS` (confirmed harmless
   so far only because BusyBox degrades gracefully when `isatty()` comes back false — see the
-  musl-port/oxfs sections above). A fake but consistent winsize (e.g. `80x24`) and a minimal
-  termios struct honoring canonical-vs-raw mode would cover most tools; the harder part isn't the
-  syscall itself but making a raw-mode switch actually change how `src/stdin.rs`'s ring buffer
-  behaves (echo, line buffering are currently hardcoded kernel-side, not mode-dependent).
-  Complexity: medium.
+  musl-port/oxfs sections above).
+  - **Fully module-able: `TIOCGWINSZ` alone.** A fake but consistent winsize (e.g. `80x24`) needs
+    no kernel state at all — a module can register `SYS_IOCTL`, switch on the `request` argument,
+    and for `TIOCGWINSZ` just write a fixed `struct winsize` back to the caller's pointer.
+  - **Kernel-resident: `TCGETS`/`TCSETS`'s actual effect.** The part that isn't just "return
+    plausible-looking data" is making a raw-mode switch (canonical vs. non-canonical, echo
+    on/off) actually change how `src/stdin.rs`'s ring buffer and `src/interrupts.rs`'s keyboard
+    handler behave — both currently hardcode line-buffered-with-echo unconditionally. This needs a
+    kernel-resident "current termios mode" (global today, same single-console limitation
+    `CURRENT_DIR_CLUSTER` used to have before `oxfs` made cwd per-process — see "oxfs filesystem
+    module" above; a pty abstraction would be what makes it per-session instead) that `stdin.rs`'s
+    push/echo logic and `read_line`-equivalent behavior actually consult. A module can still
+    *register* `SYS_IOCTL` and call a narrow kernel-exposed setter/getter for that mode, same
+    pattern as the signal-syscalls-over-kernel-state split above — just the mode itself, and what
+    consults it, has to be kernel-resident.
+  - New syscall (illustrative): `SYS_IOCTL = 122`. Complexity: medium — the winsize/struct-fill
+    half is easy, the raw-mode-actually-changing-echo-behavior half is the real work.
 - **Process groups (`setpgid`/`getpgid`/`tcsetpgrp`).** Unlocks: `bg`/`fg`, Ctrl+Z, `jobs` — real
-  job control. Needs a `pgid` field on `Process` and a "foreground process group" concept tied to
-  the (still-nonexistent) tty abstraction above; only actually valuable bundled with real signals
-  (`SIGTSTP`/`SIGCONT`), so treat this as an extension of that work, not standalone. Complexity:
-  medium, but low value in isolation.
-- **A permissions/uid model — low value unless it's real, but trivial to stub.** `chmod`/`chown`
-  as unconditional no-op successes (matching `mkdir`'s own already-established "mode is read but
-  discarded" precedent) and `id`/`whoami` always reporting a fixed `uid 0` would make those
-  applets *run* without lying about anything meaningfully — there's no real multi-user story
-  worth building without actual users/permissions enforcement, which is a much bigger, separate
-  investment than anything else on this list. Complexity: low (as stubs); high (if done for real).
-- **`uname`/`gethostname`.** Unlocks: `uname -a`, `hostname`. Trivial — a fixed string and a new
-  syscall number, no real design work. Complexity: low.
+  job control.
+  - **Same shape as `cwd`: a new kernel-resident `Process` field plus narrow accessors, thin
+    syscalls anywhere.** A `pgid: Pid` field on `Process` (`process.rs`) is kernel-resident by the
+    same logic `cwd`/`fs_base`/`brk` already are (it needs to live in the process table and survive
+    `fork`/`spawn`), but — exactly like `oxidebsd_get_cwd`/`oxidebsd_set_cwd` already do for
+    `oxfs` — a pair of narrow exported functions would let `setpgid`/`getpgid` themselves be
+    registered from any module (`native_abi` or wherever `kill`/`sigaction` end up) without that
+    module needing direct `Process` struct access. `tcsetpgrp` is the one call in this group that's
+    actually blocked, not just placed — it needs a "foreground process group" concept tied to the
+    still-nonexistent tty/pty abstraction from the termios gap above, so it has no home (module or
+    kernel) until that lands.
+  - Only actually valuable bundled with real signals (`SIGTSTP`/`SIGCONT`), so treat this as an
+    extension of that work, not standalone. Complexity: medium, but low value in isolation.
+- **A permissions/uid model — low value unless it's real, but trivial to stub.**
+  - **Fully module-able, zero kernel changes.** `chmod`/`chown` as unconditional no-op successes
+    (matching `mkdir`'s own already-established "mode is read but discarded" precedent) and
+    `id`/`whoami` always reporting a fixed `uid 0` need no state anywhere — not even a
+    module-owned static, just a handler that ignores its arguments and returns success/a constant.
+    Any module already in the boot sequence (`posix_compat` is the natural, already-empty home) can
+    register these with no new kernel API surface at all. There's no real multi-user story worth
+    building without actual users/permissions enforcement, which is a much bigger, separate
+    investment than anything else on this list — these are stubs, not a first slice of that.
+  - Complexity: low (as stubs, and the only version worth doing without a broader permissions
+    design); high (if done for real).
+- **`uname`/`gethostname`.** Unlocks: `uname -a`, `hostname`.
+  - **Fully module-able, zero kernel changes** — a fixed `struct utsname`
+    (`sysname`/`nodename`/`release`/`version`/`machine`, all fixed strings) and a fixed hostname
+    string, written to the caller's pointer by a handler with no kernel-side state to consult at
+    all. Same `posix_compat`-is-the-natural-home reasoning as the permissions stubs above.
+  - New syscall (illustrative): `SYS_UNAME = 131`. Complexity: low — no real design work.
 
 Not applet-specific, but adjacent: a real block device driver and on-disk persistence (`oxfs` is
 still in-memory only, same as `modules/fat32` before it) would matter for actually *using* this as
 a system rather than a demo, but doesn't by itself unlock any additional applet the way each gap
-above does.
+above does. Also adjacent, and a prerequisite noted above rather than its own bullet: exposing raw
+port I/O (`outb`/`inb`) through `src/module.rs`'s symbol-resolution table, which nothing currently
+needs but a module-hosted RTC driver would.
 
 ## Dependency notes
 
