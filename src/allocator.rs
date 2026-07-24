@@ -95,7 +95,15 @@ pub fn init_heap(
             .ok_or(MapToError::FrameAllocationFailed)?;
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         unsafe {
-            mapper.map_to(page, frame, flags, frame_allocator)?.flush();
+            // `.ignore()`, not `.flush()`: every page in this range is being mapped for the very
+            // first time (HEAP_START's own VA range is never touched by anything earlier in boot),
+            // so no stale TLB entry for it can exist to invalidate. `.flush()` here used to cost a
+            // real `invlpg` per page regardless -- fine when the heap was a few thousand pages, but
+            // a genuine, measured multi-minute stall once `Cargo.toml`'s QEMU `-m` grew enough to
+            // push the heap toward its 128 MiB ceiling (tens of thousands of pages, each trapped
+            // and emulated individually under QEMU's software TCG) -- see CLAUDE.md's oxfs section
+            // for the BusyBox-roster growth that first forced a bigger heap and surfaced this.
+            mapper.map_to(page, frame, flags, frame_allocator)?.ignore();
         }
     }
 

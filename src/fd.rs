@@ -293,6 +293,23 @@ pub(crate) fn real_fd_of(fd: u64) -> Option<u64> {
         .map(|ops| ops.real_fd)
 }
 
+/// FFI wrapper over `real_fd_of` for modules that own their own fd-keyed state (`modules/oxfs`'s
+/// `OPEN_FILES`, keyed by `real_fd` like every `FdOps` callback already is) but can't call
+/// `crate::fd` directly -- modules only ever call *into* the kernel, through their own hand-curated
+/// symbol table (see `src/module.rs`). `SYS_FSTAT`'s handler is the first case that needs this:
+/// unlike `SYS_READ`/`SYS_WRITE`, which this file's own `read`/`write` already resolve fd -> real_fd
+/// for before invoking a callback, a syscall-number-registered handler (`oxfs_fstat`) receives the
+/// caller's raw `fd` argument directly and has to do that resolution itself. Returns `-1` (never a
+/// valid `real_fd`, which starts at `3`) for an fd the calling process doesn't have open, rather than
+/// `Option`, to stay in this codebase's plain-`i64`-FFI-boundary convention (see `SyscallHandler`'s
+/// own doc comment in `src/syscall.rs`).
+pub(crate) extern "C" fn oxidebsd_real_fd_of(fd: u64) -> i64 {
+    match real_fd_of(fd) {
+        Some(real_fd) => real_fd as i64,
+        None => -1,
+    }
+}
+
 extern "C" fn stdin_read(_real_fd: u64, ptr: u64, len: u64) -> i64 {
     // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
     // already has -- [ptr, ptr+len) isn't checked against the caller's actual mappings first.

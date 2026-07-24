@@ -76,56 +76,397 @@ fn main() {
     // discovery process every applet before it went through. `head`/`tail`/`wc`/`cut`/`sort`/
     // `uniq` are plain stdin/stdout/file text tools needing nothing beyond `open`/`read`/`write`/
     // `close`; `basename`/`dirname`/`printf`/`seq` do no filesystem I/O at all beyond `write`ing
-    // their result, the same shape `echo`/`true`/`false` already have. Deliberately **not**
-    // included this round: `ls`/`find` (BusyBox's own implementation goes through
-    // `opendir`/`readdir`, i.e. a real `getdents` syscall -- `modules/oxfs` doesn't implement one at
-    // all, unlike `stsh`'s own built-in `ls`, which only ever worked by piggybacking on
-    // `fat32`/`oxfs`'s own "open a directory, get back a formatted listing" convention, not real
-    // POSIX directory-reading); `ps`/`date`/`sleep`/`id`/`uname`/`chmod`/`chown` (each needs a
-    // kernel facility that plain doesn't exist yet -- `/proc`, a real-time clock, or a permissions
-    // model). `kill` *is* included now that `modules/signal` (see CLAUDE.md) makes real process
-    // signaling exist -- the whole reason that gap closed.
+    // their result, the same shape `echo`/`true`/`false` already have. `kill` was included once
+    // `modules/signal` (see CLAUDE.md) made real process signaling exist -- the gap that had
+    // blocked it.
+    //
+    // Everything from `ADDGROUP` on is a later, much larger pass: once `SYS_STAT`/`SYS_FSTAT`/
+    // `SYS_LSTAT`/`SYS_GETDENTS` existed (see CLAUDE.md's oxfs section), an exhaustive per-applet
+    // build probe was run against every Kconfig applet symbol BusyBox's own `//applet:` source
+    // markers define (393 candidates) using this exact recipe. **"Builds" is a much weaker bar
+    // than "works"**: musl provides a fairly complete libc surface, so plenty of applets that make
+    // no sense on this kernel (networking, mount, `/proc`-reading, uid/passwd-db tools) still
+    // compile and link cleanly -- they just fail cleanly at runtime (usually `ENOSYS` from an
+    // unregistered syscall). They're kept anyway (build success is the bar this pass used), but
+    // every one is tagged with exactly what it's still missing in `docs/BUSYBOX_APPLETS.md`, along
+    // with the full list -- and reasons -- for every candidate that didn't even build. Load
+    // addresses use smaller (`0x40000`, not `0x100000`) steps than the original 24, purely to fit
+    // this much larger roster comfortably below `module::MODULE_VA_BASE` (`0x10000000`) -- every
+    // applet built so far stays well under 256 KiB. **All of these moved from their original,
+    // smaller values** (`0xb00000`-`0x2200000` for the original 24) once the kernel's own image
+    // grew past them -- see this array's own base (`0x4100000`) and `userland/ring3-smoke/
+    // linker.ld`'s doc comment for the full story of why, and how to re-derive the safe floor
+    // before trusting any of these numbers again.
     const BUSYBOX_APPLETS: &[(&str, &str, u64)] = &[
-        ("TRUE", "true", 0xb00000),
-        ("ECHO", "echo", 0xc00000),
-        ("CAT", "cat", 0xd00000),
-        ("HUSH", "sh", 0xe00000),
-        ("FALSE", "false", 0xf00000),
-        ("YES", "yes", 0x1000000),
-        ("MORE", "more", 0x1100000),
-        ("MKDIR", "mkdir", 0x1200000),
-        ("RMDIR", "rmdir", 0x1300000),
-        ("RM", "rm", 0x1400000),
-        ("MV", "mv", 0x1500000),
-        ("CP", "cp", 0x1600000),
-        ("TOUCH", "touch", 0x1700000),
-        ("HEAD", "head", 0x1800000),
-        ("TAIL", "tail", 0x1900000),
-        ("WC", "wc", 0x1a00000),
-        ("BASENAME", "basename", 0x1b00000),
-        ("DIRNAME", "dirname", 0x1c00000),
-        ("PRINTF", "printf", 0x1d00000),
-        ("SEQ", "seq", 0x1e00000),
-        ("CUT", "cut", 0x1f00000),
-        ("SORT", "sort", 0x2000000),
-        ("UNIQ", "uniq", 0x2100000),
-        ("KILL", "kill", 0x2200000),
+        ("TRUE", "true", 0x4100000),
+        ("ECHO", "echo", 0x4200000),
+        ("CAT", "cat", 0x4300000),
+        ("HUSH", "sh", 0x4400000),
+        ("FALSE", "false", 0x4500000),
+        ("YES", "yes", 0x4600000),
+        ("MORE", "more", 0x4700000),
+        ("MKDIR", "mkdir", 0x4800000),
+        ("RMDIR", "rmdir", 0x4900000),
+        ("RM", "rm", 0x4a00000),
+        ("MV", "mv", 0x4b00000),
+        ("CP", "cp", 0x4c00000),
+        ("TOUCH", "touch", 0x4d00000),
+        ("HEAD", "head", 0x4e00000),
+        ("TAIL", "tail", 0x4f00000),
+        ("WC", "wc", 0x5000000),
+        ("BASENAME", "basename", 0x5100000),
+        ("DIRNAME", "dirname", 0x5200000),
+        ("PRINTF", "printf", 0x5300000),
+        ("SEQ", "seq", 0x5400000),
+        ("CUT", "cut", 0x5500000),
+        ("SORT", "sort", 0x5600000),
+        ("UNIQ", "uniq", 0x5700000),
+        ("KILL", "kill", 0x5800000),
     ];
-    let busybox_applet_elfs: Vec<(&str, Vec<u8>)> = BUSYBOX_APPLETS
+
+    /// The second pass itself -- see `docs/BUSYBOX_APPLETS.md` for what every one of these
+    /// actually needs at runtime (most need *something* OxideBSD doesn't implement yet; the
+    /// doc tags each one) and for the full list of candidates that didn't even build.
+    const BUSYBOX_APPLETS_PASS2: &[(&str, &str, u64)] = &[
+        ("ADDGROUP", "addgroup", 0x5a00000),
+        ("ADDUSER", "adduser", 0x5a40000),
+        ("ADJTIMEX", "adjtimex", 0x5a80000),
+        ("AR", "ar", 0x5ac0000),
+        ("ARP", "arp", 0x5b00000),
+        ("ARPING", "arping", 0x5b40000),
+        ("ASCII", "ascii", 0x5b80000),
+        ("ASH", "ash", 0x5bc0000),
+        ("AWK", "awk", 0x5c00000),
+        ("BASE32", "base32", 0x5c40000),
+        ("BASE64", "base64", 0x5c80000),
+        ("BASH_IS_ASH", "bash_ash", 0x5cc0000),
+        ("BASH_IS_HUSH", "bash", 0x5d00000),
+        ("BBCONFIG", "bbconfig", 0x5d40000),
+        ("BB_ARCH", "arch", 0x5d80000),
+        ("BB_SYSCTL", "sysctl", 0x5dc0000),
+        ("BC", "bc", 0x5e00000),
+        ("BLKID", "blkid", 0x5e40000),
+        ("BOOTCHARTD", "bootchartd", 0x5e80000),
+        ("BUNZIP2", "bunzip2", 0x5ec0000),
+        ("BZCAT", "bzcat", 0x5f00000),
+        ("BZIP2", "bzip2", 0x5f40000),
+        ("CAL", "cal", 0x5f80000),
+        ("CHAT", "chat", 0x5fc0000),
+        ("CHATTR", "chattr", 0x6000000),
+        ("CHGRP", "chgrp", 0x6040000),
+        ("CHMOD", "chmod", 0x6080000),
+        ("CHOWN", "chown", 0x60c0000),
+        ("CHPASSWD", "chpasswd", 0x6100000),
+        ("CHROOT", "chroot", 0x6140000),
+        ("CHRT", "chrt", 0x6180000),
+        ("CHVT", "chvt", 0x61c0000),
+        ("CKSUM", "cksum", 0x6200000),
+        ("CLEAR", "clear", 0x6240000),
+        ("CMP", "cmp", 0x6280000),
+        ("COMM", "comm", 0x62c0000),
+        ("CPIO", "cpio", 0x6300000),
+        ("CRC32", "crc32", 0x6340000),
+        ("CROND", "crond", 0x6380000),
+        ("CRONTAB", "crontab", 0x63c0000),
+        ("CTTYHACK", "cttyhack", 0x6400000),
+        ("DATE", "date", 0x6440000),
+        ("DC", "dc", 0x6480000),
+        ("DD", "dd", 0x64c0000),
+        ("DEALLOCVT", "deallocvt", 0x6500000),
+        ("DELGROUP", "delgroup", 0x6540000),
+        ("DEVFSD", "devfsd", 0x6580000),
+        ("DEVMEM", "devmem", 0x65c0000),
+        ("DF", "df", 0x6600000),
+        ("DHCPRELAY", "dhcprelay", 0x6640000),
+        ("DIFF", "diff", 0x6680000),
+        ("DMESG", "dmesg", 0x66c0000),
+        ("DNSD", "dnsd", 0x6700000),
+        ("DNSDOMAINNAME", "dnsdomainname", 0x6740000),
+        ("DOS2UNIX", "dos2unix", 0x6780000),
+        ("DPKG", "dpkg", 0x67c0000),
+        ("DPKG_DEB", "dpkg_deb", 0x6800000),
+        ("DU", "du", 0x6840000),
+        ("DUMPKMAP", "dumpkmap", 0x6880000),
+        ("DUMPLEASES", "dumpleases", 0x68c0000),
+        ("ED", "ed", 0x6900000),
+        ("EGREP", "egrep", 0x6940000),
+        ("EJECT", "eject", 0x6980000),
+        ("ENV", "env", 0x69c0000),
+        ("ENVUIDGID", "envuidgid", 0x6a00000),
+        ("EXPAND", "expand", 0x6a40000),
+        ("EXPR", "expr", 0x6a80000),
+        ("FACTOR", "factor", 0x6ac0000),
+        ("FAKEIDENTD", "fakeidentd", 0x6b00000),
+        ("FALLOCATE", "fallocate", 0x6b40000),
+        ("FATATTR", "fatattr", 0x6b80000),
+        ("FBSET", "fbset", 0x6bc0000),
+        ("FDFORMAT", "fdformat", 0x6c00000),
+        ("FDISK", "fdisk", 0x6c40000),
+        ("FGCONSOLE", "fgconsole", 0x6c80000),
+        ("FGREP", "fgrep", 0x6cc0000),
+        ("FIND", "find", 0x6d00000),
+        ("FINDFS", "findfs", 0x6d40000),
+        ("FLOCK", "flock", 0x6d80000),
+        ("FOLD", "fold", 0x6dc0000),
+        ("FREE", "free", 0x6e00000),
+        ("FREERAMDISK", "freeramdisk", 0x6e40000),
+        ("FSCK", "fsck", 0x6e80000),
+        ("FSCK_MINIX", "fsck_minix", 0x6ec0000),
+        ("FSYNC", "fsync", 0x6f00000),
+        ("FTPD", "ftpd", 0x6f40000),
+        ("FTPGET", "ftpget", 0x6f80000),
+        ("FTPPUT", "ftpput", 0x6fc0000),
+        ("FUSER", "fuser", 0x7000000),
+        ("GETOPT", "getopt", 0x7040000),
+        ("GETTY", "getty", 0x7080000),
+        ("GREP", "grep", 0x70c0000),
+        ("GROUPS", "groups", 0x7100000),
+        ("GUNZIP", "gunzip", 0x7140000),
+        ("GZIP", "gzip", 0x7180000),
+        ("HALT", "halt", 0x71c0000),
+        ("HD", "hd", 0x7200000),
+        ("HEXDUMP", "hexdump", 0x7240000),
+        ("HEXEDIT", "hexedit", 0x7280000),
+        ("HOSTID", "hostid", 0x72c0000),
+        ("HTTPD", "httpd", 0x7300000),
+        ("HWCLOCK", "hwclock", 0x7340000),
+        ("IFCONFIG", "ifconfig", 0x7380000),
+        ("IFDOWN", "ifdown", 0x73c0000),
+        ("INETD", "inetd", 0x7400000),
+        ("INOTIFYD", "inotifyd", 0x7440000),
+        ("INSTALL", "install", 0x7480000),
+        ("IOSTAT", "iostat", 0x74c0000),
+        ("IPCALC", "ipcalc", 0x7500000),
+        ("IPCRM", "ipcrm", 0x7540000),
+        ("IPCS", "ipcs", 0x7580000),
+        ("KILLALL5", "killall5", 0x75c0000),
+        ("KLOGD", "klogd", 0x7600000),
+        ("LESS", "less", 0x7640000),
+        ("LINK", "link", 0x7680000),
+        ("LINUX32", "linux32", 0x76c0000),
+        ("LINUX64", "linux64", 0x7700000),
+        ("LN", "ln", 0x7740000),
+        ("LOADKMAP", "loadkmap", 0x7780000),
+        ("LOGGER", "logger", 0x77c0000),
+        ("LOGIN", "login", 0x7800000),
+        ("LOGNAME", "logname", 0x7840000),
+        ("LOGREAD", "logread", 0x7880000),
+        ("LPD", "lpd", 0x78c0000),
+        ("LPQ", "lpq", 0x7900000),
+        ("LPR", "lpr", 0x7940000),
+        ("LS", "ls", 0x7980000),
+        ("LSATTR", "lsattr", 0x79c0000),
+        ("LSOF", "lsof", 0x7a00000),
+        ("LSPCI", "lspci", 0x7a40000),
+        ("LSSCSI", "lsscsi", 0x7a80000),
+        ("LSUSB", "lsusb", 0x7ac0000),
+        ("LZCAT", "lzcat", 0x7b00000),
+        ("LZOP", "lzop", 0x7b40000),
+        ("MAKEDEVS", "makedevs", 0x7b80000),
+        ("MAKEMIME", "makemime", 0x7bc0000),
+        ("MAN", "man", 0x7c00000),
+        ("MD5SUM", "md5sum", 0x7c40000),
+        ("MESG", "mesg", 0x7c80000),
+        ("MICROCOM", "microcom", 0x7cc0000),
+        ("MINIPS", "minips", 0x7d00000),
+        ("MKFIFO", "mkfifo", 0x7d40000),
+        ("MKFS_MINIX", "mkfs", 0x7d80000),
+        ("MKNOD", "mknod", 0x7dc0000),
+        ("MKPASSWD", "mkpasswd", 0x7e00000),
+        ("MKSWAP", "mkswap", 0x7e40000),
+        ("MKTEMP", "mktemp", 0x7e80000),
+        ("MODINFO", "modinfo", 0x7ec0000),
+        ("MOUNT", "mount", 0x7f00000),
+        ("MOUNTPOINT", "mountpoint", 0x7f40000),
+        ("MPSTAT", "mpstat", 0x7f80000),
+        ("MT", "mt", 0x7fc0000),
+        ("NC", "nc", 0x8000000),
+        ("NETCAT", "netcat", 0x8040000),
+        ("NETSTAT", "netstat", 0x8080000),
+        ("NICE", "nice", 0x80c0000),
+        ("NL", "nl", 0x8100000),
+        ("NMETER", "nmeter", 0x8140000),
+        ("NOHUP", "nohup", 0x8180000),
+        ("NPROC", "nproc", 0x81c0000),
+        ("NSENTER", "nsenter", 0x8200000),
+        ("NSLOOKUP", "nslookup", 0x8240000),
+        ("NTPD", "ntpd", 0x8280000),
+        ("NUKE", "nuke", 0x82c0000),
+        ("OD", "od", 0x8300000),
+        ("PASSWD", "passwd", 0x8340000),
+        ("PASTE", "paste", 0x8380000),
+        ("PATCH", "patch", 0x83c0000),
+        ("PGREP", "pgrep", 0x8400000),
+        ("PIDOF", "pidof", 0x8440000),
+        ("PING", "ping", 0x8480000),
+        ("PIPE_PROGRESS", "pipe_progress", 0x84c0000),
+        ("PIVOT_ROOT", "pivot_root", 0x8500000),
+        ("PKILL", "pkill", 0x8540000),
+        ("PMAP", "pmap", 0x8580000),
+        ("POPMAILDIR", "popmaildir", 0x85c0000),
+        ("POWEROFF", "poweroff", 0x8600000),
+        ("POWERTOP", "powertop", 0x8640000),
+        ("PRINTENV", "printenv", 0x8680000),
+        ("PSCAN", "pscan", 0x86c0000),
+        ("PSTREE", "pstree", 0x8700000),
+        ("PWD", "pwd", 0x8740000),
+        ("PWDX", "pwdx", 0x8780000),
+        ("RDATE", "rdate", 0x87c0000),
+        ("RDEV", "rdev", 0x8800000),
+        ("READLINK", "readlink", 0x8840000),
+        ("READPROFILE", "readprofile", 0x8880000),
+        ("REALPATH", "realpath", 0x88c0000),
+        ("REFORMIME", "reformime", 0x8900000),
+        ("REMOVE_SHELL", "remove", 0x8940000),
+        ("RENICE", "renice", 0x8980000),
+        ("RESET", "reset", 0x89c0000),
+        ("RESIZE", "resize", 0x8a00000),
+        ("RESUME", "resume", 0x8a40000),
+        ("REV", "rev", 0x8a80000),
+        ("ROUTE", "route", 0x8ac0000),
+        ("RPM", "rpm", 0x8b00000),
+        ("RPM2CPIO", "rpm2cpio", 0x8b40000),
+        ("RTCWAKE", "rtcwake", 0x8b80000),
+        ("RUNSV", "runsv", 0x8bc0000),
+        ("RUNSVDIR", "runsvdir", 0x8c00000),
+        ("RUN_PARTS", "run", 0x8c40000),
+        ("RX", "rx", 0x8c80000),
+        ("SCRIPT", "script", 0x8cc0000),
+        ("SCRIPTREPLAY", "scriptreplay", 0x8d00000),
+        ("SED", "sed", 0x8d40000),
+        ("SENDMAIL", "sendmail", 0x8d80000),
+        ("SETARCH", "setarch", 0x8dc0000),
+        ("SETCONSOLE", "setconsole", 0x8e00000),
+        ("SETFATTR", "setfattr", 0x8e40000),
+        ("SETKEYCODES", "setkeycodes", 0x8e80000),
+        ("SETLOGCONS", "setlogcons", 0x8ec0000),
+        ("SETPRIV", "setpriv", 0x8f00000),
+        ("SETSERIAL", "setserial", 0x8f40000),
+        ("SETSID", "setsid", 0x8f80000),
+        ("SETUIDGID", "setuidgid", 0x8fc0000),
+        ("SHA1SUM", "sha1sum", 0x9000000),
+        ("SHA256SUM", "sha256sum", 0x9040000),
+        ("SHA3SUM", "sha3sum", 0x9080000),
+        ("SHA512SUM", "sha512sum", 0x90c0000),
+        ("SHRED", "shred", 0x9100000),
+        ("SHUF", "shuf", 0x9140000),
+        ("SLEEP", "sleep", 0x9180000),
+        ("SMEMCAP", "smemcap", 0x91c0000),
+        ("SOFTLIMIT", "softlimit", 0x9200000),
+        ("SPLIT", "split", 0x9240000),
+        ("SSL_CLIENT", "ssl_client", 0x9280000),
+        ("START_STOP_DAEMON", "start", 0x92c0000),
+        ("STAT", "stat", 0x9300000),
+        ("STRINGS", "strings", 0x9340000),
+        ("STTY", "stty", 0x9380000),
+        ("SU", "su", 0x93c0000),
+        ("SULOGIN", "sulogin", 0x9400000),
+        ("SUM", "sum", 0x9440000),
+        ("SVLOGD", "svlogd", 0x9480000),
+        ("SVOK", "svok", 0x94c0000),
+        ("SWAPOFF", "swapoff", 0x9500000),
+        ("SWITCH_ROOT", "switch_root", 0x9540000),
+        ("SYNC", "sync", 0x9580000),
+        ("SYSLOGD", "syslogd", 0x95c0000),
+        ("TAC", "tac", 0x9600000),
+        ("TAR", "tar", 0x9640000),
+        ("TASKSET", "taskset", 0x9680000),
+        ("TCPSVD", "tcpsvd", 0x96c0000),
+        ("TEE", "tee", 0x9700000),
+        ("TELNET", "telnet", 0x9740000),
+        ("TELNETD", "telnetd", 0x9780000),
+        ("TEST", "test", 0x97c0000),
+        ("TIME", "time", 0x9800000),
+        ("TIMEOUT", "timeout", 0x9840000),
+        ("TOP", "top", 0x9880000),
+        ("TR", "tr", 0x98c0000),
+        ("TRACEROUTE", "traceroute", 0x9900000),
+        ("TREE", "tree", 0x9940000),
+        ("TRUNCATE", "truncate", 0x9980000),
+        ("TS", "ts", 0x99c0000),
+        ("TSORT", "tsort", 0x9a00000),
+        ("TTY", "tty", 0x9a40000),
+        ("TTYSIZE", "ttysize", 0x9a80000),
+        ("UDHCPD", "udhcpd", 0x9ac0000),
+        ("UDPSVD", "udpsvd", 0x9b00000),
+        ("UMOUNT", "umount", 0x9b40000),
+        ("UNCOMPRESS", "uncompress", 0x9b80000),
+        ("UNEXPAND", "unexpand", 0x9bc0000),
+        ("UNIT_TEST", "unit", 0x9c00000),
+        ("UNIX2DOS", "unix2dos", 0x9c40000),
+        ("UNLINK", "unlink", 0x9c80000),
+        ("UNLZMA", "unlzma", 0x9cc0000),
+        ("UNSHARE", "unshare", 0x9d00000),
+        ("UNXZ", "unxz", 0x9d40000),
+        ("UNZIP", "unzip", 0x9d80000),
+        ("UPTIME", "uptime", 0x9dc0000),
+        ("USLEEP", "usleep", 0x9e00000),
+        ("UUDECODE", "uudecode", 0x9e40000),
+        ("UUENCODE", "uuencode", 0x9e80000),
+        ("VCONFIG", "vconfig", 0x9ec0000),
+        ("VI", "vi", 0x9f00000),
+        ("VOLNAME", "volname", 0x9f40000),
+        ("WATCH", "watch", 0x9f80000),
+        ("WGET", "wget", 0x9fc0000),
+        ("WHICH", "which", 0xa000000),
+        ("WHOAMI", "whoami", 0xa040000),
+        ("WHOIS", "whois", 0xa080000),
+        ("XARGS", "xargs", 0xa0c0000),
+        ("XXD", "xxd", 0xa100000),
+        ("XZCAT", "xzcat", 0xa140000),
+        ("ZCAT", "zcat", 0xa180000),
+    ];
+
+    // `BUSYBOX_APPLETS` above is a `&[(&str, &str, u64)]`, not `&[(&str, &str, u64); N]` --
+    // `const` slice concatenation isn't expressible without either unstable const-eval tricks or a
+    // build-dependency, so the ~300-entry second pass lives in its own array
+    // (`BUSYBOX_APPLETS_PASS2`, right below) and gets flattened into one iterator at the actual
+    // build-loop call site instead of at the `const` declaration itself.
+
+    let busybox_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/busybox");
+    println!("cargo:rerun-if-changed={}", busybox_dir.display());
+    let busybox_source_mtime = latest_mtime(&busybox_dir);
+
+    // Parallel across applets, `-j1` within each one (see `build_busybox_applet`'s own doc
+    // comment) -- a plain work-stealing pool over a shared atomic index, not a thread per applet
+    // (~300 of those would vastly oversubscribe an 8-core host) and not a chunked static split
+    // (uneven applet build times would leave some workers idle while others queue up).
+    let all_applets: Vec<(&str, &str, u64)> = BUSYBOX_APPLETS
         .iter()
-        .map(|&(applet_symbol, out_name, load_addr)| {
-            let elf_path = build_busybox_applet(applet_symbol, out_name, load_addr, &musl_sysroot);
-            let elf_bytes = std::fs::read(&elf_path)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", elf_path.display()));
-            (out_name, elf_bytes)
-        })
+        .copied()
+        .chain(BUSYBOX_APPLETS_PASS2.iter().copied())
         .collect();
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(applet_symbol, out_name, load_addr)) = all_applets.get(i) else {
+                    break;
+                };
+                build_busybox_applet(
+                    applet_symbol,
+                    out_name,
+                    load_addr,
+                    &musl_sysroot,
+                    busybox_source_mtime,
+                );
+            });
+        }
+    });
 
     // modules/fat32 is kept in the workspace but no longer loaded at boot (see CLAUDE.md's oxfs
     // section) -- still built here unmodified so it keeps compiling and self-checking on every
     // `cargo build`, a still-working format-correctness proof, just not the live filesystem.
-    let fat32_image_path =
-        write_fat32_image(&ring3_smoke_elf, &musl_smoke_elf, &busybox_applet_elfs);
+    // Deliberately passed an empty applet slice, not `&busybox_applet_elfs`: `BUSYBOX_APPLETS` grew
+    // to ~300 entries once this build script started probing/embedding every applet that happens to
+    // build (see CLAUDE.md's BusyBox section) -- `busybox_short_name`'s 8.3-short-name format can't
+    // hold names over 8 characters at all (a real `assert!`, not a soft limit) and the image's own
+    // fixed `FAT32_TOTAL_SECTORS` budget was sized for a much smaller roster. FAT32 not being the
+    // live filesystem means neither limit is worth designing around just to keep embedding
+    // applets nothing ever loads from this image.
+    let fat32_image_path = write_fat32_image(&ring3_smoke_elf, &musl_smoke_elf, &[]);
     build_module_crate(
         "fat32",
         "FAT32",
@@ -144,7 +485,7 @@ fn main() {
     // applet's own Kconfig symbol `HUSH`, not its embedded filename).
     let hush_elf_path_for_main = target_dir_busybox_elf("sh");
     println!("cargo:rustc-env=HUSH_ELF_PATH={hush_elf_path_for_main}");
-    let oxfs_applet_paths: Vec<(String, String)> = BUSYBOX_APPLETS
+    let oxfs_applet_paths: Vec<(String, String)> = all_applets
         .iter()
         .map(|&(_, out_name, _)| {
             (
@@ -255,11 +596,14 @@ fn build_musl_sysroot() -> PathBuf {
 }
 
 /// Cross-builds `userland/musl-smoke/main.c` against `sysroot` (see `build_musl_sysroot` above),
-/// at a load address (`0xa00000`) clear of both the bootloader's own ~6 MiB identity-mapped
-/// low-memory region and every other userland crate's load base (`0x600000`-`0x900000`) --
-/// confirmed empirically via `readelf -hl` before this was written, the same discipline
-/// CLAUDE.md's own `ring3-smoke` load-address collision story already established. Unlike every
-/// other `userland/*` crate this isn't a Rust crate at all -- musl-smoke exists specifically to
+/// at a load address (`0x40c0000`, 64 MiB + `0xc0000`) clear of both the kernel's own image (the
+/// actually-binding constraint today, not the bootloader's fixed ~6 MiB identity-mapped
+/// low-memory region -- see `userland/ring3-smoke/linker.ld`'s own comment for the full story of
+/// why this floor moved from an original `0xa00000` and how to re-derive it) and every other
+/// userland crate's load base (`0x4000000`-`0x4080000`) -- confirmed empirically via `readelf -hl`
+/// before this was written, the same discipline CLAUDE.md's own `ring3-smoke` load-address
+/// collision story already established. Unlike every other `userland/*` crate this isn't a Rust
+/// crate at all -- musl-smoke exists specifically to
 /// exercise a real musl static binary, so it's built with `musl-gcc` directly, no cargo involved.
 fn build_musl_smoke(sysroot: &Path) -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -274,7 +618,7 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
     let status = Command::new(&musl_gcc)
         .arg("-static")
         .arg("-no-pie")
-        .arg("-Wl,-Ttext-segment=0xa00000")
+        .arg("-Wl,-Ttext-segment=0x40c0000")
         .arg("-O2")
         .arg("-o")
         .arg(&out)
@@ -309,37 +653,55 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
 /// second applet (`ash`) and `NUM_APPLETS` becomes 2, not 1 (confirmed the hard way; BusyBox's own
 /// `make_single_applets.sh` script carries a comment about this exact same trap).
 ///
-/// No `config.mak`-exists-style caching here, unlike `build_musl_sysroot`: BusyBox's own
-/// `allnoconfig` + single-applet `.config` edit is fast (roughly a second, not musl's own
-/// multi-second `configure` re-probe of the host compiler), so always regenerating from scratch is
-/// simpler and can't go stale. `out_name` is used both for this applet's own
-/// `target/busybox-<out_name>` out-of-tree (`O=`) build directory and to describe it in panics;
-/// `load_addr` becomes its `-Wl,-Ttext-segment=` link address, which -- like every other userland
-/// binary's load base in this codebase -- must stay clear of every other one already claimed.
+/// **Staleness-checked, unlike `build_musl_sysroot`'s own `config.mak`-exists guard**: skips the
+/// entire `allnoconfig`/flip/`oldconfig`/`make` sequence if `out_dir`'s own `busybox` binary
+/// already exists and is newer than `busybox_source_mtime` (the latest mtime across all of
+/// `third_party/busybox`, computed once by the caller -- see `latest_mtime`'s own doc comment --
+/// not per applet), `build.rs` itself (so editing *this file's own recipe* -- flips, load
+/// address, applet roster -- invalidates every cached binary too, not just a real source edit),
+/// and `musl_sysroot`'s own `libc.a` (every applet links against it, so a musl source edit has to
+/// invalidate cached applet binaries too -- missed in an earlier version of this function, which
+/// only compared the first two and left every already-built applet silently linked against a
+/// stale libc after a musl-side fix).
+/// Went from "always regenerate, `allnoconfig` is roughly a second" to this once `BUSYBOX_APPLETS`
+/// grew from ~24 entries to ~300 (see CLAUDE.md's BusyBox section): at that scale, "roughly a
+/// second" per applet is minutes added to *every* `cargo build`, even when nothing changed.
+/// `out_name` is used both for this applet's own `target/busybox-<out_name>` out-of-tree (`O=`)
+/// build directory and to describe it in panics; `load_addr` becomes its
+/// `-Wl,-Ttext-segment=` link address, which -- like every other userland binary's load base in
+/// this codebase -- must stay clear of every other one already claimed.
 fn build_busybox_applet(
     applet_symbol: &str,
     out_name: &str,
     load_addr: u64,
     musl_sysroot: &Path,
+    busybox_source_mtime: std::time::SystemTime,
 ) -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let busybox_dir = Path::new(manifest_dir).join("third_party/busybox");
     let out_dir = Path::new(manifest_dir).join(format!("target/busybox-{out_name}"));
+    let binary_path = out_dir.join("busybox");
+
+    let build_rs_mtime = std::fs::metadata(Path::new(manifest_dir).join("build.rs"))
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::now());
+    // Every applet links against musl_sysroot's own libc.a -- a musl source edit (this branch
+    // patches it directly, see CLAUDE.md's musl section) has to invalidate cached applet binaries
+    // too, or they keep silently linking a stale libc. Missed once already: a getdents64 fix here
+    // rebuilt musl but every already-built applet's cached binary looked "fresh" regardless, since
+    // only busybox_source_mtime/build_rs_mtime were ever compared.
+    let musl_mtime = std::fs::metadata(musl_sysroot.join("lib/libc.a"))
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::now());
+    let freshness_floor = busybox_source_mtime.max(build_rs_mtime).max(musl_mtime);
+    if let Ok(modified) = std::fs::metadata(&binary_path).and_then(|m| m.modified()) {
+        if modified >= freshness_floor {
+            return binary_path;
+        }
+    }
+
     std::fs::create_dir_all(&out_dir)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
-
-    println!(
-        "cargo:rerun-if-changed={}",
-        busybox_dir.join("coreutils").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        busybox_dir.join("libbb").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        busybox_dir.join("Config.in").display()
-    );
 
     let out_arg = format!("O={}", out_dir.display());
     let status = Command::new("make")
@@ -353,12 +715,18 @@ fn build_busybox_applet(
     }
 
     configure_busybox_single_applet(&out_dir, applet_symbol);
-    if applet_symbol == "HUSH" {
-        resolve_busybox_new_config_options(&busybox_dir, &out_arg);
-    }
+    // Every applet's config tree can grow a cascade of newly-visible sub-options once its own
+    // symbol flips on (not just HUSH's own FEATURE_EDITING/HUSH_INTERACTIVE tree -- see
+    // `resolve_busybox_new_config_options`'s own doc comment) once the roster covers ~300 applets
+    // instead of two dozen hand-picked ones, so this now runs unconditionally rather than being
+    // special-cased to `applet_symbol == "HUSH"`.
+    resolve_busybox_new_config_options(&busybox_dir, &out_arg);
 
     let musl_gcc = musl_sysroot.join("bin/musl-gcc");
-    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // `-j1`, not `available_parallelism()`: the real concurrency now comes from building many
+    // applets at once (see this function's caller in `main`), not from parallelizing one applet's
+    // own handful of source files -- oversubscribing both levels at once (N applets each spawning
+    // N compiler jobs) thrashes far more than it helps.
     let status = Command::new("make")
         .current_dir(&busybox_dir)
         .arg(&out_arg)
@@ -366,7 +734,7 @@ fn build_busybox_applet(
         .arg(format!(
             "EXTRA_LDFLAGS=-static -no-pie -Wl,-Ttext-segment={load_addr:#x}"
         ))
-        .args(["-j", &jobs.to_string()])
+        .args(["-j", "1"])
         .status()
         .unwrap_or_else(|e| panic!("failed to run make for busybox {out_name}: {e}"));
     if !status.success() {
@@ -489,9 +857,15 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
 /// empirically that `/dev/null` (immediate EOF) still hits the exact same "NEW... " hard failure
 /// for `int`-typed options specifically (bool prompts alone tolerate EOF fine), while a live
 /// stream of blank lines lets `conf` walk through and accept every prompt's own Kconfig-declared
-/// default, `int`/`string` ones included, right through to a clean exit. Every other applet's own
-/// config tree never grows this kind of new-option cascade at all (none of them touch
-/// `FEATURE_EDITING`/`HUSH_INTERACTIVE`), so this is only ever invoked for `HUSH` itself.
+/// default, `int`/`string` ones included, right through to a clean exit.
+///
+/// Originally only invoked for `HUSH` itself (`FEATURE_EDITING`/`HUSH_INTERACTIVE`'s own cascade
+/// was the only one the original ~24-applet roster ever hit) -- now runs after every applet's
+/// `configure_busybox_single_applet` call unconditionally, since a much broader roster (see
+/// CLAUDE.md's BusyBox section) hits this same "single symbol flip reveals a whole options
+/// sub-tree" shape for plenty of other applets too (anything pulling in its own `FEATURE_*` tree).
+/// Cheap to run even when there's nothing new to resolve -- `conf` just exits quickly once no
+/// prompt remains unanswered.
 fn resolve_busybox_new_config_options(busybox_dir: &Path, out_arg: &str) {
     use std::io::Write;
     use std::process::Stdio;
@@ -504,7 +878,7 @@ fn resolve_busybox_new_config_options(busybox_dir: &Path, out_arg: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("failed to run make oldconfig for busybox sh: {e}"));
+        .unwrap_or_else(|e| panic!("failed to run make oldconfig for busybox applet: {e}"));
 
     // A generous supply of "just press Enter" answers -- bounded (this config tree has, at most,
     // a few hundred prompts), written then dropped (closing the pipe) so `conf` sees EOF only
@@ -520,15 +894,49 @@ fn resolve_busybox_new_config_options(busybox_dir: &Path, out_arg: &str) {
 
     let output = child
         .wait_with_output()
-        .unwrap_or_else(|e| panic!("failed to wait for busybox sh oldconfig: {e}"));
+        .unwrap_or_else(|e| panic!("failed to wait for busybox oldconfig: {e}"));
     if !output.status.success() {
         panic!(
-            "busybox sh oldconfig failed: {}\nstdout:\n{}\nstderr:\n{}",
+            "busybox oldconfig failed: {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// Latest mtime across every real source file under `dir`, skipping VCS metadata (any directory
+/// starting with `.`) -- computed once per `cargo build` invocation, not once per applet (see
+/// `build_busybox_applet`'s own doc comment for why that distinction matters at ~300 applets). A
+/// plain recursive walk rather than a crate dependency: this only runs when build.rs's own
+/// `cargo:rerun-if-changed` gate already decided `third_party/busybox` changed, so it's a rare,
+/// not hot-path, cost -- not worth a `walkdir`-style dependency for.
+fn latest_mtime(dir: &Path) -> std::time::SystemTime {
+    let mut latest = std::time::UNIX_EPOCH;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with('.'))
+            {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                latest = latest.max(modified);
+            }
+        }
+    }
+    latest
 }
 
 /// Cross-builds the userland crate at `userland/<crate_name>/` and exposes its resulting ELF's

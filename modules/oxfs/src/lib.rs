@@ -52,9 +52,11 @@
 //! invent their own numbers rather than copying FreeBSD's, see `SYS_GETPPID`/`SYS_GETCWD`/
 //! `SYS_PIPE`/`SYS_DUP2`): `SYS_UNLINK = 109`, `SYS_RMDIR = 110`,
 //! `SYS_RENAME = 111` (`(old_ptr, old_len, new_ptr, new_len)` -- uses all four of this ABI's
-//! argument registers, the same precedent `execve`'s `envp_ptr` set for needing `R10`).
-//! `stat`/`fstat` is deliberately not attempted here -- it needs a byte-exact musl `struct stat`
-//! layout, separate follow-up work.
+//! argument registers, the same precedent `execve`'s `envp_ptr` set for needing `R10`). Plus
+//! `SYS_FSTAT = 126`, `SYS_STAT = 127`, `SYS_LSTAT = 128` (continuing past `SYS_DUP = 125`, the
+//! highest number any module had claimed) -- see `write_stat`'s own doc comment for the wire
+//! format and what's synthesized vs. real. Plus `SYS_GETDENTS = 129` -- real `readdir()`'s own
+//! syscall, see `oxfs_getdents`'s own doc comment for the wire format.
 #![no_std]
 
 unsafe extern "C" {
@@ -73,6 +75,7 @@ unsafe extern "C" {
     fn oxidebsd_close_fd(fd: u64) -> i32;
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
+    fn oxidebsd_real_fd_of(fd: u64) -> i64;
 }
 
 const SYS_OPEN: u64 = 5;
@@ -83,11 +86,28 @@ const SYS_GETCWD: u64 = 108;
 const SYS_UNLINK: u64 = 109;
 const SYS_RMDIR: u64 = 110;
 const SYS_RENAME: u64 = 111;
+const SYS_FSTAT: u64 = 126;
+const SYS_STAT: u64 = 127;
+const SYS_LSTAT: u64 = 128;
+const SYS_GETDENTS: u64 = 129;
 
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
 /// `open()` passes real POSIX flag values).
 const O_CREAT: u64 = 0o100;
+
+/// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`), matched with `FIXED_PERM` below.
+/// There's no permission model in this kernel at all yet (see `CLAUDE.md`'s "uid/permissions
+/// stub" gap) -- every inode reports the same fixed `0755`, real enough to let `test -x`/`ls -l`
+/// work without pretending this filesystem tracks anything it doesn't.
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const FIXED_PERM: u32 = 0o755;
+
+/// Real `d_type` values (`include/dirent.h` on the `oxidebsd` musl branch) for `SYS_GETDENTS`'s
+/// own wire format -- see `write_dirent_record`'s own doc comment.
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
 
 const EBADF: i64 = 9;
 const ENOENT: i64 = 2;
@@ -104,10 +124,17 @@ const ERANGE: i64 = 34;
 const ENOTEMPTY: i64 = 66;
 
 const BLOCK_SIZE: usize = 4096;
-/// 4 MiB pool -- comfortably more than every embedded binary combined today (~250 KB), with real
-/// headroom for runtime-created files (`stsh`'s `write` built-in, BusyBox's own file creation).
-const NUM_BLOCKS: usize = 1024;
-const MAX_INODES: usize = 64;
+/// 32 MiB pool (raised from 4 MiB once the BusyBox roster grew from 24 applets to ~300 -- see
+/// CLAUDE.md's BusyBox section -- whose combined embedded ELF bytes alone run to ~18 MiB), with
+/// real headroom left over for runtime-created files (`stsh`'s `write` built-in, BusyBox's own
+/// file creation). `src/memory.rs`'s frame allocator and this module's own eager, non-paged
+/// mapping mean this whole pool becomes a real physical-memory commitment the moment the module
+/// loads (see `Cargo.toml`'s `[package.metadata.bootimage]` `-m` bump, made at the same time as
+/// this).
+const NUM_BLOCKS: usize = 8192;
+/// Raised from 64 alongside `NUM_BLOCKS` above, same reason -- ~300 applets plus root/`hello.txt`/
+/// `big.txt`/the self-check's own `/gdtest` fixtures need comfortably more than 64 inode slots.
+const MAX_INODES: usize = 512;
 const DIRECT_BLOCKS: usize = 12;
 const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
 /// Sentinel for "no block"/"no indirect block" -- block numbers are plain indices into `BLOCKS`
@@ -333,6 +360,131 @@ fn write_inode_data(inode_num: u32, content: &[u8]) -> bool {
     true
 }
 
+/// Byte-exact mirror of musl's `struct stat` for x86_64 (`arch/x86_64/bits/stat.h` in
+/// `third_party/musl`) -- `dev_t`/`ino_t`/`nlink_t`/`off_t`/`blksize_t`/`blkcnt_t` are all 64-bit
+/// on this target, and `struct timespec`'s `{tv_sec, tv_nsec}` is bit-identical to two raw `i64`s
+/// here, so this `repr(C)` struct's natural layout already matches the real one field-for-field --
+/// no manual padding needed beyond `__pad0` (which upstream also has explicitly, between the
+/// `u32` id fields and the next `u64`). `src/stat/{stat,fstat,lstat}.c` on the `oxidebsd` musl
+/// branch write straight into this shape, bypassing musl's usual `fstatat`/`kstat` indirection
+/// entirely (same "patch the entry point, not the generic multiplexer" pattern `open()`/`chdir()`/
+/// `mkdir()` already established -- see `CLAUDE.md`'s musl section).
+#[repr(C)]
+struct MuslStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime_sec: i64,
+    st_atime_nsec: i64,
+    st_mtime_sec: i64,
+    st_mtime_nsec: i64,
+    st_ctime_sec: i64,
+    st_ctime_nsec: i64,
+    __unused: [i64; 3],
+}
+
+const _: () = assert!(core::mem::size_of::<MuslStat>() == 144);
+
+/// Builds a `MuslStat` for `inode_num` and writes it into the caller's buffer at `buf_ptr` --
+/// shared by `oxfs_stat`/`oxfs_lstat` (path-based) and `oxfs_fstat` (fd-based). Everything this
+/// filesystem doesn't actually model is a fixed, honestly-fake value rather than a plausible-
+/// looking guess: `st_uid`/`st_gid` are `0` (no uid/permission model exists at all -- see
+/// `CLAUDE.md`'s gap table), `st_mode`'s permission bits are always `FIXED_PERM`, timestamps are
+/// all `0` (no clock/RTC source exists yet -- see the same gap table's "clock + nanosleep" row),
+/// and `st_dev` is a fixed `1` (there's only ever one filesystem). `st_nlink` is `2` for a
+/// directory (`.` plus its parent's entry for it) and `1` for a file -- this filesystem doesn't
+/// track hard links, so a directory's real subdirectory count (which would also bump its parent's
+/// linked-from count) isn't reflected either. `st_ino`/`st_size`/`st_blocks` are the only fields
+/// backed by something real. `write_unaligned` since a userland `struct stat*` has no alignment
+/// guarantee this kernel can rely on (same trust boundary as every other raw user pointer here --
+/// see the module doc comment).
+fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
+    let inode = read_inode(inode_num);
+    let (mode, nlink) = match inode.kind {
+        InodeKind::Dir => (S_IFDIR | FIXED_PERM, 2u64),
+        _ => (S_IFREG | FIXED_PERM, 1u64),
+    };
+    let size = inode.size as i64;
+    let stat = MuslStat {
+        st_dev: 1,
+        st_ino: inode_num as u64,
+        st_nlink: nlink,
+        st_mode: mode,
+        st_uid: 0,
+        st_gid: 0,
+        __pad0: 0,
+        st_rdev: 0,
+        st_size: size,
+        st_blksize: BLOCK_SIZE as i64,
+        st_blocks: (size + 511) / 512,
+        st_atime_sec: 0,
+        st_atime_nsec: 0,
+        st_mtime_sec: 0,
+        st_mtime_nsec: 0,
+        st_ctime_sec: 0,
+        st_ctime_nsec: 0,
+        __unused: [0; 3],
+    };
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer, sized by the caller's own
+    // `sizeof(struct stat)` (144 bytes, matching `MuslStat` exactly, checked above).
+    unsafe { (buf_ptr as *mut MuslStat).write_unaligned(stat) };
+    0
+}
+
+/// Looks up the inode number backing an already-open real fd -- `oxfs_fstat`'s own lookup, since
+/// `OPEN_FILES` is keyed by `real_fd` (see `oxidebsd_real_fd_of`'s own doc comment for why a
+/// syscall-number-registered handler has to resolve that itself rather than getting it for free
+/// the way `SYS_READ`/`SYS_WRITE` do). `None` for a `Write`-in-progress fd (`open(O_CREAT)` before
+/// `close`) -- this filesystem doesn't allocate a real inode until close (see `OpenFile::Write`'s
+/// own doc comment), so there's genuinely nothing to report yet.
+fn inode_of_open_file(real_fd: u64) -> Option<u32> {
+    match find_open_file(real_fd)? {
+        OpenFile::FileRead { inode, .. } => Some(*inode),
+        OpenFile::DirListing { inode, .. } => Some(*inode),
+        OpenFile::Write { .. } => None,
+    }
+}
+
+/// The on-wire byte size of one `SYS_GETDENTS` record for a name of `name_len` bytes -- real
+/// Linux `dirent64` layout (`d_ino: u64, d_off: i64, d_reclen: u16, d_type: u8, d_name: [u8; N]`,
+/// `N` bytes wide including a NUL terminator), padded up to the next 8-byte boundary the same way
+/// real Linux does (musl's `struct dirent` -- `arch/generic/bits/dirent.h` on the `oxidebsd` musl
+/// branch, since `x86_64` doesn't override it -- assumes 8-byte-aligned records when it casts a
+/// raw syscall buffer straight into `struct dirent*`).
+fn dirent_record_len(name_len: usize) -> usize {
+    let unpadded = 8 + 8 + 2 + 1 + name_len + 1;
+    (unpadded + 7) & !7
+}
+
+/// Writes one `SYS_GETDENTS` record into `out`, whose length must already be exactly
+/// `dirent_record_len(name.len())` (`oxfs_getdents` slices its output buffer to that size before
+/// calling this). `off_cookie` becomes `d_off` -- real Linux uses this as an opaque seek cookie
+/// for `telldir`/`seekdir`; nothing in this port's ported applets calls either, so a monotonic
+/// counter (`oxfs_getdents`'s own `dirent_pos`, one-past the record just written) is honest enough
+/// without pretending to support real seeking. Padding bytes past the NUL terminator are zeroed,
+/// not left as whatever `out` already held -- `out` is caller-owned userland memory, reused across
+/// `SYS_GETDENTS` calls at the same address in `hush`/coreutils' own DIR buffer.
+fn write_dirent_record(out: &mut [u8], ino: u64, off_cookie: i64, dtype: u8, name: &[u8]) {
+    let reclen = out.len();
+    out[0..8].copy_from_slice(&ino.to_le_bytes());
+    out[8..16].copy_from_slice(&off_cookie.to_le_bytes());
+    out[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+    out[18] = dtype;
+    let name_start = 19;
+    out[name_start..name_start + name.len()].copy_from_slice(name);
+    for b in &mut out[name_start + name.len()..reclen] {
+        *b = 0;
+    }
+}
+
 fn dir_record_used(block: &[u8; BLOCK_SIZE], idx: usize) -> bool {
     block[idx * DIR_RECORD_SIZE] != 0
 }
@@ -473,6 +625,32 @@ fn dir_entry_count(dir_inode: u32) -> usize {
         i += 1;
     }
     count
+}
+
+/// Returns the `n`th (0-indexed) used record inside `dir_inode`, walking blocks in the same
+/// order `dir_lookup`/`dir_entry_count` do -- `.`/`..` included, unlike `open_dir_listing`'s own
+/// pretty-printed summary, since `SYS_GETDENTS`'s real callers (`opendir`/`readdir`) expect every
+/// real record. `None` once `n` reaches the record count -- `oxfs_getdents`'s own EOF signal.
+fn dir_nth_used_record(dir_inode: u32, n: usize) -> Option<(u32, [u8; NAME_MAX], u8)> {
+    let inode = read_inode(dir_inode);
+    let mut seen = 0usize;
+    let mut i = 0;
+    while let Some(blk) = inode_block_at(&inode, i) {
+        let block = read_block(blk);
+        for r in 0..RECORDS_PER_BLOCK {
+            if dir_record_used(&block, r) {
+                if seen == n {
+                    let name = dir_record_name(&block, r);
+                    let mut buf = [0u8; NAME_MAX];
+                    buf[..name.len()].copy_from_slice(name);
+                    return Some((dir_record_inode(&block, r), buf, name.len() as u8));
+                }
+                seen += 1;
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Resolves `path` to a single inode number, starting from `cwd_inode` (or root, if `path` starts
@@ -623,11 +801,18 @@ enum OpenFile {
     /// A directory listing, formatted into a fixed buffer at `open` time -- listings stay small,
     /// so caching one is simpler than streaming it record-by-record, and this mirrors
     /// `modules/fat32`'s existing "open a directory, read back a formatted listing" trick for
-    /// `ls`.
+    /// `ls`. `inode` is the directory's own inode number -- used by `inode_of_open_file`
+    /// (`oxfs_fstat` on a directory fd) and by `oxfs_getdents`, which walks `inode`'s *live*
+    /// records directly rather than this variant's own pre-formatted `content` (real
+    /// `readdir()`/`getdents()` must see every record, `.`/`..` included, not the human-readable
+    /// summary `content` holds). `dirent_pos` is `oxfs_getdents`'s own resume cursor -- see that
+    /// function's own doc comment.
     DirListing {
+        inode: u32,
         content: [u8; DIR_LISTING_BUFFER],
         len: usize,
         position: usize,
+        dirent_pos: usize,
     },
     /// A file opened for writing -- accumulates across possibly-multiple `write` calls, committed
     /// to a real inode only at `close` time (same all-at-once-on-close model
@@ -702,9 +887,11 @@ fn open_dir_listing(dir_inode: u32) -> i64 {
         out.len
     };
     register_open_file(OpenFile::DirListing {
+        inode: dir_inode,
         content,
         len,
         position: 0,
+        dirent_pos: 0,
     })
 }
 
@@ -777,6 +964,7 @@ extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
             content,
             len: total,
             position,
+            ..
         } => {
             let remaining = *total - *position;
             let n = remaining.min(len as usize);
@@ -1021,6 +1209,94 @@ extern "C" fn oxfs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64
     }
 }
 
+/// Registered for `SYS_STAT`. No symlinks exist in this filesystem at all, so unlike real
+/// `stat`/`lstat`, there's no "follow the final component" distinction to make -- `oxfs_lstat`
+/// below just calls this same resolver.
+extern "C" fn oxfs_stat(path_ptr: u64, path_len: u64, buf_ptr: u64, _r10: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let cwd = current_cwd();
+    match resolve_path(cwd, path) {
+        Ok(inode_num) => write_stat(inode_num, buf_ptr),
+        Err(e) => errno_for(e),
+    }
+}
+
+/// Registered for `SYS_LSTAT` -- see `oxfs_stat`'s own doc comment for why this is just an alias
+/// rather than a separate implementation.
+extern "C" fn oxfs_lstat(path_ptr: u64, path_len: u64, buf_ptr: u64, r10: u64) -> i64 {
+    oxfs_stat(path_ptr, path_len, buf_ptr, r10)
+}
+
+/// Registered for `SYS_FSTAT`. `fd` here is the calling *process's* own fd number, not this
+/// module's `real_fd` -- `oxidebsd_real_fd_of` (see its own doc comment in `src/fd.rs`) resolves
+/// that first, the same way `SYS_READ`/`SYS_WRITE` get it resolved for them automatically by
+/// `crate::fd::read`/`write` before ever reaching a registered callback.
+extern "C" fn oxfs_fstat(fd: u64, buf_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    match inode_of_open_file(real_fd as u64) {
+        Some(inode_num) => write_stat(inode_num, buf_ptr),
+        None => -EBADF,
+    }
+}
+
+/// Registered for `SYS_GETDENTS`. `fd` is the calling process's own fd number, resolved to this
+/// module's `real_fd` the same way `oxfs_fstat` does (see its own doc comment). Fills as many
+/// whole records as fit in `buf_len` starting from the open directory's own resume cursor
+/// (`OpenFile::DirListing::dirent_pos`), returns the byte count actually written (`0` once every
+/// record has already been emitted -- real `getdents(2)`'s own EOF convention, which `readdir()`
+/// relies on to stop looping). A record that doesn't fully fit is left for the next call rather
+/// than truncated -- matching real Linux, which never splits a record across two `getdents` calls.
+extern "C" fn oxfs_getdents(fd: u64, buf_ptr: u64, buf_len: u64, _a3: u64) -> i64 {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let Some(file) = find_open_file(real_fd as u64) else {
+        return -EBADF;
+    };
+    let OpenFile::DirListing {
+        inode: dir_inode,
+        dirent_pos,
+        ..
+    } = file
+    else {
+        return -ENOTDIR;
+    };
+    let dir_inode = *dir_inode;
+
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
+    let mut written = 0usize;
+    while let Some((child_inode, name, name_len)) = dir_nth_used_record(dir_inode, *dirent_pos) {
+        let name = &name[..name_len as usize];
+        let reclen = dirent_record_len(name.len());
+        if written + reclen > out.len() {
+            break;
+        }
+        let dtype = if read_inode(child_inode).kind == InodeKind::Dir {
+            DT_DIR
+        } else {
+            DT_REG
+        };
+        write_dirent_record(
+            &mut out[written..written + reclen],
+            child_inode as u64,
+            (*dirent_pos + 1) as i64,
+            dtype,
+            name,
+        );
+        written += reclen;
+        *dirent_pos += 1;
+    }
+    written as i64
+}
+
 fn log_bytes(bytes: &[u8]) {
     unsafe { oxidebsd_log(bytes.as_ptr(), bytes.len() as u64) };
 }
@@ -1196,6 +1472,300 @@ pub extern "C" fn module_init() -> i32 {
         include_bytes!(env!("OXFS_KILL_ELF_PATH")),
     );
 
+    // Second pass: every applet build.rs's own second-pass probe found buildable against this
+    // musl port (see build.rs's own BUSYBOX_APPLETS_PASS2 comment and docs/BUSYBOX_APPLETS.md for
+    // what each one actually needs at runtime -- most need something OxideBSD doesn't implement
+    // yet; "builds" was the bar this pass used, not "works"). One-liner form (not the multi-line
+    // seed_file(...) call the first 24 applets above use) purely because there are ~300 of these --
+    // no behavioral difference.
+    ok &= seed_file(root, b"addgroup.elf", include_bytes!(env!("OXFS_ADDGROUP_ELF_PATH")));
+    ok &= seed_file(root, b"adduser.elf", include_bytes!(env!("OXFS_ADDUSER_ELF_PATH")));
+    ok &= seed_file(root, b"adjtimex.elf", include_bytes!(env!("OXFS_ADJTIMEX_ELF_PATH")));
+    ok &= seed_file(root, b"ar.elf", include_bytes!(env!("OXFS_AR_ELF_PATH")));
+    ok &= seed_file(root, b"arp.elf", include_bytes!(env!("OXFS_ARP_ELF_PATH")));
+    ok &= seed_file(root, b"arping.elf", include_bytes!(env!("OXFS_ARPING_ELF_PATH")));
+    ok &= seed_file(root, b"ascii.elf", include_bytes!(env!("OXFS_ASCII_ELF_PATH")));
+    ok &= seed_file(root, b"ash.elf", include_bytes!(env!("OXFS_ASH_ELF_PATH")));
+    ok &= seed_file(root, b"awk.elf", include_bytes!(env!("OXFS_AWK_ELF_PATH")));
+    ok &= seed_file(root, b"base32.elf", include_bytes!(env!("OXFS_BASE32_ELF_PATH")));
+    ok &= seed_file(root, b"base64.elf", include_bytes!(env!("OXFS_BASE64_ELF_PATH")));
+    ok &= seed_file(root, b"bash_ash.elf", include_bytes!(env!("OXFS_BASH_ASH_ELF_PATH")));
+    ok &= seed_file(root, b"bash.elf", include_bytes!(env!("OXFS_BASH_ELF_PATH")));
+    ok &= seed_file(root, b"bbconfig.elf", include_bytes!(env!("OXFS_BBCONFIG_ELF_PATH")));
+    ok &= seed_file(root, b"arch.elf", include_bytes!(env!("OXFS_ARCH_ELF_PATH")));
+    ok &= seed_file(root, b"sysctl.elf", include_bytes!(env!("OXFS_SYSCTL_ELF_PATH")));
+    ok &= seed_file(root, b"bc.elf", include_bytes!(env!("OXFS_BC_ELF_PATH")));
+    ok &= seed_file(root, b"blkid.elf", include_bytes!(env!("OXFS_BLKID_ELF_PATH")));
+    ok &= seed_file(root, b"bootchartd.elf", include_bytes!(env!("OXFS_BOOTCHARTD_ELF_PATH")));
+    ok &= seed_file(root, b"bunzip2.elf", include_bytes!(env!("OXFS_BUNZIP2_ELF_PATH")));
+    ok &= seed_file(root, b"bzcat.elf", include_bytes!(env!("OXFS_BZCAT_ELF_PATH")));
+    ok &= seed_file(root, b"bzip2.elf", include_bytes!(env!("OXFS_BZIP2_ELF_PATH")));
+    ok &= seed_file(root, b"cal.elf", include_bytes!(env!("OXFS_CAL_ELF_PATH")));
+    ok &= seed_file(root, b"chat.elf", include_bytes!(env!("OXFS_CHAT_ELF_PATH")));
+    ok &= seed_file(root, b"chattr.elf", include_bytes!(env!("OXFS_CHATTR_ELF_PATH")));
+    ok &= seed_file(root, b"chgrp.elf", include_bytes!(env!("OXFS_CHGRP_ELF_PATH")));
+    ok &= seed_file(root, b"chmod.elf", include_bytes!(env!("OXFS_CHMOD_ELF_PATH")));
+    ok &= seed_file(root, b"chown.elf", include_bytes!(env!("OXFS_CHOWN_ELF_PATH")));
+    ok &= seed_file(root, b"chpasswd.elf", include_bytes!(env!("OXFS_CHPASSWD_ELF_PATH")));
+    ok &= seed_file(root, b"chroot.elf", include_bytes!(env!("OXFS_CHROOT_ELF_PATH")));
+    ok &= seed_file(root, b"chrt.elf", include_bytes!(env!("OXFS_CHRT_ELF_PATH")));
+    ok &= seed_file(root, b"chvt.elf", include_bytes!(env!("OXFS_CHVT_ELF_PATH")));
+    ok &= seed_file(root, b"cksum.elf", include_bytes!(env!("OXFS_CKSUM_ELF_PATH")));
+    ok &= seed_file(root, b"clear.elf", include_bytes!(env!("OXFS_CLEAR_ELF_PATH")));
+    ok &= seed_file(root, b"cmp.elf", include_bytes!(env!("OXFS_CMP_ELF_PATH")));
+    ok &= seed_file(root, b"comm.elf", include_bytes!(env!("OXFS_COMM_ELF_PATH")));
+    ok &= seed_file(root, b"cpio.elf", include_bytes!(env!("OXFS_CPIO_ELF_PATH")));
+    ok &= seed_file(root, b"crc32.elf", include_bytes!(env!("OXFS_CRC32_ELF_PATH")));
+    ok &= seed_file(root, b"crond.elf", include_bytes!(env!("OXFS_CROND_ELF_PATH")));
+    ok &= seed_file(root, b"crontab.elf", include_bytes!(env!("OXFS_CRONTAB_ELF_PATH")));
+    ok &= seed_file(root, b"cttyhack.elf", include_bytes!(env!("OXFS_CTTYHACK_ELF_PATH")));
+    ok &= seed_file(root, b"date.elf", include_bytes!(env!("OXFS_DATE_ELF_PATH")));
+    ok &= seed_file(root, b"dc.elf", include_bytes!(env!("OXFS_DC_ELF_PATH")));
+    ok &= seed_file(root, b"dd.elf", include_bytes!(env!("OXFS_DD_ELF_PATH")));
+    ok &= seed_file(root, b"deallocvt.elf", include_bytes!(env!("OXFS_DEALLOCVT_ELF_PATH")));
+    ok &= seed_file(root, b"delgroup.elf", include_bytes!(env!("OXFS_DELGROUP_ELF_PATH")));
+    ok &= seed_file(root, b"devfsd.elf", include_bytes!(env!("OXFS_DEVFSD_ELF_PATH")));
+    ok &= seed_file(root, b"devmem.elf", include_bytes!(env!("OXFS_DEVMEM_ELF_PATH")));
+    ok &= seed_file(root, b"df.elf", include_bytes!(env!("OXFS_DF_ELF_PATH")));
+    ok &= seed_file(root, b"dhcprelay.elf", include_bytes!(env!("OXFS_DHCPRELAY_ELF_PATH")));
+    ok &= seed_file(root, b"diff.elf", include_bytes!(env!("OXFS_DIFF_ELF_PATH")));
+    ok &= seed_file(root, b"dmesg.elf", include_bytes!(env!("OXFS_DMESG_ELF_PATH")));
+    ok &= seed_file(root, b"dnsd.elf", include_bytes!(env!("OXFS_DNSD_ELF_PATH")));
+    ok &= seed_file(root, b"dnsdomainname.elf", include_bytes!(env!("OXFS_DNSDOMAINNAME_ELF_PATH")));
+    ok &= seed_file(root, b"dos2unix.elf", include_bytes!(env!("OXFS_DOS2UNIX_ELF_PATH")));
+    ok &= seed_file(root, b"dpkg.elf", include_bytes!(env!("OXFS_DPKG_ELF_PATH")));
+    ok &= seed_file(root, b"dpkg_deb.elf", include_bytes!(env!("OXFS_DPKG_DEB_ELF_PATH")));
+    ok &= seed_file(root, b"du.elf", include_bytes!(env!("OXFS_DU_ELF_PATH")));
+    ok &= seed_file(root, b"dumpkmap.elf", include_bytes!(env!("OXFS_DUMPKMAP_ELF_PATH")));
+    ok &= seed_file(root, b"dumpleases.elf", include_bytes!(env!("OXFS_DUMPLEASES_ELF_PATH")));
+    ok &= seed_file(root, b"ed.elf", include_bytes!(env!("OXFS_ED_ELF_PATH")));
+    ok &= seed_file(root, b"egrep.elf", include_bytes!(env!("OXFS_EGREP_ELF_PATH")));
+    ok &= seed_file(root, b"eject.elf", include_bytes!(env!("OXFS_EJECT_ELF_PATH")));
+    ok &= seed_file(root, b"env.elf", include_bytes!(env!("OXFS_ENV_ELF_PATH")));
+    ok &= seed_file(root, b"envuidgid.elf", include_bytes!(env!("OXFS_ENVUIDGID_ELF_PATH")));
+    ok &= seed_file(root, b"expand.elf", include_bytes!(env!("OXFS_EXPAND_ELF_PATH")));
+    ok &= seed_file(root, b"expr.elf", include_bytes!(env!("OXFS_EXPR_ELF_PATH")));
+    ok &= seed_file(root, b"factor.elf", include_bytes!(env!("OXFS_FACTOR_ELF_PATH")));
+    ok &= seed_file(root, b"fakeidentd.elf", include_bytes!(env!("OXFS_FAKEIDENTD_ELF_PATH")));
+    ok &= seed_file(root, b"fallocate.elf", include_bytes!(env!("OXFS_FALLOCATE_ELF_PATH")));
+    ok &= seed_file(root, b"fatattr.elf", include_bytes!(env!("OXFS_FATATTR_ELF_PATH")));
+    ok &= seed_file(root, b"fbset.elf", include_bytes!(env!("OXFS_FBSET_ELF_PATH")));
+    ok &= seed_file(root, b"fdformat.elf", include_bytes!(env!("OXFS_FDFORMAT_ELF_PATH")));
+    ok &= seed_file(root, b"fdisk.elf", include_bytes!(env!("OXFS_FDISK_ELF_PATH")));
+    ok &= seed_file(root, b"fgconsole.elf", include_bytes!(env!("OXFS_FGCONSOLE_ELF_PATH")));
+    ok &= seed_file(root, b"fgrep.elf", include_bytes!(env!("OXFS_FGREP_ELF_PATH")));
+    ok &= seed_file(root, b"find.elf", include_bytes!(env!("OXFS_FIND_ELF_PATH")));
+    ok &= seed_file(root, b"findfs.elf", include_bytes!(env!("OXFS_FINDFS_ELF_PATH")));
+    ok &= seed_file(root, b"flock.elf", include_bytes!(env!("OXFS_FLOCK_ELF_PATH")));
+    ok &= seed_file(root, b"fold.elf", include_bytes!(env!("OXFS_FOLD_ELF_PATH")));
+    ok &= seed_file(root, b"free.elf", include_bytes!(env!("OXFS_FREE_ELF_PATH")));
+    ok &= seed_file(root, b"freeramdisk.elf", include_bytes!(env!("OXFS_FREERAMDISK_ELF_PATH")));
+    ok &= seed_file(root, b"fsck.elf", include_bytes!(env!("OXFS_FSCK_ELF_PATH")));
+    ok &= seed_file(root, b"fsck_minix.elf", include_bytes!(env!("OXFS_FSCK_MINIX_ELF_PATH")));
+    ok &= seed_file(root, b"fsync.elf", include_bytes!(env!("OXFS_FSYNC_ELF_PATH")));
+    ok &= seed_file(root, b"ftpd.elf", include_bytes!(env!("OXFS_FTPD_ELF_PATH")));
+    ok &= seed_file(root, b"ftpget.elf", include_bytes!(env!("OXFS_FTPGET_ELF_PATH")));
+    ok &= seed_file(root, b"ftpput.elf", include_bytes!(env!("OXFS_FTPPUT_ELF_PATH")));
+    ok &= seed_file(root, b"fuser.elf", include_bytes!(env!("OXFS_FUSER_ELF_PATH")));
+    ok &= seed_file(root, b"getopt.elf", include_bytes!(env!("OXFS_GETOPT_ELF_PATH")));
+    ok &= seed_file(root, b"getty.elf", include_bytes!(env!("OXFS_GETTY_ELF_PATH")));
+    ok &= seed_file(root, b"grep.elf", include_bytes!(env!("OXFS_GREP_ELF_PATH")));
+    ok &= seed_file(root, b"groups.elf", include_bytes!(env!("OXFS_GROUPS_ELF_PATH")));
+    ok &= seed_file(root, b"gunzip.elf", include_bytes!(env!("OXFS_GUNZIP_ELF_PATH")));
+    ok &= seed_file(root, b"gzip.elf", include_bytes!(env!("OXFS_GZIP_ELF_PATH")));
+    ok &= seed_file(root, b"halt.elf", include_bytes!(env!("OXFS_HALT_ELF_PATH")));
+    ok &= seed_file(root, b"hd.elf", include_bytes!(env!("OXFS_HD_ELF_PATH")));
+    ok &= seed_file(root, b"hexdump.elf", include_bytes!(env!("OXFS_HEXDUMP_ELF_PATH")));
+    ok &= seed_file(root, b"hexedit.elf", include_bytes!(env!("OXFS_HEXEDIT_ELF_PATH")));
+    ok &= seed_file(root, b"hostid.elf", include_bytes!(env!("OXFS_HOSTID_ELF_PATH")));
+    ok &= seed_file(root, b"httpd.elf", include_bytes!(env!("OXFS_HTTPD_ELF_PATH")));
+    ok &= seed_file(root, b"hwclock.elf", include_bytes!(env!("OXFS_HWCLOCK_ELF_PATH")));
+    ok &= seed_file(root, b"ifconfig.elf", include_bytes!(env!("OXFS_IFCONFIG_ELF_PATH")));
+    ok &= seed_file(root, b"ifdown.elf", include_bytes!(env!("OXFS_IFDOWN_ELF_PATH")));
+    ok &= seed_file(root, b"inetd.elf", include_bytes!(env!("OXFS_INETD_ELF_PATH")));
+    ok &= seed_file(root, b"inotifyd.elf", include_bytes!(env!("OXFS_INOTIFYD_ELF_PATH")));
+    ok &= seed_file(root, b"install.elf", include_bytes!(env!("OXFS_INSTALL_ELF_PATH")));
+    ok &= seed_file(root, b"iostat.elf", include_bytes!(env!("OXFS_IOSTAT_ELF_PATH")));
+    ok &= seed_file(root, b"ipcalc.elf", include_bytes!(env!("OXFS_IPCALC_ELF_PATH")));
+    ok &= seed_file(root, b"ipcrm.elf", include_bytes!(env!("OXFS_IPCRM_ELF_PATH")));
+    ok &= seed_file(root, b"ipcs.elf", include_bytes!(env!("OXFS_IPCS_ELF_PATH")));
+    ok &= seed_file(root, b"killall5.elf", include_bytes!(env!("OXFS_KILLALL5_ELF_PATH")));
+    ok &= seed_file(root, b"klogd.elf", include_bytes!(env!("OXFS_KLOGD_ELF_PATH")));
+    ok &= seed_file(root, b"less.elf", include_bytes!(env!("OXFS_LESS_ELF_PATH")));
+    ok &= seed_file(root, b"link.elf", include_bytes!(env!("OXFS_LINK_ELF_PATH")));
+    ok &= seed_file(root, b"linux32.elf", include_bytes!(env!("OXFS_LINUX32_ELF_PATH")));
+    ok &= seed_file(root, b"linux64.elf", include_bytes!(env!("OXFS_LINUX64_ELF_PATH")));
+    ok &= seed_file(root, b"ln.elf", include_bytes!(env!("OXFS_LN_ELF_PATH")));
+    ok &= seed_file(root, b"loadkmap.elf", include_bytes!(env!("OXFS_LOADKMAP_ELF_PATH")));
+    ok &= seed_file(root, b"logger.elf", include_bytes!(env!("OXFS_LOGGER_ELF_PATH")));
+    ok &= seed_file(root, b"login.elf", include_bytes!(env!("OXFS_LOGIN_ELF_PATH")));
+    ok &= seed_file(root, b"logname.elf", include_bytes!(env!("OXFS_LOGNAME_ELF_PATH")));
+    ok &= seed_file(root, b"logread.elf", include_bytes!(env!("OXFS_LOGREAD_ELF_PATH")));
+    ok &= seed_file(root, b"lpd.elf", include_bytes!(env!("OXFS_LPD_ELF_PATH")));
+    ok &= seed_file(root, b"lpq.elf", include_bytes!(env!("OXFS_LPQ_ELF_PATH")));
+    ok &= seed_file(root, b"lpr.elf", include_bytes!(env!("OXFS_LPR_ELF_PATH")));
+    ok &= seed_file(root, b"ls.elf", include_bytes!(env!("OXFS_LS_ELF_PATH")));
+    ok &= seed_file(root, b"lsattr.elf", include_bytes!(env!("OXFS_LSATTR_ELF_PATH")));
+    ok &= seed_file(root, b"lsof.elf", include_bytes!(env!("OXFS_LSOF_ELF_PATH")));
+    ok &= seed_file(root, b"lspci.elf", include_bytes!(env!("OXFS_LSPCI_ELF_PATH")));
+    ok &= seed_file(root, b"lsscsi.elf", include_bytes!(env!("OXFS_LSSCSI_ELF_PATH")));
+    ok &= seed_file(root, b"lsusb.elf", include_bytes!(env!("OXFS_LSUSB_ELF_PATH")));
+    ok &= seed_file(root, b"lzcat.elf", include_bytes!(env!("OXFS_LZCAT_ELF_PATH")));
+    ok &= seed_file(root, b"lzop.elf", include_bytes!(env!("OXFS_LZOP_ELF_PATH")));
+    ok &= seed_file(root, b"makedevs.elf", include_bytes!(env!("OXFS_MAKEDEVS_ELF_PATH")));
+    ok &= seed_file(root, b"makemime.elf", include_bytes!(env!("OXFS_MAKEMIME_ELF_PATH")));
+    ok &= seed_file(root, b"man.elf", include_bytes!(env!("OXFS_MAN_ELF_PATH")));
+    ok &= seed_file(root, b"md5sum.elf", include_bytes!(env!("OXFS_MD5SUM_ELF_PATH")));
+    ok &= seed_file(root, b"mesg.elf", include_bytes!(env!("OXFS_MESG_ELF_PATH")));
+    ok &= seed_file(root, b"microcom.elf", include_bytes!(env!("OXFS_MICROCOM_ELF_PATH")));
+    ok &= seed_file(root, b"minips.elf", include_bytes!(env!("OXFS_MINIPS_ELF_PATH")));
+    ok &= seed_file(root, b"mkfifo.elf", include_bytes!(env!("OXFS_MKFIFO_ELF_PATH")));
+    ok &= seed_file(root, b"mkfs.elf", include_bytes!(env!("OXFS_MKFS_ELF_PATH")));
+    ok &= seed_file(root, b"mknod.elf", include_bytes!(env!("OXFS_MKNOD_ELF_PATH")));
+    ok &= seed_file(root, b"mkpasswd.elf", include_bytes!(env!("OXFS_MKPASSWD_ELF_PATH")));
+    ok &= seed_file(root, b"mkswap.elf", include_bytes!(env!("OXFS_MKSWAP_ELF_PATH")));
+    ok &= seed_file(root, b"mktemp.elf", include_bytes!(env!("OXFS_MKTEMP_ELF_PATH")));
+    ok &= seed_file(root, b"modinfo.elf", include_bytes!(env!("OXFS_MODINFO_ELF_PATH")));
+    ok &= seed_file(root, b"mount.elf", include_bytes!(env!("OXFS_MOUNT_ELF_PATH")));
+    ok &= seed_file(root, b"mountpoint.elf", include_bytes!(env!("OXFS_MOUNTPOINT_ELF_PATH")));
+    ok &= seed_file(root, b"mpstat.elf", include_bytes!(env!("OXFS_MPSTAT_ELF_PATH")));
+    ok &= seed_file(root, b"mt.elf", include_bytes!(env!("OXFS_MT_ELF_PATH")));
+    ok &= seed_file(root, b"nc.elf", include_bytes!(env!("OXFS_NC_ELF_PATH")));
+    ok &= seed_file(root, b"netcat.elf", include_bytes!(env!("OXFS_NETCAT_ELF_PATH")));
+    ok &= seed_file(root, b"netstat.elf", include_bytes!(env!("OXFS_NETSTAT_ELF_PATH")));
+    ok &= seed_file(root, b"nice.elf", include_bytes!(env!("OXFS_NICE_ELF_PATH")));
+    ok &= seed_file(root, b"nl.elf", include_bytes!(env!("OXFS_NL_ELF_PATH")));
+    ok &= seed_file(root, b"nmeter.elf", include_bytes!(env!("OXFS_NMETER_ELF_PATH")));
+    ok &= seed_file(root, b"nohup.elf", include_bytes!(env!("OXFS_NOHUP_ELF_PATH")));
+    ok &= seed_file(root, b"nproc.elf", include_bytes!(env!("OXFS_NPROC_ELF_PATH")));
+    ok &= seed_file(root, b"nsenter.elf", include_bytes!(env!("OXFS_NSENTER_ELF_PATH")));
+    ok &= seed_file(root, b"nslookup.elf", include_bytes!(env!("OXFS_NSLOOKUP_ELF_PATH")));
+    ok &= seed_file(root, b"ntpd.elf", include_bytes!(env!("OXFS_NTPD_ELF_PATH")));
+    ok &= seed_file(root, b"nuke.elf", include_bytes!(env!("OXFS_NUKE_ELF_PATH")));
+    ok &= seed_file(root, b"od.elf", include_bytes!(env!("OXFS_OD_ELF_PATH")));
+    ok &= seed_file(root, b"passwd.elf", include_bytes!(env!("OXFS_PASSWD_ELF_PATH")));
+    ok &= seed_file(root, b"paste.elf", include_bytes!(env!("OXFS_PASTE_ELF_PATH")));
+    ok &= seed_file(root, b"patch.elf", include_bytes!(env!("OXFS_PATCH_ELF_PATH")));
+    ok &= seed_file(root, b"pgrep.elf", include_bytes!(env!("OXFS_PGREP_ELF_PATH")));
+    ok &= seed_file(root, b"pidof.elf", include_bytes!(env!("OXFS_PIDOF_ELF_PATH")));
+    ok &= seed_file(root, b"ping.elf", include_bytes!(env!("OXFS_PING_ELF_PATH")));
+    ok &= seed_file(root, b"pipe_progress.elf", include_bytes!(env!("OXFS_PIPE_PROGRESS_ELF_PATH")));
+    ok &= seed_file(root, b"pivot_root.elf", include_bytes!(env!("OXFS_PIVOT_ROOT_ELF_PATH")));
+    ok &= seed_file(root, b"pkill.elf", include_bytes!(env!("OXFS_PKILL_ELF_PATH")));
+    ok &= seed_file(root, b"pmap.elf", include_bytes!(env!("OXFS_PMAP_ELF_PATH")));
+    ok &= seed_file(root, b"popmaildir.elf", include_bytes!(env!("OXFS_POPMAILDIR_ELF_PATH")));
+    ok &= seed_file(root, b"poweroff.elf", include_bytes!(env!("OXFS_POWEROFF_ELF_PATH")));
+    ok &= seed_file(root, b"powertop.elf", include_bytes!(env!("OXFS_POWERTOP_ELF_PATH")));
+    ok &= seed_file(root, b"printenv.elf", include_bytes!(env!("OXFS_PRINTENV_ELF_PATH")));
+    ok &= seed_file(root, b"pscan.elf", include_bytes!(env!("OXFS_PSCAN_ELF_PATH")));
+    ok &= seed_file(root, b"pstree.elf", include_bytes!(env!("OXFS_PSTREE_ELF_PATH")));
+    ok &= seed_file(root, b"pwd.elf", include_bytes!(env!("OXFS_PWD_ELF_PATH")));
+    ok &= seed_file(root, b"pwdx.elf", include_bytes!(env!("OXFS_PWDX_ELF_PATH")));
+    ok &= seed_file(root, b"rdate.elf", include_bytes!(env!("OXFS_RDATE_ELF_PATH")));
+    ok &= seed_file(root, b"rdev.elf", include_bytes!(env!("OXFS_RDEV_ELF_PATH")));
+    ok &= seed_file(root, b"readlink.elf", include_bytes!(env!("OXFS_READLINK_ELF_PATH")));
+    ok &= seed_file(root, b"readprofile.elf", include_bytes!(env!("OXFS_READPROFILE_ELF_PATH")));
+    ok &= seed_file(root, b"realpath.elf", include_bytes!(env!("OXFS_REALPATH_ELF_PATH")));
+    ok &= seed_file(root, b"reformime.elf", include_bytes!(env!("OXFS_REFORMIME_ELF_PATH")));
+    ok &= seed_file(root, b"remove.elf", include_bytes!(env!("OXFS_REMOVE_ELF_PATH")));
+    ok &= seed_file(root, b"renice.elf", include_bytes!(env!("OXFS_RENICE_ELF_PATH")));
+    ok &= seed_file(root, b"reset.elf", include_bytes!(env!("OXFS_RESET_ELF_PATH")));
+    ok &= seed_file(root, b"resize.elf", include_bytes!(env!("OXFS_RESIZE_ELF_PATH")));
+    ok &= seed_file(root, b"resume.elf", include_bytes!(env!("OXFS_RESUME_ELF_PATH")));
+    ok &= seed_file(root, b"rev.elf", include_bytes!(env!("OXFS_REV_ELF_PATH")));
+    ok &= seed_file(root, b"route.elf", include_bytes!(env!("OXFS_ROUTE_ELF_PATH")));
+    ok &= seed_file(root, b"rpm.elf", include_bytes!(env!("OXFS_RPM_ELF_PATH")));
+    ok &= seed_file(root, b"rpm2cpio.elf", include_bytes!(env!("OXFS_RPM2CPIO_ELF_PATH")));
+    ok &= seed_file(root, b"rtcwake.elf", include_bytes!(env!("OXFS_RTCWAKE_ELF_PATH")));
+    ok &= seed_file(root, b"runsv.elf", include_bytes!(env!("OXFS_RUNSV_ELF_PATH")));
+    ok &= seed_file(root, b"runsvdir.elf", include_bytes!(env!("OXFS_RUNSVDIR_ELF_PATH")));
+    ok &= seed_file(root, b"run.elf", include_bytes!(env!("OXFS_RUN_ELF_PATH")));
+    ok &= seed_file(root, b"rx.elf", include_bytes!(env!("OXFS_RX_ELF_PATH")));
+    ok &= seed_file(root, b"script.elf", include_bytes!(env!("OXFS_SCRIPT_ELF_PATH")));
+    ok &= seed_file(root, b"scriptreplay.elf", include_bytes!(env!("OXFS_SCRIPTREPLAY_ELF_PATH")));
+    ok &= seed_file(root, b"sed.elf", include_bytes!(env!("OXFS_SED_ELF_PATH")));
+    ok &= seed_file(root, b"sendmail.elf", include_bytes!(env!("OXFS_SENDMAIL_ELF_PATH")));
+    ok &= seed_file(root, b"setarch.elf", include_bytes!(env!("OXFS_SETARCH_ELF_PATH")));
+    ok &= seed_file(root, b"setconsole.elf", include_bytes!(env!("OXFS_SETCONSOLE_ELF_PATH")));
+    ok &= seed_file(root, b"setfattr.elf", include_bytes!(env!("OXFS_SETFATTR_ELF_PATH")));
+    ok &= seed_file(root, b"setkeycodes.elf", include_bytes!(env!("OXFS_SETKEYCODES_ELF_PATH")));
+    ok &= seed_file(root, b"setlogcons.elf", include_bytes!(env!("OXFS_SETLOGCONS_ELF_PATH")));
+    ok &= seed_file(root, b"setpriv.elf", include_bytes!(env!("OXFS_SETPRIV_ELF_PATH")));
+    ok &= seed_file(root, b"setserial.elf", include_bytes!(env!("OXFS_SETSERIAL_ELF_PATH")));
+    ok &= seed_file(root, b"setsid.elf", include_bytes!(env!("OXFS_SETSID_ELF_PATH")));
+    ok &= seed_file(root, b"setuidgid.elf", include_bytes!(env!("OXFS_SETUIDGID_ELF_PATH")));
+    ok &= seed_file(root, b"sha1sum.elf", include_bytes!(env!("OXFS_SHA1SUM_ELF_PATH")));
+    ok &= seed_file(root, b"sha256sum.elf", include_bytes!(env!("OXFS_SHA256SUM_ELF_PATH")));
+    ok &= seed_file(root, b"sha3sum.elf", include_bytes!(env!("OXFS_SHA3SUM_ELF_PATH")));
+    ok &= seed_file(root, b"sha512sum.elf", include_bytes!(env!("OXFS_SHA512SUM_ELF_PATH")));
+    ok &= seed_file(root, b"shred.elf", include_bytes!(env!("OXFS_SHRED_ELF_PATH")));
+    ok &= seed_file(root, b"shuf.elf", include_bytes!(env!("OXFS_SHUF_ELF_PATH")));
+    ok &= seed_file(root, b"sleep.elf", include_bytes!(env!("OXFS_SLEEP_ELF_PATH")));
+    ok &= seed_file(root, b"smemcap.elf", include_bytes!(env!("OXFS_SMEMCAP_ELF_PATH")));
+    ok &= seed_file(root, b"softlimit.elf", include_bytes!(env!("OXFS_SOFTLIMIT_ELF_PATH")));
+    ok &= seed_file(root, b"split.elf", include_bytes!(env!("OXFS_SPLIT_ELF_PATH")));
+    ok &= seed_file(root, b"ssl_client.elf", include_bytes!(env!("OXFS_SSL_CLIENT_ELF_PATH")));
+    ok &= seed_file(root, b"start.elf", include_bytes!(env!("OXFS_START_ELF_PATH")));
+    ok &= seed_file(root, b"stat.elf", include_bytes!(env!("OXFS_STAT_ELF_PATH")));
+    ok &= seed_file(root, b"strings.elf", include_bytes!(env!("OXFS_STRINGS_ELF_PATH")));
+    ok &= seed_file(root, b"stty.elf", include_bytes!(env!("OXFS_STTY_ELF_PATH")));
+    ok &= seed_file(root, b"su.elf", include_bytes!(env!("OXFS_SU_ELF_PATH")));
+    ok &= seed_file(root, b"sulogin.elf", include_bytes!(env!("OXFS_SULOGIN_ELF_PATH")));
+    ok &= seed_file(root, b"sum.elf", include_bytes!(env!("OXFS_SUM_ELF_PATH")));
+    ok &= seed_file(root, b"svlogd.elf", include_bytes!(env!("OXFS_SVLOGD_ELF_PATH")));
+    ok &= seed_file(root, b"svok.elf", include_bytes!(env!("OXFS_SVOK_ELF_PATH")));
+    ok &= seed_file(root, b"swapoff.elf", include_bytes!(env!("OXFS_SWAPOFF_ELF_PATH")));
+    ok &= seed_file(root, b"switch_root.elf", include_bytes!(env!("OXFS_SWITCH_ROOT_ELF_PATH")));
+    ok &= seed_file(root, b"sync.elf", include_bytes!(env!("OXFS_SYNC_ELF_PATH")));
+    ok &= seed_file(root, b"syslogd.elf", include_bytes!(env!("OXFS_SYSLOGD_ELF_PATH")));
+    ok &= seed_file(root, b"tac.elf", include_bytes!(env!("OXFS_TAC_ELF_PATH")));
+    ok &= seed_file(root, b"tar.elf", include_bytes!(env!("OXFS_TAR_ELF_PATH")));
+    ok &= seed_file(root, b"taskset.elf", include_bytes!(env!("OXFS_TASKSET_ELF_PATH")));
+    ok &= seed_file(root, b"tcpsvd.elf", include_bytes!(env!("OXFS_TCPSVD_ELF_PATH")));
+    ok &= seed_file(root, b"tee.elf", include_bytes!(env!("OXFS_TEE_ELF_PATH")));
+    ok &= seed_file(root, b"telnet.elf", include_bytes!(env!("OXFS_TELNET_ELF_PATH")));
+    ok &= seed_file(root, b"telnetd.elf", include_bytes!(env!("OXFS_TELNETD_ELF_PATH")));
+    ok &= seed_file(root, b"test.elf", include_bytes!(env!("OXFS_TEST_ELF_PATH")));
+    ok &= seed_file(root, b"time.elf", include_bytes!(env!("OXFS_TIME_ELF_PATH")));
+    ok &= seed_file(root, b"timeout.elf", include_bytes!(env!("OXFS_TIMEOUT_ELF_PATH")));
+    ok &= seed_file(root, b"top.elf", include_bytes!(env!("OXFS_TOP_ELF_PATH")));
+    ok &= seed_file(root, b"tr.elf", include_bytes!(env!("OXFS_TR_ELF_PATH")));
+    ok &= seed_file(root, b"traceroute.elf", include_bytes!(env!("OXFS_TRACEROUTE_ELF_PATH")));
+    ok &= seed_file(root, b"tree.elf", include_bytes!(env!("OXFS_TREE_ELF_PATH")));
+    ok &= seed_file(root, b"truncate.elf", include_bytes!(env!("OXFS_TRUNCATE_ELF_PATH")));
+    ok &= seed_file(root, b"ts.elf", include_bytes!(env!("OXFS_TS_ELF_PATH")));
+    ok &= seed_file(root, b"tsort.elf", include_bytes!(env!("OXFS_TSORT_ELF_PATH")));
+    ok &= seed_file(root, b"tty.elf", include_bytes!(env!("OXFS_TTY_ELF_PATH")));
+    ok &= seed_file(root, b"ttysize.elf", include_bytes!(env!("OXFS_TTYSIZE_ELF_PATH")));
+    ok &= seed_file(root, b"udhcpd.elf", include_bytes!(env!("OXFS_UDHCPD_ELF_PATH")));
+    ok &= seed_file(root, b"udpsvd.elf", include_bytes!(env!("OXFS_UDPSVD_ELF_PATH")));
+    ok &= seed_file(root, b"umount.elf", include_bytes!(env!("OXFS_UMOUNT_ELF_PATH")));
+    ok &= seed_file(root, b"uncompress.elf", include_bytes!(env!("OXFS_UNCOMPRESS_ELF_PATH")));
+    ok &= seed_file(root, b"unexpand.elf", include_bytes!(env!("OXFS_UNEXPAND_ELF_PATH")));
+    ok &= seed_file(root, b"unit.elf", include_bytes!(env!("OXFS_UNIT_ELF_PATH")));
+    ok &= seed_file(root, b"unix2dos.elf", include_bytes!(env!("OXFS_UNIX2DOS_ELF_PATH")));
+    ok &= seed_file(root, b"unlink.elf", include_bytes!(env!("OXFS_UNLINK_ELF_PATH")));
+    ok &= seed_file(root, b"unlzma.elf", include_bytes!(env!("OXFS_UNLZMA_ELF_PATH")));
+    ok &= seed_file(root, b"unshare.elf", include_bytes!(env!("OXFS_UNSHARE_ELF_PATH")));
+    ok &= seed_file(root, b"unxz.elf", include_bytes!(env!("OXFS_UNXZ_ELF_PATH")));
+    ok &= seed_file(root, b"unzip.elf", include_bytes!(env!("OXFS_UNZIP_ELF_PATH")));
+    ok &= seed_file(root, b"uptime.elf", include_bytes!(env!("OXFS_UPTIME_ELF_PATH")));
+    ok &= seed_file(root, b"usleep.elf", include_bytes!(env!("OXFS_USLEEP_ELF_PATH")));
+    ok &= seed_file(root, b"uudecode.elf", include_bytes!(env!("OXFS_UUDECODE_ELF_PATH")));
+    ok &= seed_file(root, b"uuencode.elf", include_bytes!(env!("OXFS_UUENCODE_ELF_PATH")));
+    ok &= seed_file(root, b"vconfig.elf", include_bytes!(env!("OXFS_VCONFIG_ELF_PATH")));
+    ok &= seed_file(root, b"vi.elf", include_bytes!(env!("OXFS_VI_ELF_PATH")));
+    ok &= seed_file(root, b"volname.elf", include_bytes!(env!("OXFS_VOLNAME_ELF_PATH")));
+    ok &= seed_file(root, b"watch.elf", include_bytes!(env!("OXFS_WATCH_ELF_PATH")));
+    ok &= seed_file(root, b"wget.elf", include_bytes!(env!("OXFS_WGET_ELF_PATH")));
+    ok &= seed_file(root, b"which.elf", include_bytes!(env!("OXFS_WHICH_ELF_PATH")));
+    ok &= seed_file(root, b"whoami.elf", include_bytes!(env!("OXFS_WHOAMI_ELF_PATH")));
+    ok &= seed_file(root, b"whois.elf", include_bytes!(env!("OXFS_WHOIS_ELF_PATH")));
+    ok &= seed_file(root, b"xargs.elf", include_bytes!(env!("OXFS_XARGS_ELF_PATH")));
+    ok &= seed_file(root, b"xxd.elf", include_bytes!(env!("OXFS_XXD_ELF_PATH")));
+    ok &= seed_file(root, b"xzcat.elf", include_bytes!(env!("OXFS_XZCAT_ELF_PATH")));
+    ok &= seed_file(root, b"zcat.elf", include_bytes!(env!("OXFS_ZCAT_ELF_PATH")));
+
     if !ok {
         log("[oxfs] self-check FAILED: seeding embedded files failed\n");
     }
@@ -1227,6 +1797,133 @@ pub extern "C" fn module_init() -> i32 {
     } else {
         ok = false;
         log("[oxfs] self-check FAILED: big.txt not found\n");
+    }
+
+    // --- stat/fstat/lstat round trip, through the real registered handlers. ---
+    if let Some(hello) = dir_lookup(root, b"hello.txt") {
+        let expected_size = read_inode(hello).size as i64;
+        let path = b"hello.txt";
+        let mut stat_buf = [0u8; 144];
+        if oxfs_stat(
+            path.as_ptr() as u64,
+            path.len() as u64,
+            stat_buf.as_mut_ptr() as u64,
+            0,
+        ) != 0
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: stat hello.txt failed\n");
+        } else {
+            let st = unsafe { (stat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+            if st.st_ino != hello as u64 || st.st_size != expected_size || st.st_mode & S_IFREG == 0
+            {
+                ok = false;
+                log("[oxfs] self-check FAILED: stat hello.txt field mismatch\n");
+            }
+        }
+
+        let mut lstat_buf = [0u8; 144];
+        if oxfs_lstat(
+            path.as_ptr() as u64,
+            path.len() as u64,
+            lstat_buf.as_mut_ptr() as u64,
+            0,
+        ) != 0
+            || lstat_buf != stat_buf
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: lstat hello.txt disagreed with stat\n");
+        }
+
+        let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, 0, 0);
+        if fd < 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: open hello.txt for fstat check failed\n");
+        } else {
+            let mut fstat_buf = [0u8; 144];
+            if oxfs_fstat(fd as u64, fstat_buf.as_mut_ptr() as u64, 0, 0) != 0
+                || fstat_buf != stat_buf
+            {
+                ok = false;
+                log("[oxfs] self-check FAILED: fstat hello.txt disagreed with stat\n");
+            }
+            oxfs_close(fd as u64);
+        }
+    } else {
+        ok = false;
+        log("[oxfs] self-check FAILED: hello.txt not found for stat check\n");
+    }
+
+    // --- getdents round trip, through the real registered handler. ---
+    let gdtest = b"/gdtest";
+    if oxfs_mkdir(gdtest.as_ptr() as u64, gdtest.len() as u64, 0, 0) != 0 {
+        ok = false;
+        log("[oxfs] self-check FAILED: mkdir /gdtest failed\n");
+    } else {
+        let mut seeded = true;
+        for name in [&b"/gdtest/a"[..], &b"/gdtest/b"[..]] {
+            let fd = oxfs_open(name.as_ptr() as u64, name.len() as u64, O_CREAT, 0);
+            if fd < 0 {
+                seeded = false;
+            } else {
+                oxfs_close(fd as u64);
+            }
+        }
+        if !seeded {
+            ok = false;
+            log("[oxfs] self-check FAILED: seeding /gdtest/{a,b} failed\n");
+        }
+
+        let dfd = oxfs_open(gdtest.as_ptr() as u64, gdtest.len() as u64, 0, 0);
+        if dfd < 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: open /gdtest for getdents failed\n");
+        } else {
+            let dfd = dfd as u64;
+            let mut buf = [0u8; 512];
+            let n = oxfs_getdents(dfd, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
+            if n <= 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: getdents /gdtest returned nothing\n");
+            } else {
+                let (mut seen_dot, mut seen_dotdot, mut seen_a, mut seen_b) =
+                    (false, false, false, false);
+                let mut off = 0usize;
+                let mut count = 0;
+                while off < n as usize {
+                    let reclen = u16::from_le_bytes([buf[off + 16], buf[off + 17]]) as usize;
+                    if reclen == 0 || off + reclen > n as usize {
+                        break;
+                    }
+                    let name_start = off + 19;
+                    let name_end = buf[name_start..off + reclen]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map_or(off + reclen, |p| name_start + p);
+                    match &buf[name_start..name_end] {
+                        b"." => seen_dot = true,
+                        b".." => seen_dotdot = true,
+                        b"a" => seen_a = true,
+                        b"b" => seen_b = true,
+                        _ => {}
+                    }
+                    count += 1;
+                    off += reclen;
+                }
+                if count != 4 || !seen_dot || !seen_dotdot || !seen_a || !seen_b {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: getdents /gdtest entries mismatch\n");
+                }
+                // Every record already consumed -- a second call must report EOF (0), the signal
+                // readdir() relies on to stop looping.
+                let n2 = oxfs_getdents(dfd, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
+                if n2 != 0 {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: getdents /gdtest didn't reach EOF\n");
+                }
+            }
+            oxfs_close(dfd);
+        }
     }
 
     // --- mkdir/chdir/open(O_CREAT)/write/close/read, through the real registered handlers. ---
@@ -1347,6 +2044,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_UNLINK, oxfs_unlink);
         oxidebsd_register_syscall(SYS_RMDIR, oxfs_rmdir);
         oxidebsd_register_syscall(SYS_RENAME, oxfs_rename);
+        oxidebsd_register_syscall(SYS_STAT, oxfs_stat);
+        oxidebsd_register_syscall(SYS_LSTAT, oxfs_lstat);
+        oxidebsd_register_syscall(SYS_FSTAT, oxfs_fstat);
+        oxidebsd_register_syscall(SYS_GETDENTS, oxfs_getdents);
     }
 
     if ok {

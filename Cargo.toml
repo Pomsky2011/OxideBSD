@@ -32,15 +32,27 @@ harness = false
 name = "fork_wait"
 harness = false
 
+# -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool
+# grew to 32 MiB once the BusyBox roster grew to ~300 applets (see CLAUDE.md's BusyBox section),
+# and -- since src/memory.rs's frame allocator never reclaims and this kernel maps every module
+# page eagerly, not on demand -- that pool is a real physical-memory commitment from the moment
+# modules/oxfs loads, on top of the kernel image/heap/stacks and the module's own embedded ELF
+# bytes (~18 MiB) also resident at the same time. 1024 MiB leaves generous headroom over that, and
+# scales src/allocator.rs's own RAM-proportional heap size up to its 128 MiB ceiling too -- safe to
+# do now that src/allocator.rs's init_heap and src/module.rs's map_region both map freshly
+# allocated pages with `.ignore()` instead of `.flush()` (a real, measured multi-minute boot stall
+# otherwise: this RAM bump alone, before that fix, pushed the heap to ~32,000 pages, each
+# individually `invlpg`-flushed and trapped under QEMU's software TCG emulation).
 [package.metadata.bootimage]
 test-args = [
   "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
   "-serial", "stdio",
   "-display", "none",
+  "-m", "1024",
 ]
 test-success-exit-code = 33
 test-timeout = 300
-run-args = ["-serial", "stdio"]
+run-args = ["-serial", "stdio", "-m", "1024"]
 
 [profile.dev]
 panic = "abort"

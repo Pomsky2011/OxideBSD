@@ -492,10 +492,17 @@ fn map_region(
         // SAFETY: frame was just allocated (unused, per BootInfoFrameAllocator's contract), and
         // page falls within this module's freshly bump-allocated, previously-unmapped region.
         unsafe {
+            // `.ignore()`, not `.flush()`: same reasoning as `allocator::init_heap`'s own
+            // identical fix -- a page this bump-allocator (`allocate_region`) hands out has never
+            // been mapped before, so there's no stale TLB entry to invalidate. Load-bearing once
+            // any single module's object grows into the tens-of-thousands-of-pages range (a real
+            // multi-minute stall under QEMU's software TCG otherwise, one trapped `invlpg` per
+            // page) -- `modules/oxfs`'s own object crossed that threshold once its embedded
+            // BusyBox roster grew to ~300 applets (see CLAUDE.md's BusyBox section).
             mapper
                 .map_to(page, frame, flags, frame_allocator)
                 .map_err(|_| ModuleError::MappingFailed)?
-                .flush();
+                .ignore();
         }
         // Freshly allocated physical frames aren't guaranteed zeroed. Written through the page's
         // own, now-mapped virtual address directly: unlike elf.rs (which maps into a *different*,
@@ -603,6 +610,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_getpgid" => Some(crate::syscall::oxidebsd_sys_getpgid as *const () as u64),
         "oxidebsd_sys_ioctl" => Some(crate::syscall::oxidebsd_sys_ioctl as *const () as u64),
         "oxidebsd_sys_dup" => Some(crate::syscall::oxidebsd_sys_dup as *const () as u64),
+        "oxidebsd_real_fd_of" => Some(crate::fd::oxidebsd_real_fd_of as *const () as u64),
         _ => None,
     }
 }

@@ -55,9 +55,30 @@ pub unsafe fn frame_to_page_table(
 
 /// A `FrameAllocator` that hands out frames from the bootloader-reported usable regions of the
 /// physical memory map, in order, never reusing a frame.
+///
+/// **Plain index/cursor state, not a rebuild-and-skip iterator.** This used to be `next: usize`
+/// with `allocate_frame` calling `self.usable_frames().nth(self.next)` -- rebuilding the entire
+/// `filter`/`map`/`flat_map`/`step_by` chain from region zero and re-walking `self.next` items
+/// *every single call*, an O(n) cost per allocation and O(n²) total across n allocations. Utterly
+/// invisible at boot's original scale (a few thousand frames total), but a real, measured
+/// multi-minute-plus stall once a single caller needs tens of thousands (`allocator::init_heap`
+/// mapping a heap anywhere near its 128 MiB ceiling, or `module::map_region` mapping
+/// `modules/oxfs`'s own object once its embedded BusyBox roster grew to ~300 applets -- see
+/// CLAUDE.md's BusyBox section): at 32,000 frames, n² is roughly a billion iterator steps, each
+/// one slow under QEMU's software TCG on top of being pure waste. A first fix tried storing a live
+/// `Box<dyn Iterator<...>>` instead (O(1) amortized `next()` per call) -- wrong, not just
+/// suboptimal: `BootInfoFrameAllocator::init` runs *before* `allocator::init_heap`, which needs a
+/// working frame allocator to map the heap's own pages in the first place, so any heap allocation
+/// this constructor makes (`Box::new` included) reliably panics ("memory allocation ... failed")
+/// with no heap to satisfy it -- a real chicken-and-egg dependency, not a hypothetical one, hit and
+/// diagnosed live. `region_index`/`frame_number` below is plain `Copy` state: `region_index` only
+/// ever increases, bounded by the memory map's own small, fixed region count (`MAX_MEMORY_MAP_SIZE
+/// = 64` in the `bootloader` crate), so total extra work *across the allocator's entire lifetime*
+/// is O(regions), not O(frames) -- no heap, no boxing, no dynamic dispatch needed at all.
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
-    next: usize,
+    region_index: usize,
+    frame_number: u64,
 }
 
 impl BootInfoFrameAllocator {
@@ -84,25 +105,33 @@ impl BootInfoFrameAllocator {
 
         BootInfoFrameAllocator {
             memory_map,
-            next: 0,
+            region_index: 0,
+            frame_number: 0,
         }
-    }
-
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        self.memory_map
-            .iter()
-            .filter(|region| region.region_type == MemoryRegionType::Usable)
-            .map(|region| region.range.start_addr()..region.range.end_addr())
-            .flat_map(|range| range.step_by(4096))
-            .map(|addr| PhysFrame::containing_address(x86_64::PhysAddr::new(addr)))
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
-        frame
+        loop {
+            let region = self.memory_map.get(self.region_index)?;
+            if region.region_type != MemoryRegionType::Usable {
+                self.region_index += 1;
+                continue;
+            }
+            if self.frame_number < region.range.start_frame_number {
+                self.frame_number = region.range.start_frame_number;
+            }
+            if self.frame_number >= region.range.end_frame_number {
+                self.region_index += 1;
+                continue;
+            }
+            let frame_number = self.frame_number;
+            self.frame_number += 1;
+            return Some(PhysFrame::containing_address(x86_64::PhysAddr::new(
+                frame_number * 4096,
+            )));
+        }
     }
 }
 
