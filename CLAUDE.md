@@ -301,8 +301,15 @@ its fixed sector budget was sized for a much smaller roster) — harmless, since
 image at boot.
 
 - `hush` (pid 1) uses real `execvp()`/`$PATH` search — `process::spawn` passes a fixed `envp` of
-  `PATH=` (present, empty), which short-circuits musl's `__execvpe` into trying exactly one
-  root-relative candidate per name instead of a multi-component hardcoded search path.
+  `PATH=/bin`, so musl's `__execvpe` always searches oxfs's `/bin` directory as an absolute path
+  (`/bin/<name>`), independent of hush's current cwd. `modules/oxfs`'s `module_init` creates
+  `/bin` explicitly (own inode, `.`/`..` entries, inserted into root) and seeds every applet
+  there under its bare name (`ls`, `cat`, ...), not `.elf`-suffixed, so `ls` typed at any cwd
+  resolves; `hello.txt`/`big.txt` (data, not executables) stay at root. (An earlier version used
+  `PATH=/` with applets seeded directly at root — worked, but conflated executables with data
+  files in one flat directory; before that, `PATH=` (present, empty) relied on musl's "empty
+  component means search cwd" rule plus hush's cwd starting at root — worked only by
+  coincidence, broke the moment cwd moved elsewhere via `cd`.)
 - New kernel-resident pieces `sh` required: the real 4th syscall argument (`R10`, for `envp`),
   real blocking `pipe(2)`/`dup2(2)` (`src/pipe.rs` — an unbounded `VecDeque<u8>`; a read genuinely
   blocks via `BlockReason::WaitingForPipeData` + `scheduler::schedule()`, since busy-spinning would

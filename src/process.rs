@@ -398,18 +398,20 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
     // spawn() has no real invocation path to use as argv[0] (unlike do_execve, which knows exactly
     // what path it opened) -- this is only ever pid 1, built directly from an embedded ELF at
-    // boot, so a fixed placeholder is all there is to give. `stsh`/`fork-exec-smoke` (this
-    // function's other historical callers) never read their own argv/envp, but pid 1 is a real
-    // musl-linked binary (BusyBox's `hush`) now -- `envp` carries the same one-entry `PATH=`
-    // `stsh`'s own execve wrapper already passes to every child it runs, for the identical reason
-    // (see CLAUDE.md's BusyBox section): an empty, but *present*, `$PATH` short-circuits musl's
-    // `__execvpe` into trying exactly one root-relative candidate per name
-    // (`/<name>`), the one shape `modules/oxfs`'s flat root layout actually resolves, instead of
-    // musl's own hardcoded `/usr/local/bin:/bin:/usr/bin` fallback when `$PATH` is unset entirely.
+    // boot, so a fixed placeholder is all there is to give. pid 1 is a real musl-linked binary
+    // (BusyBox's `hush`) now -- `envp` carries a single-entry `PATH=/bin`: musl's `__execvpe`
+    // builds one candidate per colon-separated component as `<component>/<name>`, so this always
+    // searches oxfs's `/bin` directory (where every applet is seeded, under its bare name --
+    // `ls`, `cat`, ... -- not `.elf`-suffixed) as an *absolute* path, regardless of hush's current
+    // cwd. (An earlier version relied on an empty `PATH=` component, which POSIX defines as
+    // "search cwd" -- only worked by coincidence while both applets and hush's cwd sat at root;
+    // see CLAUDE.md's BusyBox section.) `PATH=/bin` beats musl's own hardcoded
+    // `/usr/local/bin:/bin:/usr/bin` fallback (used only when `$PATH` is unset entirely), since
+    // none of *those* directories exist in oxfs.
     let initial_rsp = crate::user_stack::build(
         &elf,
         &[b"(init)"],
-        &[b"PATH="],
+        &[b"PATH=/bin"],
         stack_top,
         user_stack_bottom(stack_top),
         &mapped_pages,
