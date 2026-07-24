@@ -352,6 +352,13 @@ pub struct Process {
     /// calls `setpgid` itself). `do_execve` deliberately leaves this untouched, same reasoning as
     /// `cwd` — real `execve()` preserves the caller's process group.
     pub pgid: Pid,
+    /// Executable basename (no path, no parens) — populated by `do_execve`/`spawn`, copied
+    /// verbatim by `fork` (real `fork()` semantics: a child keeps its parent's `comm`/`cmdline`
+    /// until it execs its own). Backs `/proc/[pid]/stat`'s `(comm)` field and `status`'s `Name:`.
+    pub comm: Vec<u8>,
+    /// Real `/proc/[pid]/cmdline` wire format: each `argv` entry followed by one NUL byte, no
+    /// trailing separator beyond that. Same copy-on-fork/reset-on-exec semantics as `comm`.
+    pub cmdline: Vec<u8>,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -423,6 +430,10 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     // either -- cwd/fs_base/brk all start fresh too) -- becomes its own group leader, same
     // convention as a real init/session leader.
     let pgid = pid;
+    // pid 1 is BusyBox's `hush` today (see the `argv[0]` placeholder note above) -- more accurate
+    // for `/proc/1/stat`'s `(comm)` field than reusing that same "(init)" placeholder verbatim.
+    let comm = b"hush".to_vec();
+    let cmdline = build_cmdline(&[b"(init)"]);
     let kernel_stack = KernelStack::new();
     let kernel_stack_top = kernel_stack.top();
     let rsp = crate::context_switch::seed_spawn_frame(kernel_stack_top);
@@ -448,6 +459,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         signal_saved_blocked: 0,
         priority: 0,
         pgid,
+        comm,
+        cmdline,
     };
 
     {
@@ -534,6 +547,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_sigactions,
         parent_signal_saved_frame,
         parent_signal_saved_blocked,
+        parent_comm,
+        parent_cmdline,
     ) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
@@ -559,6 +574,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             parent.sigactions,
             parent.signal_saved_frame,
             parent.signal_saved_blocked,
+            // Real fork() semantics: the child keeps the parent's comm/cmdline until it execs its
+            // own -- same reasoning as brk/fs_base/cwd above.
+            parent.comm.clone(),
+            parent.cmdline.clone(),
         )
     };
 
@@ -589,6 +608,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         signal_saved_blocked: parent_signal_saved_blocked,
         priority: 0,
         pgid: parent_pgid,
+        comm: parent_comm,
+        cmdline: parent_cmdline,
     };
 
     {
@@ -601,7 +622,6 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
     // crate::fd::fork_inherit's own doc comment for why this specifically matters for pipes.
     crate::fd::fork_inherit(caller_pid, child_pid);
     scheduler::enqueue_ready(child_pid);
-    crate::serial_println!("[proc] pid {} forked pid {}", caller_pid, child_pid);
     Ok(child_pid)
 }
 
@@ -663,6 +683,27 @@ fn read_ptr_len_array(ptr: u64) -> Vec<Vec<u8>> {
         entries_out.push(bytes.to_vec());
     }
     entries_out
+}
+
+/// Tail of `path` after its last `/` (the whole slice if there's none) -- used to derive
+/// `Process::comm` from the path `execve`/`spawn` actually loaded, matching real Linux's own
+/// "comm comes from the executable's filename, not argv[0]" rule.
+fn basename(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// Real `/proc/[pid]/cmdline` wire format: each `argv` entry followed by one NUL byte, no
+/// trailing separator beyond that.
+fn build_cmdline(argv: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for arg in argv {
+        out.extend_from_slice(arg);
+        out.push(0);
+    }
+    out
 }
 
 pub fn do_execve(
@@ -760,6 +801,8 @@ pub fn do_execve(
         me.user_stack_top = initial_rsp;
         me.entry_point = entry;
         me.brk = VirtAddr::new(elf.highest_loaded_address());
+        me.comm = basename(&path_bytes).to_vec();
+        me.cmdline = build_cmdline(&argv);
         // The old program's TLS base doesn't mean anything to the new one -- reset the stored value
         // (restored on every future context switch, see Process::fs_base's own doc comment) *and*
         // the live MSR right now, since execve keeps running as this exact process/kernel stack with
@@ -778,7 +821,6 @@ pub fn do_execve(
             }
         }
     }
-    crate::serial_println!("[proc] pid {} execve'd, entry={:?}", caller_pid, entry);
 
     let frame = syscall::current_frame();
     // SAFETY: frame is this exact syscall's own live frame -- do_execve is only ever reached via
@@ -887,7 +929,6 @@ pub fn do_exit(caller_pid: Pid, code: i32) -> ! {
 /// caller` always means "not the one currently executing") must not, since the calling process
 /// itself is still running and hasn't blocked or exited.
 fn terminate_process(pid: Pid, code: i32) {
-    crate::serial_println!("[proc] pid {} terminated with code {}", pid, code);
     // Real exit() semantics: every fd this process still has open gets closed automatically.
     // Genuinely load-bearing, not just tidiness -- see crate::fd::close_all's own doc comment for
     // why a leaked fd here can leave a pipe's reader blocked forever.
@@ -1217,6 +1258,157 @@ pub(crate) extern "C" fn oxidebsd_set_cwd(inode: u64) {
     if let Some(p) = table().lock().get_mut(&pid) {
         p.cwd = inode;
     }
+}
+
+/// Appends `value`'s decimal representation (no leading zeros; `0` prints as `"0"`) -- kernel-side
+/// equivalent of `modules/oxfs`'s own `ByteBuf::push_decimal`, duplicated rather than shared since
+/// modules can't depend on kernel-crate internals and vice versa.
+fn push_decimal(out: &mut Vec<u8>, value: u64) {
+    if value == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut v = value;
+    while v > 0 {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    out.extend(digits[..n].iter().rev());
+}
+
+/// Copies `min(content.len(), buf_cap)` bytes into the caller-owned `buf_ptr`, returning that
+/// count -- the shape every `/proc` accessor below returns content through, since modules can't
+/// receive a `Vec`/`&str` directly across the FFI boundary (same raw pointer+len convention
+/// `oxidebsd_log` and oxfs's own `write_stat` already use).
+fn copy_into(content: &[u8], buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let n = content.len().min(buf_cap as usize);
+    // SAFETY: the caller (modules/oxfs, via the FFI boundary these functions are exported across)
+    // owns buf_ptr for at least buf_cap bytes -- same trust boundary as every other module<->kernel
+    // raw-pointer handoff in this codebase.
+    unsafe { core::ptr::copy_nonoverlapping(content.as_ptr(), buf_ptr, n) };
+    n as i64
+}
+
+fn state_char(state: ProcState) -> u8 {
+    match state {
+        ProcState::Ready | ProcState::Running => b'R',
+        ProcState::Blocked(_) => b'S',
+        ProcState::Zombie(_) => b'Z',
+    }
+}
+
+/// Exposed to `modules/oxfs` for its `/proc` directory listing -- `1`/`0` rather than `bool` to
+/// stay a plain FFI scalar, same convention `oxidebsd_register_syscall`'s own return already uses.
+pub(crate) extern "C" fn oxidebsd_proc_exists(pid: u64) -> i32 {
+    if PROCESS_TABLE.lock().contains_key(&pid) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The `index`-th live pid in ascending order (`BTreeMap` iteration is already sorted), `-1` once
+/// `index` is past the end -- lets `modules/oxfs` enumerate `/proc`'s own directory listing without
+/// a "how many pids" call of its own (just loop until `-1`).
+pub(crate) extern "C" fn oxidebsd_proc_pid_at(index: u64) -> i64 {
+    PROCESS_TABLE
+        .lock()
+        .keys()
+        .nth(index as usize)
+        .map(|&pid| pid as i64)
+        .unwrap_or(-1)
+}
+
+/// Formats a real `/proc/[pid]/stat` line (`pid (comm) state ppid pgrp session ...`, all ~52
+/// space-separated fields real Linux defines) into `buf_ptr`/`buf_cap`. Real values for
+/// `pid`/`comm`/`state`/`ppid`/`pgrp`/`session`/`num_threads`/`blocked`/`start_brk`; `0` for
+/// everything else this kernel doesn't track (`utime`/`vsize`/`rss`/...) -- same "documented fixed
+/// placeholder" precedent as oxfs's own `write_stat` uses for `st_uid`/`st_gid`/timestamps.
+/// Returns bytes written, or `-1` if `pid` no longer exists (a race between the caller's own
+/// existence check and this call -- the process table isn't locked across both).
+pub(crate) extern "C" fn oxidebsd_proc_stat_line(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let table = PROCESS_TABLE.lock();
+    let Some(proc) = table.get(&pid) else {
+        return -1;
+    };
+    let ppid = proc.parent.unwrap_or(0);
+    let pgid = proc.pgid;
+    let brk = proc.brk.as_u64();
+    let blocked = proc.blocked_signals;
+
+    let mut out = Vec::new();
+    push_decimal(&mut out, pid);
+    out.push(b' ');
+    out.push(b'(');
+    out.extend_from_slice(&proc.comm);
+    out.push(b')');
+    out.push(b' ');
+    out.push(state_char(proc.state));
+
+    // Fields 4 (ppid) through 52 (exit_code) -- see proc(5). Non-zero entries: pgrp/session
+    // (idx 1/2), priority (idx 14), num_threads (idx 16), blocked (idx 28), exit_signal (idx 34,
+    // SIGCHLD), start_brk (idx 43).
+    let fields: [u64; 49] = [
+        ppid, pgid, pgid, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 4-13
+        20, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 14-27 (priority, nice, num_threads, ...)
+        blocked, 0, 0, 0, 0, 0, // 28-33
+        17, 0, 0, 0, 0, 0, 0, // 34-40 (exit_signal, processor, rt_priority, ...)
+        0, 0, brk, 0, 0, 0, 0, 0, // 41-48 (start_data, end_data, start_brk, ...)
+    ];
+    for f in fields {
+        out.push(b' ');
+        push_decimal(&mut out, f);
+    }
+    drop(table);
+    copy_into(&out, buf_ptr, buf_cap)
+}
+
+/// Raw copy of `Process::cmdline` (already real `/proc/[pid]/cmdline` wire format) into
+/// `buf_ptr`/`buf_cap`. `-1` if `pid` no longer exists.
+pub(crate) extern "C" fn oxidebsd_proc_cmdline(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let table = PROCESS_TABLE.lock();
+    let Some(proc) = table.get(&pid) else {
+        return -1;
+    };
+    copy_into(&proc.cmdline, buf_ptr, buf_cap)
+}
+
+/// A handful of `Key:\tvalue\n` lines into `buf_ptr`/`buf_cap`, the fields this tier's target
+/// applets plausibly read (`Name`/`State`/`Tgid`/`Pid`/`PPid`/`Threads`) -- a small subset of real
+/// Linux's own much longer `/proc/[pid]/status`. `-1` if `pid` no longer exists.
+pub(crate) extern "C" fn oxidebsd_proc_status(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let table = PROCESS_TABLE.lock();
+    let Some(proc) = table.get(&pid) else {
+        return -1;
+    };
+    let ppid = proc.parent.unwrap_or(0);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"Name:\t");
+    out.extend_from_slice(&proc.comm);
+    out.push(b'\n');
+    out.extend_from_slice(b"State:\t");
+    out.extend_from_slice(match proc.state {
+        ProcState::Ready | ProcState::Running => b"R (running)".as_slice(),
+        ProcState::Blocked(_) => b"S (sleeping)".as_slice(),
+        ProcState::Zombie(_) => b"Z (zombie)".as_slice(),
+    });
+    out.push(b'\n');
+    out.extend_from_slice(b"Tgid:\t");
+    push_decimal(&mut out, pid);
+    out.push(b'\n');
+    out.extend_from_slice(b"Pid:\t");
+    push_decimal(&mut out, pid);
+    out.push(b'\n');
+    out.extend_from_slice(b"PPid:\t");
+    push_decimal(&mut out, ppid);
+    out.push(b'\n');
+    out.extend_from_slice(b"Threads:\t1\n");
+    drop(table);
+    copy_into(&out, buf_ptr, buf_cap)
 }
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from

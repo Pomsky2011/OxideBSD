@@ -76,6 +76,11 @@ unsafe extern "C" {
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
     fn oxidebsd_real_fd_of(fd: u64) -> i64;
+    fn oxidebsd_proc_exists(pid: u64) -> i32;
+    fn oxidebsd_proc_pid_at(index: u64) -> i64;
+    fn oxidebsd_proc_stat_line(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_proc_cmdline(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_proc_status(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64;
 }
 
 const SYS_OPEN: u64 = 5;
@@ -122,6 +127,9 @@ const ERANGE: i64 = 34;
 /// FreeBSD's value (`66`), not Linux's (`39`) -- matching this codebase's established convention
 /// of using FreeBSD errno values where they diverge (see `src/syscall.rs`'s own `ENOSYS`).
 const ENOTEMPTY: i64 = 66;
+/// Real value (`3`, same on FreeBSD/Linux) -- returned when a `/proc/<pid>/...` path's `pid`
+/// vanishes between `proc_open`'s own existence check and the kernel accessor call that follows it.
+const ESRCH: i64 = 3;
 
 const BLOCK_SIZE: usize = 4096;
 /// 32 MiB pool (raised from 4 MiB once the BusyBox roster grew from 24 applets to ~300 -- see
@@ -147,6 +155,15 @@ const ROOT_INODE: u32 = 0;
 const DIR_RECORD_SIZE: usize = 32;
 const NAME_MAX: usize = 26;
 const RECORDS_PER_BLOCK: usize = BLOCK_SIZE / DIR_RECORD_SIZE;
+
+/// Synthetic `/proc/<pid>/{stat,cmdline,status}` content buffer -- comfortably covers any of the
+/// three for this kernel's simple, single-threaded processes; longer content silently truncates
+/// (accepted simplification for this tier, not indefinite-length-safe).
+const PROC_BUFFER: usize = 1024;
+/// Base for synthetic `d_ino` values `/proc`'s own `getdents` records report -- nothing
+/// dereferences these as real inodes (there's no real inode backing any `/proc` entry), they only
+/// need to be distinct and non-zero. Clear of `MAX_INODES`'s real range by a wide margin.
+const PROC_INODE_BASE: u64 = 0x7000_0000;
 
 const MAX_OPEN_FILES: usize = 8;
 /// Write-side accumulator cap (see `OpenFile::Write`'s own doc comment) -- comfortably past
@@ -439,6 +456,43 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     0
 }
 
+/// `write_stat`'s counterpart for a synthetic `/proc` entry -- no real inode to read, so every
+/// field is a fixed placeholder except `st_mode` (the one thing callers actually branch on, e.g.
+/// `ls`/`pstree`'s own `stat()`-before-`opendir()` checks). `st_size` is always `0` rather than a
+/// leaf file's real content length -- no target applet for this tier checks it, and computing a
+/// real one would mean generating that content a second time just to measure it.
+fn write_proc_stat(is_dir: bool, buf_ptr: u64) -> i64 {
+    let (mode, nlink) = if is_dir {
+        (S_IFDIR | FIXED_PERM, 2u64)
+    } else {
+        (S_IFREG | FIXED_PERM, 1u64)
+    };
+    let stat = MuslStat {
+        st_dev: 1,
+        st_ino: PROC_INODE_BASE,
+        st_nlink: nlink,
+        st_mode: mode,
+        st_uid: 0,
+        st_gid: 0,
+        __pad0: 0,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: BLOCK_SIZE as i64,
+        st_blocks: 0,
+        st_atime_sec: 0,
+        st_atime_nsec: 0,
+        st_mtime_sec: 0,
+        st_mtime_nsec: 0,
+        st_ctime_sec: 0,
+        st_ctime_nsec: 0,
+        __unused: [0; 3],
+    };
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer, sized by the caller's own
+    // `sizeof(struct stat)` (144 bytes, matching `MuslStat` exactly, checked above).
+    unsafe { (buf_ptr as *mut MuslStat).write_unaligned(stat) };
+    0
+}
+
 /// Looks up the inode number backing an already-open real fd -- `oxfs_fstat`'s own lookup, since
 /// `OPEN_FILES` is keyed by `real_fd` (see `oxidebsd_real_fd_of`'s own doc comment for why a
 /// syscall-number-registered handler has to resolve that itself rather than getting it for free
@@ -450,6 +504,9 @@ fn inode_of_open_file(real_fd: u64) -> Option<u32> {
         OpenFile::FileRead { inode, .. } => Some(*inode),
         OpenFile::DirListing { inode, .. } => Some(*inode),
         OpenFile::Write { .. } => None,
+        // No real inode backs a synthetic /proc entry -- fstat on one of these fds fails as
+        // -EBADF, a documented known gap for this tier (no target applet needs it).
+        OpenFile::ProcRead { .. } | OpenFile::ProcDir { .. } => None,
     }
 }
 
@@ -824,6 +881,40 @@ enum OpenFile {
         buffer: [u8; MAX_WRITE_BUFFER],
         len: usize,
     },
+    /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
+    /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
+    /// no real inode backs this, mirroring `DirListing`'s own "format once, stream on read" shape.
+    ProcRead {
+        content: [u8; PROC_BUFFER],
+        len: usize,
+        position: usize,
+    },
+    /// A synthetic `/proc` directory listing -- see `ProcDirKind` for what each variant lists.
+    /// `content`/`position` back a human-readable read (`cat /proc`, mirroring `DirListing`'s dual
+    /// read/getdents purpose); `dirent_pos` is `oxfs_getdents`'s own resume cursor, same role as
+    /// `DirListing::dirent_pos`.
+    ProcDir {
+        kind: ProcDirKind,
+        content: [u8; DIR_LISTING_BUFFER],
+        len: usize,
+        position: usize,
+        dirent_pos: usize,
+    },
+}
+
+/// What a synthetic `/proc` directory fd lists -- see `oxfs_getdents`'s own `ProcDir` handling.
+#[derive(Clone, Copy)]
+enum ProcDirKind {
+    /// `/proc` itself: one entry per live pid (`oxidebsd_proc_pid_at`).
+    Root,
+    /// `/proc/<pid>`: the fixed three leaf names (`stat`/`cmdline`/`status`).
+    PidFiles(u32),
+    /// `/proc/<pid>/task`: exactly one entry, `<pid>`'s own decimal string -- this kernel has no
+    /// real threading, so a process's only "task" is itself. See this file's own module doc
+    /// comment / `CLAUDE.md`'s /proc section for why this exists at all: `pstree` (a target applet
+    /// for this tier) unconditionally `opendir()`s this path and silently skips a pid entirely if
+    /// it's missing, rather than falling back to treating the pid as single-threaded itself.
+    TaskList(u32),
 }
 
 fn register_open_file(open_file: OpenFile) -> i64 {
@@ -895,16 +986,239 @@ fn open_dir_listing(dir_inode: u32) -> i64 {
     })
 }
 
-/// Registered for `SYS_OPEN`. `""`/`"."`/`".."`/`"/"` are special-cased (mirroring
-/// `modules/fat32`'s own handling of them) before falling into `resolve_parent`, which -- unlike
-/// FAT32's single-component `to_short_name` -- handles an arbitrarily deep path
-/// (`sub/inner/file.txt`) in this one call.
+/// Which synthetic `/proc/<pid>/*` leaf a call to `open_proc_leaf` should generate.
+#[derive(Clone, Copy)]
+enum ProcLeaf {
+    Stat,
+    Cmdline,
+    Status,
+}
+
+/// All-ASCII-digit, non-empty, fits in `u32` -- a real pid never needs more, and this doubles as
+/// the "not a valid pid component" rejection every unrecognized `/proc/<garbage>` path needs.
+fn parse_pid(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(value)
+}
+
+/// `/proc` itself: one live pid per line (`oxidebsd_proc_pid_at`, ascending, `-1`-terminated),
+/// mirroring `open_dir_listing`'s own human-readable style.
+fn open_proc_root_dir() -> i64 {
+    let mut content = [0u8; DIR_LISTING_BUFFER];
+    let len = {
+        let mut out = ByteBuf {
+            buf: &mut content,
+            len: 0,
+        };
+        let mut i = 0u64;
+        loop {
+            // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+            let pid = unsafe { oxidebsd_proc_pid_at(i) };
+            if pid < 0 {
+                break;
+            }
+            out.push_decimal(pid as u32);
+            out.push_bytes(b"\n");
+            i += 1;
+        }
+        out.len
+    };
+    register_open_file(OpenFile::ProcDir {
+        kind: ProcDirKind::Root,
+        content,
+        len,
+        position: 0,
+        dirent_pos: 0,
+    })
+}
+
+/// `/proc/<pid>`: the fixed three leaf names.
+fn open_proc_pid_dir(pid: u32) -> i64 {
+    let mut content = [0u8; DIR_LISTING_BUFFER];
+    let len = {
+        let mut out = ByteBuf {
+            buf: &mut content,
+            len: 0,
+        };
+        out.push_bytes(b"stat\ncmdline\nstatus\n");
+        out.len
+    };
+    register_open_file(OpenFile::ProcDir {
+        kind: ProcDirKind::PidFiles(pid),
+        content,
+        len,
+        position: 0,
+        dirent_pos: 0,
+    })
+}
+
+/// `/proc/<pid>/task`: exactly one entry, `pid`'s own decimal string -- see `ProcDirKind::TaskList`'s
+/// own doc comment for why this exists at all.
+fn open_task_dir(pid: u32) -> i64 {
+    let mut content = [0u8; DIR_LISTING_BUFFER];
+    let len = {
+        let mut out = ByteBuf {
+            buf: &mut content,
+            len: 0,
+        };
+        out.push_decimal(pid);
+        out.push_bytes(b"\n");
+        out.len
+    };
+    register_open_file(OpenFile::ProcDir {
+        kind: ProcDirKind::TaskList(pid),
+        content,
+        len,
+        position: 0,
+        dirent_pos: 0,
+    })
+}
+
+/// `/proc/<pid>/{stat,cmdline,status}`: calls the matching kernel accessor once, at `open` time,
+/// into a fresh fixed buffer -- same "format once, stream on read" shape `open_dir_listing` uses.
+fn open_proc_leaf(pid: u32, leaf: ProcLeaf) -> i64 {
+    let mut content = [0u8; PROC_BUFFER];
+    // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures; each
+    // writes at most PROC_BUFFER bytes into content, sized to match.
+    let n = unsafe {
+        match leaf {
+            ProcLeaf::Stat => {
+                oxidebsd_proc_stat_line(pid as u64, content.as_mut_ptr(), PROC_BUFFER as u64)
+            }
+            ProcLeaf::Cmdline => {
+                oxidebsd_proc_cmdline(pid as u64, content.as_mut_ptr(), PROC_BUFFER as u64)
+            }
+            ProcLeaf::Status => {
+                oxidebsd_proc_status(pid as u64, content.as_mut_ptr(), PROC_BUFFER as u64)
+            }
+        }
+    };
+    if n < 0 {
+        // The pid existed at proc_open's own check but is gone now (exited between that check and
+        // this call) -- ESRCH is the honest answer, not EBADF/ENOENT.
+        return -ESRCH;
+    }
+    register_open_file(OpenFile::ProcRead {
+        content,
+        len: n as usize,
+        position: 0,
+    })
+}
+
+/// Dispatches every `/proc/...` path `oxfs_open` hands off to it (`suffix` is the path *after*
+/// `/proc`, e.g. `""`, `"/3"`, `"/3/stat"`, `"/3/task/3/status"`). No real inode/path resolution
+/// involved -- every case here is synthesized directly from the live process table via the
+/// `oxidebsd_proc_*` kernel accessors.
+fn proc_open(suffix: &[u8]) -> i64 {
+    let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    let Some(pid_str) = comps.next() else {
+        return open_proc_root_dir();
+    };
+    let Some(pid) = parse_pid(pid_str) else {
+        return -ENOENT;
+    };
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+    if unsafe { oxidebsd_proc_exists(pid as u64) } == 0 {
+        return -ENOENT;
+    }
+    match comps.next() {
+        None => open_proc_pid_dir(pid),
+        Some(b"stat") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Stat),
+        Some(b"cmdline") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Cmdline),
+        Some(b"status") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Status),
+        // /proc/<pid>/task[/<tid>[/stat|cmdline|status]] -- see ProcDirKind::TaskList's doc
+        // comment for why this redirect exists. Only tid == pid is ever valid: this kernel has no
+        // real threading, so a process's only "task" is itself.
+        Some(b"task") => match comps.next() {
+            None => open_task_dir(pid),
+            Some(tid_str) => {
+                let Some(tid) = parse_pid(tid_str) else {
+                    return -ENOENT;
+                };
+                if tid != pid {
+                    return -ENOENT;
+                }
+                match comps.next() {
+                    None => open_proc_pid_dir(pid),
+                    Some(b"stat") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Stat),
+                    Some(b"cmdline") if comps.next().is_none() => {
+                        open_proc_leaf(pid, ProcLeaf::Cmdline)
+                    }
+                    Some(b"status") if comps.next().is_none() => {
+                        open_proc_leaf(pid, ProcLeaf::Status)
+                    }
+                    _ => -ENOENT,
+                }
+            }
+        },
+        _ => -ENOENT,
+    }
+}
+
+/// Resolves a `/proc` suffix (same grammar as `proc_open`, see its own doc comment) to whether it
+/// names a directory, without generating any real content -- shared by `oxfs_stat`/`oxfs_lstat`'s
+/// own `/proc` handling, which only needs the file type to fill in `st_mode`. `None` means no such
+/// entry (`-ENOENT`). A separate, smaller match from `proc_open`'s own -- that one additionally has
+/// to pick which specific kernel accessor to call for a leaf file's real content, which this
+/// doesn't need.
+fn proc_kind(suffix: &[u8]) -> Option<bool> {
+    let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    let Some(pid_str) = comps.next() else {
+        return Some(true); // /proc itself
+    };
+    let pid = parse_pid(pid_str)?;
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+    if unsafe { oxidebsd_proc_exists(pid as u64) } == 0 {
+        return None;
+    }
+    match comps.next() {
+        None => Some(true), // /proc/<pid>
+        Some(b"stat" | b"cmdline" | b"status") if comps.next().is_none() => Some(false),
+        Some(b"task") => match comps.next() {
+            None => Some(true), // /proc/<pid>/task
+            Some(tid_str) => {
+                let tid = parse_pid(tid_str)?;
+                if tid != pid {
+                    return None;
+                }
+                match comps.next() {
+                    None => Some(true), // /proc/<pid>/task/<tid>
+                    Some(b"stat" | b"cmdline" | b"status") if comps.next().is_none() => {
+                        Some(false)
+                    }
+                    _ => None,
+                }
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Registered for `SYS_OPEN`. `/proc/...` (absolute only -- this tier doesn't special-case a
+/// relative `proc` component reached via cwd) is intercepted before any of the real, cwd-relative
+/// special-casing below, since it isn't backed by a real inode at all -- see `proc_open`.
+/// `""`/`"."`/`".."`/`"/"` are special-cased next (mirroring `modules/fat32`'s own handling of
+/// them) before falling into `resolve_parent`, which -- unlike FAT32's single-component
+/// `to_short_name` -- handles an arbitrarily deep path (`sub/inner/file.txt`) in this one call.
 extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> i64 {
     // SAFETY: same trust boundary as sys_write's own documented pointer-validation gap in
     // src/syscall.rs -- the caller (ultimately userland, via SYS_OPEN) owns this pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let create = flags & O_CREAT != 0;
     let cwd = current_cwd();
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        return proc_open(&path[5..]);
+    }
 
     if path.is_empty() || path == b"." {
         return open_dir_listing(cwd);
@@ -974,6 +1288,31 @@ extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
             n as i64
         }
         OpenFile::Write { .. } => -EBADF,
+        OpenFile::ProcRead {
+            content,
+            len: total,
+            position,
+        } => {
+            let remaining = *total - *position;
+            let n = remaining.min(len as usize);
+            let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, n) };
+            out.copy_from_slice(&content[*position..*position + n]);
+            *position += n;
+            n as i64
+        }
+        OpenFile::ProcDir {
+            content,
+            len: total,
+            position,
+            ..
+        } => {
+            let remaining = *total - *position;
+            let n = remaining.min(len as usize);
+            let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, n) };
+            out.copy_from_slice(&content[*position..*position + n]);
+            *position += n;
+            n as i64
+        }
     }
 }
 
@@ -1211,10 +1550,20 @@ extern "C" fn oxfs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64
 
 /// Registered for `SYS_STAT`. No symlinks exist in this filesystem at all, so unlike real
 /// `stat`/`lstat`, there's no "follow the final component" distinction to make -- `oxfs_lstat`
-/// below just calls this same resolver.
+/// below just calls this same resolver. `/proc/...` is intercepted the same way `oxfs_open` does
+/// (see `proc_kind`) -- needed for `ls`/`pstree`, both of which `stat()` a path before deciding
+/// whether to list it.
 extern "C" fn oxfs_stat(path_ptr: u64, path_len: u64, buf_ptr: u64, _r10: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        return match proc_kind(&path[5..]) {
+            Some(is_dir) => write_proc_stat(is_dir, buf_ptr),
+            None => -ENOENT,
+        };
+    }
+
     let cwd = current_cwd();
     match resolve_path(cwd, path) {
         Ok(inode_num) => write_stat(inode_num, buf_ptr),
@@ -1244,13 +1593,74 @@ extern "C" fn oxfs_fstat(fd: u64, buf_ptr: u64, _a2: u64, _a3: u64) -> i64 {
     }
 }
 
+/// Writes `value`'s decimal digits (no leading zeros; `0` prints as `"0"`) into `buf`, returning
+/// the byte count -- module-side equivalent of `src/process.rs`'s own `push_decimal`, duplicated
+/// rather than shared for the same reason: modules can't depend on kernel-crate internals.
+fn decimal_into(buf: &mut [u8], value: u64) -> usize {
+    if value == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut n = 0;
+    let mut v = value;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        buf[i] = tmp[n - 1 - i];
+    }
+    n
+}
+
+/// The `n`-th entry of a synthetic `/proc` directory (`kind`) -- `(d_ino, name, name_len, d_type)`,
+/// mirroring `dir_nth_used_record`'s shape for a real directory (plus a `d_type`, since a synthetic
+/// directory has no inode to derive one from). `None` once every entry has been emitted.
+fn proc_dir_nth_entry(kind: ProcDirKind, n: usize) -> Option<(u64, [u8; NAME_MAX], u8, u8)> {
+    match kind {
+        ProcDirKind::Root => {
+            // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+            let pid = unsafe { oxidebsd_proc_pid_at(n as u64) };
+            if pid < 0 {
+                return None;
+            }
+            let mut name = [0u8; NAME_MAX];
+            let name_len = decimal_into(&mut name, pid as u64);
+            Some((PROC_INODE_BASE + pid as u64, name, name_len as u8, DT_DIR))
+        }
+        ProcDirKind::PidFiles(pid) => {
+            const NAMES: [&[u8]; 3] = [b"stat", b"cmdline", b"status"];
+            let name_bytes = *NAMES.get(n)?;
+            let mut name = [0u8; NAME_MAX];
+            name[..name_bytes.len()].copy_from_slice(name_bytes);
+            Some((
+                PROC_INODE_BASE + (pid as u64) * 8 + n as u64 + 1,
+                name,
+                name_bytes.len() as u8,
+                DT_REG,
+            ))
+        }
+        ProcDirKind::TaskList(pid) => {
+            if n != 0 {
+                return None;
+            }
+            let mut name = [0u8; NAME_MAX];
+            let name_len = decimal_into(&mut name, pid as u64);
+            Some((PROC_INODE_BASE + pid as u64, name, name_len as u8, DT_DIR))
+        }
+    }
+}
+
 /// Registered for `SYS_GETDENTS`. `fd` is the calling process's own fd number, resolved to this
 /// module's `real_fd` the same way `oxfs_fstat` does (see its own doc comment). Fills as many
 /// whole records as fit in `buf_len` starting from the open directory's own resume cursor
-/// (`OpenFile::DirListing::dirent_pos`), returns the byte count actually written (`0` once every
-/// record has already been emitted -- real `getdents(2)`'s own EOF convention, which `readdir()`
-/// relies on to stop looping). A record that doesn't fully fit is left for the next call rather
-/// than truncated -- matching real Linux, which never splits a record across two `getdents` calls.
+/// (`OpenFile::DirListing::dirent_pos`/`ProcDir::dirent_pos`), returns the byte count actually
+/// written (`0` once every record has already been emitted -- real `getdents(2)`'s own EOF
+/// convention, which `readdir()` relies on to stop looping). A record that doesn't fully fit is
+/// left for the next call rather than truncated -- matching real Linux, which never splits a
+/// record across two `getdents` calls.
 extern "C" fn oxfs_getdents(fd: u64, buf_ptr: u64, buf_len: u64, _a3: u64) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
@@ -1260,41 +1670,64 @@ extern "C" fn oxfs_getdents(fd: u64, buf_ptr: u64, buf_len: u64, _a3: u64) -> i6
     let Some(file) = find_open_file(real_fd as u64) else {
         return -EBADF;
     };
-    let OpenFile::DirListing {
-        inode: dir_inode,
-        dirent_pos,
-        ..
-    } = file
-    else {
-        return -ENOTDIR;
-    };
-    let dir_inode = *dir_inode;
-
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let out = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
-    let mut written = 0usize;
-    while let Some((child_inode, name, name_len)) = dir_nth_used_record(dir_inode, *dirent_pos) {
-        let name = &name[..name_len as usize];
-        let reclen = dirent_record_len(name.len());
-        if written + reclen > out.len() {
-            break;
+    match file {
+        OpenFile::DirListing {
+            inode: dir_inode,
+            dirent_pos,
+            ..
+        } => {
+            let dir_inode = *dir_inode;
+            let mut written = 0usize;
+            while let Some((child_inode, name, name_len)) =
+                dir_nth_used_record(dir_inode, *dirent_pos)
+            {
+                let name = &name[..name_len as usize];
+                let reclen = dirent_record_len(name.len());
+                if written + reclen > out.len() {
+                    break;
+                }
+                let dtype = if read_inode(child_inode).kind == InodeKind::Dir {
+                    DT_DIR
+                } else {
+                    DT_REG
+                };
+                write_dirent_record(
+                    &mut out[written..written + reclen],
+                    child_inode as u64,
+                    (*dirent_pos + 1) as i64,
+                    dtype,
+                    name,
+                );
+                written += reclen;
+                *dirent_pos += 1;
+            }
+            written as i64
         }
-        let dtype = if read_inode(child_inode).kind == InodeKind::Dir {
-            DT_DIR
-        } else {
-            DT_REG
-        };
-        write_dirent_record(
-            &mut out[written..written + reclen],
-            child_inode as u64,
-            (*dirent_pos + 1) as i64,
-            dtype,
-            name,
-        );
-        written += reclen;
-        *dirent_pos += 1;
+        OpenFile::ProcDir { kind, dirent_pos, .. } => {
+            let kind = *kind;
+            let mut written = 0usize;
+            while let Some((ino, name, name_len, dtype)) = proc_dir_nth_entry(kind, *dirent_pos) {
+                let name = &name[..name_len as usize];
+                let reclen = dirent_record_len(name.len());
+                if written + reclen > out.len() {
+                    break;
+                }
+                write_dirent_record(
+                    &mut out[written..written + reclen],
+                    ino,
+                    (*dirent_pos + 1) as i64,
+                    dtype,
+                    name,
+                );
+                written += reclen;
+                *dirent_pos += 1;
+            }
+            written as i64
+        }
+        _ => -ENOTDIR,
     }
-    written as i64
 }
 
 fn log_bytes(bytes: &[u8]) {
