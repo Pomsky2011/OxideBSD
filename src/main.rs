@@ -87,6 +87,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     )
     .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
 
+    // Registers SYS_KILL/SYS_SIGACTION/SYS_SIGPROCMASK -- real process signaling. See
+    // modules/signal/src/lib.rs's own doc comment; must load before hush, below, is spawned, same
+    // as every other syscall-registering module.
+    const SIGNAL_MOD: &[u8] = include_bytes!(env!("SIGNAL_MOD_PATH"));
+    const SIGNAL_PANIC_SYMBOL: &str = env!("SIGNAL_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "signal",
+        SIGNAL_MOD,
+        SIGNAL_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the signal module: {e:?}"));
+
     // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
     // (still built and self-checked by build.rs on every `cargo build`) but deliberately not
     // loaded here anymore.

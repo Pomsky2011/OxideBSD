@@ -21,7 +21,7 @@ use crate::address_space::AddressSpace;
 use crate::elf::{self, Elf};
 use crate::memory::{self, with_frame_allocator};
 use crate::scheduler;
-use crate::syscall::{self, ECHILD, EINVAL, ENOEXEC, ENOMEM, SyscallFrame};
+use crate::syscall::{self, ECHILD, EINVAL, ENOEXEC, ENOMEM, ESRCH, SyscallFrame};
 
 pub type Pid = u64;
 
@@ -123,6 +123,118 @@ pub enum BlockReason {
     WaitingForStdin,
 }
 
+/// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
+/// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own
+/// doc comment. Using real numbers here (rather than inventing OxideBSD-own ones, unlike most of
+/// this ABI's own syscalls) is deliberate: a signal *number* is just a plain argument value, not a
+/// syscall number, so there's no ABI collision risk the way `open`/`execve` had -- and using the
+/// real values is what let `bits/syscall.h.in`'s own remap of `SYS_kill`/`SYS_rt_sigaction`/
+/// `SYS_rt_sigprocmask` be the *only* musl-side patch this feature needed (see that file's own
+/// comment on the musl fork): musl's `kill.c`/`sigaction.c`/`sigprocmask.c`/`pthread_sigmask.c`
+/// already build exactly the wire format `do_kill`/`do_sigaction`/`do_sigprocmask` below expect,
+/// unmodified.
+pub const SIGHUP: u64 = 1;
+pub const SIGINT: u64 = 2;
+pub const SIGQUIT: u64 = 3;
+pub const SIGILL: u64 = 4;
+pub const SIGTRAP: u64 = 5;
+pub const SIGABRT: u64 = 6;
+pub const SIGBUS: u64 = 7;
+pub const SIGFPE: u64 = 8;
+pub const SIGKILL: u64 = 9;
+pub const SIGUSR1: u64 = 10;
+pub const SIGSEGV: u64 = 11;
+pub const SIGUSR2: u64 = 12;
+pub const SIGPIPE: u64 = 13;
+pub const SIGALRM: u64 = 14;
+pub const SIGTERM: u64 = 15;
+pub const SIGCHLD: u64 = 17;
+pub const SIGCONT: u64 = 18;
+pub const SIGSTOP: u64 = 19;
+pub const SIGTSTP: u64 = 20;
+pub const SIGTTIN: u64 = 21;
+pub const SIGTTOU: u64 = 22;
+pub const SIGURG: u64 = 23;
+pub const SIGXCPU: u64 = 24;
+pub const SIGXFSZ: u64 = 25;
+pub const SIGVTALRM: u64 = 26;
+pub const SIGPROF: u64 = 27;
+pub const SIGWINCH: u64 = 28;
+pub const SIGIO: u64 = 29;
+pub const SIGSYS: u64 = 31;
+
+/// One process's disposition for one signal, indexed `1..=31` into `Process::sigactions`
+/// (index `0` is unused). Mirrors real POSIX `sigaction`'s own `handler` sentinel convention
+/// directly -- `0` = `SIG_DFL`, `1` = `SIG_IGN`, anything else is a real handler address -- which
+/// is why `do_sigaction`'s own wire-format read/write needs no translation: musl's real `SIG_DFL`/
+/// `SIG_IGN` macros already expand to these exact values.
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    pub handler: u64,
+    pub flags: u64,
+    pub restorer: u64,
+    pub mask: u64,
+}
+
+impl SigAction {
+    const DEFAULT: SigAction = SigAction {
+        handler: 0,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+}
+
+/// `SA_NODEFER` -- the one `sa_flags` bit `deliver_pending_signal`'s own mask computation
+/// consults (real Linux/x86_64 value; every other flag, `SA_RESTART` included, is accepted but has
+/// no observable effect on this kernel -- there's no blocking-syscall-restart machinery to hook it
+/// into).
+const SA_NODEFER: u64 = 0x40000000;
+
+/// What `default_disposition` says happens to a signal nothing has installed a handler for (or
+/// that's been explicitly reset to `SIG_DFL`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultDisposition {
+    Terminate,
+    Ignore,
+}
+
+/// Real POSIX default dispositions for the signals this ABI recognizes (`1..=31`), collapsed to
+/// just two outcomes -- this kernel has no core-dump concept (`Terminate` covers both "term" and
+/// "core" defaults identically) and no real job control (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`
+/// default to `Ignore` here rather than a real "stopped" process state -- a deliberate, documented
+/// simplification; see CLAUDE.md's BusyBox gap-analysis section on signals: stop/continue is only
+/// valuable bundled with real job control, not attempted standalone in this pass). A signal number
+/// outside `1..=31` (real-time signals, or garbage) isn't reachable here at all -- every caller
+/// (`sys_kill`/`sys_sigaction`, `take_deliverable_signal`'s own pending-bit scan) is already
+/// bounded to that range before this is consulted.
+fn default_disposition(sig: u64) -> DefaultDisposition {
+    match sig {
+        SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGIO | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => {
+            DefaultDisposition::Ignore
+        }
+        _ => DefaultDisposition::Terminate,
+    }
+}
+
+/// `take_deliverable_signal`'s own result -- what `deliver_pending_signal`
+/// (`src/syscall.rs`) should actually do about the signal it picked.
+pub(crate) enum SignalDelivery {
+    /// Terminate the process with this exit code (`128 + signum`, the real shell/POSIX
+    /// convention for "died from a signal").
+    Terminate(i32),
+    /// Redirect the live frame into this handler.
+    Handler {
+        signum: u64,
+        handler: u64,
+        restorer: u64,
+        /// The blocked-signal mask to install (on top of whatever's already blocked) for the
+        /// duration of the handler -- `action.mask` plus the signal's own bit, unless
+        /// `SA_NODEFER` was set.
+        mask_to_add: u64,
+    },
+}
+
 /// A process's own kernel stack: heap-allocated (not a fixed-size `static`/`static mut` array like
 /// `gdt.rs`'s single RSP0 stack, since the number of processes isn't fixed) via a raw
 /// `alloc`/`dealloc` pair rather than `Vec<u8>`/`Box<[u8]>`, neither of which guarantees the
@@ -209,9 +321,37 @@ pub struct Process {
     /// this untouched (real `execve()` preserves the caller's cwd, unlike `fs_base`, which an
     /// exec'd program's own TLS layout makes meaningless to keep).
     pub cwd: u64,
+    /// Bitmask, bit `N-1` = signal `N` is pending delivery. Set by `do_kill`; drained by
+    /// `take_deliverable_signal` (called once, at the tail of every completed syscall — see
+    /// `src/syscall.rs`'s `deliver_pending_signal`).
+    pub pending_signals: u64,
+    /// Bitmask, bit `N-1` = signal `N` is currently blocked (won't be delivered even if pending,
+    /// until unblocked) — set by `SYS_SIGPROCMASK`, and temporarily grown by
+    /// `stash_signal_context` for the duration of a handler's own execution (restored by
+    /// `take_signal_saved_frame` on `sigreturn`).
+    pub blocked_signals: u64,
+    /// Indexed `1..=31` (index `0` unused) — see `SigAction`'s own doc comment.
+    pub sigactions: [SigAction; 32],
+    /// The interrupted context a `Handler`-disposition delivery snapshotted, restored verbatim by
+    /// `sigreturn` (`take_signal_saved_frame`) once the handler itself returns. `None` whenever
+    /// this process isn't currently inside a signal handler.
+    pub(crate) signal_saved_frame: Option<SyscallFrame>,
+    /// `blocked_signals`'s value from just before the handler above was entered — restored
+    /// alongside `signal_saved_frame` on `sigreturn`. Meaningless while `signal_saved_frame` is
+    /// `None`.
+    pub signal_saved_blocked: u64,
     /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
     #[allow(dead_code)]
     pub priority: u8,
+    /// This process's process-group ID — an ordinary `Pid`, not a distinct namespace (real POSIX
+    /// process groups are just pids reinterpreted). Persisted/restored per process on
+    /// `fork`/`spawn` exactly like `cwd`/`fs_base`/`brk` already are. A freshly `spawn`ed process
+    /// (pid 1 today — no parent to inherit a group from) becomes its own group leader
+    /// (`pgid == pid`), matching real init/session-leader convention; a forked child inherits the
+    /// parent's live `pgid` (real `fork()` semantics — a child stays in its parent's group until it
+    /// calls `setpgid` itself). `do_execve` deliberately leaves this untouched, same reasoning as
+    /// `cwd` — real `execve()` preserves the caller's process group.
+    pub pgid: Pid,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -277,6 +417,10 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     );
 
     let pid = alloc_pid();
+    // No parent to inherit a process group from (spawn doesn't inherit anything else from parent
+    // either -- cwd/fs_base/brk all start fresh too) -- becomes its own group leader, same
+    // convention as a real init/session leader.
+    let pgid = pid;
     let kernel_stack = KernelStack::new();
     let kernel_stack_top = kernel_stack.top();
     let rsp = crate::context_switch::seed_spawn_frame(kernel_stack_top);
@@ -295,7 +439,13 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         brk: VirtAddr::new(elf.highest_loaded_address()),
         fs_base: 0,
         cwd: 0,
+        pending_signals: 0,
+        blocked_signals: 0,
+        sigactions: [SigAction::DEFAULT; 32],
+        signal_saved_frame: None,
+        signal_saved_blocked: 0,
         priority: 0,
+        pgid,
     };
 
     {
@@ -372,7 +522,17 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
     let phys_offset = memory::phys_mem_offset();
 
     let child_pid = alloc_pid();
-    let (child_address_space, parent_brk, parent_fs_base, parent_cwd) = {
+    let (
+        child_address_space,
+        parent_brk,
+        parent_fs_base,
+        parent_cwd,
+        parent_pgid,
+        parent_blocked_signals,
+        parent_sigactions,
+        parent_signal_saved_frame,
+        parent_signal_saved_blocked,
+    ) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
             .get_mut(&caller_pid)
@@ -382,7 +542,22 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // with its own CR3 still live.
         let child_address_space =
             with_frame_allocator(|fa| parent.address_space.fork(phys_offset, fa));
-        (child_address_space, parent.brk, parent.fs_base, parent.cwd)
+        (
+            child_address_space,
+            parent.brk,
+            parent.fs_base,
+            parent.cwd,
+            parent.pgid,
+            // Real fork() semantics: signal disposition and the blocked-signal mask are
+            // inherited; pending signals are not (the child starts with an empty pending set —
+            // see the child's own construction below). signal_saved_frame/signal_saved_blocked
+            // are inherited too, in case the parent forked from inside a handler — the child gets
+            // its own independent copy of that same in-progress-handler bookkeeping.
+            parent.blocked_signals,
+            parent.sigactions,
+            parent.signal_saved_frame,
+            parent.signal_saved_blocked,
+        )
     };
 
     let kernel_stack = KernelStack::new();
@@ -405,7 +580,13 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         brk: parent_brk,
         fs_base: parent_fs_base,
         cwd: parent_cwd,
+        pending_signals: 0,
+        blocked_signals: parent_blocked_signals,
+        sigactions: parent_sigactions,
+        signal_saved_frame: parent_signal_saved_frame,
+        signal_saved_blocked: parent_signal_saved_blocked,
         priority: 0,
+        pgid: parent_pgid,
     };
 
     {
@@ -585,6 +766,15 @@ pub fn do_execve(
         // read garbage through %fs before then.
         me.fs_base = 0;
         x86_64::registers::model_specific::FsBase::write(VirtAddr::new(0));
+        // Real execve() semantics: a caught signal's handler address means nothing in the new
+        // program image, so it resets to SIG_DFL; SIG_IGN and already-SIG_DFL entries are left
+        // alone (both are position-independent of any particular program's own code), and so is
+        // pending_signals/blocked_signals -- both persist across execve on a real system too.
+        for action in me.sigactions.iter_mut() {
+            if action.handler > 1 {
+                *action = SigAction::DEFAULT;
+            }
+        }
     }
     crate::serial_println!("[proc] pid {} execve'd, entry={:?}", caller_pid, entry);
 
@@ -680,33 +870,272 @@ pub fn do_wait4(caller_pid: Pid, target_pid: i64, status_ptr: u64) -> Result<u64
 /// Orphaned grandchildren are *not* reparented to a pid-1 "init" this pass — an accepted
 /// simplification (see CLAUDE.md), not required for fork/exec/wait correctness.
 pub fn do_exit(caller_pid: Pid, code: i32) -> ! {
-    crate::serial_println!("[proc] pid {} exited with code {}", caller_pid, code);
+    terminate_process(caller_pid, code);
+    scheduler::schedule();
+    unreachable!("do_exit: schedule() returned control to a Zombie process");
+}
+
+/// The actual state transition `do_exit` (the caller terminating itself) and `do_kill` (one
+/// process terminating a *different* one, for a default-disposition signal — see that function's
+/// own doc comment) both need: closes every fd `pid` still has open, marks it `Zombie(code)`, and
+/// wakes its parent if it's blocked waiting on it (or on any child). Deliberately does *not* call
+/// `scheduler::schedule()` — `do_exit` (terminating the *currently running* process) needs to
+/// yield afterward; `do_kill` (terminating some other, not-currently-running process — only one
+/// process is ever `Running` at a time on this cooperatively-scheduled kernel, so `target !=
+/// caller` always means "not the one currently executing") must not, since the calling process
+/// itself is still running and hasn't blocked or exited.
+fn terminate_process(pid: Pid, code: i32) {
+    crate::serial_println!("[proc] pid {} terminated with code {}", pid, code);
     // Real exit() semantics: every fd this process still has open gets closed automatically.
     // Genuinely load-bearing, not just tidiness -- see crate::fd::close_all's own doc comment for
     // why a leaked fd here can leave a pipe's reader blocked forever.
-    crate::fd::close_all(caller_pid);
+    crate::fd::close_all(pid);
+    let mut table = PROCESS_TABLE.lock();
+    match table.get_mut(&pid) {
+        Some(me) if matches!(me.state, ProcState::Zombie(_)) => return, // already dead
+        Some(me) => me.state = ProcState::Zombie(code),
+        None => return,
+    }
+    let parent_pid = table.get(&pid).and_then(|p| p.parent);
+    if let Some(parent_pid) = parent_pid
+        && let Some(parent) = table.get_mut(&parent_pid)
     {
-        let mut table = PROCESS_TABLE.lock();
-        if let Some(me) = table.get_mut(&caller_pid) {
-            me.state = ProcState::Zombie(code);
+        let should_wake = matches!(
+            parent.state,
+            ProcState::Blocked(BlockReason::WaitingForChild(target))
+                if target.is_none() || target == Some(pid)
+        );
+        if should_wake {
+            parent.state = ProcState::Ready;
+            scheduler::enqueue_ready(parent_pid);
         }
-        let parent_pid = table.get(&caller_pid).and_then(|p| p.parent);
-        if let Some(parent_pid) = parent_pid
-            && let Some(parent) = table.get_mut(&parent_pid)
-        {
-            let should_wake = matches!(
-                parent.state,
-                ProcState::Blocked(BlockReason::WaitingForChild(target))
-                    if target.is_none() || target == Some(caller_pid)
-            );
-            if should_wake {
-                parent.state = ProcState::Ready;
-                scheduler::enqueue_ready(parent_pid);
+    }
+}
+
+/// `SYS_KILL`'s real logic. Only a positive `target_pid` (no process-group/broadcast targeting —
+/// real `kill(2)`'s `pid <= 0` cases) and signals `1..=31` are supported; anything else is
+/// `EINVAL`, matching real `kill()`'s own validation.
+///
+/// Sending to *self* just sets the pending bit and returns — actual delivery happens naturally at
+/// this exact syscall's own dispatch tail (`src/syscall.rs`'s `deliver_pending_signal`), since the
+/// caller is, by definition, the currently running process.
+///
+/// Sending to a *different* process (never the currently running one — only one process is ever
+/// `Running` at a time here) is where this gets a real, documented simplification: this kernel has
+/// no way to force an arbitrary, not-currently-scheduled process to notice a new signal the
+/// instant it arrives (no `EINTR`, no forced wakeup of a blocked `wait4`/pipe-read/stdin-read).
+/// - If the target's *current* disposition for this signal is `Ignore`, it's discarded right now
+///   — matches real semantics (a signal ignored at delivery time is simply dropped).
+/// - If the target's disposition is the default `Terminate` (no custom handler installed), it's
+///   terminated *immediately*, right here — this is the case that actually matters for real use
+///   (`kill`-ing a runaway process like `yes.elf`, which installs no handler at all), and doesn't
+///   need the target to ever be scheduled again to take effect.
+/// - If the target has a custom handler installed, the pending bit is set and delivery is
+///   deferred until the target is next naturally scheduled and completes a syscall of its own (or,
+///   if currently blocked, until whatever it's blocked on resolves on its own) — a real, narrower
+///   gap than the `Terminate` case above, since a process sitting in a long/indefinite block with
+///   a handler installed won't see the signal promptly. Acceptable for this pass: the common,
+///   high-value case (killing something with no handler) works correctly and immediately.
+pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
+    if !(1..=31).contains(&sig) {
+        return Err(EINVAL);
+    }
+    if target_pid <= 0 {
+        return Err(EINVAL);
+    }
+    let target = target_pid as u64;
+    let sig = sig as u64;
+
+    if target == caller_pid {
+        let mut table = PROCESS_TABLE.lock();
+        let me = table
+            .get_mut(&caller_pid)
+            .expect("kill: current process missing from table");
+        me.pending_signals |= 1 << (sig - 1);
+        return Ok(0);
+    }
+
+    enum Action {
+        Discard,
+        Terminate,
+        SetPending,
+    }
+
+    let action = {
+        // Scoped so this lock is dropped before terminate_process/the SetPending branch below
+        // re-lock the table -- spin::Mutex isn't reentrant (same discipline table()'s own doc
+        // comment already establishes for every other function here).
+        let table = PROCESS_TABLE.lock();
+        let proc = table.get(&target).ok_or(ESRCH)?;
+        if matches!(proc.state, ProcState::Zombie(_)) {
+            return Ok(0); // still "exists" until reaped, but there's nothing left to signal
+        }
+        match proc.sigactions[sig as usize].handler {
+            1 => Action::Discard, // SIG_IGN
+            0 => match default_disposition(sig) {
+                DefaultDisposition::Ignore => Action::Discard,
+                DefaultDisposition::Terminate => Action::Terminate,
+            },
+            _ => Action::SetPending,
+        }
+    };
+
+    match action {
+        Action::Discard => {}
+        Action::Terminate => terminate_process(target, 128 + sig as i32),
+        Action::SetPending => {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(proc) = table.get_mut(&target) {
+                proc.pending_signals |= 1 << (sig - 1);
             }
         }
     }
-    scheduler::schedule();
-    unreachable!("do_exit: schedule() returned control to a Zombie process");
+    Ok(0)
+}
+
+/// `SYS_SIGACTION`'s real logic (`sig` already validated — `1..=31`, not `SIGKILL`/`SIGSTOP` — by
+/// `src/syscall.rs`'s `sys_sigaction` before this is reached). Reads/writes a real musl
+/// `struct k_sigaction` (`handler`, `flags`, `restorer`, then `mask` as a plain `u64` — matching
+/// what musl's own `_NSIG/8 == 8`-byte mask width already is on this ABI, see `SigAction`'s own
+/// doc comment) directly at `act_ptr`/`oldact_ptr` — no translation needed, since real `SIG_DFL`/
+/// `SIG_IGN` already are `0`/`1`.
+pub fn do_sigaction(pid: Pid, sig: u64, act_ptr: u64, oldact_ptr: u64) -> Result<u64, u64> {
+    #[repr(C)]
+    struct RawSigAction {
+        handler: u64,
+        flags: u64,
+        restorer: u64,
+        mask: u64,
+    }
+
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("sigaction: current process missing from table");
+
+    if oldact_ptr != 0 {
+        let old = proc.sigactions[sig as usize];
+        let raw = RawSigAction {
+            handler: old.handler,
+            flags: old.flags,
+            restorer: old.restorer,
+            mask: old.mask,
+        };
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        unsafe { (oldact_ptr as *mut RawSigAction).write(raw) };
+    }
+    if act_ptr != 0 {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        let raw = unsafe { &*(act_ptr as *const RawSigAction) };
+        proc.sigactions[sig as usize] = SigAction {
+            handler: raw.handler,
+            flags: raw.flags,
+            restorer: raw.restorer,
+            mask: raw.mask,
+        };
+    }
+    Ok(0)
+}
+
+/// `SYS_SIGPROCMASK`'s real logic. `set`/`old` are read/written as a plain `u64` (see
+/// `do_sigaction`'s own doc comment for why that's the right width here) rather than iterating
+/// musl's own wider in-memory `sigset_t` — `sigsetsize` (always `8` from musl) tells the real
+/// kernel how many bytes to actually exchange, and this ABI just always treats that as "one
+/// `u64`," matching what musl's callers always pass anyway.
+pub fn do_sigprocmask(pid: Pid, how: u64, set_ptr: u64, oldset_ptr: u64) -> Result<u64, u64> {
+    const SIG_BLOCK: u64 = 0;
+    const SIG_UNBLOCK: u64 = 1;
+    const SIG_SETMASK: u64 = 2;
+
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("sigprocmask: current process missing from table");
+
+    if oldset_ptr != 0 {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        unsafe { (oldset_ptr as *mut u64).write(proc.blocked_signals) };
+    }
+    if set_ptr != 0 {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        let requested = unsafe { (set_ptr as *const u64).read() };
+        // SIGKILL/SIGSTOP can never be blocked, matching real sigprocmask()'s own silent masking.
+        let unblockable = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+        match how {
+            SIG_BLOCK => proc.blocked_signals |= requested & !unblockable,
+            SIG_UNBLOCK => proc.blocked_signals &= !requested,
+            SIG_SETMASK => proc.blocked_signals = requested & !unblockable,
+            _ => return Err(EINVAL),
+        }
+    }
+    Ok(0)
+}
+
+/// Called once, at the tail of every completed syscall (`src/syscall.rs`'s
+/// `deliver_pending_signal`) for whichever process is currently running. Picks the
+/// lowest-numbered pending, unblocked signal (if any), removes it from `pending_signals`, and
+/// resolves it against that signal's *current* disposition — looping past any that turn out to be
+/// `SIG_IGN`/default-`Ignore` (discarded silently) rather than returning early, so a single call
+/// still surfaces the next real (`Terminate`/`Handler`) signal if one's also pending.
+pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.get_mut(&pid)?;
+    loop {
+        let deliverable = proc.pending_signals & !proc.blocked_signals;
+        if deliverable == 0 {
+            return None;
+        }
+        let signum = deliverable.trailing_zeros() as u64 + 1;
+        proc.pending_signals &= !(1 << (signum - 1));
+
+        let action = proc.sigactions[signum as usize];
+        match action.handler {
+            1 => continue, // SIG_IGN
+            0 => match default_disposition(signum) {
+                DefaultDisposition::Ignore => continue,
+                DefaultDisposition::Terminate => {
+                    return Some(SignalDelivery::Terminate(128 + signum as i32));
+                }
+            },
+            handler_addr => {
+                let mut mask_to_add = action.mask | (1 << (signum - 1));
+                if action.flags & SA_NODEFER != 0 {
+                    mask_to_add &= !(1u64 << (signum - 1));
+                }
+                return Some(SignalDelivery::Handler {
+                    signum,
+                    handler: handler_addr,
+                    restorer: action.restorer,
+                    mask_to_add,
+                });
+            }
+        }
+    }
+}
+
+/// Snapshots `saved` (the frame the interrupted syscall was about to resume into) and grows
+/// `blocked_signals` by `mask_to_add` for the handler's own duration — called by
+/// `deliver_pending_signal` right before it redirects the live frame into the handler itself.
+/// `take_signal_saved_frame` (below) is this operation's inverse, run by `sigreturn`.
+pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(proc) = table.get_mut(&pid) {
+        proc.signal_saved_blocked = proc.blocked_signals;
+        proc.blocked_signals |= mask_to_add;
+        proc.signal_saved_frame = Some(saved);
+    }
+}
+
+/// `sigreturn`'s real logic (`src/syscall.rs`'s `do_sigreturn` — kept here, not there, since it
+/// only needs `Process`/table access, not `SyscallFrame` field access). Takes (removes) the
+/// snapshot `stash_signal_context` stored and restores `blocked_signals` to what it was before the
+/// handler was entered. `None` if nothing was actually stashed (a spurious call).
+pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<SyscallFrame> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.get_mut(&pid)?;
+    let saved = proc.signal_saved_frame.take()?;
+    proc.blocked_signals = proc.signal_saved_blocked;
+    Some(saved)
 }
 
 pub fn do_getpid() -> u64 {
@@ -721,6 +1150,39 @@ pub fn do_getppid() -> u64 {
         .get(&scheduler::current_pid())
         .and_then(|p| p.parent)
         .unwrap_or(0)
+}
+
+/// `SYS_SETPGID`'s real logic — matches real `setpgid(pid_t pid, pid_t pgid)`'s exact wire format
+/// and `pid == 0`/`pgid == 0` "use the caller"/"use `pid` itself" conventions. **A real, documented
+/// simplification, not full POSIX semantics**: this kernel has no uid/permission model at all yet
+/// (see CLAUDE.md's BusyBox gap analysis — "uid/permissions stub" is its own, separate,
+/// unimplemented gap), so unlike real `setpgid`, any live pid can retarget any other live pid's
+/// group — there's no restriction to "only the caller itself, or a child that hasn't `execve`'d
+/// yet" the way real `setpgid` enforces, and no session-membership check on `pgid` either (this
+/// kernel has no session concept at all). Good enough for the case that actually matters here: a
+/// shell with job control calling `setpgid` on its own freshly forked children right after `fork`,
+/// the same "value now, correctness later" tradeoff `do_kill`'s own cross-process case already
+/// documents.
+pub fn do_setpgid(caller_pid: Pid, pid: i64, pgid: i64) -> Result<u64, u64> {
+    if pid < 0 || pgid < 0 {
+        return Err(EINVAL);
+    }
+    let target = if pid == 0 { caller_pid } else { pid as u64 };
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.get_mut(&target).ok_or(ESRCH)?;
+    proc.pgid = if pgid == 0 { target } else { pgid as u64 };
+    Ok(0)
+}
+
+/// `SYS_GETPGID`'s real logic — matches real `getpgid(pid_t pid)`'s exact wire format and
+/// `pid == 0` "use the caller" convention.
+pub fn do_getpgid(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
+    if pid < 0 {
+        return Err(EINVAL);
+    }
+    let target = if pid == 0 { caller_pid } else { pid as u64 };
+    let table = PROCESS_TABLE.lock();
+    table.get(&target).map(|p| p.pgid).ok_or(ESRCH)
 }
 
 /// Backing store for `oxidebsd_get_cwd`/`oxidebsd_set_cwd` while `scheduler::current_pid() == 0`

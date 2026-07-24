@@ -97,8 +97,7 @@ See "User-mode execution", "Syscall ABI", "musl port", "BusyBox port", "Interact
 fork/exec/wait" below for the current, deliberate limits (`sys_write`/`sys_read` don't validate
 their pointers, no line editing beyond backspace/Ctrl+C/Ctrl+D in the shell, no module unload/
 reload, FAT32 writes don't persist across reboot, no preemptive scheduling, no copy-on-write fork,
-no frame deallocation anywhere, `execve` can't give a process a different `argv[0]` than its own
-exec path, `stdin`'s own non-blocking `sys_read` means no program can read a real interactive
+no frame deallocation anywhere, `stdin`'s own non-blocking `sys_read` means no program can read a real interactive
 prompt from the keyboard except via `stsh`'s own busy-poll convention — real blocking would need
 interrupts re-enabled mid-syscall, not attempted — and a handful of syscalls musl's fuller startup
 would still need are unimplemented). A *real* filesystem (backed by an actual block device, not an
@@ -641,18 +640,21 @@ is explicitly a temporary/placeholder libc choice for this phase, not a long-ter
     pointer). `third_party/musl`'s `src/process/execve.c` now builds `argv_ptr`/`envp_ptr` as real
     `RawArgvEntry`-shaped arrays (see "BusyBox port" below) from the real `argv[1..]`/`envp[]` it
     was given, on the caller's own stack, and issues a real 4-argument `__syscall4` — needed the
-    ABI's `R10` register to become a genuine 4th argument first (see "Syscall ABI" above). **Still
-    not fixed**: real `argv[0]` is silently dropped (OxideBSD's `execve` always supplies `argv[0]`
-    from `path_ptr`/`path_len` itself — no way to give a process a different one under this ABI) —
-    a known, separate, smaller limitation, not attempted here.
+    ABI's `R10` register to become a genuine 4th argument first (see "Syscall ABI" above). Real
+    `argv[0]` passthrough (a separate, later gap — see "Process abstraction, scheduler, and
+    fork/exec/wait" below) fixed the one remaining piece: originally `argv[0]` was always silently
+    overwritten with `path_bytes` regardless of what a real caller supplied.
 - **Two syscalls musl's startup reaches but this kernel doesn't implement, left unmapped
-  (their original Linux numbers) rather than stubbed — both confirmed harmless for `musl-smoke`
-  specifically, not fixed just because they were seen:** `set_tid_address` (`__init_tp`, right
-  after TLS setup — failing just leaves an unused `tid` field with a bogus value) and `ioctl`
-  (`__stdout_write`'s `TIOCGWINSZ` probe — failing just makes musl correctly conclude stdout isn't
-  a sized terminal and proceed to the real write anyway). Both log `[boot] unrecognized syscall
-  number N` (218 and 16 respectively) every run; a future binary that actually depends on either
-  succeeding would need them implemented for real.
+  (their original Linux numbers) rather than stubbed at the time — both confirmed harmless for
+  `musl-smoke` specifically, not fixed just because they were seen:** `set_tid_address`
+  (`__init_tp`, right after TLS setup — failing just leaves an unused `tid` field with a bogus
+  value, **still true today, still logs `[boot] unrecognized syscall number 218` every run**) and
+  `ioctl` (`__stdout_write`'s `TIOCGWINSZ` probe — failing just made musl correctly conclude stdout
+  isn't a sized terminal and proceed to the real write anyway). **`ioctl` is no longer one of
+  these** — see "Interactive shell" above for the real, later implementation (`SYS_IOCTL = 124`,
+  remapped off its original inert value `16`); this bullet's own account of `ioctl` describes what
+  was true only up through the musl-port/BusyBox-port passes, superseded once termios/ioctl support
+  landed.
 - **`userland/musl-smoke/main.c` and its build are unlike every other `userland/*` entry** — see
   "User-mode execution" above for the load-base/linker-flag side of this; on the build-system side,
   `build.rs`'s `build_musl_sysroot` runs musl's *own* build system directly (`configure`/`make`/
@@ -704,15 +706,17 @@ nothing-new-needed shape `true`/`echo` originally had.
   canonical's real `1_36_1` tag commit hash before forking it (the same "authenticity, not blind
   trust" discipline musl's own fork source was picked with).
 - **Each applet is built as its own genuinely standalone, single-applet static binary — not a
-  multi-call `busybox` binary dispatching on argv[0].** This is a hard requirement, not a style
-  choice: this codebase's `execve` (`src/process.rs`'s `do_execve`) doesn't pass a real, chosen
-  argv[0] through at all yet (`argv[0]` is always just whatever path string was passed to `execve`
-  itself — see "Process abstraction, scheduler, and fork/exec/wait" below), so a multi-call binary
-  relying on argv[0]/basename matching to pick an applet (the usual BusyBox trick) couldn't work
-  here. A genuinely single-applet build sidesteps the whole problem: confirmed by reading
-  `libbb/appletlib.c`'s own `main()`, when only one applet is compiled in
-  (`#if defined(SINGLE_APPLET_MAIN)`), BusyBox calls that applet's `_main` function directly and
-  never looks at argv[0]/basename at all.
+  multi-call `busybox` binary dispatching on argv[0].** This was a hard requirement at the time,
+  not a style choice: this codebase's `execve` (`src/process.rs`'s `do_execve`) didn't pass a real,
+  chosen argv[0] through at all yet (`argv[0]` was always just whatever path string was passed to
+  `execve` itself), so a multi-call binary relying on argv[0]/basename matching to pick an applet
+  (the usual BusyBox trick) couldn't work here. A genuinely single-applet build sidestepped the
+  whole problem: confirmed by reading `libbb/appletlib.c`'s own `main()`, when only one applet is
+  compiled in (`#if defined(SINGLE_APPLET_MAIN)`), BusyBox calls that applet's `_main` function
+  directly and never looks at argv[0]/basename at all. **This constraint no longer holds** — real
+  `argv[0]` passthrough landed later (see "Process abstraction, scheduler, and fork/exec/wait"
+  below) — but the applet roster hasn't been switched to a single multi-call `busybox` build; each
+  one is still its own standalone binary, just no longer for lack of an alternative.
 - **`build.rs`'s `build_busybox_applet` follows BusyBox's own documented recipe for this** — the
   comment at `third_party/busybox/scripts/kconfig/Makefile:22`: `make allnoconfig`, flip the one
   applet's Kconfig line to `=y` by hand (`configure_busybox_single_applet`, direct text replacement
@@ -754,9 +758,11 @@ nothing-new-needed shape `true`/`echo` originally had.
   at a sequence of `RawArgvEntry { ptr: u64, len: u64 }` structs, length-prefixed like every other
   pointer this ABI passes — not real `execve`'s NUL-terminated `char **argv` (see the
   argument-convention-mismatches bullet in "musl port" above, which this doesn't touch or fix) —
-  terminated by a `ptr == 0` entry. `argv[0]` is still always the `execve` path itself
-  (`path_bytes`), unchanged; `argv_ptr` only ever supplies `argv[1..]`, and `argv_ptr == 0` (every
-  pre-existing caller) means "no extra arguments," so this is fully backward compatible. `stsh`'s
+  terminated by a `ptr == 0` entry. At this point `argv[0]` was still always the `execve` path
+  itself (`path_bytes`), unchanged; `argv_ptr` only ever supplied `argv[1..]` — real, caller-chosen
+  `argv[0]` was a separate, later fix, see "Process abstraction, scheduler, and fork/exec/wait"
+  below. `argv_ptr == 0` (every pre-existing caller) means "no extra arguments," so this was fully
+  backward compatible. `stsh`'s
   own `execve` wrapper (`userland/stsh/`) builds this via a new `split_words` helper, repeated up to
   `MAX_ARGV` (`16`) times, so `run_program` now carries the typed line's remaining words through to
   the child instead of discarding them. `split_words` gained basic double-quote support
@@ -830,9 +836,10 @@ nothing-new-needed shape `true`/`echo` originally had.
     parameter and a generalized `read_ptr_len_array` helper (renamed from the old, argv-only
     `read_extra_argv` — same wire format, now shared by both `argv_ptr` and `envp_ptr`); the real
     `envp` it reads now actually reaches `user_stack::build` (see "musl port" above), instead of
-    that call's `envp` argument always being `&[]`. **Still not fixed**: real `argv[0]` is silently
-    dropped — OxideBSD's `execve` always supplies `argv[0]` from `path_ptr`/`path_len` itself, with
-    no way for a caller to override it, a known, smaller, separate limitation.
+    that call's `envp` argument always being `&[]`. At this point real `argv[0]` was still silently
+    dropped — OxideBSD's `execve` always supplied `argv[0]` from `path_ptr`/`path_len` itself, with
+    no way for a caller to override it — fixed in a later, separate pass; see "Process abstraction,
+    scheduler, and fork/exec/wait" below.
   - **stderr (`fd == 2`)** — see "Syscall ABI" above for the fix itself (an alias for stdout, not a
     real second destination). Found by testing `cat.elf --help`/`cat.elf nonexistent.txt`: neither
     printed anything at all before this, since every BusyBox diagnostic goes to stderr and this
@@ -1020,14 +1027,14 @@ nothing-new-needed shape `true`/`echo` originally had.
   for the next line. What was actually verified: ordinary commands and `cwd`/file reads through
   `hush` interactively; *not* re-verified here: job control, `Ctrl+C`/`Ctrl+D` inside `hush`
   itself, or anything `CONFIG_HUSH_INTERACTIVE` would add.
-- **What's still out of scope**: multi-applet dispatch in a single binary (still blocked —
-  `argv[0]` itself is still always the `execve` path, never caller-chosen, even now that `envp` is
-  real), overriding `argv[0]` to anything other than the `execve` path (same underlying cause), a
-  real `fstat` implementation (see the numeric-collision note above — still not implemented; see
-  "oxfs filesystem module" below for why this pass didn't attempt it either), persistence, and any
-  automated integration test (verified manually via QEMU + injected keystrokes instead, the same
-  method every interactive `stsh`/`hush` feature already uses — see "oxfs filesystem module"
-  below).
+- **What's still out of scope**: multi-applet dispatch in a single binary — no longer blocked on
+  `argv[0]` passthrough itself (see "Process abstraction, scheduler, and fork/exec/wait" below,
+  where that landed), but the applet roster hasn't been rebuilt as one multi-call `busybox` binary
+  to actually exploit it; a real `fstat` implementation (see the numeric-collision note above —
+  still not implemented; see "oxfs filesystem module" below for why this pass didn't attempt it
+  either), persistence, and any automated integration test (verified manually via QEMU + injected
+  keystrokes instead, the same method every interactive `stsh`/`hush` feature already uses — see
+  "oxfs filesystem module" below).
 
 ## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
 
@@ -1071,6 +1078,148 @@ filesystem module" below.
   constructs its `PS2Keyboard` with `HandleControl::MapLettersToUnicode`, not `Ignore` — the
   reason `stsh` can see Ctrl+C/Ctrl+D as the C0 control codes 0x03/0x04 at all, rather than
   Ctrl being silently dropped and the bare letter coming through instead.
+- **Real `SYS_IOCTL` (`124`) now makes the keyboard handler's own auto-echo a genuinely
+  switchable, kernel-resident termios setting — the "termios/ioctl + pty" gap from the BusyBox
+  gap analysis below, minus an actual pty device layer (deliberately not built — this kernel has
+  no multi-session/multi-user concept for one to serve; see that gap's own entry for the scoping
+  discussion).** `src/stdin.rs` gained a real musl x86_64 `struct termios` layout (`RawTermios`,
+  60 bytes — `c_iflag`/`c_oflag`/`c_cflag`/`c_lflag` as `u32`s, `c_line`, `c_cc[32]`, then
+  `c_ispeed`/`c_ospeed`, matching `third_party/musl`'s `arch/generic/bits/termios.h` field-for-
+  field; plain `#[repr(C)]` already gives the right padding, no explicit padding field needed) and
+  a single global `TERMIOS` (`Mutex<RawTermios>`, default `ISIG | ICANON | ECHO` — a plausible
+  "cooked mode" default). **Deliberately a single global, not per-process/per-session** — the same
+  simplification `CURRENT_DIR_CLUSTER` used to be before `oxfs` made `cwd` per-process (see "oxfs
+  filesystem module" below), except there's no equivalent fix available here, since this kernel
+  has exactly one console and nothing to scope a second one to. `echo_enabled()` (consulting the
+  `ECHO` bit) is now what `keyboard_interrupt_handler`'s own auto-echo (see above) actually checks
+  before printing a typed character back — real terminal convention: a program that switches to
+  raw mode with `ECHO` cleared (a readline-style line editor doing its own echoing) would otherwise
+  get every keystroke echoed twice. **`ICANON` is stored (so `TCGETS` round-trips whatever was
+  last set) but not otherwise consulted** — this kernel's ring buffer has never done real
+  canonical-mode line-holdback (backspace/erase has always been `read_line`'s own userland concern,
+  see below), so it's already effectively raw-mode-shaped regardless of this bit; toggling it
+  doesn't change anything further.
+  - `src/syscall.rs`'s `sys_ioctl(fd, request, argp)` matches real `ioctl(2)`'s own argument
+    positions and reuses real Linux/generic request codes (`TCGETS = 0x5401`, `TCSETS = 0x5402`,
+    `TCSETSW = 0x5403`, `TCSETSF = 0x5404`, `TIOCGWINSZ = 0x5413`, `TIOCSWINSZ = 0x5414` — no
+    argument-convention patch needed on the musl side, only the syscall number itself, same "just
+    remap the number" story `kill`/`sigaction` already had) — but implements only this handful of
+    tty-specific requests, not real `ioctl`'s full surface; anything else is `ENOTTY`, logged the
+    same discoverable way an unregistered syscall number already is. `TCSETS`/`TCSETSW`/`TCSETSF`
+    are all treated identically (this kernel has no queued-output concept to make the real
+    "when does the change take effect" distinction between them meaningful). `TIOCGWINSZ` writes a
+    fixed, plausible `struct winsize` (`24x80`, matched to `third_party/musl`'s own
+    `include/alltypes.h.in` layout) — not measured from anything, VGA text mode's real dimensions
+    just happen to already be `80x25`; `TIOCSWINSZ` is accepted and silently discarded, since
+    nothing ever reads window size back out again.
+  - **Only ever succeeds against the console — `ENOTTY` for every other fd, checked via
+    `crate::fd::real_fd_of(fd)` resolving to stdin's/stdout's own `real_fd` (`0`/`1`), not by
+    checking `fd` itself.** Load-bearing, not incidental: musl's own `isatty(fd)`
+    (`third_party/musl`'s `src/unistd/isatty.c`) is implemented as "does `ioctl(fd, TIOCGWINSZ,
+    ...)` succeed" — answering every fd successfully would make every `oxfs` file and every pipe
+    end suddenly report itself as a tty too, breaking BusyBox's own graceful "not a tty"
+    degradation an already-verified real pipeline (`cat.elf hello.txt | cat.elf`, see "BusyBox
+    port" below) depends on: after `dup2`ing a pipe end onto fd 0/1, that fd's own `real_fd` is the
+    pipe's, not `0`/`1`, so checking `real_fd_of` (not the fd number itself) correctly keeps
+    reporting non-tty for it. `src/fd.rs` gained `real_fd_of` specifically for this — the first
+    caller of that lookup outside `src/fd.rs` itself.
+  - **Not live-verified in the pass that added `SYS_IOCTL` itself** (superseded by
+    `CONFIG_HUSH_INTERACTIVE` below, which *does* now exercise `TCGETS`/`TCSETS`/`TIOCGWINSZ` for
+    real — see that bullet for what an actual full boot confirmed): nothing in the current
+    environment can inject real PS/2 keystrokes into a headless (`-display none`) QEMU boot, so an
+    actual typed-keystroke echo/line-editing session still isn't something this sandbox can drive
+    — only a real display/VNC/QEMU-monitor-`sendkey` path could close that specific gap.
+    `more.elf`'s own paging behavior with a real, succeeding `TIOCGWINSZ` also still isn't
+    re-verified (its already-documented fallback — see "BusyBox port" below — depended specifically
+    on `TIOCGWINSZ` always failing before this).
+- **`CONFIG_HUSH_INTERACTIVE`/`CONFIG_HUSH_JOB`/`CONFIG_FEATURE_EDITING` are now on for the `sh`
+  applet specifically (only) — `hush` boots to a genuine, working `/ #` prompt with real line
+  editing/history infrastructure initialized, not just a mechanism that exists but nothing
+  exercises.** `build.rs`'s `configure_busybox_single_applet` flips these (plus
+  `CONFIG_FEATURE_EDITING_FANCY_PROMPT`, for a real `$PWD $`/`#`-style `PS1` instead of a blank
+  one) only when `applet_symbol == "HUSH"` — every other applet's own config tree is untouched.
+  Deliberately left off: `CONFIG_HUSH_SAVEHISTORY`/`CONFIG_FEATURE_EDITING_SAVEHISTORY` (no
+  `HISTFILE` persistence — in-session history only) and `CONFIG_FEATURE_EDITING_WINCH` (nothing in
+  this kernel ever sends `SIGWINCH`, so tracking it would be pure unused surface).
+  - **A real, previously-unneeded build-time step: `make oldconfig` fed a stream of blank lines,
+    not `/dev/null`.** Turning these options on makes a whole tree of previously-invisible
+    sub-options (`FEATURE_EDITING_MAX_LEN`, `FEATURE_EDITING_HISTORY`, `HUSH_BASH_COMPAT`, ...)
+    newly visible — Kconfig only ever emits a symbol into `.config` at `allnoconfig` time if its
+    own dependencies are already satisfied, so `configure_busybox_single_applet`'s direct
+    text-replacement approach (which can only edit *existing* lines) can't set any of them. The
+    normal build's own internal `silentoldconfig` step refuses to guess a default for a genuinely
+    new `int`/`string` option when stdin isn't a real terminal (`Console input/output is
+    redirected` — a real failure hit and diagnosed live, not a hypothetical) — confirmed
+    empirically that even `/dev/null` (immediate EOF) still hits that exact failure for `int`-typed
+    options specifically (`bool` prompts alone tolerate EOF fine and default correctly). The fix,
+    `resolve_busybox_new_config_options`: run `make oldconfig` explicitly first, with stdin fed
+    10,000 blank lines from a separate writer thread (avoiding a full-pipe deadlock against the
+    child's own stdout/stderr draining) — matching what pressing Enter at every prompt would do,
+    letting `conf` walk through and accept each prompt's own Kconfig-declared default, `int`/
+    `string` ones included. Only ever invoked for `HUSH` — no other applet's config tree grows
+    this kind of new-option cascade.
+  - **A real, previously-latent kernel gap: `dup(2)`'s single-argument form didn't exist at all.**
+    `CONFIG_HUSH_JOB` (needed to reach `hush`'s own real `FEATURE_EDITING` initialization at
+    all — traced through `shell/hush.c`: the `line_input_state = new_line_input_t(...)` call only
+    happens inside the `#if ENABLE_HUSH_JOB` branch, not the plainer `#elif ENABLE_HUSH_INTERACTIVE`
+    one — so `HUSH_JOB` is required even though this pass doesn't implement real job control)
+    makes `hush` call `dup_CLOEXEC(STDIN_FILENO, 254)` to set up `G_interactive_fd`. That tries
+    `fcntl(fd, F_DUPFD_CLOEXEC, ...)` first (this kernel has no `fcntl` at all — confirmed harmless,
+    logs `[boot] unrecognized syscall number 72` once and falls through), then falls back to plain
+    `dup(fd)` — which this kernel *also* didn't implement, meaning `G_interactive_fd` would
+    silently end up `0` (hush concluding it isn't interactive after all) without a fix. `SYS_DUP =
+    125` (`src/fd.rs`'s new `dup`, aliasing a freshly bump-allocated fd to the source's own
+    `real_fd` — the same mechanism `dup2` already uses, minus the caller-chosen-target-fd case),
+    registered in `modules/posix_compat/`; `third_party/musl`'s `bits/syscall.h.in` remaps
+    `__NR_dup` off its inert original value (`32`) — real `dup(2)`'s exact single-argument wire
+    format needed no argument-convention patch beyond that.
+  - **`TIOCGPGRP` (unimplemented, `ENOTTY`) turns out to make `HUSH_JOB` degrade into "line editing
+    only, no real job control" automatically, for free — not something this pass had to build.**
+    Traced through `hush.c`'s own interactive-setup block: `tcgetpgrp(STDIN_FILENO)` failing makes
+    `G_saved_tty_pgrp` end up `0`, which skips *both* `if (G_saved_tty_pgrp)` blocks that would
+    otherwise call `kill()`/`bb_setpgrp()`/`tcsetpgrp()` for real foreground-process-group handoff
+    — `close_on_exec_on`/`install_special_sighandlers`/`enable_restore_tty_pgrp_on_exit` still run
+    (all either no-ops here or already-working `sigaction` calls), and
+    `line_input_state = new_line_input_t(...)` (the real editing-state init) is reached regardless,
+    completely unconditionally on the job-control pieces actually working. Confirmed via a real
+    boot's own log: `[boot] unrecognized ioctl request 0x540f` (`TIOCGPGRP`) appears once, then the
+    real `BusyBox v1.36.1 ... hush - the humble shell` banner and a genuine `/ #` prompt follow with
+    no fault.
+  - **A real, previously-latent bug, found only by actually running this: `fopen()`/`tmpfile()`/
+    `__fopen_rb_ca()` bypass the patched public `open()` entirely, via a separate internal
+    `sys_open()`/`__sys_open` macro path (`third_party/musl`'s `src/internal/syscall.h`) that still
+    assumed real `open(2)`'s `(path, flags, mode)` wire format.** The very first thing real
+    interactive `hush`'s own startup does that calls `fopen()` (not pinned down to an exact call
+    site — plausibly something in `FEATURE_EDITING`'s own init path, though `HUSH_SAVEHISTORY` is
+    off) page-faulted immediately after printing the version banner, with `oxfs_open` (`modules/
+    oxfs/src/lib.rs`) constructing a `core::slice::from_raw_parts` covering hundreds of KB starting
+    at the real filename pointer, walking off the end of hush's own mapped memory. Found by
+    tracing every dispatched syscall number/args from the kernel side, then — once the args alone
+    (`path_ptr` looking like a real pointer, but a second argument of `0x88000` where a path
+    *length* should be, and a third of `0x1b6` = octal `0666`, a suspiciously mode-shaped value)
+    pointed at a `(path, flags, mode)`-shaped call reaching `SYS_OPEN` — instrumenting
+    `__syscall3` itself (`arch/x86_64/syscall_arch.h`) to capture its own caller's return address
+    via `__builtin_return_address(0)` and disassembling the real `busybox` binary at that address,
+    which showed a direct `call` into a function loading two nearby string-literal pointers into
+    `RDI`/`RSI` right beforehand — matching `fopen(filename, mode)`'s own two-string-argument shape
+    exactly, and `fopen.c`'s own `sys_open(filename, flags, 0666)` call explains the `0666`/mode
+    argument precisely. The already-existing patch to the *public* `open()` (`src/fcntl/open.c`,
+    documented above) never covered this, since `fopen`/`tmpfile`/`__fopen_rb_ca` never call it —
+    they go through `sys_open()`/`__sys_open` directly. Fixed in `src/internal/syscall.h` itself:
+    `__sys_open2`/`__sys_open3` (and their `_cp` cancellation-point variants) now compute
+    `path_len` via `__builtin_strlen` (a compiler builtin, not a declared libc function — chosen so
+    the macro doesn't depend on every expansion site already including `<string.h>`) and drop
+    `mode`/`O_LARGEFILE`-oring, matching OxideBSD's `(path_ptr, path_len, flags)` shape instead —
+    the exact same fix `open()`'s own patch already applied, just at the lower macro layer every
+    *internal* stdio caller actually goes through. All temporary tracing (kernel-side per-dispatch
+    logging, `oxfs`'s own per-call/argument logging, the `__syscall3` return-address capture) was
+    removed once diagnosed — none of it is a permanent part of this codebase.
+  - **Verified**: a full boot now reaches a real, working `/ #` prompt with no fault — `hush`'s own
+    version banner prints, then a genuine `PS1`-expanded prompt (proving `FEATURE_EDITING_
+    FANCY_PROMPT` and a real `getcwd()`-backed `\w` substitution both work), then blocks cleanly on
+    a real stdin read (confirmed by the boot process idling rather than crashing or exiting).
+    **Not live-verified**: actually typing at that prompt — same PS/2-keystroke-injection gap as
+    above; nothing in this environment can drive that interactively.
 - **`src/vga.rs`'s `Writer` special-cases a raw `0x08` (backspace) as "step the cursor back one
   column, draw nothing"**, rather than falling into its placeholder-glyph path for
   not-`0x20..=0x7e`/`\n` bytes. This exists specifically so the standard `"\x08 \x08"` terminal
@@ -1129,6 +1278,54 @@ not a new regression). `argv`/`envp` are both real now — see "musl port" below
 "BusyBox port" below for how `envp` itself actually reaches `execve` (added well after this
 subsystem's first pass, once a 4th syscall argument existed to carry it).
 
+- **`do_execve` now passes real, caller-chosen `argv[0]` through, instead of always silently
+  overwriting it with the exec path itself.** This was the single item flagged as the top of the
+  "BusyBox gap analysis" list below (see that section for what it unlocks) — the last piece of the
+  argv/envp story left over from the "BusyBox port" section's own `argv[1..]`/`envp` passes. A
+  non-empty `argv_ptr` (see `RawArgvEntry`'s own doc comment) now supplies the *complete* argv[]
+  array, including `argv[0]`, matching real `execve(2)` semantics (the caller's own `argv[0]` need
+  not equal the path used to find the file — e.g. a login shell's `argv[0]` of `-bash`); an empty
+  or immediately-terminated `argv_ptr` still falls back to a synthesized single-element
+  `argv = [path_bytes]`, so every pre-existing caller (`stsh`, before this) is unaffected.
+  `userland/stsh/src/main.rs`'s own `execve()` wrapper was updated to build the complete array
+  (`path` as `entries[0]`, `extra_args` from `entries[1..]`) to match the new wire format,
+  and `third_party/musl`'s `src/process/execve.c` (fork, `oxidebsd` branch) likewise now places
+  real `argv[0]` (not just `argv[1..]`) into the array it builds. **What this unlocks, not yet
+  acted on**: real multi-call-binary dispatch (one `busybox`-style binary picking an applet by
+  `argv[0]`/basename) is no longer structurally blocked — but the BusyBox applet roster (see
+  "BusyBox port" below) hasn't been rebuilt that way; each applet is still its own standalone
+  single-applet binary, just no longer for lack of an alternative.
+- **`Process` also carries `pgid: Pid` now — real `setpgid(2)`/`getpgid(2)`, the first piece of
+  the "process groups" gap (see "BusyBox gap analysis" below).** Persisted/restored per process on
+  `fork`/`spawn` exactly like `cwd`/`fs_base`/`brk` already are: a freshly `spawn`ed process (pid 1
+  today, no parent to inherit a group from) becomes its own group leader (`pgid == pid`, matching
+  real init/session-leader convention); a forked child inherits the parent's live `pgid` (real
+  `fork()` semantics — a child stays in its parent's group until it calls `setpgid` itself);
+  `do_execve` leaves it untouched (real `execve()` preserves process group). `process::
+  do_setpgid`/`do_getpgid` match real `setpgid(2)`/`getpgid(2)`'s exact wire formats — `(pid,
+  pgid)`/`(pid)`, `pid == 0` meaning "the caller" for both, `pgid == 0` meaning "use `pid` itself"
+  for `setpgid` (a fresh, self-led group) — real conventions, not invented ones. **A real,
+  documented simplification, not full POSIX semantics**: neither call does any permission or
+  session-membership checking at all (this kernel has no uid model or session concept — see the
+  "uid/permissions stub" gap below, still unimplemented), so unlike real `setpgid` any live pid can
+  retarget any other live pid's group; only a target pid that doesn't exist at all is rejected
+  (`ESRCH`), the same "value now, correctness later" tradeoff `do_kill`'s own cross-process case
+  already documents. `SYS_SETPGID = 120`/`SYS_GETPGID = 121` are registered by
+  `modules/posix_compat/`, not `modules/native_abi/` (see "BusyBox port" below for why new syscalls
+  go there) — both happen to match real `setpgid(2)`/`getpgid(2)`'s wire formats exactly, so no
+  musl-side argument-convention patch was needed, just a header remap (`getpgid`'s Linux-original
+  value even already happens to be `121`, needing no remap at all; `setpgid`'s own Linux-original
+  value, `109`, was remapped off of what would otherwise have silently collided with OxideBSD's own
+  `SYS_UNLINK = 109` — see `third_party/musl`'s `bits/syscall.h.in` comments for the full reasoning,
+  including a new, narrow, deliberately-left-open collision this `120` remap itself introduces
+  against `getresgid`'s own untouched value, same "flagged, not fixed, since nothing reaches it
+  yet" story as the pre-existing `open`/`fstat` collision documented in "BusyBox port" below).
+  **Not implemented**: `tcsetpgrp` (needs a foreground-process-group concept tied to the
+  still-nonexistent tty/pty abstraction — genuinely blocked, not just unattempted), process-group-
+  targeted signal delivery (`do_kill` is still purely per-pid — no `kill(-pgid, sig)`), and the
+  `SIGTSTP`/`SIGCONT` stop/continue process-state machinery real job control also needs (signals
+  still default to `Ignore` for those, no "stopped" `ProcState` exists) — `setpgid`/`getpgid` alone
+  don't unlock `bg`/`fg`/`jobs`, just the first piece of it.
 - **`Process` also carries `fs_base` now — restored on every context switch, but *not* by
   `context_switch::switch_context` itself.** `IA32_FS_BASE` (the MSR real `%fs`-relative TLS access
   reads through — see "musl port" above) is a single *global* register, invisible to
@@ -1743,9 +1940,161 @@ reboot.
   unconditionally) — rather than patching each individual callback, so `stdin`/`stdout`/oxfs
   files/pipes are all covered by the one guard.
 
+## Signal handling module (`modules/signal/`, `src/process.rs`, `src/syscall.rs`)
+
+Real process signaling: `kill(2)`, `sigaction(2)`, `sigprocmask(2)`, and delivery (including
+invoking an installed handler and returning from it via `sigreturn`). The gap-analysis pass this
+supersedes (see the "BusyBox gap analysis" section below, which used to carry the full design
+proposal this section now describes as implemented) flagged this as the single biggest lift of
+everything left after the BusyBox/oxfs work — the one gap that genuinely touches syscall entry/
+exit, `Process`, and the scheduler all at once, not just one module's own state.
+
+- **`SYS_KILL = 116`/`SYS_SIGACTION = 117`/`SYS_SIGPROCMASK = 118`/`SYS_SIGRETURN = 119`** continue
+  the existing invented-number sequence right past `SYS_RENAME = 111` — but, unlike most of this
+  ABI's own inventions, **all four happen to match their real Linux/BSD wire formats exactly**, the
+  same "no argument-convention patch needed" story `SYS_PIPE`/`SYS_DUP2` already had. Confirmed by
+  reading `third_party/musl`'s own `src/signal/kill.c`/`sigaction.c`/`sigprocmask.c`/
+  `pthread_sigmask.c` directly before writing any kernel code: `kill(pid, sig)` is already a plain
+  2-argument syscall; `__libc_sigaction` already issues `__syscall(SYS_rt_sigaction, sig, &ksa,
+  old ? &ksa_old : 0, _NSIG/8)` — a real `struct k_sigaction` (`handler`, `flags`, `restorer`,
+  `mask[2]` — 32 bytes, matching this ABI's own `RawSigAction` field-for-field, `mask[2]`'s two
+  `u32`s read back as one `u64` matching `_NSIG/8 == 8` bytes exactly) as a 4-argument call, the
+  same width this ABI already has; `pthread_sigmask` already issues `__syscall(SYS_rt_sigprocmask,
+  how, set, old, _NSIG/8)`, same shape. **This meant the entire musl-side patch for this feature is
+  just four `#define` remaps in `bits/syscall.h.in`** (`SYS_kill`/`SYS_rt_sigaction`/
+  `SYS_rt_sigprocmask`/`SYS_rt_sigreturn`) plus one more line: every arch's own
+  `src/signal/<arch>/restore.s` (confirmed by reading all of them, not just x86_64's) hardcodes its
+  own trap-number literal directly in the restorer stub (`mov $15, %rax; syscall` on x86_64) rather
+  than referencing the `bits/syscall.h.in` macro at all — remapping the header alone doesn't reach
+  it, so `src/signal/x86_64/restore.s` needed its own one-line patch (`mov $119, %rax`) to match.
+  No changes to `sigaction.c`/`kill.c`/`sigprocmask.c`/`pthread_sigmask.c` themselves. **A real,
+  if narrow, build-time gotcha found while writing the `bits/syscall.h.in` comments explaining
+  this**: `build.rs`'s own header generation (`sed -n -e s/__NR_/SYS_/p`) matches the literal text
+  `__NR_` anywhere in the file, comments included, and turns any comment line containing it into a
+  garbled `#define` — a doc comment that happened to mention the macro name by writing it out
+  literally broke the musl build with a real, confusing C parse error until reworded to avoid the
+  substring.
+- **Real signal numbers (`SIGHUP = 1` … `SIGSYS = 31`), not OxideBSD-invented ones** — deliberately
+  breaking from this ABI's usual "own numbers, don't chase authenticity" pattern for syscalls
+  (`mmap`/`brk`/etc.): a signal *number* is a plain argument value, not a syscall number, so there
+  was never an ABI-collision reason to invent different ones, and using the real values is
+  specifically what let the musl-side patch stay a pure number-remap (see above) instead of needing
+  an `open`/`execve`-style translation layer. Only `1..=31` (no real-time signals) are recognized;
+  `sig` outside that range is `EINVAL` from `sys_kill`/`sys_sigaction`, and `blocked_signals`/
+  `pending_signals` mask bits beyond `31` (e.g. musl's own internal `SIGCANCEL`/`SIGSYNCCALL`/
+  `SIGTIMER` at `32`-`34`, unblocked once by `__libc_sigaction`'s own startup path) are silently
+  representable but never delivered.
+- **One `Process::sigactions: [SigAction; 32]` array per process** (`SigAction { handler, flags,
+  restorer, mask }`, indexed `1..=31`), mirroring real POSIX `sigaction`'s own `SIG_DFL = 0`/
+  `SIG_IGN = 1` handler-pointer sentinel convention directly — `do_sigaction`'s wire-format read/
+  write needs no translation at all as a result. Plus `pending_signals`/`blocked_signals` (`u64`
+  bitmasks, bit `N-1` = signal `N`) and `signal_saved_frame: Option<SyscallFrame>`/
+  `signal_saved_blocked: u64` (the pre-handler snapshot `sigreturn` restores from — see below). All
+  five follow the exact same per-process-state precedent `cwd`/`fs_base`/`brk` already set:
+  inherited by `fork` (except `pending_signals`, which starts empty in a child — real `fork()`
+  semantics), left alone by `execve` except that any *caught* (real handler address, `> 1`)
+  `sigaction` entry resets to `SIG_DFL` (the old handler address means nothing in the new program
+  image; `SIG_IGN`/already-`SIG_DFL` entries, and `pending_signals`/`blocked_signals` themselves,
+  survive `execve` unchanged, matching real semantics).
+- **Delivery happens once, at the tail of `syscall_dispatch`, right after the normal `Ok`/`Err`
+  rewrite** (`src/syscall.rs`'s `deliver_pending_signal`) — every path back to userspace this
+  kernel has funnels through finishing some syscall (a blocked-then-woken process always resumes by
+  completing the exact syscall it blocked inside, same as `do_wait4`/pipe-read already do), so
+  checking once here covers every real case except a never-run process's very first launch (which
+  can't have a signal pending before it's executed even once). `take_deliverable_signal`
+  (`src/process.rs`) picks the lowest-numbered pending, unblocked signal, resolves it against its
+  *current* disposition (looping past any that turn out to be `SIG_IGN`/default-`Ignore` rather
+  than returning early, so a real signal still surfaces if one's also pending behind an ignored
+  one), and returns `Terminate(code)` or `Handler { signum, handler, restorer, mask_to_add }`.
+  `Terminate` just calls `do_exit` (never returns). `Handler` snapshots the live frame into
+  `Process::signal_saved_frame` (`stash_signal_context`), then rewrites the live frame in place:
+  pushes `restorer`'s address onto the user stack at exactly the offset an ordinary `call`'s own
+  implicit return-address push would leave it (128 bytes of red-zone headroom, 16-byte-align down,
+  back off 8 more — `RSP % 16 == 8` at the handler's own entry, matching System V's calling
+  convention), sets `rdi = signum` (`void (*)(int)` — real `SA_SIGINFO` 3-argument handlers are
+  **not** supported; `rsi`/`rdx` are left `0`, so a real `SA_SIGINFO` handler dereferencing its
+  `info`/`ucontext` arguments would fault on that `NULL`), and points `rcx`/`user_rsp` at the
+  handler/new stack. `mask_to_add` (the signal's own bit, unless `SA_NODEFER`, plus `sa_mask`) gets
+  ORed into `blocked_signals` for the handler's own duration.
+- **`sigreturn` bypasses `syscall_dispatch`'s normal `Ok`/`Err` rewrite entirely — a real, narrow
+  exception, not an oversight.** A restored context's own saved carry flag (packed into `r11`,
+  which doubles as saved `RFLAGS`) can be either polarity, but the normal convention can only ever
+  force one fixed polarity (`Ok` always clears `CF`, `Err` always sets it) — neither can reproduce
+  an arbitrary restored value. `syscall_dispatch` checks `frame.rax == SYS_SIGRETURN` *before* the
+  normal `dispatch()`/table-lookup path at all and calls `do_sigreturn(frame)` directly, which
+  restores every field of `*frame` verbatim from `Process::signal_saved_frame`
+  (`take_signal_saved_frame`, which also restores `blocked_signals` to its pre-handler value) and
+  returns — `SYS_SIGRETURN` is consequently **not registered in `SYSCALL_TABLE` at all**, the one
+  syscall number in this whole ABI with no module owning it. Reached via `sa_restorer` — musl's own
+  `__restore_rt` (`src/signal/x86_64/restore.s`, patched as above), a real function inside the
+  process's own already-mapped ELF image, not a kernel-provided trampoline page — a signal handler
+  installed without `SA_RESTORER` (i.e. hand-rolled `rt_sigaction` calls bypassing libc) has no
+  working way to return, matching the fact that this codebase's own musl fork always sets it (see
+  `sigaction.c`).
+- **Known, deliberate simplification: `Process::signal_saved_frame` holds exactly one snapshot,
+  not a real signal stack.** If a second, different (unblocked) signal becomes deliverable while
+  already inside a handler — e.g. the handler itself makes a syscall, and *that* syscall's own tail
+  finds another pending signal — the second delivery overwrites the first snapshot instead of
+  nesting it, so the eventual `sigreturn` from the *inner* handler restores into the *outer*
+  handler's own interrupted state, not back to the original pre-signal program. Not hit by
+  anything exercised so far (see the verification note below), but a real correctness gap for
+  nested delivery specifically.
+- **`do_kill`'s cross-process case is a real, documented simplification, not full POSIX semantics
+  — but the common, high-value case (killing something with no handler) is immediate and correct.**
+  Only a positive `target_pid` (no process-group/broadcast targeting) and signals `1..=31` are
+  accepted. Sending to *self* just sets the pending bit, delivered naturally at this exact
+  syscall's own dispatch tail. Sending to a *different* process (never the currently `Running` one
+  — this kernel is single-core and purely cooperatively scheduled, so `target != caller` always
+  means "not currently executing") has no way to force an arbitrary, not-currently-scheduled
+  process to notice a signal the instant it arrives (no `EINTR`, no forced wakeup of a blocked
+  `wait4`/pipe-read/stdin-read): if the target's *current* disposition is `Ignore`, the signal is
+  discarded right now; if it's the default `Terminate` (no handler installed), the target is
+  terminated **immediately**, right there in `do_kill`, without needing to ever be scheduled again
+  — this is the case that matters for real use (`kill`-ing a runaway process like `yes.elf`, or
+  `kill.elf $$` against an interactive shell blocked reading its next line — see the verification
+  note below) and is what's actually verified end to end; if the target has a custom handler
+  installed, delivery is deferred until it's next naturally scheduled, a narrower, real gap.
+  `do_exit`'s own old body was factored into a new, shared `terminate_process(pid, code)` (closes
+  every fd, marks `Zombie(code)`, wakes a waiting parent) that both `do_exit` (terminating the
+  *caller*, which must yield to the scheduler afterward) and `do_kill` (terminating someone else,
+  which must not — the caller is still running) call into.
+- **New syscalls are registered by a new, dedicated module, `modules/signal/`**, not folded into
+  `native_abi`/`posix_compat` — the same "kernel stays micro, modules carry the extra function"
+  reasoning `posix_compat` itself was created for (see that section above), applied to a subsystem
+  big enough to deserve its own home. Same "module registers, kernel implements" split every other
+  syscall module already uses: this module only ever gains thin `extern "C" fn handle_x` wrappers
+  over kernel-resident `oxidebsd_sys_kill`/`oxidebsd_sys_sigaction`/`oxidebsd_sys_sigprocmask`
+  (`src/syscall.rs`) — the real logic (`do_kill`/`do_sigaction`/`do_sigprocmask`/
+  `take_deliverable_signal`/`stash_signal_context`/`take_signal_saved_frame` in `src/process.rs`,
+  plus the frame-manipulation half in `src/syscall.rs`) all stays kernel-resident, since this
+  module can't use `alloc` and the process table needs `BTreeMap` freely.
+- **A new BusyBox applet, `kill.elf`** (`modules/oxfs/src/lib.rs`'s `module_init` gained a
+  `seed_file` call for it, same pattern every other applet already uses — `build.rs`'s own
+  `BUSYBOX_APPLETS` list is build-script-only, so adding an applet there doesn't automatically seed
+  it into `oxfs`'s inode table; that half still needs its own one-line addition per applet, unlike
+  everything else about adding one, which *is* fully data-driven) — previously excluded from the
+  applet roster specifically because process signaling didn't exist (see "BusyBox port" above); the
+  whole reason that exclusion existed is what this section closes.
+- **Verified booting in QEMU (headless, `-display none`) with injected keystrokes**: the
+  `signal`/`oxfs` modules both load and relocate cleanly, and — most importantly — typing
+  `kill.elf $$` at `hush`'s own prompt (sending `SIGTERM` to `hush`'s own pid from a forked,
+  `execve`'d child) terminates `hush` (pid 1) immediately with exit code `143` (`128 + 15`) while
+  `kill.elf` itself (the child) exits cleanly with code `0` — real proof the cross-process
+  immediate-termination path works correctly even against a target that's currently *blocked*
+  reading its next line of stdin, not just an actively-running one. `rt_sigaction`/`rt_sigprocmask`
+  no longer show up in the `[boot] unrecognized syscall number N` log `hush`'s own startup used to
+  spam (see `src/syscall.rs`'s `dispatch` doc comment) — real evidence they're being called
+  successfully now, not just that they're registered. **Not** live-verified this pass: a full
+  handler-invocation/`sigreturn` round trip (this build's `hush` doesn't have `trap` support
+  compiled in, so nothing available end-to-end actually installs a real signal handler to exercise
+  that path against) — the delivery/redirect/restore logic was checked carefully by hand instead
+  (see the stack-alignment and carry-flag-preservation reasoning in `src/syscall.rs`'s own
+  comments), and is the natural next thing to verify live if a purpose-built test binary (a small
+  musl C program that calls `sigaction`+self-`kill`+prints from inside the handler) is ever added.
+
 ## BusyBox gap analysis: what's needed for more applets
 
-Twenty-three applets run today (see "BusyBox port" above). Getting meaningfully further isn't
+Twenty-four applets run today (see "BusyBox port" above). Getting meaningfully further isn't
 really an "add one more applet" problem anymore — almost everything left over needs one of a
 small number of kernel capabilities this codebase doesn't have at all, and each of those unlocks a
 whole cluster of applets at once rather than just one. This section is a forward-looking gap
@@ -1772,42 +2121,23 @@ placement decision is a per-gap tradeoff, not one blanket answer. At a glance:
 
 | Gap | Placement |
 |---|---|
-| `argv[0]` passthrough | kernel-resident only (`process.rs`) |
+| `argv[0]` passthrough | **done** — see "Process abstraction, scheduler, and fork/exec/wait" above |
 | `stat`/`fstat`/`lstat` | fully module-able (`modules/oxfs`) |
 | `getdents`/`getdents64` | fully module-able (`modules/oxfs`) |
-| signals | mixed — delivery/`sigreturn` kernel-resident, `kill`/`sigaction`/`sigprocmask` thin-module-over-kernel-function |
+| signals | **done** — see "Signal handling module" below |
 | clock + `nanosleep` | mixed — monotonic read is a trivial module accessor, `nanosleep` blocking is kernel-resident, wall clock is a new kernel-resident driver |
-| termios/`ioctl` + pty | mixed — `TIOCGWINSZ` fully module-able, raw-mode switching is kernel-resident (`stdin.rs`) |
-| process groups | new kernel-resident `Process` field + narrow accessors, syscalls thin-module (same shape as `cwd`) |
+| termios/`ioctl` + pty | **done** (scoped: no real pty device layer) — `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ` implemented, `CONFIG_HUSH_INTERACTIVE`/`HUSH_JOB`/`FEATURE_EDITING` on, `hush` boots to a real `/ #` prompt — see "Interactive shell" above |
+| process groups | `setpgid`/`getpgid` **done** — see "Process abstraction, scheduler, and fork/exec/wait" above; `tcsetpgrp` still blocked on the termios/pty gap |
 | uid/permissions stub | fully module-able, no kernel changes at all |
 | `uname`/`gethostname` | fully module-able, no kernel changes at all |
 
-- **Real `argv[0]` passthrough in `execve` — arguably the single highest-leverage change on this
-  list.** Every applet today is its own standalone single-applet static binary specifically
-  *because* `do_execve` always supplies `argv[0]` from the exec path itself, with no way for a
-  caller to override it (see "Process abstraction, scheduler, and fork/exec/wait" and "BusyBox
-  port" above) — real BusyBox's own space-saving trick, one `busybox` binary dispatching on
-  `argv[0]`/basename to pick an applet, is unreachable without this. Fixing it would let a
-  *single* embedded `busybox` build provide dozens of applets at once, instead of one full
-  cross-compiled BusyBox build (and one claimed load address) per applet.
-  - **Kernel-resident (only option — no module can own this).** `do_execve` (`src/process.rs`)
-    is the sole place `argv[0]` is ever assembled onto the new process's stack (via
-    `user_stack::build`, itself kernel-resident); there is no module-boundary crossing to route
-    around, unlike `stat`/`getdents` below. The change is narrowly scoped: either interpret a
-    `argv_ptr` entry index `0` specially as an `argv[0]` override, or add a fifth wire concept —
-    but this ABI's syscalls are hard-capped at four register-carried arguments
-    (`RDI`/`RSI`/`RDX`/`R10`, see "Syscall ABI" above), so a fifth logical value has to be encoded
-    within one of the existing four, not added as a new register. The lowest-friction option:
-    treat `argv_ptr`'s *first* `RawArgvEntry` as `argv[0]` itself (a real override) rather than
-    `argv[1]`, shifting what "extra args start at" means by one — a wire-format change, not an
-    ABI-width change, and backward compatible only if every existing caller (`stsh`'s `execve`
-    wrapper, musl's `execve.c`) is updated in lockstep, since both currently assume `argv_ptr`
-    starts at `argv[1]`.
-  - Needed: `RawArgvEntry` wire-format change (as above); `third_party/musl`'s
-    `src/process/execve.c` updated to place real `argv[0]` (not just `argv[1..]`) into that array,
-    matching real `execve()`'s actual semantics for the first time. New syscalls: none — reuses
-    `SYS_EXECVE = 59`. Complexity: low-medium — a bounded, well-scoped change to `do_execve`,
-    `RawArgvEntry` handling, and one musl file, not a new subsystem.
+- **Real `argv[0]` passthrough in `execve` — done.** See "Process abstraction, scheduler, and
+  fork/exec/wait" above for the implementation (`do_execve`'s `argv_ptr` now carries the complete
+  argv[] array, including a real caller-chosen `argv[0]`, exactly the lowest-friction wire-format
+  option this bullet used to propose). **Not yet acted on**: the BusyBox applet roster hasn't been
+  rebuilt as a single multi-call `busybox` binary dispatching on `argv[0]`/basename to actually
+  exploit this — each applet is still its own standalone single-applet build (see "BusyBox port"
+  above).
 - **`stat`/`fstat`/`lstat`.** Unlocks: `ls -l`, `test -f`/`-d`/`-e`, `cp`/`mv` (mode/size checks),
   `du`, `find` (needs a `stat` per visited entry), and any script doing existence/type checks.
   - **Fully module-able — the cleanest gap on this list.** Every input `stat` needs (path
@@ -1855,53 +2185,13 @@ placement decision is a per-gap tradeoff, not one blanket answer. At a glance:
     convention, needed since musl's own `readdir()` walks these records by `d_reclen`, not a fixed
     stride). New syscall: `SYS_GETDENTS64 = 115`. Complexity: medium — the record-packing/padding
     logic needs care, but no new kernel-resident concept.
-- **Real signals — the biggest lift on this list, and the one gap that's genuinely split across
-  the kernel/module boundary rather than sitting cleanly on one side.** Unlocks: `kill`, stopping a
-  runaway process cleanly (`yes.elf` today can only be stopped by killing the whole VM), Ctrl+C
-  actually interrupting a *running child* (today Ctrl+C is only handled inside `stsh`'s own
-  `read_line`, intercepting byte `0x03` after a blocking read — not a real `SIGINT` delivered by
-  the kernel), `trap`, timeout-style tools, and job control's own underlying mechanism
-  (`SIGTSTP`/`SIGCONT`).
-  - **Kernel-resident, no choice about it: delivery and `sigreturn`.** The delivery check (is
-    there a pending, unmasked signal for this process?) has to run on the return-to-userspace path
-    out of `syscall_dispatch` and after every blocking wakeup (`do_wait4`, pipe reads, a future
-    `nanosleep`) — that path is `src/syscall.rs`/`src/scheduler.rs`, kernel-owned, not reachable
-    from module code. Actually invoking a handler means redirecting the live `SyscallFrame`'s
-    `rcx`/user-stack fields to jump into userspace at the handler address instead of resuming the
-    interrupted code — the exact same narrow-accessor pattern `fork`/`execve` already needed
-    (`copy_frame_for_fork`, `redirect_frame`, `CURRENT_FRAME` — see "Process abstraction..."
-    above), because `SyscallFrame`'s fields are deliberately private outside `src/syscall.rs`.
-    `SYS_SIGRETURN`'s own handler needs the same raw frame access in reverse (restore the
-    pre-signal frame it saved) — it's the closest thing to a new `context_switch` trampoline this
-    list has, in the same spirit as `spawn_trampoline_asm`/`fork_trampoline_asm`. A `SIGSTOP`
-    disposition also needs a new `BlockReason` variant (`process.rs`/`scheduler.rs`), the same
-    kernel-resident shape `WaitingForChild`/`WaitingForPipeData` already are.
-  - **Module-able piece: `kill`/`sigaction`/`sigprocmask` themselves.** None of these three need
-    live `SyscallFrame` access — they just read/write per-process signal state (mask, pending set,
-    handler table). If `Process` grows those fields (kernel-resident, `process.rs`, same as
-    `cwd`/`fs_base`/`brk` already are) with narrow accessor functions exposed to modules
-    (`oxidebsd_get_sigmask`/`oxidebsd_set_sigaction`-style, mirroring `oxidebsd_get_cwd`/
-    `oxidebsd_set_cwd`'s existing precedent), the three syscalls themselves can be thin handlers in
-    a module — either `native_abi` (they're process-management-adjacent, like `getpid`/`wait4`) or
-    a dedicated new `modules/signal`, whichever the user prefers once this is scoped for real; only
-    `SYS_SIGRETURN` is forced kernel-resident by the frame-manipulation requirement above, and even
-    that could be *registered* by a module while calling straight through to a kernel-resident
-    `do_sigreturn`, same as every other frame-touching syscall already does.
-  - **A real design fork, not just an implementation detail: sigaction's own wire format.**
-    Real POSIX `sigaction()` (and musl's own struct layout for it) isn't just a syscall
-    convention — it's real libc API surface a program calls directly, so — matching this project's
-    existing "own ABI, not a copycat" discipline (see `execve`/`open`'s own argument-convention
-    fixes) — `third_party/musl`'s `src/signal/sigaction.c` would need a patch analogous to
-    `execve.c`'s, translating real POSIX's `struct sigaction` into whatever wire shape
-    `do_sigaction` actually expects, rather than assuming Linux's on-the-wire layout works
-    unmodified.
-  - New syscalls (illustrative): `SYS_KILL = 116`, `SYS_SIGACTION = 117`, `SYS_SIGPROCMASK = 118`,
-    `SYS_SIGRETURN = 119`. Also needed: wiring the keyboard IRQ's own Ctrl+C handling
-    (`src/interrupts.rs`) to send a real `SIGINT` to whatever process is in the foreground, not
-    just to `stsh`'s own now-obsolete `read_line` interception — itself blocked on the (also
-    still-nonexistent) foreground-process-group concept from the process-groups gap below.
-    Complexity: high — the only gap here that genuinely touches syscall entry/exit, `Process`, and
-    the scheduler all at once, rather than being purely additive.
+- **Real signals — done.** See "Signal handling module" below for the real implementation
+  (`SYS_KILL`/`SYS_SIGACTION`/`SYS_SIGPROCMASK`/`SYS_SIGRETURN`, `modules/signal/`). Still
+  genuinely out of scope, not attempted by that pass either: real job control
+  (`SIGSTOP`/`SIGTSTP`/`SIGCONT` all default to `Ignore`, no "stopped" process state), Ctrl+C
+  delivering a real `SIGINT` to a foreground child (still just `stsh`'s own now-unused
+  `read_line` byte interception — blocked on the still-nonexistent foreground-process-group
+  concept from the process-groups gap below), and `SA_SIGINFO` handlers.
 - **A clock and `nanosleep`.** Unlocks: `sleep`, `date`, `time`, any timeout-based tool.
   - **Module-able: reading the existing monotonic tick counter.** The timer IRQ handler
     (`src/interrupts.rs`) already increments a tick count for scheduling purposes — it's just never
@@ -1922,45 +2212,33 @@ placement decision is a per-gap tradeoff, not one blanket answer. At a glance:
     port-I/O (`outb`/`inb`) primitive exposed to them at all today, so an RTC driver *as* a module
     would first need that gap closed in `src/module.rs`'s symbol-resolution table, a separate,
     smaller prerequisite.
-  - New syscalls (illustrative): `SYS_CLOCK_GETTIME = 120`, `SYS_NANOSLEEP = 121`. Complexity:
+  - New syscalls (illustrative): `SYS_CLOCK_GETTIME = 122`, `SYS_NANOSLEEP = 123` (`120`/`121` are
+    taken now — see the "process groups" bullet below). Complexity:
     medium for monotonic/`sleep` (mostly registration plumbing); higher for a real wall clock (a
     genuinely new hardware driver).
-- **Termios/`ioctl` + a minimal pty concept.** Unlocks: `CONFIG_HUSH_INTERACTIVE` (a real prompt,
-  line editing, and history *inside* `hush` itself, rather than only via `stsh`'s own hand-rolled
-  `read_line` — see "Interactive shell" above), `stty`, and full-screen tools (`vi`, `less`).
-  `TCGETS`/`TCSETS`/`TIOCGWINSZ` are all currently unmapped, silently `ENOSYS` (confirmed harmless
-  so far only because BusyBox degrades gracefully when `isatty()` comes back false — see the
-  musl-port/oxfs sections above).
-  - **Fully module-able: `TIOCGWINSZ` alone.** A fake but consistent winsize (e.g. `80x24`) needs
-    no kernel state at all — a module can register `SYS_IOCTL`, switch on the `request` argument,
-    and for `TIOCGWINSZ` just write a fixed `struct winsize` back to the caller's pointer.
-  - **Kernel-resident: `TCGETS`/`TCSETS`'s actual effect.** The part that isn't just "return
-    plausible-looking data" is making a raw-mode switch (canonical vs. non-canonical, echo
-    on/off) actually change how `src/stdin.rs`'s ring buffer and `src/interrupts.rs`'s keyboard
-    handler behave — both currently hardcode line-buffered-with-echo unconditionally. This needs a
-    kernel-resident "current termios mode" (global today, same single-console limitation
-    `CURRENT_DIR_CLUSTER` used to have before `oxfs` made cwd per-process — see "oxfs filesystem
-    module" above; a pty abstraction would be what makes it per-session instead) that `stdin.rs`'s
-    push/echo logic and `read_line`-equivalent behavior actually consult. A module can still
-    *register* `SYS_IOCTL` and call a narrow kernel-exposed setter/getter for that mode, same
-    pattern as the signal-syscalls-over-kernel-state split above — just the mode itself, and what
-    consults it, has to be kernel-resident.
-  - New syscall (illustrative): `SYS_IOCTL = 122`. Complexity: medium — the winsize/struct-fill
-    half is easy, the raw-mode-actually-changing-echo-behavior half is the real work.
-- **Process groups (`setpgid`/`getpgid`/`tcsetpgrp`).** Unlocks: `bg`/`fg`, Ctrl+Z, `jobs` — real
-  job control.
-  - **Same shape as `cwd`: a new kernel-resident `Process` field plus narrow accessors, thin
-    syscalls anywhere.** A `pgid: Pid` field on `Process` (`process.rs`) is kernel-resident by the
-    same logic `cwd`/`fs_base`/`brk` already are (it needs to live in the process table and survive
-    `fork`/`spawn`), but — exactly like `oxidebsd_get_cwd`/`oxidebsd_set_cwd` already do for
-    `oxfs` — a pair of narrow exported functions would let `setpgid`/`getpgid` themselves be
-    registered from any module (`native_abi` or wherever `kill`/`sigaction` end up) without that
-    module needing direct `Process` struct access. `tcsetpgrp` is the one call in this group that's
-    actually blocked, not just placed — it needs a "foreground process group" concept tied to the
-    still-nonexistent tty/pty abstraction from the termios gap above, so it has no home (module or
-    kernel) until that lands.
-  - Only actually valuable bundled with real signals (`SIGTSTP`/`SIGCONT`), so treat this as an
-    extension of that work, not standalone. Complexity: medium, but low value in isolation.
+- **Termios/`ioctl` — done, minus a real pty device layer (deliberately not built), and
+  `CONFIG_HUSH_INTERACTIVE` is on.** See "Interactive shell" above for the implementation
+  (`src/stdin.rs`'s `RawTermios`/global `TERMIOS`/`echo_enabled`, `src/syscall.rs`'s `sys_ioctl`,
+  `SYS_IOCTL = 124`/`SYS_DUP = 125` in `modules/posix_compat/`, and the `CONFIG_HUSH_INTERACTIVE`/
+  `HUSH_JOB`/`FEATURE_EDITING` build.rs work plus the real `fopen()`-bypasses-`open()` musl bug it
+  surfaced). `hush` now boots to a genuine, working `/ #` prompt with real line editing/history
+  infrastructure initialized — not just a mechanism that exists but nothing exercises. **What this
+  still doesn't unlock**: `tcsetpgrp`/real job control (still needs a foreground-process-group
+  concept this pass didn't add — `TIOCGPGRP` failing cleanly is what let `HUSH_JOB` degrade into
+  "line editing only" instead, not real job control actually working); and full-screen tools (`vi`,
+  `less`) would additionally need this kernel's own console to interpret ANSI cursor-movement
+  escape sequences at all, which `src/vga.rs` doesn't (non-printable bytes outside
+  `0x20..=0x7e`/`\n`/`0x08` just become its placeholder glyph) — a separate, unstarted gap this
+  pass didn't surface until now.
+- **Process groups (`setpgid`/`getpgid`) — done.** See "Process abstraction, scheduler, and
+  fork/exec/wait" above for the implementation (`Process::pgid`, `process::do_setpgid`/
+  `do_getpgid`, `SYS_SETPGID = 120`/`SYS_GETPGID = 121` in `modules/posix_compat/`). **Not
+  implemented, and real job control (`bg`/`fg`/`jobs`) still doesn't work**: `tcsetpgrp` (blocked
+  on the still-nonexistent tty/pty abstraction from the termios gap above), process-group-targeted
+  signal delivery (`do_kill` is still purely per-pid, no `kill(-pgid, sig)`), and the
+  `SIGTSTP`/`SIGCONT` stop/continue process-state machinery job control also needs (still default
+  `Ignore`, no "stopped" `ProcState`) — `setpgid`/`getpgid` are the first piece of this gap, not
+  the whole thing.
 - **A permissions/uid model — low value unless it's real, but trivial to stub.**
   - **Fully module-able, zero kernel changes.** `chmod`/`chown` as unconditional no-op successes
     (matching `mkdir`'s own already-established "mode is read but discarded" precedent) and

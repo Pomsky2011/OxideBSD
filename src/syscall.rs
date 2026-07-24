@@ -67,6 +67,12 @@ pub(crate) const ENOEXEC: u64 = 8;
 pub(crate) const ENOMEM: u64 = 12;
 /// Returned by `crate::pipe`'s `pipe_write` once a pipe's read end has been closed.
 pub(crate) const EPIPE: u64 = 32;
+/// Returned by `sys_kill` when the target pid doesn't exist -- "no such process," identical on
+/// Linux and the BSDs.
+pub(crate) const ESRCH: u64 = 3;
+/// Returned by `sys_ioctl` for a tty-specific request issued against a non-console fd -- identical
+/// on Linux and the BSDs, same as most of this group.
+pub(crate) const ENOTTY: u64 = 25;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -158,6 +164,11 @@ unsafe extern "C" {
 // seeded stack region and to type its `parent_frame`/`dst` pointers) without being able to touch
 // its fields directly -- field access stays private to this module; only `copy_frame_for_fork`/
 // `redirect_frame`/`current_frame` below cross that boundary, deliberately narrow.
+//
+// `Clone`/`Copy`: lets `process::Process` hold a `signal_saved_frame: Option<SyscallFrame>`
+// snapshot (moved/copied by value, never needing field access outside this module) for signal
+// delivery/`sigreturn` -- see `deliver_pending_signal`/`do_sigreturn` below.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct SyscallFrame {
     r15: u64,
@@ -258,11 +269,26 @@ pub(crate) unsafe fn redirect_frame(frame: *mut SyscallFrame, rip: VirtAddr, rsp
     }
 }
 
+/// OxideBSD's own invention -- see `bits/syscall.h.in`'s own comment on the musl fork for why
+/// this bypasses `SYSCALL_TABLE`/`dispatch` entirely (`do_sigreturn` below) rather than being
+/// registered like every other syscall.
+const SYS_SIGRETURN: u64 = 119;
+
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // SAFETY: frame points at syscall_entry's just-pushed register block, on the current
     // process's own kernel stack, valid and exclusively ours for the duration of this call.
     let frame = unsafe { &mut *frame };
+
+    // A real, narrow exception, not routed through the normal table/Ok-Err machinery below:
+    // sigreturn must restore the interrupted context's own saved carry flag (in `r11`) bit for
+    // bit, but the normal `Ok(value)`/`Err(errno)` convention can only ever force that bit to one
+    // fixed polarity (clear on `Ok`, set on `Err`) -- neither can reproduce an arbitrary restored
+    // value. See `do_sigreturn`'s own doc comment.
+    if frame.rax == SYS_SIGRETURN {
+        do_sigreturn(frame);
+        return;
+    }
 
     CURRENT_FRAME.store(frame as *mut SyscallFrame, Ordering::Relaxed);
     let result = dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx, frame.r10);
@@ -277,6 +303,110 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
         }
     }
     CURRENT_FRAME.store(core::ptr::null_mut(), Ordering::Relaxed);
+
+    // Every path back to userspace this kernel has funnels through here (a blocked-then-woken
+    // process resumes by finishing the very syscall it blocked inside, same as any other) except
+    // a never-run process's very first launch (`spawn_trampoline_inner`, which can't have a signal
+    // pending before it's even executed once) -- so checking here, once, covers every real case.
+    // See `deliver_pending_signal`'s own doc comment.
+    deliver_pending_signal(frame);
+}
+
+/// Restores `*frame` from this process's own `Process::signal_saved_frame` (see
+/// `deliver_pending_signal` below), byte for byte -- including `rax`/`r11`'s carry-flag bit, which
+/// is exactly why this bypasses `syscall_dispatch`'s normal `Ok`/`Err` rewrite instead of being a
+/// registered handler returning a plain `Result` like every other syscall. If nothing is actually
+/// stashed (a spurious/duplicate call -- the trampoline this codebase installs only ever calls
+/// this once, right after a real handler returns, so this should never happen in practice, but
+/// nothing about a syscall number is trustworthy input), fails the call directly here (the normal
+/// error-signaling convention, just applied by hand since the usual `dispatch()`/`Result` path
+/// isn't reached for this number at all).
+fn do_sigreturn(frame: &mut SyscallFrame) {
+    let pid = crate::scheduler::current_pid();
+    match crate::process::take_signal_saved_frame(pid) {
+        Some(saved) => *frame = saved,
+        None => {
+            frame.rax = EINVAL;
+            frame.r11 |= CARRY_FLAG;
+        }
+    }
+}
+
+/// Checked once, at the tail of every completed syscall (see `syscall_dispatch` above): if the
+/// current process has a pending, unblocked signal, act on it now, right before control actually
+/// returns to userspace. Real Unix semantics for the same reason: a signal only ever "arrives"
+/// (steps a handler, or ends the process) between one instruction and the next of the process's
+/// own userspace execution, never mid-syscall.
+///
+/// `SigDisposition::Terminate` calls `process::do_exit`, which never returns -- this function
+/// itself can too, for that one case (it just never reaches its own tail).
+/// `SigDisposition::Handler` rewrites `*frame` in place so the *next* thing this process's own
+/// `sysretq` resumes into is the handler, not whatever userspace code the syscall originally
+/// interrupted -- the interrupted state is snapshotted into `Process::signal_saved_frame` first
+/// (see `process::stash_signal_context`), restored later by `do_sigreturn` once the handler
+/// itself returns (via the trampoline `sa_restorer` names -- musl's own `__restore_rt`, patched to
+/// call `SYS_SIGRETURN` -- see `bits/syscall.h.in`'s own comment on the musl fork).
+///
+/// Two known, deliberate simplifications:
+/// - **No `SA_SIGINFO` support.** A handler is always invoked as `void (*)(int)` (`rdi = signum`
+///   only, `rsi`/`rdx` zeroed) even if `SA_SIGINFO` was set and a real 3-argument
+///   `void (*)(int, siginfo_t *, void *)` handler was installed -- there's no `siginfo_t`/
+///   `ucontext_t` construction anywhere in this file. A real `SA_SIGINFO` handler that
+///   dereferences its `info`/`ucontext` arguments would fault on the `NULL` this hands it.
+/// - **`Process::signal_saved_frame` holds exactly one snapshot, not a real signal stack.** If a
+///   *second*, different (unblocked) signal becomes deliverable while already inside a handler --
+///   e.g. the handler itself issues a syscall, and that syscall's own tail finds another pending
+///   signal -- this overwrites the first snapshot rather than nesting it, so the eventual
+///   `sigreturn` from the *inner* handler restores into the *outer* handler's own interrupted
+///   state, not back to the original pre-signal program -- a real correctness gap for nested
+///   delivery specifically (single, non-nested signal handling was the only case exercised so
+///   far: `kill.elf $$`-style default-terminate delivery, not a live handler-invocation round
+///   trip -- see CLAUDE.md's own note on what was and wasn't boot-verified for this feature).
+fn deliver_pending_signal(frame: &mut SyscallFrame) {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 {
+        // Boot time (module_init self-checks, etc.) -- no real Process to carry signal state.
+        return;
+    }
+    let Some(delivery) = crate::process::take_deliverable_signal(pid) else {
+        return;
+    };
+    match delivery {
+        crate::process::SignalDelivery::Terminate(code) => {
+            crate::process::do_exit(pid, code);
+        }
+        crate::process::SignalDelivery::Handler {
+            signum,
+            handler,
+            restorer,
+            mask_to_add,
+        } => {
+            // Snapshotted *before* frame is mutated below -- this is the exact state the
+            // interrupted syscall was about to resume into.
+            crate::process::stash_signal_context(pid, *frame, mask_to_add);
+
+            // 128 bytes of red-zone headroom (the interrupted code may have live data there,
+            // System V's own red-zone convention this ABI otherwise never has to think about),
+            // then 16-byte-align down, then back off 8 more bytes so the slot this writes to
+            // lands exactly where an ordinary `call`'s own implicit return-address push would --
+            // i.e. RSP%16==8 at the handler's own entry, matching System V's calling convention.
+            let mut sp = frame.user_rsp.wrapping_sub(128);
+            sp &= !0xF;
+            sp = sp.wrapping_sub(8);
+            // SAFETY: same known pointer-validation gap every other user-memory write in this
+            // file already has -- sp is derived from this process's own live user_rsp, and this
+            // process's own address space is the one currently active (signals are only ever
+            // delivered to the process that's actually running right now).
+            unsafe { (sp as *mut u64).write(restorer) };
+
+            frame.rdi = signum;
+            frame.rsi = 0;
+            frame.rdx = 0;
+            frame.rcx = handler; // resume RIP
+            frame.r11 = crate::usermode::USER_RFLAGS; // resume RFLAGS
+            frame.user_rsp = sp;
+        }
+    }
 }
 
 /// Numbers `dispatch` has already logged an "unrecognized syscall" line for — see `dispatch`'s own
@@ -395,6 +525,13 @@ pub(crate) fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, u64> {
     crate::fd::dup2(oldfd, newfd).map_err(|_| EBADF)
 }
 
+/// `SYS_DUP` (`125`) — matches real `dup(2)`'s exact single-argument `(oldfd)` signature.
+/// Delegates to `crate::fd::dup` — see that function's own doc comment for why this exists at all
+/// (BusyBox's `hush`, with `CONFIG_HUSH_JOB` on, needs it to set up `G_interactive_fd`).
+pub(crate) fn sys_dup(oldfd: u64) -> Result<u64, u64> {
+    crate::fd::dup(oldfd).map_err(|_| EBADF)
+}
+
 /// `SYS_SET_FS_BASE` (`103`) — OxideBSD's own invention, not modeled on any real OS's syscall (see
 /// `modules/native_abi/`'s doc comment for why new syscalls this ABI adds don't chase FreeBSD
 /// authenticity the way the pre-existing ones do). musl's x86_64 port needs a way to point `FS`
@@ -420,6 +557,147 @@ pub(crate) fn sys_set_fs_base(base: u64) -> Result<u64, u64> {
         me.fs_base = base;
     }
     Ok(0)
+}
+
+/// `SYS_KILL` (`116`) — matches real `kill(2)`'s exact `(pid, sig)` wire format, same
+/// "no argument-convention patch needed" story `sys_pipe`/`sys_dup2` already established.
+/// Delegates to `process::do_kill` — see that function's own doc comment for what's and isn't
+/// supported (no process-group/broadcast targeting, signals 1-31 only, no `EINTR` for a signal
+/// that arrives while the target is already blocked on something else).
+pub(crate) fn sys_kill(pid: u64, sig: u64) -> Result<u64, u64> {
+    crate::process::do_kill(crate::scheduler::current_pid(), pid as i64, sig as i64)
+}
+
+/// `SYS_SIGACTION` (`117`) — matches real `rt_sigaction(2)`'s exact
+/// `(sig, act_ptr, oldact_ptr, sigsetsize)` wire format (`sigsetsize` is read but not otherwise
+/// validated — this ABI always treats a signal set as a single `u64`, matching what musl's own
+/// `_NSIG/8` happens to already be on this ABI). `SIGKILL`/`SIGSTOP` can never be caught, matching
+/// real `sigaction()`'s own `EINVAL` for them.
+pub(crate) fn sys_sigaction(
+    sig: u64,
+    act_ptr: u64,
+    oldact_ptr: u64,
+    sigsetsize: u64,
+) -> Result<u64, u64> {
+    let _ = sigsetsize;
+    if !(1..=31).contains(&sig) || sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP
+    {
+        return Err(EINVAL);
+    }
+    crate::process::do_sigaction(crate::scheduler::current_pid(), sig, act_ptr, oldact_ptr)
+}
+
+/// `SYS_SIGPROCMASK` (`118`) — matches real `rt_sigprocmask(2)`'s exact
+/// `(how, set_ptr, oldset_ptr, sigsetsize)` wire format, same story as `sys_sigaction` above.
+pub(crate) fn sys_sigprocmask(
+    how: u64,
+    set_ptr: u64,
+    oldset_ptr: u64,
+    sigsetsize: u64,
+) -> Result<u64, u64> {
+    let _ = sigsetsize;
+    crate::process::do_sigprocmask(crate::scheduler::current_pid(), how, set_ptr, oldset_ptr)
+}
+
+/// `SYS_SETPGID` (`120`) — matches real `setpgid(2)`'s exact `(pid, pgid)` wire format, same
+/// "no argument-convention patch needed" story `sys_pipe`/`sys_dup2`/`sys_kill` already
+/// established. Delegates to `process::do_setpgid` — see that function's own doc comment for the
+/// real, documented simplification (no permission/session checks — this kernel has no uid model at
+/// all yet).
+pub(crate) fn sys_setpgid(pid: u64, pgid: u64) -> Result<u64, u64> {
+    crate::process::do_setpgid(crate::scheduler::current_pid(), pid as i64, pgid as i64)
+}
+
+/// `SYS_GETPGID` (`121`) — matches real `getpgid(2)`'s exact `(pid)` wire format.
+pub(crate) fn sys_getpgid(pid: u64) -> Result<u64, u64> {
+    crate::process::do_getpgid(crate::scheduler::current_pid(), pid as i64)
+}
+
+/// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
+/// this ABI's `SYS_IOCTL` reuses these verbatim as its own `request` argument values (they're
+/// already architecture-generic constants, not syscall numbers, so there's nothing to remap the
+/// way `open`/`execve` needed -- see `sys_ioctl`'s own doc comment).
+const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
+const TIOCGWINSZ: u64 = 0x5413;
+const TIOCSWINSZ: u64 = 0x5414;
+
+/// A fixed, plausible `struct winsize` (`third_party/musl`'s `include/alltypes.h.in`: four `u16`s,
+/// `ws_row`/`ws_col`/`ws_xpixel`/`ws_ypixel`, no padding) -- this kernel has no real display-size
+/// concept to report (VGA text mode is a fixed 80x25, but nothing downstream actually depends on
+/// the exact number, same "value now, precision later" reasoning `AT_RANDOM`'s own placeholder
+/// bytes already use), so `80x24` (leaving one row of headroom, the traditional default terminal
+/// size real `stty size`/`resize`-less setups already assume) is picked purely to look sane, not
+/// measured from anything.
+#[repr(C)]
+struct RawWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+const FIXED_WINSIZE: RawWinsize = RawWinsize {
+    ws_row: 24,
+    ws_col: 80,
+    ws_xpixel: 0,
+    ws_ypixel: 0,
+};
+
+/// `SYS_IOCTL` (`124`) — real request codes (see above), but **not** real `ioctl(2)`'s full
+/// surface: only the handful of tty-specific requests this kernel's own console can plausibly
+/// answer (`TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`) are handled; anything else is `ENOTTY`,
+/// logged the same way an unregistered syscall number already is, so a future need is discoverable
+/// the same "boot it and read the log" way every other gap in this codebase was found.
+///
+/// **Only ever succeeds against the console** (`crate::fd::real_fd_of(fd)` resolving to stdin's or
+/// stdout's own `real_fd`, `0`/`1` -- see `src/fd.rs`'s module doc comment for why checking `fd`
+/// itself, rather than what it currently resolves to, would be wrong after a `dup2`), `ENOTTY`
+/// otherwise. This is load-bearing, not incidental: musl's own `isatty(fd)`
+/// (`third_party/musl`'s `src/unistd/isatty.c`) is implemented as "does `ioctl(fd, TIOCGWINSZ,
+/// ...)` succeed" -- if this answered every fd successfully, every regular `oxfs` file and every
+/// pipe end would suddenly report itself as a tty too, which would be a real regression: BusyBox's
+/// own graceful "not a tty" degradation (see CLAUDE.md's musl-port/BusyBox-port sections) is what
+/// currently keeps e.g. a redirected/piped `cat`/`more` behaving like a real Unix pipeline.
+///
+/// **`TCSETS`/`TCSETSW`/`TCSETSF` are all treated identically** — real Unix distinguishes them by
+/// *when* the change takes effect relative to already-queued output/input (immediately, after
+/// output drains, or after input is also flushed), a distinction this kernel has no queued-output
+/// concept to make meaningful at all, so applying the new settings immediately, unconditionally,
+/// is already the correct behavior for the two "drain first" variants and a harmless
+/// oversimplification for the third.
+pub(crate) fn sys_ioctl(fd: u64, request: u64, argp: u64) -> Result<u64, u64> {
+    match crate::fd::real_fd_of(fd) {
+        Some(0) | Some(1) => {}
+        _ => return Err(ENOTTY),
+    }
+
+    match request {
+        TCGETS => {
+            let termios = crate::stdin::get_termios();
+            // SAFETY: same known pointer-validation gap every other user-memory write in this
+            // file already has -- argp isn't checked against the caller's actual mappings first.
+            unsafe { *(argp as *mut crate::stdin::RawTermios) = termios };
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            // SAFETY: same known pointer-validation gap as above, for a read this time.
+            let termios = unsafe { *(argp as *const crate::stdin::RawTermios) };
+            crate::stdin::set_termios(termios);
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            // SAFETY: same known pointer-validation gap as above.
+            unsafe { *(argp as *mut RawWinsize) = FIXED_WINSIZE };
+            Ok(0)
+        }
+        TIOCSWINSZ => Ok(0), // accepted, silently discarded -- nothing reads window size back out
+        _ => {
+            serial_println!("[boot] unrecognized ioctl request 0x{:x}", request);
+            Err(ENOTTY)
+        }
+    }
 }
 
 /// Thin FFI adapters over `sys_read`/`sys_write` for `modules/native_abi/` to call — see this
@@ -454,8 +732,46 @@ pub(crate) extern "C" fn oxidebsd_sys_dup2(oldfd: u64, newfd: u64) -> i64 {
     result_to_ffi(sys_dup2(oldfd, newfd))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_dup(oldfd: u64) -> i64 {
+    result_to_ffi(sys_dup(oldfd))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_set_fs_base(base: u64) -> i64 {
     result_to_ffi(sys_set_fs_base(base))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_kill(pid: u64, sig: u64) -> i64 {
+    result_to_ffi(sys_kill(pid, sig))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sigaction(
+    sig: u64,
+    act_ptr: u64,
+    oldact_ptr: u64,
+    sigsetsize: u64,
+) -> i64 {
+    result_to_ffi(sys_sigaction(sig, act_ptr, oldact_ptr, sigsetsize))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sigprocmask(
+    how: u64,
+    set_ptr: u64,
+    oldset_ptr: u64,
+    sigsetsize: u64,
+) -> i64 {
+    result_to_ffi(sys_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_setpgid(pid: u64, pgid: u64) -> i64 {
+    result_to_ffi(sys_setpgid(pid, pgid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getpgid(pid: u64) -> i64 {
+    result_to_ffi(sys_getpgid(pid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {
+    result_to_ffi(sys_ioctl(fd, request, argp))
 }
 
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/

@@ -6,6 +6,7 @@ members = [
   "modules/hello",
   "modules/native_abi",
   "modules/posix_compat",
+  "modules/signal",
   "modules/fat32",
   "modules/oxfs",
 ]

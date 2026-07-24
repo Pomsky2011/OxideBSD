@@ -83,6 +83,78 @@ impl RingBuffer {
 
 static BUFFER: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
 
+/// Real musl x86_64 `struct termios` layout (`third_party/musl`'s `arch/generic/bits/termios.h`) —
+/// `c_iflag`/`c_oflag`/`c_cflag`/`c_lflag` as `u32`s, `c_line` as one byte, `c_cc[32]`, then
+/// `c_ispeed`/`c_ospeed` as `u32`s. `repr(C)` alone gives the right layout (60 bytes total,
+/// `c_ispeed` naturally padded up to offset 52 after `c_line`+`c_cc`'s 33 bytes) — no explicit
+/// padding field needed, this is exactly what a real C compiler already does for this field order.
+/// `syscall::sys_ioctl` reads/writes this directly at a caller's `TCGETS`/`TCSETS*` pointer, the
+/// same "cast a raw pointer straight to a `#[repr(C)]` struct" pattern `RawSigAction`/
+/// `RawArgvEntry` already use elsewhere in this codebase.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct RawTermios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 32],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+/// `c_lflag` bits this kernel actually consults — see `arch/generic/bits/termios.h` for the
+/// complete real set. `ICANON` is stored (so `TCGETS` round-trips whatever was last set) but not
+/// otherwise consulted: this kernel's own ring buffer has never done real canonical-mode
+/// line-holdback (backspace/erase has always been a userland concern — see `userland/stsh/`'s own
+/// `read_line`), so there's no existing "canonical" behavior for turning `ICANON` off to actually
+/// change; it's already effectively raw-mode-shaped regardless of this bit. `ECHO` is the one bit
+/// with a real, live effect — see `echo_enabled` below.
+pub(crate) const ICANON: u32 = 0o000002;
+pub(crate) const ECHO: u32 = 0o000010;
+const ISIG: u32 = 0o000001;
+
+/// A plausible "cooked mode" default (`ISIG | ICANON | ECHO`, real Unix convention for a freshly
+/// opened terminal) — matters only in that it must be *something* self-consistent: nothing in this
+/// kernel or the musl fork ever depends on exact default `c_cc`/speed values (every real caller
+/// reads the current settings via `TCGETS` before modifying and restoring them via `TCSETS`, never
+/// assumes a specific starting value beyond "cooked mode looks cooked").
+const DEFAULT_TERMIOS: RawTermios = RawTermios {
+    c_iflag: 0,
+    c_oflag: 0,
+    c_cflag: 0,
+    c_lflag: ISIG | ICANON | ECHO,
+    c_line: 0,
+    c_cc: [0; 32],
+    c_ispeed: 0,
+    c_ospeed: 0,
+};
+
+/// The kernel-resident "current termios mode" the BusyBox gap analysis (see CLAUDE.md) calls for —
+/// deliberately a single global, not per-process/per-session: this kernel has exactly one console
+/// (no pty concept, no multiple sessions), the same simplification `CURRENT_DIR_CLUSTER` used to be
+/// before `oxfs` made cwd per-process (see "oxfs filesystem module" in CLAUDE.md) — except there's
+/// no equivalent fix available here yet, since there's nothing to scope a second console to.
+static TERMIOS: Mutex<RawTermios> = Mutex::new(DEFAULT_TERMIOS);
+
+/// `keyboard_interrupt_handler`'s own auto-echo (see `src/interrupts.rs`) consults this before
+/// printing a typed character back to the console — real terminal convention: a program that
+/// switches to raw mode with `ECHO` cleared (readline-style line editors, like `hush`'s own
+/// `CONFIG_FEATURE_EDITING` would if enabled — see CLAUDE.md's BusyBox gap analysis) does its own
+/// echoing, and a kernel that kept echoing on top of it would double every keystroke.
+pub(crate) fn echo_enabled() -> bool {
+    TERMIOS.lock().c_lflag & ECHO != 0
+}
+
+pub(crate) fn get_termios() -> RawTermios {
+    *TERMIOS.lock()
+}
+
+pub(crate) fn set_termios(new: RawTermios) {
+    *TERMIOS.lock() = new;
+}
+
 /// Called from `keyboard_interrupt_handler` for each decoded ASCII character. Also wakes any
 /// process blocked in `read` below waiting for exactly this — see this module's own doc comment.
 pub fn push_byte(byte: u8) {

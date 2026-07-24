@@ -18,6 +18,7 @@ fn main() {
     build_module_crate("hello", "HELLO", &[]);
     build_module_crate("native_abi", "NATIVE_ABI", &[]);
     build_module_crate("posix_compat", "POSIX_COMPAT", &[]);
+    build_module_crate("signal", "SIGNAL", &[]);
 
     // ring3-smoke is embedded into the FAT32 image below (as SMOKE.ELF) so stsh's fork+execve+wait
     // path has a real, already-working target it can run as an actual file, not just another
@@ -80,9 +81,10 @@ fn main() {
     // `opendir`/`readdir`, i.e. a real `getdents` syscall -- `modules/oxfs` doesn't implement one at
     // all, unlike `stsh`'s own built-in `ls`, which only ever worked by piggybacking on
     // `fat32`/`oxfs`'s own "open a directory, get back a formatted listing" convention, not real
-    // POSIX directory-reading); `ps`/`date`/`sleep`/`id`/`uname`/`kill`/`chmod`/`chown` (each needs
-    // a kernel facility that plain doesn't exist yet -- `/proc`, a real-time clock, process
-    // signaling, or a permissions model).
+    // POSIX directory-reading); `ps`/`date`/`sleep`/`id`/`uname`/`chmod`/`chown` (each needs a
+    // kernel facility that plain doesn't exist yet -- `/proc`, a real-time clock, or a permissions
+    // model). `kill` *is* included now that `modules/signal` (see CLAUDE.md) makes real process
+    // signaling exist -- the whole reason that gap closed.
     const BUSYBOX_APPLETS: &[(&str, &str, u64)] = &[
         ("TRUE", "true", 0xb00000),
         ("ECHO", "echo", 0xc00000),
@@ -107,6 +109,7 @@ fn main() {
         ("CUT", "cut", 0x1f00000),
         ("SORT", "sort", 0x2000000),
         ("UNIQ", "uniq", 0x2100000),
+        ("KILL", "kill", 0x2200000),
     ];
     let busybox_applet_elfs: Vec<(&str, Vec<u8>)> = BUSYBOX_APPLETS
         .iter()
@@ -350,6 +353,9 @@ fn build_busybox_applet(
     }
 
     configure_busybox_single_applet(&out_dir, applet_symbol);
+    if applet_symbol == "HUSH" {
+        resolve_busybox_new_config_options(&busybox_dir, &out_arg);
+    }
 
     let musl_gcc = musl_sysroot.join("bin/musl-gcc");
     let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -388,11 +394,24 @@ fn build_busybox_applet(
 /// replacement of the exact lines `allnoconfig` is known (confirmed empirically) to produce,
 /// rather than shelling out to `sed` as BusyBox's own documented recipe does, so a shape this
 /// doesn't expect fails loudly (the `assert!` below) instead of silently doing nothing.
+///
+/// For `HUSH` specifically (only), also flips on real interactive mode -- `CONFIG_HUSH_INTERACTIVE`
+/// (prompt + `$-`), `CONFIG_HUSH_JOB` (needed to reach `hush`'s own real `FEATURE_EDITING`
+/// initialization at all -- see CLAUDE.md's "Interactive shell" section for the exact code path
+/// traced through `shell/hush.c` that makes this true, and why enabling it doesn't actually
+/// require real job control to work despite the name: `tcgetpgrp` cleanly failing, via this
+/// kernel's own `ENOTTY` for the unimplemented `TIOCGPGRP` request, degrades `hush`'s own job-
+/// control setup into a no-op rather than a crash), `CONFIG_FEATURE_EDITING` (real line editing),
+/// and `CONFIG_FEATURE_EDITING_FANCY_PROMPT` (a real `$PWD $`-style `PS1`, not a blank prompt).
+/// Left off deliberately: `CONFIG_HUSH_SAVEHISTORY`/`CONFIG_FEATURE_EDITING_SAVEHISTORY` (no
+/// `HISTFILE` persistence -- in-session history only, one less thing to get right this pass) and
+/// `CONFIG_FEATURE_EDITING_WINCH` (nothing in this kernel ever sends `SIGWINCH`, so tracking it
+/// would be pure unused surface). Every other applet stays exactly as narrow as it already was.
 fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
     let config_path = out_dir.join(".config");
     let mut config = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", config_path.display()));
-    for (from, to) in [
+    let mut flips = vec![
         (
             format!("# CONFIG_{applet_symbol} is not set"),
             format!("CONFIG_{applet_symbol}=y"),
@@ -424,7 +443,28 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
             "# CONFIG_FEATURE_VERBOSE_USAGE is not set".to_string(),
             "CONFIG_FEATURE_VERBOSE_USAGE=y".to_string(),
         ),
-    ] {
+    ];
+    if applet_symbol == "HUSH" {
+        flips.extend([
+            (
+                "# CONFIG_HUSH_INTERACTIVE is not set".to_string(),
+                "CONFIG_HUSH_INTERACTIVE=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_JOB is not set".to_string(),
+                "CONFIG_HUSH_JOB=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_EDITING is not set".to_string(),
+                "CONFIG_FEATURE_EDITING=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_EDITING_FANCY_PROMPT is not set".to_string(),
+                "CONFIG_FEATURE_EDITING_FANCY_PROMPT=y".to_string(),
+            ),
+        ]);
+    }
+    for (from, to) in flips {
         assert!(
             config.contains(&from),
             "busybox .config for {applet_symbol} is missing the expected line {from:?} -- \
@@ -434,6 +474,61 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
     }
     std::fs::write(&config_path, config)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", config_path.display()));
+}
+
+/// Turning on `CONFIG_HUSH_INTERACTIVE`/`CONFIG_HUSH_JOB`/`CONFIG_FEATURE_EDITING` makes a whole
+/// tree of previously-invisible sub-options (`FEATURE_EDITING_MAX_LEN`, `FEATURE_EDITING_HISTORY`,
+/// `HUSH_BASH_COMPAT`, ...) newly visible -- Kconfig only ever emits a symbol into `.config` at
+/// `allnoconfig` time if its own dependencies are already satisfied, so none of these existed as
+/// lines `configure_busybox_single_applet`'s direct text-replacement approach could edit at all.
+/// The normal build's own internal `silentoldconfig` step refuses to guess a default for a
+/// genuinely new `int`/`string` option when stdin isn't a real terminal (`Console input/output is
+/// redirected` -- a real failure hit and diagnosed live, not a hypothetical), so this runs an
+/// explicit `make oldconfig` first, with stdin fed a large supply of blank lines (`\n`, matching
+/// what pressing Enter at every prompt would do) rather than closed/`/dev/null` -- confirmed
+/// empirically that `/dev/null` (immediate EOF) still hits the exact same "NEW... " hard failure
+/// for `int`-typed options specifically (bool prompts alone tolerate EOF fine), while a live
+/// stream of blank lines lets `conf` walk through and accept every prompt's own Kconfig-declared
+/// default, `int`/`string` ones included, right through to a clean exit. Every other applet's own
+/// config tree never grows this kind of new-option cascade at all (none of them touch
+/// `FEATURE_EDITING`/`HUSH_INTERACTIVE`), so this is only ever invoked for `HUSH` itself.
+fn resolve_busybox_new_config_options(busybox_dir: &Path, out_arg: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("make")
+        .current_dir(busybox_dir)
+        .arg(out_arg)
+        .arg("oldconfig")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run make oldconfig for busybox sh: {e}"));
+
+    // A generous supply of "just press Enter" answers -- bounded (this config tree has, at most,
+    // a few hundred prompts), written then dropped (closing the pipe) so `conf` sees EOF only
+    // once every real prompt it could possibly ask has already been answered.
+    let mut stdin = child.stdin.take().expect("child stdin was piped");
+    let blank_lines = "\n".repeat(10_000);
+    // A child process reading slower than this writes can deadlock a pipe write once the OS
+    // buffer fills -- write from a separate thread so this function's own main-thread `wait()`
+    // below can keep draining the child's stdout/stderr concurrently rather than blocking on it.
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(blank_lines.as_bytes());
+    });
+
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait for busybox sh oldconfig: {e}"));
+    if !output.status.success() {
+        panic!(
+            "busybox sh oldconfig failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// Cross-builds the userland crate at `userland/<crate_name>/` and exposes its resulting ELF's

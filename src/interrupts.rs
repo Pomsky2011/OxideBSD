@@ -164,7 +164,15 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                     // etc.) is a userland concern -- see `userland/stsh/`'s `read_line` -- and
                     // echoing them raw here just produces VGA's placeholder glyph for anything
                     // outside 0x20..=0x7e, which isn't useful for any of them.
-                    if byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte) {
+                    //
+                    // Gated on the console's own current termios ECHO bit (see `src/stdin.rs`) --
+                    // a program that's switched to raw mode with ECHO cleared (e.g. a real
+                    // line-editing shell) does its own echoing; echoing here on top of that would
+                    // double every keystroke. Defaults to on, matching this kernel's original,
+                    // always-echo behavior before real termios existed.
+                    if crate::stdin::echo_enabled()
+                        && (byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte))
+                    {
                         serial_print!("{character}");
                     }
                     crate::stdin::push_byte(byte);

@@ -592,6 +592,17 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_close_fd" => Some(crate::fd::oxidebsd_close_fd as *const () as u64),
         "oxidebsd_get_cwd" => Some(crate::process::oxidebsd_get_cwd as *const () as u64),
         "oxidebsd_set_cwd" => Some(crate::process::oxidebsd_set_cwd as *const () as u64),
+        "oxidebsd_sys_kill" => Some(crate::syscall::oxidebsd_sys_kill as *const () as u64),
+        "oxidebsd_sys_sigaction" => {
+            Some(crate::syscall::oxidebsd_sys_sigaction as *const () as u64)
+        }
+        "oxidebsd_sys_sigprocmask" => {
+            Some(crate::syscall::oxidebsd_sys_sigprocmask as *const () as u64)
+        }
+        "oxidebsd_sys_setpgid" => Some(crate::syscall::oxidebsd_sys_setpgid as *const () as u64),
+        "oxidebsd_sys_getpgid" => Some(crate::syscall::oxidebsd_sys_getpgid as *const () as u64),
+        "oxidebsd_sys_ioctl" => Some(crate::syscall::oxidebsd_sys_ioctl as *const () as u64),
+        "oxidebsd_sys_dup" => Some(crate::syscall::oxidebsd_sys_dup as *const () as u64),
         _ => None,
     }
 }

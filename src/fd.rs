@@ -222,6 +222,31 @@ pub(crate) fn dup2(oldfd: u64, newfd: u64) -> Result<u64, ()> {
     Ok(newfd)
 }
 
+/// `SYS_DUP`'s real logic (`src/syscall.rs`'s `sys_dup` is a thin wrapper over this) — real
+/// `dup(2)`'s single-argument form: allocate a fresh fd (via the same bump counter
+/// `oxidebsd_alloc_fd` uses) and alias it to `oldfd`'s own `real_fd`, same aliasing mechanics as
+/// `dup2` above minus the caller-chosen-target-fd/close-first cases `dup2` has to handle. Added
+/// specifically because BusyBox's `hush` (`CONFIG_HUSH_JOB`) calls `dup_CLOEXEC`, which tries
+/// `fcntl(fd, F_DUPFD_CLOEXEC, ...)` first — this kernel has no `fcntl` at all, so that call
+/// harmlessly `ENOSYS`s — and only then falls back to plain `dup(fd)`; without this, hush's own
+/// `G_interactive_fd` setup gives up entirely and silently treats itself as non-interactive, the
+/// exact thing turning on real interactive mode was for. See CLAUDE.md's "Interactive shell"
+/// section for the full trace of why `fcntl` itself doesn't need implementing for this to work.
+pub(crate) fn dup(oldfd: u64) -> Result<u64, ()> {
+    let pid = scheduler::current_pid();
+    let old_ops = *TABLE.lock().get(&(pid, oldfd)).ok_or(())?;
+    let newfd = oxidebsd_alloc_fd();
+    TABLE.lock().insert(
+        (pid, newfd),
+        FdOps {
+            real_fd: old_ops.real_fd,
+            ..old_ops
+        },
+    );
+    *REFCOUNTS.lock().entry(old_ops.real_fd).or_insert(0) += 1;
+    Ok(newfd)
+}
+
 /// Looks the calling process's own `fd` up and, if registered, calls its read callback (with
 /// `real_fd`, not `fd` — see this file's module doc comment). `None` (not any particular error
 /// value) means the calling process has no such `fd` registered — `syscall::sys_read` treats that
@@ -252,6 +277,20 @@ pub(crate) fn write(fd: u64, ptr: u64, len: u64) -> Option<i64> {
         return Some(0);
     }
     Some((ops.write)(ops.real_fd, ptr, len))
+}
+
+/// Looks up the calling process's own `fd` and returns its `real_fd` — the underlying resource
+/// identity a `dup2`/`fork_inherit` alias ultimately resolves to (see this file's module doc
+/// comment), not necessarily `fd` itself. `None` if the calling process has no such `fd`
+/// registered. Used by `syscall::sys_ioctl` to answer "is this fd actually the console" correctly
+/// even after `dup2` — checking `fd == 0/1/2` directly would be wrong, since a shell can `dup2` a
+/// pipe end onto fd 0/1 (real pipelines already do exactly this), and a program can just as
+/// legitimately `dup2` its real stdout onto some other fd number.
+pub(crate) fn real_fd_of(fd: u64) -> Option<u64> {
+    TABLE
+        .lock()
+        .get(&(scheduler::current_pid(), fd))
+        .map(|ops| ops.real_fd)
 }
 
 extern "C" fn stdin_read(_real_fd: u64, ptr: u64, len: u64) -> i64 {

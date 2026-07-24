@@ -761,6 +761,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
 }
 
 extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
+
     let Some(file) = find_open_file(fd) else {
         return -EBADF;
     };
@@ -789,6 +790,7 @@ extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
 }
 
 extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
+
     let Some(file) = find_open_file(fd) else {
         return -EBADF;
     };
@@ -817,6 +819,7 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
 /// writing, this is the only point its accumulated buffer is actually committed to a real inode
 /// (same all-at-once-on-close model `modules/fat32` already uses).
 extern "C" fn oxfs_close(fd: u64) -> i64 {
+
     let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
     let Some(slot) = slots
         .iter_mut()
@@ -861,6 +864,7 @@ extern "C" fn sys_close(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
 /// (`""`/`"."`/`".."`/`"/"`/a multi-component path) uniformly -- no separate resolver needed the
 /// way `modules/fat32`'s own single-component-only grammar required.
 extern "C" fn oxfs_chdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
+
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let cwd = current_cwd();
@@ -896,6 +900,7 @@ extern "C" fn oxfs_getcwd(buf_ptr: u64, buf_len: u64, _a2: u64, _a3: u64) -> i64
 /// already exists) -- `resolve_parent` handles that the same way it does for `open`'s `O_CREAT`
 /// case.
 extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
+
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let cwd = current_cwd();
@@ -926,6 +931,7 @@ extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 /// instead, matching real Unix convention). The removed record's inode/blocks are not freed (see
 /// the module doc comment).
 extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
+
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let cwd = current_cwd();
@@ -949,6 +955,7 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
 /// Registered for `SYS_RMDIR`. Only succeeds on an empty directory (`.`/`..` excepted, via
 /// `dir_entry_count`).
 extern "C" fn oxfs_rmdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
+
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let cwd = current_cwd();
@@ -978,6 +985,7 @@ extern "C" fn oxfs_rmdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 /// here); overwriting an existing directory is refused (`EISDIR`, kept simple rather than
 /// implementing real directory-replace semantics).
 extern "C" fn oxfs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> i64 {
+
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let old_path = unsafe { core::slice::from_raw_parts(old_ptr as *const u8, old_len as usize) };
     let new_path = unsafe { core::slice::from_raw_parts(new_ptr as *const u8, new_len as usize) };
@@ -1181,6 +1189,11 @@ pub extern "C" fn module_init() -> i32 {
         root,
         b"uniq.elf",
         include_bytes!(env!("OXFS_UNIQ_ELF_PATH")),
+    );
+    ok &= seed_file(
+        root,
+        b"kill.elf",
+        include_bytes!(env!("OXFS_KILL_ELF_PATH")),
     );
 
     if !ok {
