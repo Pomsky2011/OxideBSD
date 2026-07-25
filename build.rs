@@ -415,6 +415,10 @@ fn main() {
         ("XXD", "xxd", 0xa100000),
         ("XZCAT", "xzcat", 0xa140000),
         ("ZCAT", "zcat", 0xa180000),
+        // Appended out of alphabetical order (rest of the list above was already full) --
+        // `uname -a` needed `SYS_UNAME` (see CLAUDE.md's "BusyBox gap analysis") registered first,
+        // so this applet wasn't part of the original exhaustive probe.
+        ("UNAME", "uname", 0xa1c0000),
     ];
 
     // `BUSYBOX_APPLETS` above is a `&[(&str, &str, u64)]`, not `&[(&str, &str, u64); N]` --
@@ -812,6 +816,17 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
             "CONFIG_FEATURE_VERBOSE_USAGE=y".to_string(),
         ),
     ];
+    if applet_symbol == "UNAME" {
+        // `allnoconfig` emits `CONFIG_UNAME_OSNAME=""` (the string option's own Kconfig `default
+        // "GNU/Linux"` doesn't apply while `depends on UNAME` is unsatisfied -- confirmed by
+        // reading an already-built applet's generated `.config`) -- overridden here so `uname -a`'s
+        // trailing `-o`/`--all` field reads "OxideBSD" instead of either the empty string or
+        // BusyBox's own Linux-flavored default.
+        flips.push((
+            "CONFIG_UNAME_OSNAME=\"\"".to_string(),
+            "CONFIG_UNAME_OSNAME=\"OxideBSD\"".to_string(),
+        ));
+    }
     if applet_symbol == "HUSH" {
         flips.extend([
             (

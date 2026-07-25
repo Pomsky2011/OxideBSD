@@ -173,7 +173,8 @@ Everything added since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=102`, `SYS_SE
 `SYS_WRITEV=104`, `SYS_PIPE=105`, `SYS_DUP2=106`, `SYS_GETPPID=107`, `SYS_GETCWD=108`,
 `SYS_UNLINK=109`, `SYS_RMDIR=110`, `SYS_RENAME=111`, `SYS_KILL=116`, `SYS_SIGACTION=117`,
 `SYS_SIGPROCMASK=118`, `SYS_SIGRETURN=119`, `SYS_SETPGID=120`, `SYS_GETPGID=121`, `SYS_IOCTL=124`,
-`SYS_DUP=125`, `SYS_FSTAT=126`, `SYS_STAT=127`, `SYS_LSTAT=128`, `SYS_GETDENTS=129`) is OxideBSD's
+`SYS_DUP=125`, `SYS_FSTAT=126`, `SYS_STAT=127`, `SYS_LSTAT=128`, `SYS_GETDENTS=129`,
+`SYS_UNAME=137`) is OxideBSD's
 own invention —
 numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
@@ -568,7 +569,8 @@ at once, so the rows aren't a clean partition.
 | clock + `nanosleep` | not started | 9 (`NEEDS_CLOCK`) | monotonic tick read is a trivial module accessor; `nanosleep` blocking is kernel-resident (new `BlockReason::Sleeping`, woken from the timer IRQ handler); a real wall clock needs a new RTC driver (module code has no port-I/O primitive exposed yet — a smaller prerequisite) |
 | Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | `runsv`/`svlogd`/`bootchartd`/... — this kernel has no init framework to plug into at all |
 | `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (folded into `NEEDS_HARDWARE`) | — |
-| `uname`/`gethostname` | not started, trivial | — | fully module-able, fixed strings (`modules/posix_compat`) |
+| `uname` | done | — | `SYS_UNAME=137` in `modules/posix_compat` — real `uname(2)`'s exact single-pointer wire format, fixed `struct utsname` fields (`src/syscall.rs`'s `sys_uname`); `release` is this crate's own `CARGO_PKG_VERSION`, everything else a fixed placeholder (no real hostname-config or build-timestamp mechanism exists) |
+| `gethostname` | not started, trivial | — | fully module-able, fixed string (`modules/posix_compat`) |
 
 **83 more candidate applets didn't even build** — `docs/BUSYBOX_APPLETS.md` breaks those down too:
 54 need real Linux kernel uapi headers (`linux/*.h`, `mtd/*.h`) musl deliberately doesn't vendor

@@ -36,6 +36,11 @@
 //! implement at all (harmlessly `ENOSYS`s), then falls back to plain `dup(fd)` — without this,
 //! that fallback fails too and `hush` silently gives up on interactive mode entirely. See
 //! `src/fd.rs`'s `dup` for the real aliasing logic.
+//!
+//! `SYS_UNAME = 137` (see CLAUDE.md's "BusyBox gap analysis" — the "uname/gethostname" gap)
+//! continues the sequence past `modules/oxfs`'s `SYS_MKDIR = 136`. Real logic (`src/syscall.rs`'s
+//! `sys_uname`, filling in a fixed `struct utsname`) is kernel-resident, same reasoning as
+//! everything else this module only ever calls through to.
 #![no_std]
 
 unsafe extern "C" {
@@ -50,6 +55,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_getpgid(pid: u64) -> i64;
     fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64;
     fn oxidebsd_sys_dup(oldfd: u64) -> i64;
+    fn oxidebsd_sys_uname(uts_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -67,6 +73,7 @@ const SYS_SETPGID: u64 = 120;
 const SYS_GETPGID: u64 = 121;
 const SYS_IOCTL: u64 = 124;
 const SYS_DUP: u64 = 125;
+const SYS_UNAME: u64 = 137;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -92,6 +99,10 @@ extern "C" fn handle_dup(oldfd: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 
     unsafe { oxidebsd_sys_dup(oldfd) }
 }
 
+extern "C" fn handle_uname(uts_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_uname(uts_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -101,7 +112,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_GETPGID, handle_getpgid);
         oxidebsd_register_syscall(SYS_IOCTL, handle_ioctl);
         oxidebsd_register_syscall(SYS_DUP, handle_dup);
+        oxidebsd_register_syscall(SYS_UNAME, handle_uname);
     }
-    log("[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP)\n");
+    log("[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP/SYS_UNAME)\n");
     0
 }
