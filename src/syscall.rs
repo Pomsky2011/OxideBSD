@@ -878,6 +878,14 @@ pub(crate) extern "C" fn oxidebsd_sys_clock_gettime(clockid: u64, ts_ptr: u64) -
     result_to_ffi(sys_clock_gettime(clockid, ts_ptr))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i64 {
+    result_to_ffi(crate::process::do_nanosleep(
+        crate::scheduler::current_pid(),
+        req_ptr,
+        rem_ptr,
+    ))
+}
+
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/
 /// `do_getpid`/`do_mmap`/`do_munmap`/`do_brk` for `modules/native_abi/` to call — same pattern as
 /// the exit/read/write adapters above, real logic kept kernel-side since module code can't use

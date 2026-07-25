@@ -121,6 +121,13 @@ pub enum BlockReason {
     /// argument, able to actually block reading a line from the keyboard instead of seeing an
     /// instant EOF.
     WaitingForStdin,
+    /// Blocked in `do_nanosleep` until `interrupts::ticks()` reaches this absolute deadline (not a
+    /// duration). Unlike `WaitingForPipeData`/`WaitingForChild` (woken by another schedulable
+    /// process's own syscall), the only thing that ever wakes this one is
+    /// `interrupts::timer_interrupt_handler` itself — the same "IRQ handler reaches directly into
+    /// `process::table()`" shape `crate::stdin::push_byte`'s own `wake_blocked_readers` already
+    /// established for `WaitingForStdin`, just driven by the timer IRQ instead of the keyboard one.
+    Sleeping(u64),
 }
 
 /// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
@@ -1226,6 +1233,69 @@ pub fn do_getpgid(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
     let target = if pid == 0 { caller_pid } else { pid as u64 };
     let table = PROCESS_TABLE.lock();
     table.get(&target).map(|p| p.pgid).ok_or(ESRCH)
+}
+
+/// musl's own `struct timespec` on x86_64 -- see `src/syscall.rs`'s `RawTimespec` (duplicated
+/// here rather than shared, same "no shared crate across this internal ABI boundary" convention
+/// this file's own `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE` constants above already follow).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// `SYS_NANOSLEEP` — matches real `nanosleep(2)`'s exact `(req_ptr, rem_ptr)` wire format (musl's
+/// own `nanosleep()`, calling through `__clock_nanosleep(CLOCK_REALTIME, 0, req, rem)`, reduces to
+/// exactly this shape whenever `flags == 0`, the common case), so only the number needed
+/// remapping.
+///
+/// Converts the requested duration into an absolute wake-up tick deadline (`src/pit.rs`'s
+/// `TIMER_HZ` ground truth, the same one `src/syscall.rs`'s `sys_clock_gettime` already uses for
+/// `CLOCK_MONOTONIC`), blocks the caller (`BlockReason::Sleeping`), and lets
+/// `interrupts::timer_interrupt_handler` do the actual waking once that many ticks have passed —
+/// the same block-then-`scheduler::schedule()` shape `WaitingForPipeData`/`WaitingForStdin`
+/// already established, just woken by a timer IRQ instead of another process's syscall. Rounds the
+/// requested duration *up* to a whole tick (never sleeps for less than asked, consistent with real
+/// `nanosleep`'s own "at least this long" contract) — a `{0, 0}` request returns immediately
+/// without ever blocking at all.
+///
+/// `rem_ptr` (if non-null) is always zeroed on return — this kernel has no signal-delivery-during-
+/// sleep interruption path yet (a real early wake with a meaningful "how much time was left"), so
+/// a sleep always either runs to its full requested duration or (via `SIGKILL`'s own immediate,
+/// no-handler termination path) never returns at all.
+pub fn do_nanosleep(pid: Pid, req_ptr: u64, rem_ptr: u64) -> Result<u64, u64> {
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has -- req_ptr isn't checked against the caller's actual mappings first.
+    let req = unsafe { *(req_ptr as *const RawTimespec) };
+    if req.tv_sec < 0 || !(0..1_000_000_000).contains(&req.tv_nsec) {
+        return Err(EINVAL);
+    }
+
+    let hz = crate::pit::TIMER_HZ as u64;
+    let whole_second_ticks = req.tv_sec as u64 * hz;
+    let sub_second_ticks = (req.tv_nsec as u64 * hz).div_ceil(1_000_000_000);
+    let requested_ticks = whole_second_ticks + sub_second_ticks;
+
+    if requested_ticks > 0 {
+        let deadline = crate::interrupts::ticks() + requested_ticks;
+        {
+            let mut table = PROCESS_TABLE.lock();
+            table.get_mut(&pid).unwrap().state = ProcState::Blocked(BlockReason::Sleeping(deadline));
+        } // lock dropped before schedule() -- see process::table()'s own doc comment
+        crate::scheduler::schedule();
+    }
+
+    if rem_ptr != 0 {
+        // SAFETY: same known pointer-validation gap as above, for a write this time.
+        unsafe {
+            *(rem_ptr as *mut RawTimespec) = RawTimespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }
+        };
+    }
+    Ok(0)
 }
 
 /// Backing store for `oxidebsd_get_cwd`/`oxidebsd_set_cwd` while `scheduler::current_pid() == 0`

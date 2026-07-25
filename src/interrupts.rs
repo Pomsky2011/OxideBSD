@@ -135,7 +135,29 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // Wake any process blocked in `process::do_nanosleep` (`BlockReason::Sleeping`) whose deadline
+    // has now passed -- same "IRQ handler reaches directly into `process::table()`" shape
+    // `crate::stdin::push_byte`'s own `wake_blocked_readers` already established for
+    // `WaitingForStdin`, just driven by this timer IRQ instead of the keyboard one. Safe for the
+    // same reason that one is: every other place `process::table()` is locked either runs inside a
+    // `SYSCALL` (where `SFMASK` clears `IF` for the syscall's entire duration) or inside
+    // `scheduler::schedule()`'s own `without_interrupts` section -- this lock can never be held by
+    // code this interrupt could actually preempt.
+    {
+        let mut table = crate::process::table().lock();
+        for (&pid, proc) in table.iter_mut() {
+            if let crate::process::ProcState::Blocked(crate::process::BlockReason::Sleeping(
+                deadline,
+            )) = proc.state
+                && now >= deadline
+            {
+                proc.state = crate::process::ProcState::Ready;
+                crate::scheduler::enqueue_ready(pid);
+            }
+        }
+    }
 
     unsafe {
         pic::notify_end_of_interrupt(InterruptIndex::Timer.as_u8());

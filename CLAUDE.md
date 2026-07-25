@@ -174,7 +174,7 @@ Everything added since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=102`, `SYS_SE
 `SYS_UNLINK=109`, `SYS_RMDIR=110`, `SYS_RENAME=111`, `SYS_KILL=116`, `SYS_SIGACTION=117`,
 `SYS_SIGPROCMASK=118`, `SYS_SIGRETURN=119`, `SYS_SETPGID=120`, `SYS_GETPGID=121`, `SYS_IOCTL=124`,
 `SYS_DUP=125`, `SYS_FSTAT=126`, `SYS_STAT=127`, `SYS_LSTAT=128`, `SYS_GETDENTS=129`,
-`SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`) is OxideBSD's
+`SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`, `SYS_NANOSLEEP=139`) is OxideBSD's
 own invention —
 numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
@@ -566,9 +566,25 @@ time.c`/`gettimeofday.c`) are both plain C-level wrappers around `clock_gettime(
   (matches real `CLOCK_MONOTONIC` semantics: unspecified epoch, only meaningful as a delta between
   two readings). Any other `clockid` (`CLOCK_PROCESS_CPUTIME_ID`, ...) is `EINVAL` — no per-process/
   per-thread CPU time is tracked.
-- **Deliberately doesn't implement `nanosleep`/`clock_nanosleep`** — see this file's own "BusyBox
-  gap analysis" below: real blocking needs a new `BlockReason::Sleeping` woken from the timer IRQ
-  handler, scheduler-resident work a syscall module can't do by itself, unlike a plain clock read.
+- **`SYS_NANOSLEEP=139`** — real `nanosleep(2)`'s exact `(req_ptr, rem_ptr)` wire format (musl's own
+  `sleep()`/`usleep()`, `third_party/musl/src/unistd/sleep.c`/`usleep.c`, are both plain wrappers
+  around `nanosleep()`, so this one remap unlocks both). `src/process.rs`'s `do_nanosleep` converts
+  the requested duration to an absolute wake-up tick deadline against `TIMER_HZ`, blocks the caller
+  (`ProcState::Blocked(BlockReason::Sleeping(deadline))`), and calls `scheduler::schedule()` — the
+  same block-then-`schedule()` shape `WaitingForPipeData`/`WaitingForStdin` already established,
+  just woken by `interrupts::timer_interrupt_handler` itself (scanning `process::table()` for any
+  expired deadline on every tick) instead of another process's syscall. Safe for the same reason
+  `crate::stdin::push_byte`'s own table-locking from the keyboard IRQ handler already is: every
+  other place `process::table()` is locked runs either inside a `SYSCALL` (where `SFMASK` clears
+  `IF` for its entire duration) or inside `scheduler::schedule()`'s own `without_interrupts` section
+  — never somewhere this timer IRQ could actually preempt mid-hold. Rounds the requested duration
+  *up* to a whole tick (never sleeps for less than asked); a `{0, 0}` request returns immediately
+  without blocking at all. `rem_ptr` is always zeroed on return — no signal-delivery-during-sleep
+  interruption path exists yet, so a sleep either runs to its full duration or (via `SIGKILL`'s
+  immediate, no-handler termination path) never returns.
+- Doesn't implement `clock_nanosleep(2)` itself for any case beyond what plain `nanosleep()`
+  reduces to (`CLOCK_REALTIME`, no `TIMER_ABSTIME`) — no BusyBox applet in the roster calls it
+  directly with a different clock or absolute-deadline flag.
 
 ## BusyBox gap analysis: what's needed for more applets
 
@@ -598,7 +614,7 @@ at once, so the rows aren't a clean partition.
 | Real block device driver + mount table | not started | 20 (`NEEDS_BLOCKDEV`) | `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... — not applet-specific, would matter for actual persistence too, not just more applets |
 | uid/passwd-db model | not started, trivial stub possible | 16 (`NEEDS_UID`) | fully module-able, no-op stubs get partway there (`modules/posix_compat`) — `adduser`/`passwd`/`su`/`login`/... need a real `/etc/passwd`-equivalent to go further |
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` — see this file's own "Real-time clock" section |
-| `nanosleep` | not started | 9 (`NEEDS_CLOCK`), several also need the clock read above | real blocking is kernel-resident (new `BlockReason::Sleeping`, woken from the timer IRQ handler) — a different kind of work than a plain clock read, not just a module addition |
+| `nanosleep` | done | 9 (`NEEDS_CLOCK`), several also needed the clock read above | `SYS_NANOSLEEP=139` — see this file's own "Real-time clock" section. `date`/`hwclock`/`rtcwake`/`adjtimex`/`crond`/`crontab` needed the clock read more than a real sleep; not re-probed against the current roster to confirm which now fully work end to end |
 | Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | `runsv`/`svlogd`/`bootchartd`/... — this kernel has no init framework to plug into at all |
 | `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (folded into `NEEDS_HARDWARE`) | — |
 | `uname` | done | — | `SYS_UNAME=137` in `modules/posix_compat` — real `uname(2)`'s exact single-pointer wire format, fixed `struct utsname` fields (`src/syscall.rs`'s `sys_uname`); `release` is this crate's own `CARGO_PKG_VERSION`, everything else a fixed placeholder (no real hostname-config or build-timestamp mechanism exists) |
