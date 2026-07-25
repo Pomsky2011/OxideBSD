@@ -419,6 +419,13 @@ fn main() {
         // `uname -a` needed `SYS_UNAME` (see CLAUDE.md's "BusyBox gap analysis") registered first,
         // so this applet wasn't part of the original exhaustive probe.
         ("UNAME", "uname", 0xa1c0000),
+        // Same story as UNAME above: CONFIG_HOSTNAME's own `//applet:` marker sits right next to
+        // DNSDOMAINNAME's (already in the roster, tagged NEEDS_NETWORK -- it unconditionally takes
+        // hostname.c's DNS-lookup path) but was missed by the original extraction. Unlike
+        // dnsdomainname, plain `hostname` (no args, or `-s`) only needs safe_gethostname(), which
+        // is just uname() under the hood -- no new syscall required now that SYS_UNAME exists;
+        // only its `-d`/`-f`/`-i` flags (real DNS resolution) stay NEEDS_NETWORK.
+        ("HOSTNAME", "hostname", 0xa200000),
     ];
 
     // `BUSYBOX_APPLETS` above is a `&[(&str, &str, u64)]`, not `&[(&str, &str, u64); N]` --

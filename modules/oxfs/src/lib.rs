@@ -2209,6 +2209,7 @@ pub extern "C" fn module_init() -> i32 {
     // Appended out of alphabetical order, added after SYS_UNAME existed -- see build.rs's own
     // BUSYBOX_APPLETS_PASS2 comment.
     ok &= seed_file(bin, b"uname", include_bytes!(env!("OXFS_UNAME_ELF_PATH")));
+    ok &= seed_file(bin, b"hostname", include_bytes!(env!("OXFS_HOSTNAME_ELF_PATH")));
 
     if !ok {
         log("[oxfs] self-check FAILED: seeding embedded files failed\n");

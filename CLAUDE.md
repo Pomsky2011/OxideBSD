@@ -570,7 +570,7 @@ at once, so the rows aren't a clean partition.
 | Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | `runsv`/`svlogd`/`bootchartd`/... — this kernel has no init framework to plug into at all |
 | `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (folded into `NEEDS_HARDWARE`) | — |
 | `uname` | done | — | `SYS_UNAME=137` in `modules/posix_compat` — real `uname(2)`'s exact single-pointer wire format, fixed `struct utsname` fields (`src/syscall.rs`'s `sys_uname`); `release` is this crate's own `CARGO_PKG_VERSION`, everything else a fixed placeholder (no real hostname-config or build-timestamp mechanism exists) |
-| `gethostname` | not started, trivial | — | fully module-able, fixed string (`modules/posix_compat`) |
+| `gethostname` | done | — | no new syscall needed -- musl's `gethostname()` (`src/unistd/gethostname.c`) is a pure wrapper around `uname()`. Wired up the `hostname` applet (`CONFIG_HOSTNAME`'s own `//applet:` marker was missed by the same extraction gap as `uname`'s) so there's something real to exercise it; its `-d`/`-f`/`-i` flags stay `NEEDS_NETWORK` (real DNS resolution) |
 
 **83 more candidate applets didn't even build** — `docs/BUSYBOX_APPLETS.md` breaks those down too:
 54 need real Linux kernel uapi headers (`linux/*.h`, `mtd/*.h`) musl deliberately doesn't vendor
