@@ -12,3 +12,7 @@ Currently it can run a lot of the Busybox applets, and is in Phase 1 of ROADMAP.
 The kernel is a highly modular monolithic kernel, to allow isolating attack surface even if it is wide, such that exploits can be isolated and fixed quickly.
 This technique also speeds up development as it allows critical system components to be developed seperately from the kernel.
 It also removes one of the key disadvantages of modularity, as it allows components to run at the same level as the kernel.
+
+To build it, use `cargo build`. You will also need GNU make and a C compiler/binutils installed as of right now due to Busybox being the userland.
+GCC is recommended.
+You will likely need to build it on linux? But it might also work on macOS and Windows.
