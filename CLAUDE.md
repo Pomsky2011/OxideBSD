@@ -356,8 +356,12 @@ kernel's stdin path works:
 - Line editing: backspace/delete both erase-and-reprint `"\x08 \x08"`; Ctrl+C aborts the line
   (prints `^C`, returns empty); Ctrl+D on an empty line exits via `SYS_EXIT`. No cursor movement,
   no history, 128-byte line cap.
-- `src/vga.rs`'s `Writer` special-cases raw `0x08` as "step cursor back, draw nothing" so the same
-  backspace idiom works on the VGA console.
+- `src/vga.rs`'s `Writer` special-cases raw `0x08`/`0x7f` as "step cursor back, erase" so the same
+  backspace idiom works on the VGA console. The `Writer` is a true 2D-addressable console with a
+  minimal ANSI/VT100 CSI escape parser (cursor position/relative moves, erase display/line, SGR
+  colors) — added so full-screen BusyBox applets (`vi`, `clear`, `reset`) render correctly instead
+  of printing raw escape bytes; unrecognized sequences are parsed just enough to find the final
+  byte, then dropped silently.
 - Real `SYS_IOCTL=124` (`src/stdin.rs`'s `RawTermios`, a single **global** — not per-session —
   `TERMIOS`) implements `TCGETS`/`TCSETS*`/`TIOCGWINSZ` (fixed `24x80`)/`TIOCSWINSZ` (accepted,
   discarded); everything else is `ENOTTY`. Only succeeds against the real console (checked via
