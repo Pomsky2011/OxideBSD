@@ -174,7 +174,7 @@ Everything added since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=102`, `SYS_SE
 `SYS_UNLINK=109`, `SYS_RMDIR=110`, `SYS_RENAME=111`, `SYS_KILL=116`, `SYS_SIGACTION=117`,
 `SYS_SIGPROCMASK=118`, `SYS_SIGRETURN=119`, `SYS_SETPGID=120`, `SYS_GETPGID=121`, `SYS_IOCTL=124`,
 `SYS_DUP=125`, `SYS_FSTAT=126`, `SYS_STAT=127`, `SYS_LSTAT=128`, `SYS_GETDENTS=129`,
-`SYS_UNAME=137`) is OxideBSD's
+`SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`) is OxideBSD's
 own invention —
 numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
@@ -539,6 +539,37 @@ no reason to pick different ones here.
   permission checks (no uid model exists).
 - Only 1-argument `void (*)(int)` handlers are supported — no `SA_SIGINFO`.
 
+## Real-time clock (`modules/clock/`, `src/pit.rs`, `src/rtc.rs`, `src/syscall.rs`)
+
+`SYS_CLOCK_GETTIME=138` — real `clock_gettime(2)`'s exact `(clockid, timespec_ptr)` wire format, so
+only the number needed remapping in musl. `time()`/`gettimeofday()` (`third_party/musl/src/time/
+time.c`/`gettimeofday.c`) are both plain C-level wrappers around `clock_gettime(CLOCK_REALTIME,
+...)`, not separate syscalls, so this one remap unlocks all three.
+
+- **`src/pit.rs`** reprograms the 8253/8254 PIT's channel 0 to a known, fixed `TIMER_HZ=100`
+  (traditional old-Linux `HZ`) at boot — before this, `src/interrupts.rs`'s `TICKS` counter (used
+  by `CLOCK_MONOTONIC`) incremented once per IRQ at whatever rate the BIOS happened to leave the
+  chip at (its power-on default, ~18.2065 Hz, is why it already worked at all, but was never a rate
+  this kernel actually configured or could rely on for real time arithmetic). 100 Hz, not a finer
+  1000 Hz some modern kernels use, deliberately — every extra timer IRQ has real, measured overhead
+  under QEMU's software TCG emulation (same class of concern as `src/memory.rs`'s own `invlpg`-cost
+  note), and nothing here needs sub-10ms resolution yet.
+- **`src/rtc.rs`** reads the CMOS/MC146818 RTC (ports `0x70`/`0x71`) fresh on every
+  `CLOCK_REALTIME` request rather than caching a boot-time baseline — the chip is always there and
+  cheap to read, so there's no drift/staleness tradeoff to make the way deriving wall-clock time
+  from tick count would have. Known simplifications: doesn't wait out an in-progress RTC update
+  before reading (rare, self-correcting, off-by-up-to-a-second failure mode — not worth the
+  standard double-read-until-stable dance here) and assumes the 21st century (`2000 + CMOS year`,
+  no century register read). `tv_nsec` is always `0` for `CLOCK_REALTIME` — no sub-second
+  resolution offered.
+- `CLOCK_MONOTONIC` converts `ticks()` against `TIMER_HZ` — seconds since boot, not wall-clock time
+  (matches real `CLOCK_MONOTONIC` semantics: unspecified epoch, only meaningful as a delta between
+  two readings). Any other `clockid` (`CLOCK_PROCESS_CPUTIME_ID`, ...) is `EINVAL` — no per-process/
+  per-thread CPU time is tracked.
+- **Deliberately doesn't implement `nanosleep`/`clock_nanosleep`** — see this file's own "BusyBox
+  gap analysis" below: real blocking needs a new `BlockReason::Sleeping` woken from the timer IRQ
+  handler, scheduler-resident work a syscall module can't do by itself, unlike a plain clock read.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
@@ -566,7 +597,8 @@ at once, so the rows aren't a clean partition.
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | each needs a real device/driver this kernel doesn't model — not one gap, several unrelated small ones (see `docs/BUSYBOX_APPLETS.md`) |
 | Real block device driver + mount table | not started | 20 (`NEEDS_BLOCKDEV`) | `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... — not applet-specific, would matter for actual persistence too, not just more applets |
 | uid/passwd-db model | not started, trivial stub possible | 16 (`NEEDS_UID`) | fully module-able, no-op stubs get partway there (`modules/posix_compat`) — `adduser`/`passwd`/`su`/`login`/... need a real `/etc/passwd`-equivalent to go further |
-| clock + `nanosleep` | not started | 9 (`NEEDS_CLOCK`) | monotonic tick read is a trivial module accessor; `nanosleep` blocking is kernel-resident (new `BlockReason::Sleeping`, woken from the timer IRQ handler); a real wall clock needs a new RTC driver (module code has no port-I/O primitive exposed yet — a smaller prerequisite) |
+| `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` — see this file's own "Real-time clock" section |
+| `nanosleep` | not started | 9 (`NEEDS_CLOCK`), several also need the clock read above | real blocking is kernel-resident (new `BlockReason::Sleeping`, woken from the timer IRQ handler) — a different kind of work than a plain clock read, not just a module addition |
 | Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | `runsv`/`svlogd`/`bootchartd`/... — this kernel has no init framework to plug into at all |
 | `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (folded into `NEEDS_HARDWARE`) | — |
 | `uname` | done | — | `SYS_UNAME=137` in `modules/posix_compat` — real `uname(2)`'s exact single-pointer wire format, fixed `struct utsname` fields (`src/syscall.rs`'s `sys_uname`); `release` is this crate's own `CARGO_PKG_VERSION`, everything else a fixed placeholder (no real hostname-config or build-timestamp mechanism exists) |

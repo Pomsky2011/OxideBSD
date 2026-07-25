@@ -101,6 +101,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     )
     .unwrap_or_else(|e| panic!("failed to load the signal module: {e:?}"));
 
+    // Registers SYS_CLOCK_GETTIME -- CLOCK_REALTIME/CLOCK_MONOTONIC reads. See
+    // modules/clock/src/lib.rs's own doc comment; must load before hush, below, is spawned, same
+    // as every other syscall-registering module.
+    const CLOCK_MOD: &[u8] = include_bytes!(env!("CLOCK_MOD_PATH"));
+    const CLOCK_PANIC_SYMBOL: &str = env!("CLOCK_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "clock",
+        CLOCK_MOD,
+        CLOCK_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the clock module: {e:?}"));
+
     // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
     // (still built and self-checked by build.rs on every `cargo build`) but deliberately not
     // loaded here anymore.

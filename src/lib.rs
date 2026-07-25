@@ -19,9 +19,11 @@ pub mod memory;
 pub mod module;
 pub mod pic;
 pub mod pipe;
+pub mod pit;
 pub mod process;
 pub mod qemu;
 pub mod reboot;
+pub mod rtc;
 pub mod scheduler;
 pub mod serial;
 pub mod stdin;
@@ -55,6 +57,9 @@ pub fn init(
     fpu::init();
     interrupts::init_idt();
     interrupts::init_pics();
+    unsafe {
+        pit::init();
+    }
     syscall::init();
 
     serial_println!("[boot] enabling interrupts");

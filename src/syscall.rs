@@ -748,6 +748,54 @@ pub(crate) fn sys_uname(uts_ptr: u64) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// musl's own `struct timespec` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
+/// timespec` template, `time_t`/`long` both 8 bytes on this arch): two `i64`s, no padding.
+#[repr(C)]
+struct RawTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Real, architecture-generic `clockid_t` values (`third_party/musl/include/time.h`) -- not
+/// syscall numbers, so no remapping needed, unlike `SYS_clock_gettime` itself below.
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// `SYS_CLOCK_GETTIME` (registered as `138` by `modules/clock`, continuing on from `SYS_UNAME =
+/// 137`) — matches real `clock_gettime(2)`'s exact `(clockid, timespec_ptr)` wire format, so only
+/// the number needed remapping. musl's own `time()`/`gettimeofday()` (`third_party/musl/src/time/
+/// time.c`/`gettimeofday.c`) are both plain wrappers around `clock_gettime(CLOCK_REALTIME, ...)`
+/// at the C level, not separate syscalls, so this one remap is enough to unlock all three.
+///
+/// `CLOCK_REALTIME` reads `src/rtc.rs`'s CMOS RTC live on every call (see that module's own doc
+/// comment for why that's simpler and more honest than caching a boot-time baseline).
+/// `CLOCK_MONOTONIC` converts `src/interrupts.rs`'s `ticks()` against `src/pit.rs`'s now-known
+/// `TIMER_HZ`, seconds since boot -- not wall-clock time, matching real `CLOCK_MONOTONIC`
+/// semantics (unspecified epoch, only meaningful as a delta between two readings). Any other
+/// `clockid` (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`, ...) is `EINVAL` -- this
+/// kernel tracks neither per-process nor per-thread CPU time.
+pub(crate) fn sys_clock_gettime(clockid: u64, ts_ptr: u64) -> Result<u64, u64> {
+    let ts = match clockid {
+        CLOCK_REALTIME => RawTimespec {
+            tv_sec: crate::rtc::unix_epoch_seconds(),
+            tv_nsec: 0,
+        },
+        CLOCK_MONOTONIC => {
+            let ticks = crate::interrupts::ticks();
+            let hz = crate::pit::TIMER_HZ as u64;
+            RawTimespec {
+                tv_sec: (ticks / hz) as i64,
+                tv_nsec: ((ticks % hz) * 1_000_000_000 / hz) as i64,
+            }
+        }
+        _ => return Err(EINVAL),
+    };
+    // SAFETY: same known pointer-validation gap every other user-memory write in this file
+    // already has -- ts_ptr isn't checked against the caller's actual mappings first.
+    unsafe { *(ts_ptr as *mut RawTimespec) = ts };
+    Ok(0)
+}
+
 /// Thin FFI adapters over `sys_read`/`sys_write` for `modules/native_abi/` to call — see this
 /// file's module doc comment for why the underlying behavior stays here rather than being
 /// duplicated into that module. Converts each function's `Result<u64, u64>` into `SyscallHandler`'s
@@ -824,6 +872,10 @@ pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) ->
 
 pub(crate) extern "C" fn oxidebsd_sys_uname(uts_ptr: u64) -> i64 {
     result_to_ffi(sys_uname(uts_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_clock_gettime(clockid: u64, ts_ptr: u64) -> i64 {
+    result_to_ffi(sys_clock_gettime(clockid, ts_ptr))
 }
 
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/
