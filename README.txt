@@ -1,5 +1,9 @@
 OxideBSD
 
+AI GENERATED CONTENT DISCLOSURE!
+
+AI assistance was used in the making of this project. If you do not like this, you can look at a different repository.
+
 I honestly don't expect this to go far.
 It's just an experiment to see if I can make a BSD from scratch in Rust, and by me I mean Claude.
 If this goes well I will be happy.
