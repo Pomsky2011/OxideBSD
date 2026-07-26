@@ -80,6 +80,27 @@ pub unsafe fn init() {
 /// # Safety
 ///
 /// Must only be called from within the interrupt handler for `vector`.
+/// Clears the mask bit for `irq` (0-15), letting it start delivering interrupts. Must only be
+/// called after a handler for that line is already installed (`interrupts::register_irq_handler`
+/// for anything beyond the timer/keyboard) -- unmasking first risks a line firing before anything
+/// is listening for it.
+///
+/// # Safety
+///
+/// Caller must ensure a handler for `irq`'s vector is already installed in the IDT.
+pub unsafe fn unmask_irq(irq: u8) {
+    debug_assert!(irq < 16, "PIC pair only owns IRQ0-15");
+    let (mut port, bit): (Port<u8>, u8) = if irq < 8 {
+        (Port::new(PIC1_DATA), irq)
+    } else {
+        (Port::new(PIC2_DATA), irq - 8)
+    };
+    unsafe {
+        let mask = port.read();
+        port.write(mask & !(1 << bit));
+    }
+}
+
 pub unsafe fn notify_end_of_interrupt(vector: u8) {
     let mut pic1_command: Port<u8> = Port::new(PIC1_COMMAND);
     let mut pic2_command: Port<u8> = Port::new(PIC2_COMMAND);

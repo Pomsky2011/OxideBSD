@@ -10,6 +10,7 @@ members = [
   "modules/clock",
   "modules/fat32",
   "modules/oxfs",
+  "modules/net",
 ]
 
 [package]
@@ -33,6 +34,22 @@ harness = false
 name = "fork_wait"
 harness = false
 
+[[test]]
+name = "rtl8139_smoke"
+harness = false
+
+[[test]]
+name = "icmp_smoke"
+harness = false
+
+[[test]]
+name = "udp_smoke"
+harness = false
+
+[[test]]
+name = "tcp_smoke"
+harness = false
+
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool
 # grew to 32 MiB once the BusyBox roster grew to ~300 applets (see CLAUDE.md's BusyBox section),
 # and -- since src/memory.rs's frame allocator never reclaims and this kernel maps every module
@@ -45,15 +62,39 @@ harness = false
 # otherwise: this RAM bump alone, before that fix, pushed the heap to ~32,000 pages, each
 # individually `invlpg`-flushed and trapped under QEMU's software TCG emulation).
 [package.metadata.bootimage]
+# -accel kvm -accel tcg: neither test-args nor run-args ever requested an accelerator before, so
+# QEMU silently ran pure-software TCG the whole time -- normally fine (this kernel boots in a
+# couple seconds under it), but TCG's per-instruction interpretation overhead is entirely at the
+# mercy of host CPU contention, and under load this boot went from ~4s to well past a minute,
+# indistinguishable from a genuine hang (confirmed: the exact same stall reproduces on a clean
+# pre-networking master checkout with plain `cargo run`, so it was never caused by any of this
+# branch's own code -- see this repo's networking plan/session history for the investigation).
+# Two repeated `-accel` flags, not the single-flag `kvm:tcg` list form -- this QEMU build rejects
+# that syntax outright (`invalid accelerator kvm:tcg`); passing `-accel` twice is the form that
+# actually falls back to tcg when `/dev/kvm` isn't available (nested VMs, CI, sandboxes).
+# -nic user,model=rtl8139: an rtl8139 NIC on QEMU's built-in SLIRP user-mode network backend, no
+# host tap/bridge setup required. `bootimage` shares one test-args list across every `[[test]]`
+# target, so this also boots basic_boot/fork_wait with the device present -- harmless, since
+# neither calls oxidebsd::net::rtl8139::init. See tests/rtl8139_smoke.rs and this repo's
+# networking plan.
 test-args = [
+  "-accel", "kvm",
+  "-accel", "tcg",
   "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
   "-serial", "stdio",
   "-display", "none",
   "-m", "1024",
+  "-nic", "user,model=rtl8139",
 ]
 test-success-exit-code = 33
 test-timeout = 300
-run-args = ["-serial", "stdio", "-m", "1024"]
+run-args = [
+  "-accel", "kvm",
+  "-accel", "tcg",
+  "-serial", "stdio",
+  "-m", "1024",
+  "-nic", "user,model=rtl8139",
+]
 
 [profile.dev]
 panic = "abort"

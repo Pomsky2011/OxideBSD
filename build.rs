@@ -20,6 +20,7 @@ fn main() {
     build_module_crate("posix_compat", "POSIX_COMPAT", &[]);
     build_module_crate("signal", "SIGNAL", &[]);
     build_module_crate("clock", "CLOCK", &[]);
+    build_module_crate("net", "NET", &[]);
 
     // ring3-smoke is embedded into the FAT32 image below (as SMOKE.ELF) so stsh's fork+execve+wait
     // path has a real, already-working target it can run as an actual file, not just another

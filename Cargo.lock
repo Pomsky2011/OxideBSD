@@ -62,6 +62,10 @@ name = "native_abi"
 version = "0.1.0"
 
 [[package]]
+name = "net"
+version = "0.1.0"
+
+[[package]]
 name = "oxfs"
 version = "0.1.0"
 

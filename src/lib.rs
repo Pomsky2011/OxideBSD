@@ -17,6 +17,8 @@ pub mod gdt;
 pub mod interrupts;
 pub mod memory;
 pub mod module;
+pub mod net;
+pub mod pci;
 pub mod pic;
 pub mod pipe;
 pub mod pit;

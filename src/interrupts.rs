@@ -32,6 +32,74 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+type IrqHandlerSlot = Mutex<Option<fn()>>;
+
+/// One slot per possible IRQ line (0-15); only 2-15 are ever populated -- 0/1 are permanently
+/// owned by the timer/keyboard's own dedicated handlers below, never routed through this table.
+/// Lets a driver whose IRQ line isn't known until runtime (e.g. read from a PCI device's
+/// interrupt-line register during `net::rtl8139::probe_and_init`) claim a vector without the
+/// static `IDT` needing to change shape.
+static IRQ_HANDLERS: [IrqHandlerSlot; 16] = [const { Mutex::new(None) }; 16];
+
+/// Registers `handler` to be called whenever `irq` fires. Must be paired with a subsequent
+/// `pic::unmask_irq(irq)` -- until that call, the line stays masked at the controller and
+/// `handler` is simply never invoked. Both calls should happen inside
+/// `x86_64::instructions::interrupts::without_interrupts` to close the race where the line fires
+/// between registration and unmasking.
+pub fn register_irq_handler(irq: u8, handler: fn()) {
+    assert!(
+        (2..16).contains(&irq),
+        "IRQ 0/1 are reserved for the timer/keyboard"
+    );
+    *IRQ_HANDLERS[irq as usize].lock() = Some(handler);
+}
+
+/// Defines one `extern "x86-interrupt"` trampoline per listed IRQ line (each must be a distinct
+/// function item -- a handler installed into the IDT can't be parameterized by IRQ number at
+/// runtime) plus `install_irq_trampolines`, which wires all of them into a `Lazy<IDT>` under
+/// construction. Each trampoline dispatches through `IRQ_HANDLERS`, doing nothing but the EOI if
+/// that line has no registered handler (a spurious or not-yet-claimed IRQ) -- and always sends
+/// the EOI regardless, since skipping it leaves the line masked at the controller forever, not
+/// just for this one interrupt.
+macro_rules! define_irq_trampolines {
+    ($( $name:ident => $irq:literal ),+ $(,)?) => {
+        $(
+            extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+                let handler = *IRQ_HANDLERS[$irq].lock();
+                if let Some(handler) = handler {
+                    handler();
+                }
+                unsafe {
+                    pic::notify_end_of_interrupt(PIC_1_OFFSET + $irq);
+                }
+            }
+        )+
+
+        fn install_irq_trampolines(idt: &mut InterruptDescriptorTable) {
+            $(
+                idt[PIC_1_OFFSET + $irq].set_handler_fn($name);
+            )+
+        }
+    };
+}
+
+define_irq_trampolines! {
+    irq2_trampoline => 2,
+    irq3_trampoline => 3,
+    irq4_trampoline => 4,
+    irq5_trampoline => 5,
+    irq6_trampoline => 6,
+    irq7_trampoline => 7,
+    irq8_trampoline => 8,
+    irq9_trampoline => 9,
+    irq10_trampoline => 10,
+    irq11_trampoline => 11,
+    irq12_trampoline => 12,
+    irq13_trampoline => 13,
+    irq14_trampoline => 14,
+    irq15_trampoline => 15,
+}
+
 // MapLettersToUnicode (not Ignore) so Ctrl+<letter> decodes to the corresponding C0 control code
 // (Ctrl+C => 0x03, Ctrl+D => 0x04, etc.) instead of being silently dropped to the plain letter --
 // stsh's read_line (see `userland/stsh/`) relies on those bytes reaching stdin to implement
@@ -63,6 +131,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+    install_irq_trampolines(&mut idt);
 
     idt
 });
@@ -70,9 +139,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 pub fn init_idt() {
     serial_println!(
         "[boot] loading IDT: breakpoint, invalid_opcode, general_protection_fault, page_fault, \
-         double_fault, timer (vector {:#x}), keyboard (vector {:#x})",
+         double_fault, timer (vector {:#x}), keyboard (vector {:#x}), IRQ2-15 trampolines \
+         (vectors {:#x}-{:#x}, unclaimed until a driver calls register_irq_handler)",
         InterruptIndex::Timer.as_u8(),
         InterruptIndex::Keyboard.as_u8(),
+        PIC_1_OFFSET + 2,
+        PIC_1_OFFSET + 15,
     );
     IDT.load();
     serial_println!("[boot] IDT loaded");

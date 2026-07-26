@@ -1,0 +1,907 @@
+//! Minimal TCP: a real (if simplified) state machine -- one segment in flight at a time
+//! (stop-and-wait, no sliding window/congestion control), a fixed 536-byte MSS (RFC 1122's safe
+//! default; this kernel does no IP fragmentation, so staying under the guaranteed minimum path
+//! MTU avoids ever needing it), a fixed retransmission timeout (no RTT estimation), and no
+//! TIME_WAIT/out-of-order reassembly/urgent-pointer/options support beyond correctly skipping
+//! past whatever the peer's `data_offset` says (real interoperability doesn't need parsing
+//! options we don't use, just not misreading their length as payload). See this repo's
+//! networking plan for the full list of what's deferred.
+//!
+//! `connect()`/`listen()`/`accept()` are dedicated syscalls (state transitions, not data flow);
+//! once a connection reaches `Established`, its `read`/`write` fd-ops callbacks genuinely are
+//! plain-byte-stream-shaped (an implicit peer, no address argument needed) -- the one place in
+//! this whole design where existing `SYS_READ`/`SYS_WRITE` machinery carries socket data, exactly
+//! mirroring how `fat32`/`oxfs` register file read/write today.
+//!
+//! `connect`/`accept` are non-blocking-with-self-poll, same convention `udp.rs`'s `recvfrom`
+//! already established (matches this kernel's own `sys_read`-on-stdin precedent) rather than
+//! real scheduler blocking -- a well-justified follow-up once real interactive use (a program
+//! that wants to sit in `accept()` indefinitely) actually needs it, not built speculatively now.
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec::Vec;
+
+use spin::Mutex;
+
+use super::ipv4::{self, Ipv4Addr};
+use crate::syscall::{EBADF, EINVAL};
+
+pub const PROTO_TCP: u8 = 6;
+
+const FLAG_FIN: u8 = 0x01;
+const FLAG_SYN: u8 = 0x02;
+const FLAG_RST: u8 = 0x04;
+const FLAG_PSH: u8 = 0x08;
+const FLAG_ACK: u8 = 0x10;
+
+const HEADER_LEN: usize = 20;
+const MSS: usize = 536;
+const MAX_RECV_BUF: usize = 65536;
+const EPHEMERAL_PORT_START: u16 = 49152;
+const RETRANSMIT_TICKS: u64 = 100; // ~1s at 100 Hz
+const MAX_RETRANSMITS: u32 = 5;
+const CONNECT_TIMEOUT_TICKS: u64 = 500; // ~5s
+const ACCEPT_BACKLOG_MIN: usize = 1;
+const ACCEPT_BACKLOG_MAX: usize = 128;
+
+const EAGAIN: i64 = 35;
+const EISCONN: i64 = 56;
+const ENOTCONN: i64 = 57;
+const ECONNREFUSED: i64 = 61;
+const ETIMEDOUT: i64 = 60;
+const EOPNOTSUPP: i64 = 45;
+const EADDRINUSE: i64 = 48;
+const EHOSTUNREACH: i64 = 65;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnState {
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    LastAck,
+    Closed,
+}
+
+struct Connection {
+    state: ConnState,
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+    send_next: u32,
+    send_unacked: u32,
+    recv_next: u32,
+    send_buf: VecDeque<u8>,
+    recv_buf: VecDeque<u8>,
+    /// The raw bytes of the last segment sent that still needs an ACK -- retransmitted verbatim
+    /// on timeout (see `check_retransmits`). `None` means nothing is currently in flight.
+    unacked_segment: Option<Vec<u8>>,
+    retransmit_deadline: Option<u64>,
+    retransmit_count: u32,
+}
+
+struct Listener {
+    backlog: usize,
+    /// `real_fd`s of connections that completed their handshake and are waiting for `accept()`
+    /// to claim them.
+    pending: VecDeque<u64>,
+}
+
+enum TcpSocket {
+    /// Created by `socket()`, not yet `bind()`/`connect()`/`listen()`-ed.
+    Unbound {
+        local_port: Option<u16>,
+    },
+    Listener(Listener),
+    Connection(Connection),
+}
+
+struct TcpState {
+    /// Every TCP socket this kernel knows about, keyed by the same `real_fd` identity
+    /// `crate::fd` uses -- including connections still mid-handshake, which get an id (via
+    /// `oxidebsd_alloc_fd`) the moment a SYN arrives, well before `accept()` ever attaches one to
+    /// a calling process's own fd table (real TCP stacks track half-open connections
+    /// independently of any fd too; reusing the same id space just avoids a second one).
+    sockets: BTreeMap<u64, TcpSocket>,
+    /// local port -> the `Listener`'s own `real_fd`, so a fresh inbound SYN can be routed there.
+    listeners: BTreeMap<u16, u64>,
+    /// (local port, remote ip, remote port) -> that connection's `real_fd`, for demuxing every
+    /// other inbound segment.
+    connections: BTreeMap<(u16, Ipv4Addr, u16), u64>,
+    next_ephemeral: u16,
+}
+
+impl TcpState {
+    const fn new() -> Self {
+        TcpState {
+            sockets: BTreeMap::new(),
+            listeners: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            next_ephemeral: EPHEMERAL_PORT_START,
+        }
+    }
+
+    fn alloc_ephemeral_port(&mut self) -> Option<u16> {
+        let start = self.next_ephemeral;
+        loop {
+            let port = self.next_ephemeral;
+            self.next_ephemeral = if self.next_ephemeral == u16::MAX {
+                EPHEMERAL_PORT_START
+            } else {
+                self.next_ephemeral + 1
+            };
+            if !self.listeners.contains_key(&port) {
+                return Some(port);
+            }
+            if self.next_ephemeral == start {
+                return None; // wrapped all the way around -- exhausted
+            }
+        }
+    }
+}
+
+static STATE: Mutex<TcpState> = Mutex::new(TcpState::new());
+static ISN_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn resolve(fd: u64) -> Option<u64> {
+    crate::fd::real_fd_of(fd)
+}
+
+/// Not RFC 6528 hash-based/random -- ticks mixed with a plain counter is non-repeating in
+/// practice and cheap, and this kernel has no real security model to defend yet anyway (same
+/// "no entropy source" simplification `AT_RANDOM` already documents elsewhere).
+fn isn() -> u32 {
+    let counter = ISN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    (crate::interrupts::ticks() as u32) ^ counter.wrapping_mul(0x9E37_79B1)
+}
+
+fn window_for(recv_buf_len: usize) -> u16 {
+    MAX_RECV_BUF
+        .saturating_sub(recv_buf_len)
+        .min(u16::MAX as usize) as u16
+}
+
+/// TCP's checksum covers a 12-byte pseudo-header (src/dst IP, zero, protocol, segment length)
+/// prepended to the real segment -- mandatory for TCP, unlike UDP/ICMP over IPv4 where a zero
+/// checksum is legal. Built as one temporary buffer and handed to `ipv4::checksum`, which knows
+/// nothing about pseudo-headers itself.
+fn tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, segment: &[u8]) -> u16 {
+    let mut buf = Vec::with_capacity(12 + segment.len());
+    buf.extend_from_slice(&src_ip);
+    buf.extend_from_slice(&dst_ip);
+    buf.push(0);
+    buf.push(PROTO_TCP);
+    buf.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+    buf.extend_from_slice(segment);
+    ipv4::checksum(&buf)
+}
+
+fn build_segment(
+    local_port: u16,
+    remote_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut seg = Vec::with_capacity(HEADER_LEN + data.len());
+    seg.extend_from_slice(&local_port.to_be_bytes());
+    seg.extend_from_slice(&remote_port.to_be_bytes());
+    seg.extend_from_slice(&seq.to_be_bytes());
+    seg.extend_from_slice(&ack.to_be_bytes());
+    seg.push(5 << 4); // data offset = 5 (20 bytes, no options); reserved bits = 0
+    seg.push(flags);
+    seg.extend_from_slice(&window.to_be_bytes());
+    seg.extend_from_slice(&[0, 0]); // checksum placeholder
+    seg.extend_from_slice(&[0, 0]); // urgent pointer, unused
+    seg.extend_from_slice(data);
+    seg
+}
+
+/// Builds, checksums, and transmits one segment. Returns the built segment's own bytes (for
+/// retransmission tracking) on success. Eight parameters, one per real TCP header field this
+/// layer actually varies -- grouping them into a params struct wouldn't make a raw
+/// header-building function any clearer.
+#[allow(clippy::too_many_arguments)]
+fn send_segment(
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let mut seg = build_segment(local_port, remote_port, seq, ack, flags, window, data);
+    let cksum = tcp_checksum(ipv4::GUEST_IP, remote_ip, &seg);
+    seg[16..18].copy_from_slice(&cksum.to_be_bytes());
+    ipv4::send_packet(remote_ip, PROTO_TCP, &seg)?;
+    Some(seg)
+}
+
+/// Sends a segment for an existing connection and, if it carries a SYN/FIN/data (anything the
+/// peer must ACK), tracks it for retransmission. `seq`/`ack`/`flags`/`data` are explicit
+/// (rather than always read straight from the connection) since callers building a SYN/FIN use a
+/// seq value distinct from `send_next` at the moment they call this.
+fn send_and_track(real_fd: u64, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Option<()> {
+    let (local_port, remote_ip, remote_port, window) = {
+        let state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get(&real_fd) else {
+            return None;
+        };
+        (
+            conn.local_port,
+            conn.remote_ip,
+            conn.remote_port,
+            window_for(conn.recv_buf.len()),
+        )
+    };
+    let segment = send_segment(
+        local_port,
+        remote_ip,
+        remote_port,
+        seq,
+        ack,
+        flags,
+        window,
+        data,
+    )?;
+
+    if flags & (FLAG_SYN | FLAG_FIN) != 0 || !data.is_empty() {
+        let mut state = STATE.lock();
+        if let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) {
+            conn.unacked_segment = Some(segment);
+            conn.retransmit_deadline = Some(crate::interrupts::ticks() + RETRANSMIT_TICKS);
+        }
+    }
+    Some(())
+}
+
+fn teardown(state: &mut TcpState, real_fd: u64) {
+    if let Some(TcpSocket::Connection(conn)) = state.sockets.get(&real_fd) {
+        let key = (conn.local_port, conn.remote_ip, conn.remote_port);
+        state.connections.remove(&key);
+    }
+    state.sockets.remove(&real_fd);
+}
+
+/// Sends a buffered chunk (up to `MSS`) if nothing's currently in flight and the connection can
+/// still send. Called after `write()` and after any state change that might have freed up the
+/// single in-flight slot (an ACK, a fresh accept).
+fn try_send(real_fd: u64) {
+    let sendable = {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return;
+        };
+        if conn.unacked_segment.is_some()
+            || conn.send_buf.is_empty()
+            || !matches!(conn.state, ConnState::Established | ConnState::CloseWait)
+        {
+            None
+        } else {
+            let take = conn.send_buf.len().min(MSS);
+            let chunk: Vec<u8> = conn.send_buf.drain(..take).collect();
+            Some((conn.send_next, conn.recv_next, chunk))
+        }
+    };
+    let Some((seq, ack, chunk)) = sendable else {
+        return;
+    };
+
+    if send_and_track(real_fd, seq, ack, FLAG_ACK | FLAG_PSH, &chunk).is_some() {
+        let mut state = STATE.lock();
+        if let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) {
+            conn.send_next = seq.wrapping_add(chunk.len() as u32);
+        }
+    } else {
+        // Send failed (e.g. ARP resolution failed) -- put the bytes back so a later attempt can
+        // retry, rather than silently losing them.
+        let mut state = STATE.lock();
+        if let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) {
+            for &b in chunk.iter().rev() {
+                conn.send_buf.push_front(b);
+            }
+        }
+    }
+}
+
+/// Sends a FIN for a connection currently in `Established`/`CloseWait` and transitions it to
+/// `next_state`. Shared by `tcp_close`'s two graceful-shutdown cases.
+fn send_fin_and_transition(real_fd: u64, next_state: ConnState) {
+    let pair = {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return;
+        };
+        let pair = (conn.send_next, conn.recv_next);
+        conn.state = next_state;
+        pair
+    };
+    let (seq, ack) = pair;
+    send_and_track(real_fd, seq, ack, FLAG_FIN | FLAG_ACK, &[]);
+    let mut state = STATE.lock();
+    if let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) {
+        conn.send_next = seq.wrapping_add(1);
+    }
+}
+
+/// Checks every connection's retransmission deadline, resending or giving up as needed. Called
+/// from `net::poll()` -- the same self-driving mechanism every socket syscall already funnels
+/// through, so this runs whenever anything touches the network, not on a dedicated timer.
+pub fn check_retransmits() {
+    let now = crate::interrupts::ticks();
+    let due: Vec<u64> = {
+        let state = STATE.lock();
+        state
+            .sockets
+            .iter()
+            .filter_map(|(&fd, sock)| match sock {
+                TcpSocket::Connection(conn)
+                    if conn.retransmit_deadline.is_some_and(|d| now >= d) =>
+                {
+                    Some(fd)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for fd in due {
+        retransmit_or_give_up(fd);
+    }
+}
+
+fn retransmit_or_give_up(real_fd: u64) {
+    let outcome = {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return;
+        };
+        conn.retransmit_count += 1;
+        if conn.retransmit_count > MAX_RETRANSMITS {
+            None
+        } else {
+            conn.retransmit_deadline = Some(crate::interrupts::ticks() + RETRANSMIT_TICKS);
+            Some((conn.unacked_segment.clone(), conn.remote_ip))
+        }
+    };
+    match outcome {
+        None => {
+            let mut state = STATE.lock();
+            teardown(&mut state, real_fd);
+        }
+        Some((Some(segment), remote_ip)) => {
+            let _ = ipv4::send_packet(remote_ip, PROTO_TCP, &segment);
+        }
+        Some((None, _)) => {}
+    }
+}
+
+/// Parses one inbound TCP segment (already IP-payload-only, see `ipv4::handle_packet`) and
+/// routes it to an existing connection, a listener (for a fresh SYN), or an RST (for anything
+/// else -- a segment to a closed port, matching real TCP).
+pub fn handle_packet(payload: &[u8], src_ip: Ipv4Addr) {
+    if payload.len() < HEADER_LEN {
+        return;
+    }
+    let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+    let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
+    let seq = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+    let ack = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+    let data_offset = ((payload[12] >> 4) as usize) * 4;
+    let flags = payload[13];
+    if data_offset < HEADER_LEN || data_offset > payload.len() {
+        return;
+    }
+    let data = &payload[data_offset..];
+
+    let key = (dst_port, src_ip, src_port);
+    let existing = STATE.lock().connections.get(&key).copied();
+
+    if let Some(real_fd) = existing {
+        handle_for_connection(real_fd, seq, ack, flags, data);
+        return;
+    }
+
+    if flags & FLAG_SYN != 0 && flags & FLAG_ACK == 0 {
+        handle_new_syn(dst_port, src_ip, src_port, seq);
+        return;
+    }
+
+    if flags & FLAG_RST == 0 {
+        let _ = send_segment(
+            dst_port,
+            src_ip,
+            src_port,
+            0,
+            seq.wrapping_add(1),
+            FLAG_RST | FLAG_ACK,
+            0,
+            &[],
+        );
+    }
+}
+
+fn handle_new_syn(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, their_seq: u32) {
+    let listener_fd = {
+        let state = STATE.lock();
+        state.listeners.get(&local_port).copied()
+    };
+    let Some(listener_fd) = listener_fd else {
+        let _ = send_segment(
+            local_port,
+            remote_ip,
+            remote_port,
+            0,
+            their_seq.wrapping_add(1),
+            FLAG_RST | FLAG_ACK,
+            0,
+            &[],
+        );
+        return;
+    };
+    let backlog_full = {
+        let state = STATE.lock();
+        match state.sockets.get(&listener_fd) {
+            Some(TcpSocket::Listener(l)) => l.pending.len() >= l.backlog,
+            _ => true,
+        }
+    };
+    if backlog_full {
+        return; // silently drop -- the peer's own SYN retransmission will retry later
+    }
+
+    let seq = isn();
+    let conn_fd = crate::fd::oxidebsd_alloc_fd();
+    let conn = Connection {
+        state: ConnState::SynReceived,
+        local_port,
+        remote_ip,
+        remote_port,
+        send_next: seq.wrapping_add(1),
+        send_unacked: seq,
+        recv_next: their_seq.wrapping_add(1),
+        send_buf: VecDeque::new(),
+        recv_buf: VecDeque::new(),
+        unacked_segment: None,
+        retransmit_deadline: None,
+        retransmit_count: 0,
+    };
+    {
+        let mut state = STATE.lock();
+        state
+            .connections
+            .insert((local_port, remote_ip, remote_port), conn_fd);
+        state.sockets.insert(conn_fd, TcpSocket::Connection(conn));
+    }
+    send_and_track(
+        conn_fd,
+        seq,
+        their_seq.wrapping_add(1),
+        FLAG_SYN | FLAG_ACK,
+        &[],
+    );
+}
+
+fn handle_for_connection(real_fd: u64, seq: u32, ack: u32, flags: u8, data: &[u8]) {
+    if flags & FLAG_RST != 0 {
+        let mut state = STATE.lock();
+        teardown(&mut state, real_fd);
+        return;
+    }
+
+    let cur_state = {
+        let state = STATE.lock();
+        match state.sockets.get(&real_fd) {
+            Some(TcpSocket::Connection(conn)) => conn.state,
+            _ => return,
+        }
+    };
+
+    match cur_state {
+        ConnState::SynSent => handle_syn_sent(real_fd, seq, ack, flags),
+        ConnState::SynReceived => handle_syn_received(real_fd, ack, flags),
+        ConnState::Established
+        | ConnState::FinWait1
+        | ConnState::FinWait2
+        | ConnState::CloseWait => process_established(real_fd, seq, ack, flags, data),
+        ConnState::LastAck => {
+            if flags & FLAG_ACK != 0 {
+                let mut state = STATE.lock();
+                teardown(&mut state, real_fd);
+            }
+        }
+        ConnState::Closed => {}
+    }
+}
+
+fn handle_syn_sent(real_fd: u64, seq: u32, ack: u32, flags: u8) {
+    if flags & FLAG_SYN == 0 || flags & FLAG_ACK == 0 {
+        return;
+    }
+    let outcome = {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return;
+        };
+        if ack != conn.send_next {
+            None
+        } else {
+            conn.recv_next = seq.wrapping_add(1);
+            conn.send_unacked = conn.send_next;
+            conn.unacked_segment = None;
+            conn.retransmit_deadline = None;
+            conn.state = ConnState::Established;
+            Some((
+                conn.local_port,
+                conn.remote_ip,
+                conn.remote_port,
+                conn.send_next,
+                conn.recv_next,
+                window_for(conn.recv_buf.len()),
+            ))
+        }
+    };
+    if let Some((lp, ri, rp, sn, rn, window)) = outcome {
+        let _ = send_segment(lp, ri, rp, sn, rn, FLAG_ACK, window, &[]);
+    }
+}
+
+fn handle_syn_received(real_fd: u64, ack: u32, flags: u8) {
+    if flags & FLAG_ACK == 0 {
+        return;
+    }
+    let mut state = STATE.lock();
+    let local_port = {
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return;
+        };
+        if ack != conn.send_next {
+            return;
+        }
+        conn.send_unacked = conn.send_next;
+        conn.unacked_segment = None;
+        conn.retransmit_deadline = None;
+        conn.state = ConnState::Established;
+        conn.local_port
+    };
+    if let Some(&listener_fd) = state.listeners.get(&local_port)
+        && let Some(TcpSocket::Listener(l)) = state.sockets.get_mut(&listener_fd)
+    {
+        l.pending.push_back(real_fd);
+    }
+}
+
+fn process_established(real_fd: u64, seq: u32, ack: u32, flags: u8, data: &[u8]) {
+    let outcome = {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return;
+        };
+
+        if flags & FLAG_ACK != 0 && ack != conn.send_unacked && ack == conn.send_next {
+            conn.send_unacked = conn.send_next;
+            conn.unacked_segment = None;
+            conn.retransmit_deadline = None;
+            conn.retransmit_count = 0;
+            if conn.state == ConnState::FinWait1 {
+                conn.state = ConnState::FinWait2;
+            }
+        }
+
+        // In-order data only -- no reassembly for out-of-order segments (a known simplification).
+        if !data.is_empty() && seq == conn.recv_next {
+            let room = MAX_RECV_BUF.saturating_sub(conn.recv_buf.len());
+            let take = data.len().min(room);
+            conn.recv_buf.extend(&data[..take]);
+            conn.recv_next = conn.recv_next.wrapping_add(take as u32);
+        }
+
+        let mut fin_seen = false;
+        if flags & FLAG_FIN != 0 && seq.wrapping_add(data.len() as u32) == conn.recv_next {
+            conn.recv_next = conn.recv_next.wrapping_add(1);
+            fin_seen = true;
+            conn.state = match conn.state {
+                ConnState::Established => ConnState::CloseWait,
+                ConnState::FinWait1 | ConnState::FinWait2 => ConnState::Closed,
+                other => other,
+            };
+        }
+
+        let should_ack = !data.is_empty() || fin_seen;
+        (
+            should_ack,
+            conn.local_port,
+            conn.remote_ip,
+            conn.remote_port,
+            conn.send_next,
+            conn.recv_next,
+            window_for(conn.recv_buf.len()),
+        )
+    };
+    let (should_ack, lp, ri, rp, sn, rn, window) = outcome;
+    if should_ack {
+        let _ = send_segment(lp, ri, rp, sn, rn, FLAG_ACK, window, &[]);
+    }
+    try_send(real_fd);
+}
+
+/// Test-support only, not part of the real syscall ABI (same "kept `pub` for a test" precedent
+/// `syscall::oxidebsd_register_syscall` already has for `tests/fork_wait.rs`'s own
+/// `SYS_TEST_EXIT`) -- a scripted-peer test (`tests/tcp_smoke.rs`) needs to construct valid
+/// reply segments, which means knowing sequence numbers this module generates internally
+/// (`isn()`'s output isn't predictable from outside, by design) rather than guessing them.
+pub fn debug_connection_for(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> Option<u64> {
+    STATE
+        .lock()
+        .connections
+        .get(&(local_port, remote_ip, remote_port))
+        .copied()
+}
+
+/// See `debug_connection_for`'s own doc comment.
+pub fn debug_send_next(real_fd: u64) -> Option<u32> {
+    match STATE.lock().sockets.get(&real_fd) {
+        Some(TcpSocket::Connection(conn)) => Some(conn.send_next),
+        _ => None,
+    }
+}
+
+pub fn create_socket() -> u64 {
+    let fd = crate::fd::oxidebsd_alloc_fd();
+    STATE
+        .lock()
+        .sockets
+        .insert(fd, TcpSocket::Unbound { local_port: None });
+    crate::fd::oxidebsd_register_fd_ops(fd, tcp_read, tcp_write, tcp_close);
+    fd
+}
+
+/// `None` if `real_fd` isn't a TCP socket at all (the caller, `udp::oxidebsd_sys_bind`, should
+/// keep looking in its own table); `Some(result)` if it is.
+pub fn bind(real_fd: u64, addr_ptr: u64) -> Option<i64> {
+    let mut state = STATE.lock();
+    match state.sockets.get(&real_fd) {
+        Some(TcpSocket::Unbound { .. }) => {}
+        Some(_) => return Some(-EISCONN),
+        None => return None,
+    }
+    let Some((_ip, port)) = super::udp::read_sockaddr(addr_ptr) else {
+        return Some(-(EINVAL as i64));
+    };
+    let port = if port == 0 {
+        match state.alloc_ephemeral_port() {
+            Some(p) => p,
+            None => return Some(-EADDRINUSE),
+        }
+    } else {
+        port
+    };
+    if let Some(TcpSocket::Unbound { local_port }) = state.sockets.get_mut(&real_fd) {
+        *local_port = Some(port);
+    }
+    Some(0)
+}
+
+/// Same not-mine-vs-mine `Option` convention as `bind` above.
+pub fn setsockopt(real_fd: u64) -> Option<i64> {
+    STATE.lock().sockets.get(&real_fd).map(|_| 0)
+}
+
+pub extern "C" fn oxidebsd_sys_connect(fd: u64, addr_ptr: u64, len: u64) -> i64 {
+    let _ = len;
+    let Some(real_fd) = resolve(fd) else {
+        return -(EBADF as i64);
+    };
+    let Some((remote_ip, remote_port)) = super::udp::read_sockaddr(addr_ptr) else {
+        return -(EINVAL as i64);
+    };
+
+    let local_port = {
+        let mut state = STATE.lock();
+        let existing_port = match state.sockets.get(&real_fd) {
+            Some(TcpSocket::Unbound { local_port }) => *local_port,
+            Some(_) => return -EISCONN,
+            None => return -(EBADF as i64),
+        };
+        match existing_port {
+            Some(p) => p,
+            None => match state.alloc_ephemeral_port() {
+                Some(p) => p,
+                None => return -EADDRINUSE,
+            },
+        }
+    };
+
+    let seq = isn();
+    let conn = Connection {
+        state: ConnState::SynSent,
+        local_port,
+        remote_ip,
+        remote_port,
+        send_next: seq.wrapping_add(1),
+        send_unacked: seq,
+        recv_next: 0,
+        send_buf: VecDeque::new(),
+        recv_buf: VecDeque::new(),
+        unacked_segment: None,
+        retransmit_deadline: None,
+        retransmit_count: 0,
+    };
+    {
+        let mut state = STATE.lock();
+        state
+            .connections
+            .insert((local_port, remote_ip, remote_port), real_fd);
+        state.sockets.insert(real_fd, TcpSocket::Connection(conn));
+    }
+
+    if send_and_track(real_fd, seq, 0, FLAG_SYN, &[]).is_none() {
+        let mut state = STATE.lock();
+        teardown(&mut state, real_fd);
+        return -EHOSTUNREACH;
+    }
+
+    let deadline = crate::interrupts::ticks() + CONNECT_TIMEOUT_TICKS;
+    loop {
+        super::poll();
+        let outcome = {
+            let state = STATE.lock();
+            match state.sockets.get(&real_fd) {
+                Some(TcpSocket::Connection(conn)) => match conn.state {
+                    ConnState::Established => Some(0),
+                    ConnState::Closed => Some(-ECONNREFUSED),
+                    _ => None,
+                },
+                _ => Some(-ECONNREFUSED),
+            }
+        };
+        if let Some(result) = outcome {
+            return result;
+        }
+        if crate::interrupts::ticks() >= deadline {
+            let mut state = STATE.lock();
+            teardown(&mut state, real_fd);
+            return -ETIMEDOUT;
+        }
+        x86_64::instructions::hlt();
+    }
+}
+
+pub extern "C" fn oxidebsd_sys_listen(fd: u64, backlog: u64) -> i64 {
+    let Some(real_fd) = resolve(fd) else {
+        return -(EBADF as i64);
+    };
+    let mut state = STATE.lock();
+    let local_port = match state.sockets.get(&real_fd) {
+        Some(TcpSocket::Unbound { local_port }) => *local_port,
+        Some(TcpSocket::Listener(_)) => return 0, // already listening -- idempotent
+        Some(_) => return -EISCONN,
+        None => return -(EBADF as i64),
+    };
+    let local_port = match local_port {
+        Some(p) => p,
+        None => match state.alloc_ephemeral_port() {
+            Some(p) => p,
+            None => return -EADDRINUSE,
+        },
+    };
+    if state.listeners.contains_key(&local_port) {
+        return -EADDRINUSE;
+    }
+    let backlog = (backlog as usize).clamp(ACCEPT_BACKLOG_MIN, ACCEPT_BACKLOG_MAX);
+    state.sockets.insert(
+        real_fd,
+        TcpSocket::Listener(Listener {
+            backlog,
+            pending: VecDeque::new(),
+        }),
+    );
+    state.listeners.insert(local_port, real_fd);
+    0
+}
+
+pub extern "C" fn oxidebsd_sys_accept(fd: u64, addr_out_ptr: u64, addrlen_ptr: u64) -> i64 {
+    let Some(real_fd) = resolve(fd) else {
+        return -(EBADF as i64);
+    };
+
+    super::poll();
+
+    let conn_fd = {
+        let mut state = STATE.lock();
+        match state.sockets.get_mut(&real_fd) {
+            Some(TcpSocket::Listener(l)) => l.pending.pop_front(),
+            Some(_) => return -EOPNOTSUPP,
+            None => return -(EBADF as i64),
+        }
+    };
+    let Some(conn_fd) = conn_fd else {
+        return -EAGAIN;
+    };
+
+    let addr = {
+        let state = STATE.lock();
+        match state.sockets.get(&conn_fd) {
+            Some(TcpSocket::Connection(conn)) => Some((conn.remote_ip, conn.remote_port)),
+            _ => None, // torn down (e.g. RST) between promotion and accept()
+        }
+    };
+    let Some((remote_ip, remote_port)) = addr else {
+        return -ECONNREFUSED;
+    };
+
+    crate::fd::oxidebsd_register_fd_ops(conn_fd, tcp_read, tcp_write, tcp_close);
+    super::udp::write_sockaddr(addr_out_ptr, remote_ip, remote_port);
+    if addrlen_ptr != 0 {
+        unsafe {
+            *(addrlen_ptr as *mut u32) = 16;
+        }
+    }
+    conn_fd as i64
+}
+
+extern "C" fn tcp_read(real_fd: u64, ptr: u64, len: u64) -> i64 {
+    super::poll();
+    let bytes = {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return -(EBADF as i64);
+        };
+        let n = conn.recv_buf.len().min(len as usize);
+        if n == 0 {
+            return 0; // matches this kernel's established non-blocking-read convention
+        }
+        conn.recv_buf.drain(..n).collect::<Vec<u8>>()
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+    }
+    bytes.len() as i64
+}
+
+extern "C" fn tcp_write(real_fd: u64, ptr: u64, len: u64) -> i64 {
+    {
+        let mut state = STATE.lock();
+        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+            return -(EBADF as i64);
+        };
+        if !matches!(conn.state, ConnState::Established | ConnState::CloseWait) {
+            return -ENOTCONN;
+        }
+        let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+        conn.send_buf.extend(data);
+    }
+    try_send(real_fd);
+    len as i64
+}
+
+extern "C" fn tcp_close(real_fd: u64) -> i64 {
+    let mut state = STATE.lock();
+    let conn_state = match state.sockets.get(&real_fd) {
+        Some(TcpSocket::Connection(conn)) => Some(conn.state),
+        _ => None,
+    };
+    match conn_state {
+        Some(ConnState::Established) => {
+            drop(state);
+            send_fin_and_transition(real_fd, ConnState::FinWait1);
+        }
+        Some(ConnState::CloseWait) => {
+            drop(state);
+            send_fin_and_transition(real_fd, ConnState::LastAck);
+        }
+        Some(_) => teardown(&mut state, real_fd),
+        None => {
+            state.listeners.retain(|_, &mut v| v != real_fd);
+            state.sockets.remove(&real_fd);
+        }
+    }
+    0
+}

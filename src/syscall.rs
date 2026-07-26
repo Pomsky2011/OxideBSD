@@ -808,11 +808,15 @@ pub(crate) extern "C" fn oxidebsd_sys_exit(code: u64) -> ! {
     crate::process::do_exit(crate::scheduler::current_pid(), code as i32)
 }
 
-pub(crate) extern "C" fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
+// `pub`, not `pub(crate)` -- same "kept public for test use" precedent `oxidebsd_register_syscall`
+// already has (see `tests/fork_wait.rs`). `tests/tcp_smoke.rs` needs the real SYS_READ/SYS_WRITE
+// entry point (not a lower-level shortcut) to exercise an accepted TCP connection's fd-ops
+// callbacks the exact way a real process's read()/write() would reach them.
+pub extern "C" fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
     result_to_ffi(sys_read(fd, ptr, len))
 }
 
-pub(crate) extern "C" fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
+pub extern "C" fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
     result_to_ffi(sys_write(fd, ptr, len))
 }
 

@@ -46,6 +46,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let (mut mapper, mut frame_allocator) = oxidebsd::init(boot_info);
     let physical_memory_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
 
+    // Phase 1 of networking (see this repo's networking plan): probes for and brings up a real
+    // NIC, if one is present, before any module loads. Not fatal either way -- logged, boot
+    // continues regardless of whether a supported device was found. No protocol stack, no
+    // syscalls, no `modules/net` yet -- just raw Ethernet frame TX/RX, IRQ-driven.
+    oxidebsd::net::rtl8139::init(&mut frame_allocator, physical_memory_offset);
+
     const HELLO_MOD: &[u8] = include_bytes!(env!("HELLO_MOD_PATH"));
     const HELLO_PANIC_SYMBOL: &str = env!("HELLO_MOD_PANIC_SYMBOL");
     oxidebsd::module::load(
@@ -128,6 +134,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         &mut frame_allocator,
     )
     .unwrap_or_else(|e| panic!("failed to load the oxfs module: {e:?}"));
+
+    // Registers SYS_SOCKET/SYS_BIND/SYS_SENDTO/SYS_RECVFROM/SYS_SETSOCKOPT -- UDP sockets (see
+    // CLAUDE.md's networking plan; src/net/udp.rs holds the real logic, this module is just the
+    // usual thin syscall-registration shim). Must load before hush, below, is spawned, same as
+    // every other syscall-registering module.
+    const NET_MOD: &[u8] = include_bytes!(env!("NET_MOD_PATH"));
+    const NET_PANIC_SYMBOL: &str = env!("NET_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "net",
+        NET_MOD,
+        NET_PANIC_SYMBOL,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the net module: {e:?}"));
 
     // Modules are loaded; nothing else needs `frame_allocator`/`physical_memory_offset` as local
     // values from here on -- hand them over to memory's global state (moving frame_allocator by
