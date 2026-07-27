@@ -29,12 +29,17 @@ Current state:
   standalone static binaries, `execve`'d individually (not a multi-call `busybox` binary
   dispatching on `argv[0]` — that passthrough exists now, but the roster hasn't been rebuilt to
   use it).
+- A real networking stack (`src/pci.rs`, `src/net/*`, `modules/net/`): PCI + an rtl8139 driver,
+  Ethernet/ARP/IPv4/ICMP, UDP/TCP/raw-ICMP sockets, `poll(2)`, and real hostname resolution over
+  musl's own DNS stub resolver (no DNS protocol code of its own) — see this file's own "Real
+  networking" section.
 
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
 no filesystem persistence, no preemption, no copy-on-write fork, no frame deallocation anywhere,
-`sys_read` on stdin is non-blocking (busy-polled by userland), no real block device driver. See
-"BusyBox gap analysis" below for what's needed to go further. Architecture decisions for remaining
-subsystems haven't been made — discuss with the user before large structural commitments.
+`sys_read` on stdin is non-blocking (busy-polled by userland), no real block device driver,
+no `alarm`/`setitimer`, no IPv6, no real routing table (one default-gateway rule
+only). See "BusyBox gap analysis" below for what's needed to go further. Architecture decisions for
+remaining subsystems haven't been made — discuss with the user before large structural commitments.
 
 ## Toolchain
 
@@ -174,13 +179,33 @@ Everything added since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=102`, `SYS_SE
 `SYS_UNLINK=109`, `SYS_RMDIR=110`, `SYS_RENAME=111`, `SYS_KILL=116`, `SYS_SIGACTION=117`,
 `SYS_SIGPROCMASK=118`, `SYS_SIGRETURN=119`, `SYS_SETPGID=120`, `SYS_GETPGID=121`, `SYS_IOCTL=124`,
 `SYS_DUP=125`, `SYS_FSTAT=126`, `SYS_STAT=127`, `SYS_LSTAT=128`, `SYS_GETDENTS=129`,
-`SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`, `SYS_NANOSLEEP=139`) is OxideBSD's
+`SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`, `SYS_NANOSLEEP=139`, `SYS_SOCKET=140`, `SYS_BIND=141`,
+`SYS_SENDTO=142`, `SYS_RECVFROM=143`, `SYS_SETSOCKOPT=144`, `SYS_CONNECT=145`, `SYS_LISTEN=146`,
+`SYS_ACCEPT=147`, `SYS_POLL=148`, `SYS_SOCKETPAIR=149`, `SYS_SET_TID_ADDRESS=150`, `SYS_FCNTL=151`,
+`SYS_SHUTDOWN=152`, `SYS_READV=153`) is OxideBSD's
 own invention —
 numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
 match real wire formats anyway; check `src/syscall.rs` and module sources for the current highest
-number before assigning a new one). errno uses FreeBSD's values where Linux/BSD diverge (e.g.
-`ENOSYS=78`).
+number before assigning a new one). errno **is meant to** use FreeBSD's values where Linux/BSD
+diverge (e.g.
+`ENOSYS=78`) — **but this was never actually completed on the musl side, and is currently broken
+for at least `ENOSYS`/`EPROTONOSUPPORT`/`ENOTSOCK`/`EDESTADDRREQ`/`EADDRINUSE`/`EHOSTUNREACH`.**
+Whatever this file returns via the carry-flag ABI becomes musl's raw `errno` value directly (see
+`third_party/musl/arch/x86_64/syscall_arch.h`'s `jnc`/`neg` conversion) — so it must match whatever
+number musl's *own* compiled-in `bits/errno.h` (`third_party/musl/arch/generic/bits/errno.h`, since
+no x86_64-specific override exists) actually defines that symbolic name as, not a real-BSD nod that
+only lives on the kernel side. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC`/`EPIPE`/`ESRCH`/`ENOTTY` happen
+to be identical between Linux/generic and FreeBSD numbering, so those are accidentally fine; `src/
+syscall.rs`'s own `ENOSYS=78` and `src/net/udp.rs`'s `ENOTSOCK=38`/`EDESTADDRREQ=39`/
+`EADDRINUSE=48`/`EHOSTUNREACH=65` are real FreeBSD values that musl's own header does **not** share
+(its real values are `38`/`88`/`89`/`98`/`113` respectively — note musl's real `ENOSYS` **is** this
+codebase's own wrong `ENOTSOCK` value, a doubly-confusing collision) — found while tracing an
+unrelated `wget` HTTPS failure, fixed only for the two new-that-session constants this pass
+actually introduced (`src/syscall.rs`'s `EPROTONOSUPPORT=93`/`EAGAIN=11`/`ENOTSOCK=88`, now correct
+and matching musl), not yet fixed for the pre-existing four in `udp.rs` or for `ENOSYS` itself
+(referenced far more broadly) — deliberately left as a flagged, known bug rather than a silent
+sweeping renumbering; discuss scope with the user before touching it further.
 
 The number→handler mapping is a runtime registry (`SYSCALL_TABLE`, a `Mutex<BTreeMap>`) populated
 by `oxidebsd_register_syscall` from each module's `module_init` — not a hardcoded `match`. An
@@ -586,6 +611,289 @@ time.c`/`gettimeofday.c`) are both plain C-level wrappers around `clock_gettime(
   reduces to (`CLOCK_REALTIME`, no `TIMER_ABSTIME`) — no BusyBox applet in the roster calls it
   directly with a different clock or absolute-deadline flag.
 
+## Real networking (`src/pci.rs`, `src/net/*`, `modules/net/`)
+
+A real, phased networking stack: PCI enumeration, an IRQ-driven rtl8139 NIC driver, Ethernet/ARP/
+IPv4/ICMP, UDP/TCP sockets, raw ICMP sockets (for `ping`), `poll(2)`, and — critically — no DNS
+protocol code of its own at all: real hostname resolution works by making musl's own real stub
+resolver (`third_party/musl/src/network/`) function correctly over this ABI, the same "port
+libc's real code, don't reimplement its logic kernel-side" philosophy the rest of this musl port
+already follows (`open`/`execve`/`stat`/...).
+
+- **`src/pci.rs`**: legacy I/O-port config-space access (`0xCF8`/`0xCFC`), a flat scan of all 256
+  buses (no bridge traversal — QEMU puts everything on bus 0). `find_by_class`/`find_by_id` are the
+  generic lookups any driver can use.
+- **`src/net/rtl8139.rs`**: brought up unconditionally at boot (`main.rs`, before any module
+  loads), not gated on whether a NIC is actually present — absence is logged, not fatal.
+  `src/interrupts.rs` gained a generic `IRQ_HANDLERS` dispatch table (IRQ2–15; `IRQ0`/`1` stay
+  hardcoded for timer/keyboard) so a driver whose IRQ line isn't known until PCI probe time can
+  still claim a vector without the static IDT changing shape (`register_irq_handler`/
+  `src/pic.rs`'s `unmask_irq`).
+- **`src/net/{ethernet,arp,ipv4,icmp}.rs`**: real frame/packet construction and checksums,
+  no fragmentation, no IP options. `ipv4::next_hop` is the *only* routing rule that exists — not a
+  real routing table: an address outside `GUEST_IP`'s own `/24` (i.e. any real internet
+  destination) is sent to `GATEWAY_IP`'s MAC instead of `dest_ip`'s own, since QEMU SLIRP only
+  answers ARP for its own virtual IPs (`GATEWAY_IP`=`10.0.2.2`, `DNS_SERVER_IP`=`10.0.2.3`) and
+  never for an arbitrary off-link address. Without this rule nothing beyond SLIRP's own gateway/
+  DNS-relay addresses could ever be reached at all.
+- **`src/net/udp.rs`, `src/net/tcp.rs`**: real sockets behind `SYS_SOCKET=140`/`SYS_BIND=141`/
+  `SYS_SENDTO=142`/`SYS_RECVFROM=143`/`SYS_SETSOCKOPT=144` (UDP) and `SYS_CONNECT=145`/
+  `SYS_LISTEN=146`/`SYS_ACCEPT=147` (TCP; once `Established`, data flows over plain
+  `SYS_READ`/`SYS_WRITE` instead). TCP is stop-and-wait (one segment in flight, fixed 536-byte MSS,
+  no window/congestion control, no TIME_WAIT). `oxidebsd_sys_socket` masks off `SOCK_CLOEXEC`/
+  `SOCK_NONBLOCK` (real Linux/musl OR these into `type` directly — musl's own DNS resolver does
+  exactly this) before matching, rather than rejecting the call outright.
+- **`src/net/icmp.rs`**'s raw sockets (`SOCK_RAW`+`IPPROTO_ICMP`, dispatched from
+  `udp::oxidebsd_sys_socket`) exist specifically so a *real* `ping` binary can work, not just the
+  kernel's own echo-request/reply logic (`tests/icmp_smoke.rs`'s target). Unlike UDP/TCP, a raw
+  socket isn't port-addressed — every inbound ICMP packet fans out to *every* open raw socket
+  (matching real Linux; the app filters by `icmp_id`/type itself, exactly what BusyBox's own
+  `ping.c` does), and delivery includes the *real IP header* prepended (`ping.c`'s `unpack4` reads
+  `iphdr->ihl`/`ttl` straight out of the receive buffer) — the one place this stack's delivery
+  shape differs from UDP/TCP's payload-only convention.
+- **`SYS_POLL=148`** (`src/net/mod.rs`'s `oxidebsd_sys_poll`): added purely to unblock musl's real
+  DNS resolver, which multiplexes nameserver retries with a real `poll()`. Real Linux's own
+  `__NR_poll` value (`7`) was left unmapped in musl on purpose — it collides with this ABI's own
+  `SYS_WAIT4` (the same class of numeric collision this file's musl section already warns about
+  for `getdents`/`getdents64`) — remapped to `148` instead. Reports `POLLIN` only (the one event
+  class any fd here has real blocking semantics for); an fd not owned by udp/tcp/icmp (a regular
+  oxfs file, a pipe, stdin) is always reported ready, matching real POSIX behavior for regular
+  files and a reasonable stand-in for everything else.
+- **Real DNS resolution**: `modules/oxfs`'s `module_init` seeds `/etc/resolv.conf` with
+  `nameserver 10.0.2.3` (SLIRP's built-in DNS relay, forwarding to whatever the host itself uses).
+  That, plus `SYS_POLL` and the `SOCK_CLOEXEC`/`SOCK_NONBLOCK` masking above, was *nearly* enough —
+  the last gap was musl's `recvmsg`/`sendmsg` (`third_party/musl/src/network/`), which its
+  resolver (`res_msend.c`) uses instead of `recvfrom`/`sendto` even though it only ever needs a
+  single iovec and no ancillary data — exactly the shape the already-patched `recvfrom`/`sendto`
+  handle. Neither was remapped or patched before, so every real reply the kernel correctly
+  delivered got silently dropped (`ENOSYS`) and never consumed. Fixed by patching `recvmsg`/
+  `sendmsg` themselves to delegate straight to `recvfrom`/`sendto` for that shape (multi-iovec/
+  control-message callers get a clean error instead — nothing in this port's roster needs either).
+  No new syscall numbers were needed for this part at all.
+
+**Two real bugs found getting this far, both worth remembering (one general, one specific to any
+future syscall-reachable busy-wait):**
+
+1. **QEMU was never asked to accelerate.** Neither `test-args` nor `run-args` in `Cargo.toml` ever
+   passed `-accel` — every boot silently ran pure-software TCG, whose per-instruction speed is
+   entirely at the mercy of host CPU contention. Normally fast enough to go unnoticed (~4s boot),
+   but under load this could stretch past a minute — indistinguishable from a genuine hang, and
+   confirmed (via `git stash` bisection) to predate the networking work entirely, not caused by
+   it. Fixed by adding `-accel kvm -accel tcg` (two repeated flags — this QEMU build rejects the
+   single-flag `kvm:tcg` list syntax) to both arg lists; falls back to `tcg` cleanly on a host with
+   no `/dev/kvm`.
+2. **`hlt()` inside a syscall handler can freeze the CPU permanently.** `src/syscall.rs`'s SFMASK
+   setup clears `RFLAGS::INTERRUPT_FLAG` for a syscall's *entire* duration, not just its entry (see
+   this file's own Syscall ABI section). `hlt()` only wakes on an unmasked interrupt or an NMI —
+   with `IF` cleared, an ordinary timer/NIC IRQ can't wake it at all, and *no* timer tick can fire
+   to advance `ticks()` either, so a tick-bounded deadline check can never even be re-evaluated.
+   Three real syscall-reachable busy-wait loops called `hlt()` between retries: `ipv4::
+   resolve_with_retry` (ARP wait, reachable from any real `sendto()`), `tcp::oxidebsd_sys_connect`'s
+   handshake wait, and `net::oxidebsd_sys_poll` itself. Each would freeze solid the instant the
+   awaited condition wasn't already true *before* the loop started — timing-dependent, not
+   deterministic, which is exactly why it looked so inconsistent from the outside. Fixed by
+   replacing all three with `core::hint::spin_loop()` (packet arrival in the NIC's ring is a
+   hardware DMA-like effect, not gated on this core's interrupt-enable state, so a real reply is
+   still found the moment it lands — only the "give up after N ticks" bound goes uneven for a
+   genuinely unreachable destination, spinning for the syscall's whole duration instead of timing
+   out cleanly, a real remaining limitation, not something this fix addresses).
+   **The entire automated test suite (`icmp_smoke`/`udp_smoke`/`tcp_smoke`/`ping_smoke`/
+   `poll_smoke`) missed this completely** — every one of them calls the kernel-side handlers
+   directly as plain Rust functions from a test's own `main()` (interrupts enabled throughout,
+   never inside a real `SYSCALL`), so none of them ever exercised the code path where the bug
+   actually lived. A real blind spot in how these tests are built, not just this one bug — any
+   future test claiming to verify syscall-reachable code should spawn a real ELF and go through an
+   actual `SYSCALL` instruction, the way `tests/fork_wait.rs` already does for `fork`/`wait4`.
+
+**Known gaps, current as of this pass:**
+
+- **`alarm()`/`setitimer()` are not implemented.** Unrelated to the `hlt()` bug above — this is
+  simply that BusyBox's `ping` (run without `-c N`) has no way to bound its own receive loop if a
+  target never replies at all; it relies entirely on an OS-delivered `SIGALRM` it will never get
+  here, so it hangs indefinitely rather than timing out. `ping -c N <host>` doesn't help either if
+  zero replies ever arrive (the count only bounds *received* replies).
+- **`socketpair(AF_UNIX, SOCK_STREAM, ...)` — `SYS_SOCKETPAIR = 149`, `modules/posix_compat/`.**
+  Real `socketpair(2)`'s exact `(domain, type, protocol, sv_ptr)` shape already fits this ABI's
+  4-register width whole (like `bind`/`connect`/`listen` before it), so only a plain `__NR_*`
+  remap was needed on the musl side, no call-site patch. Not a real `AF_UNIX` abstraction (this
+  kernel has no socket address-family concept beyond UDP/TCP/raw-ICMP's own `AF_INET`) — built
+  from the exact same blocking `PipeBuffer` machinery `pipe(2)` already uses (`src/pipe.rs`), just
+  two buffers cross-wired into a full-duplex pair, which is why it lives in `posix_compat`
+  (pipe-shaped) rather than `modules/net/` (never touches the actual network stack). Verified via
+  `tests/socketpair_smoke.rs`: both directions of the pair, plus real EOF/EPIPE on close.
+
+  **A live retest surfaced three more missing syscalls, all now fixed in the same pass**: `wget`
+  reached its HTTPS path but got no response at all (`fgets`-returning-NULL, no useful errno) --
+  the TLS helper child was dying before ever writing a decrypted byte back through the socketpair.
+  Tracing it (`src/network/wget.c`/`tls.c` in `third_party/busybox`) found:
+  - **`SYS_SET_TID_ADDRESS = 150`** (`modules/native_abi/`) — called unconditionally by *every*
+    musl program at startup (`__init_tls.c`) and after every real `fork()` (`_Fork.c`); previously
+    unregistered, so every process's own `tid` silently held `-ENOSYS` the whole time. No real
+    threading exists here, so `tid` and `pid` are the same concept — `sys_set_tid_address` just
+    echoes `scheduler::current_pid()` back.
+  - **`SYS_FCNTL = 151`** (`modules/posix_compat/`) — BusyBox's `libbb/xfuncs.c` (`ndelay_on`/
+    `ndelay_off`, used by `wget`'s own progress-bar/timeout loop) calls real `fcntl(F_GETFL/
+    F_SETFL)` to toggle `O_NONBLOCK`; previously unregistered, so the fd never actually became
+    non-blocking (harmless for `wget` specifically, since `src/pipe.rs`'s already-blocking reads
+    still eventually return real data, just without the progress-bar/timeout niceties — but a real
+    correctness gap for anything that depends on real `EAGAIN`). Only `F_GETFL`/`F_SETFL`
+    (`O_NONBLOCK` only)/`F_SETFD` (no-op, no close-on-exec enforcement exists)/`F_DUPFD`/
+    `F_DUPFD_CLOEXEC` (delegate to `crate::fd::dup`) are implemented — everything else is
+    `EINVAL`. `crate::pipe::blocking_read` is the *only* reader that honors `O_NONBLOCK`
+    (`crate::fd::is_nonblocking`, tracked per-`real_fd` — the correct POSIX "open file description"
+    scope) — a TCP/UDP socket's own read already returns promptly on "no data yet" by a different,
+    pre-existing convention (`src/net/tcp.rs`'s `tcp_read`), so setting `O_NONBLOCK` there is
+    accepted and tracked but doesn't change behavior, a known simplification.
+  - **`SYS_SHUTDOWN = 152`** (`modules/posix_compat/`) — `wget.c` itself calls
+    `shutdown(fileno(sfp), SHUT_WR)` right after sending the request, on exactly the kind of
+    socketpair endpoint `SYS_SOCKETPAIR` provides. Real half-close semantics only for a
+    `crate::pipe`-backed socketpair endpoint (`ENOTSOCK` for anything else, including a real TCP/
+    UDP socket) — `SHUT_WR` marks that one direction's buffer closed (future writes on it fail,
+    the peer still sees real EOF once drained) without tearing down the fd itself, so the *other*
+    direction of the same pair keeps working. This is also what forced `close_direction`
+    (`src/pipe.rs`) to stop `.expect()`-panicking on an already-removed buffer — a partial
+    `shutdown()` followed later by the fd's real `close()` can legitimately hit the same buffer
+    twice, once the peer has also gone away in between.
+
+  All three verified via the same `tests/socketpair_smoke.rs`.
+
+  **A live retest with all four of the above still got no response at all** (`fgets` returning
+  `NULL`, a stale/misleading errno from something unrelated -- likely musl's resolver quietly
+  finding no `/etc/hosts`, which this kernel doesn't seed at all; harmless to resolution itself,
+  but `fgets` doesn't clear `errno` on a clean EOF, so whatever was last set gets printed). Tracing
+  it further found the *real* cause: BusyBox's vendored TLS code
+  (`networking/tls.c`'s `tls_get_random`) needs real random bytes from `/dev/urandom` for its
+  ClientHello nonce and key generation --
+  ```c
+  void FAST_FUNC tls_get_random(void *buf, unsigned len)
+  {
+      if (len != open_read_close("/dev/urandom", buf, len))
+          xfunc_die();
+  }
+  ```
+  This kernel had no `/dev` at all, so that `open()` failed and `xfunc_die()` silently exited the
+  TLS helper child before it ever wrote a single decrypted byte back through the socketpair --
+  independent of, and hiding behind, the misleading stale-errno text above.
+
+  **Fixed**: `modules/oxfs/` gained a second synthetic path prefix alongside `/proc` (`dev_open`,
+  called from `oxfs_open` for any `/dev/...` path) covering `/dev/random`, `/dev/urandom`,
+  `/dev/null`, `/dev/zero` -- `open()`+`read()`/`write()`+`close()` only, no directory-listing/
+  `stat()` support (nothing in this port's roster needs it yet, a known gap the same tier `/proc`
+  itself went through incrementally). `random`/`urandom` share one `OpenFile::DevRandom` variant --
+  this kernel has no real entropy-pool concept, so there's no meaningful "blocks until enough
+  entropy" distinction to make between the two, matching modern Linux's own post-5.6 stance.
+
+  The actual bytes come from a new kernel-resident module, **`src/random.rs`**, deliberately built
+  as *real* cryptography rather than a fast throwaway PRNG (the user's own call, given `/dev/
+  random`'s traditional "must actually be secure" expectation): every call gathers several
+  independent, jittery values (the CPU cycle counter via `RDTSC`, PIT tick count, RTC wall-clock, a
+  monotonic call counter, a stack address, and real hardware `RDRAND` output when `CPUID` reports
+  it available), hashes them all together with SHA-256 into a 32-byte key, then generates the
+  requested output as a ChaCha20 keystream under that key -- the same "gather a pile of diverse
+  state, hash it into a seed, drive a real algorithm with it" design Pokemon Black/White's own RNG
+  made famous, just with a real stream cipher instead of that game's own LCG. No persistent DRBG
+  state to reseed on a schedule -- each call derives an independent key from scratch, so a fixed,
+  all-zero ChaCha20 nonce is safe (the algorithm's real requirement is "never reuse a
+  `(key, nonce)` pair," and a key is never reused across two different calls).
+
+  **Crypto primitives are vetted external crates (RustCrypto's `sha2`/`chacha20`), not hand-rolled**
+  -- a deliberate exception to this codebase's usual "own the small stuff" bias (`src/pic.rs`
+  instead of `pic8259`, ...): a subtle bug in a hand-written hash/cipher is far harder to catch
+  than in a driver, the same reasoning `linked_list_allocator`/the `x86_64` crate already followed
+  for different safety-critical logic. Both needed real build fixes to even compile for this
+  target: `sha2` needs its own `force-soft` feature (this target disables SSE/MMX entirely, and
+  without it `rustc`'s vector-op legalization can't lower the crate's default SIMD-capable
+  compress function -- a real `rustc-LLVM ERROR: Do not know how to split the result of this
+  operator!`, not a warning); `chacha20` has no equivalent Cargo feature, so `.cargo/config.toml`
+  now passes `--cfg chacha20_backend="soft"` via `[target.x86_64-oxidebsd] rustflags` to force the
+  same thing for its own runtime-`cpufeatures`-detected AVX2/SSE2 backend selection.
+
+  Verified via `tests/random_smoke.rs` (the generator itself: no crash across buffer sizes
+  including `0`, two consecutive calls produce different output, output isn't a degenerate
+  single-byte pattern) -- `modules/oxfs`'s own `/dev` path routing can only really be exercised by
+  a real process actually `open()`ing it, which needs a full module-loading boot, so that part
+  isn't covered by an automated test yet.
+
+  **A fourth live-retest round got past the handshake's own random-data needs, and found a real
+  bug in `src/net/tcp.rs` itself**: `wget` failed with `got bad TLS record (len:0) while expecting
+  handshake record`. `tcp_read` used to return `0` (real EOF, by POSIX contract) the instant
+  `recv_buf` was momentarily empty, *regardless of whether the connection was still open* --
+  indistinguishable from a real peer close to any caller. BusyBox's TLS code (`tls_xread_record`)
+  correctly-by-its-own-logic treated that early `0` as "abrupt EOF, no TLS shutdown" and gave up,
+  even though the real server's ServerHello simply hadn't arrived yet. Plain HTTP never triggered
+  this in practice (by the time `wget`'s own body-reading loop gets there, there's usually already
+  been enough round-trip latency for data to already be sitting in the buffer), but it was always
+  a real, latent race -- the first real remote (not synthetic-peer) TCP exchange this stack had
+  ever actually driven.
+
+  **Fixed**: `tcp_read` now genuinely waits while the connection is still open and simply has
+  nothing buffered *yet*, only returning `0` once the peer has actually signaled closure
+  (`ConnState::CloseWait`/`FinWait2`/`Closed`, reached via a real FIN -- not just an empty buffer).
+  **Deliberately does *not* reuse `crate::pipe`'s own `BlockReason`/`scheduler::schedule()`
+  pattern** -- that would be a *worse* bug than the one it replaces: incoming-packet processing on
+  this kernel is pull-based, driven entirely by whichever process happens to call `net::poll()`
+  (the rtl8139 IRQ handler itself does no heap allocation and touches no protocol state, just sets
+  a flag -- see `src/net/rtl8139.rs`'s own doc comment). Yielding to the scheduler here would mean
+  nothing ever calls `poll()` again on this connection's behalf once the only process that cares
+  about it stops running -- a real, permanent hang. Instead it spins (`core::hint::spin_loop()`),
+  the same reasoning already established for `oxidebsd_sys_connect`'s own handshake wait and
+  `ipv4::resolve_with_retry`'s ARP wait (see this section's own two-real-bugs entry on the
+  `hlt()`-in-syscall freeze those two were fixed for) -- ordinary interrupts (timer, keyboard)
+  still fire throughout, only a voluntary yield to another *schedulable* process doesn't happen.
+  No timeout, unlike connection *establishment*: blocking indefinitely for more data on an
+  already-open connection is correct, ordinary blocking-`read()` behavior, the same accepted
+  "spins for the syscall's whole duration against a genuinely unresponsive peer" tradeoff already
+  documented for that class of wait.
+
+  This also needed real `O_NONBLOCK` support on TCP fds (`crate::fd::is_nonblocking`, real
+  `EAGAIN` instead of blocking) so a caller that explicitly asks for non-blocking behavior still
+  gets it -- and, while touching this, `tcp.rs`'s own local `EAGAIN` constant was corrected from
+  `35` (a real FreeBSD value, but not what musl's own compiled header actually defines) to `11`,
+  the same "must match musl's own macro value" fix already applied to `src/syscall.rs`'s and
+  `src/net/udp.rs`'s own copies (see this file's syscall-ABI section's own errno note --
+  `EISCONN`/`ENOTCONN`/`ECONNREFUSED`/`ETIMEDOUT`/`EOPNOTSUPP`/`EADDRINUSE`/`EHOSTUNREACH` in this
+  same file have the identical latent mismatch, not yet audited/fixed).
+
+  Verified via `tests/tcp_smoke.rs`: a real peer FIN now produces real EOF; an `O_NONBLOCK` fd with
+  an empty-but-still-open connection returns real `EAGAIN` immediately rather than spinning
+  forever (which would have hung the test itself, not just been slow, if the fix regressed).
+
+  **A fifth live-retest round got a real HTTPS download actually flowing** — `wget` reached
+  `saving to 'README'` and real response bytes came through (confirmed by the file's own real
+  content afterward: `cat README` printed the actual `torvalds/linux` README text) — then failed
+  mid-download with `[boot] unrecognized syscall number 19` / `wget: read error: No error
+  information`. Syscall `19` is real Linux's `readv`. Tracing it found the read-side mirror of the
+  `writev` gap already fixed for `printf`:
+  ```c
+  // third_party/musl/src/stdio/__stdio_read.c
+  cnt = iov[0].iov_len ? syscall(SYS_readv, f->fd, iov, 2)
+      : syscall(SYS_read, f->fd, iov[1].iov_base, iov[1].iov_len);
+  ```
+  Any buffered `fread()`/`fgets()` call — not specific to `wget`, or even to networking — goes
+  through `readv`, not plain `read`, whenever the `FILE*` has real internal buffering. Nothing had
+  exercised a buffered read against a real, slow-arriving data source until this exact download.
+
+  **Fixed**: `SYS_READV = 153` (`modules/native_abi/`, right next to `SYS_WRITEV`) — a thin
+  per-`iovec` loop over `sys_read`, matching real `readv`'s own short-read contract (a partially
+  filled iovec ends the call there, it doesn't move on to the next iovec expecting more to somehow
+  still be available). Verified via `tests/readv_smoke.rs`.
+
+  **Confirmed live**: `wget https://raw.githubusercontent.com/torvalds/linux/master/README`
+  completed a full HTTPS download end to end, real content verified via `cat README` afterward.
+  Five real bugs found and fixed across five live-retest rounds to get there, not just the
+  original `socketpair()` one — this was the harder, more valuable path than stopping at "the
+  syscall exists": `SYS_SOCKETPAIR=149`/`SYS_SET_TID_ADDRESS=150`/`SYS_FCNTL=151`/
+  `SYS_SHUTDOWN=152`/`SYS_READV=153`, a synthetic `/dev` backed by a real SHA-256/ChaCha20
+  generator, and a real `tcp_read` correctness bug (false EOF instead of blocking) that had never
+  been exercised before since every prior TCP test used a synthetic in-process peer, never a real
+  remote one.
+- **No real routing table** — `ipv4::next_hop`'s single default-gateway rule is the entire routing
+  decision this stack makes. No multi-hop routes, no interface selection, no route metrics.
+- **No IPv6 anywhere in the stack.**
+- BusyBox's own built-in TLS client (`networking/tls.c`, once `socketpair()` unblocks it) does not
+  validate certificate chains — a limitation of that vendored code itself (it logs a "note", not an
+  error, and proceeds), not something a kernel-side fix could address.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
@@ -606,7 +914,9 @@ at once, so the rows aren't a clean partition.
 | termios/`ioctl` | done (no real pty layer) | — | `SYS_IOCTL` in `posix_compat` |
 | `stat`/`fstat`/`lstat` | done | — | `modules/oxfs` (`SYS_STAT=127`/`SYS_FSTAT=126`/`SYS_LSTAT=128`) |
 | `getdents`/`getdents64` | done | — | `modules/oxfs` (`SYS_GETDENTS=129`; **both** `__NR_getdents` and `__NR_getdents64` had to be remapped to it in musl, not just the former — see this file's musl section's "64-bit-suffixed sibling" gotcha) — real `ls`/`find`/`tree`/`du` confirmed working against it |
-| Socket syscalls (`socket`/`bind`/`connect`/...) | not started | 38 (`NEEDS_NETWORK`) | no networking stack exists at any layer; the largest single blocked category — `wget`/`ftpd`/`telnet`/`nc`/`ping`/`route`/`ifconfig`/... |
+| Socket syscalls (`socket`/`bind`/`connect`/`sendto`/`recvfrom`/`poll`/...) + real DNS | done | most of 38 (`NEEDS_NETWORK`) | see this file's own "Real networking" section for the full architecture and the two real bugs (QEMU acceleration, `hlt()`-in-syscall freeze) found getting it working. `ping`/`nslookup`/`wget` (plain HTTP) confirmed working live, including real hostname resolution over musl's own DNS stub resolver; `docs/BUSYBOX_APPLETS.md`'s `NEEDS_NETWORK` list is now stale for those three specifically, not yet regenerated wholesale |
+| `socketpair(AF_UNIX, SOCK_STREAM, ...)` + `fcntl`/`shutdown`/`set_tid_address`/`readv` + `/dev/{u}random`/`null`/`zero` + a real `tcp_read` EOF-vs-empty fix | **done, confirmed live** — `wget` HTTPS completed a real end-to-end download | `wget` HTTPS specifically (plain HTTP already worked) | see "Real networking" section's own known-gaps entry — `SYS_SOCKETPAIR=149`/`SYS_SET_TID_ADDRESS=150`/`SYS_FCNTL=151`/`SYS_SHUTDOWN=152`/`SYS_READV=153` in `posix_compat`/`native_abi`, built on `src/pipe.rs`'s existing blocking-buffer machinery; a synthetic `/dev` in `modules/oxfs` backed by a real SHA-256/ChaCha20 generator (`src/random.rs`); and a real bug in `src/net/tcp.rs`'s own `tcp_read` (returned false EOF instead of blocking) — five real bugs, each surfaced only once the previous fix got live-retested |
+| `alarm`/`setitimer` | not started | any program (`ping` chief among them) that needs to bound its own wait against a target that never replies | see "Real networking" section's own known-gaps entry — distinct from the `hlt()` bug; even a bug-free busy-wait can't self-terminate without this if nothing ever arrives |
 | A specific missing syscall per applet (`chmod`/`chown`/`link`/`mknod`/`flock`/`fsync`/`ftruncate`/`fallocate`/SysV IPC/`setrlimit`/`statfs`/sched-priority/`reboot`/`sync`/`inotify`/`chroot`/namespaces) | not started | 36 (`NEEDS_SYSCALL`) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
 | `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips`. `chdir` into `/proc` and system-wide files (`/proc/meminfo`/`uptime`/`stat`, for `top`/`free`/`uptime`) remain explicit known gaps of this pass, not implemented |
 | `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | not started | subset of the above | needs `src/fd.rs` to support enumeration (currently lookup-only) — would unlock `lsof`/`fuser` specifically |
@@ -647,3 +957,12 @@ undefined-symbol gap in how BusyBox's own compression-transformer infrastructure
   (`src/pic.rs`, `src/serial.rs`) outweighs the dependency. Different call than `pc-keyboard`
   (hundreds of lines of scancode tables) or `linked_list_allocator` (safety-critical free-list
   logic), which stay external.
+- `sha2`/`chacha20` (`src/random.rs`, backing `/dev/random`/`/dev/urandom` — see this file's "Real
+  networking" known-gaps section): `default-features = false`, `sha2` additionally needs
+  `features = ["force-soft"]` and `chacha20` needs `--cfg chacha20_backend="soft"` passed via
+  `.cargo/config.toml`'s `[target.x86_64-oxidebsd] rustflags` — both crates otherwise try to
+  compile a SIMD-capable backend this target's disabled SSE/MMX can't lower (a real
+  `rustc-LLVM ERROR`, not a lint). Crypto primitives are the one place this codebase deliberately
+  prefers a vetted dependency over hand-rolling — the opposite call from `pic8259`/`uart_16550`
+  above, same reasoning `linked_list_allocator`/`x86_64` already get for different safety-critical
+  logic.

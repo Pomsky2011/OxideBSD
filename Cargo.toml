@@ -25,6 +25,8 @@ linked_list_allocator = { version = "0.10", default-features = false }
 pc-keyboard = "0.9"
 spin = "0.9"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }
 
 [[test]]
 name = "basic_boot"
@@ -48,6 +50,26 @@ harness = false
 
 [[test]]
 name = "tcp_smoke"
+harness = false
+
+[[test]]
+name = "ping_smoke"
+harness = false
+
+[[test]]
+name = "poll_smoke"
+harness = false
+
+[[test]]
+name = "socketpair_smoke"
+harness = false
+
+[[test]]
+name = "random_smoke"
+harness = false
+
+[[test]]
+name = "readv_smoke"
 harness = false
 
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool

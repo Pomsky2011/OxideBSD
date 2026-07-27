@@ -29,13 +29,43 @@ Builds and needs only syscalls OxideBSD already implements -- plain file/text/ar
 
 ### NEEDS_NETWORK (38)
 
-Builds, but needs socket syscalls -- none exist in OxideBSD at all.
+Builds, but needs socket syscalls -- originally none existed in OxideBSD at all. **Stale as of
+real socket/DNS support landing (see CLAUDE.md's own "Real networking" section) -- socket syscalls
+now exist, so this whole category needs re-probing against the current kernel, not just the three
+below that have actually been re-verified live.** The rest of this list hasn't been individually
+retested and may still be blocked for other reasons (raw sockets, broadcast/multicast, netlink-
+shaped ioctls, etc.) even though "no socket syscalls at all" is no longer the reason.
+
+- **confirmed working live**: `ping` (real `SOCK_RAW`/`IPPROTO_ICMP` socket, real routing via a
+  default-gateway rule, real DNS resolution for a hostname target), `nslookup` (real DNS
+  resolution via musl's own stub resolver), `wget` (**both plain HTTP and HTTPS now confirmed
+  live** -- `wget https://raw.githubusercontent.com/torvalds/linux/master/README` completed a
+  full download, real content verified afterward via `cat`. HTTPS previously failed at
+  `socketpair(AF_UNIX, SOCK_STREAM, ...)` with `ENOSYS`; getting it working end to end took five
+  rounds of live retesting, each surfacing the next gap once the previous fix landed: `fcntl`/
+  `shutdown`/`set_tid_address` were *also* entirely unregistered (`SYS_SET_TID_ADDRESS=150`/
+  `SYS_FCNTL=151`/`SYS_SHUTDOWN=152` now exist); then the TLS handshake itself turned out to need
+  real `/dev/urandom` (BusyBox's own vendored `tls_get_random`), which this kernel had no `/dev`
+  for at all -- `modules/oxfs` now has a synthetic `/dev/{u}random`/`null`/`zero`, backed by a real
+  SHA-256/ChaCha20 generator (`src/random.rs`); then a real bug surfaced in `src/net/tcp.rs`'s own
+  `tcp_read`, which used to return false EOF the instant its buffer was momentarily empty
+  (indistinguishable from a real peer close) -- the first real remote TCP exchange this stack had
+  ever actually driven, previously only exercised against a synthetic in-test peer; then, once
+  real response bytes were flowing, `readv` (real Linux syscall `19`) turned out to be missing too
+  -- musl's own buffered-`fread()` read path (`third_party/musl/src/stdio/__stdio_read.c`), the
+  read-side mirror of the `writev` gap already fixed for `printf`. `SYS_READV=153` now exists. All
+  verified via `tests/socketpair_smoke.rs`/`tests/random_smoke.rs`/`tests/tcp_smoke.rs`/
+  `tests/readv_smoke.rs`; see CLAUDE.md's own gap entry for the full trace)
 
 - POP3 client -- connects to a mail server: `popmaildir`
 
 - SMTP client -- connects to a mail server: `sendmail`
 
-- no socket syscalls implemented at all: `arp`, `arping`, `dhcprelay`, `dnsd`, `dnsdomainname`, `dumpleases`, `fakeidentd`, `ftpd`, `ftpget`, `ftpput`, `httpd`, `ifconfig`, `ifdown`, `inetd`, `lpd`, `lpq`, `lpr`, `nc`, `netcat`, `netstat`, `nslookup`, `ntpd`, `ping`, `pscan`, `rdate`, `route`, `ssl_client`, `tcpsvd`, `telnet`, `telnetd`, `traceroute`, `udhcpd`, `udpsvd`, `vconfig`, `wget`, `whois`
+- not yet re-verified against current socket/DNS support (originally: "no socket syscalls
+  implemented at all"): `arp`, `arping`, `dhcprelay`, `dnsd`, `dnsdomainname`, `dumpleases`,
+  `fakeidentd`, `ftpd`, `ftpget`, `ftpput`, `httpd`, `ifconfig`, `ifdown`, `inetd`, `lpd`, `lpq`,
+  `lpr`, `nc`, `netcat`, `netstat`, `ntpd`, `pscan`, `rdate`, `route`, `ssl_client`, `tcpsvd`,
+  `telnet`, `telnetd`, `traceroute`, `udhcpd`, `udpsvd`, `vconfig`, `whois`
 
 
 ### NEEDS_PROC (26)

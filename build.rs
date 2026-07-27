@@ -856,6 +856,23 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
             ),
         ]);
     }
+    if applet_symbol == "WGET" {
+        // BusyBox ships its own self-contained minimal TLS 1.2 client (networking/tls.c) --
+        // enabling it needs no external crypto library port (CONFIG_FEATURE_WGET_OPENSSL, left
+        // off, would need one). Without this, wget can only speak plain HTTP -- useless against
+        // GitHub, which redirects/refuses everything but HTTPS (github.com,
+        // raw.githubusercontent.com, codeload.github.com all require it).
+        flips.extend([
+            (
+                "# CONFIG_TLS is not set".to_string(),
+                "CONFIG_TLS=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_WGET_HTTPS is not set".to_string(),
+                "CONFIG_FEATURE_WGET_HTTPS=y".to_string(),
+            ),
+        ]);
+    }
     for (from, to) in flips {
         assert!(
             config.contains(&from),

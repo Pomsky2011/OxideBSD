@@ -30,10 +30,30 @@ pub const PROTO_UDP: u8 = 17;
 const AF_INET: i64 = 2;
 const SOCK_STREAM: i64 = 1;
 const SOCK_DGRAM: i64 = 2;
+const SOCK_RAW: i64 = 3;
+/// Real Linux/musl OR these bits directly into `socket()`'s `type` argument
+/// (`third_party/musl/arch/generic/bits/socket.h`) rather than passing them separately -- musl's
+/// own DNS stub resolver does exactly this (`src/network/res_msend.c`'s
+/// `SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK`). Masked off in `oxidebsd_sys_socket` before dispatch:
+/// every socket this stack hands out already behaves non-blocking (the established self-poll
+/// convention `oxidebsd_sys_recvfrom` set), and fd-level close-on-exec isn't modeled at all, so
+/// both flags are accepted and silently ignored rather than making the type match fail outright.
+const SOCK_CLOEXEC: i64 = 0o2000000;
+const SOCK_NONBLOCK: i64 = 0o4000;
 
+/// `ENOTSOCK`/`EDESTADDRREQ`/`EADDRINUSE`/`EHOSTUNREACH` below are real FreeBSD values (matching
+/// this ABI's own stated "BSD authenticity" errno convention, see `src/syscall.rs`'s module doc
+/// comment) -- but, like `EPROTONOSUPPORT` used to be (see `src/syscall.rs`'s own corrected copy
+/// and its doc comment), musl's actual compiled-in `bits/errno.h` was never patched to match, so
+/// none of these four currently equal what musl's own C code means by the same symbolic name --
+/// e.g. this file's own `ENOTSOCK = 38` is musl's real `ENOSYS`. Not fixed here (out of scope for
+/// the socketpair/fcntl/shutdown pass that found this) -- a real, latent, previously undiscovered
+/// bug across this whole file, flagged but not yet addressed.
 const ENOTSOCK: i64 = 38;
 const EDESTADDRREQ: i64 = 39;
-const EPROTONOSUPPORT: i64 = 43;
+/// `93`, matching musl's actual compiled-in value -- see `src/syscall.rs`'s own copy of this
+/// constant for the full story (this one used to be the same wrong `43` before that fix).
+const EPROTONOSUPPORT: i64 = 93;
 const EADDRINUSE: i64 = 48;
 const EHOSTUNREACH: i64 = 65;
 
@@ -173,6 +193,16 @@ pub fn handle_packet(payload: &[u8], src_ip: Ipv4Addr) {
         .push_back((src_ip, src_port, data.to_vec()));
 }
 
+/// `None` if `real_fd` isn't a UDP socket (caller, `net::oxidebsd_sys_poll`, keeps looking in the
+/// other protocols' tables).
+pub fn has_data_ready(real_fd: u64) -> Option<bool> {
+    STATE
+        .lock()
+        .sockets
+        .get(&real_fd)
+        .map(|socket| !socket.recv_queue.is_empty())
+}
+
 extern "C" fn udp_read(_real_fd: u64, _ptr: u64, _len: u64) -> i64 {
     // A UDP socket has no default peer without `connect()` (a later phase) -- real programs must
     // use `recvfrom`, matching real Linux/BSD behavior for plain `read()` on an unconnected UDP
@@ -195,11 +225,11 @@ extern "C" fn udp_close(real_fd: u64) -> i64 {
 }
 
 pub extern "C" fn oxidebsd_sys_socket(domain: u64, ty: u64, protocol: u64) -> i64 {
-    let _ = protocol;
     if domain as i64 != AF_INET {
         return -EPROTONOSUPPORT;
     }
-    match ty as i64 {
+    let base_ty = (ty as i64) & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    match base_ty {
         SOCK_DGRAM => {
             let fd = crate::fd::oxidebsd_alloc_fd();
             STATE.lock().sockets.insert(fd, UdpSocket::new());
@@ -207,6 +237,11 @@ pub extern "C" fn oxidebsd_sys_socket(domain: u64, ty: u64, protocol: u64) -> i6
             fd as i64
         }
         SOCK_STREAM => super::tcp::create_socket() as i64,
+        // socket(AF_INET, SOCK_RAW, 1) is exactly what a real `ping` asks for (see
+        // third_party/busybox's own ping.c) -- no other raw protocol is supported.
+        SOCK_RAW if protocol as i64 == super::ipv4::PROTO_ICMP as i64 => {
+            super::icmp::create_socket() as i64
+        }
         _ => -EPROTONOSUPPORT,
     }
 }
@@ -220,7 +255,10 @@ pub extern "C" fn oxidebsd_sys_bind(fd: u64, addr_ptr: u64, len: u64) -> i64 {
     let mut state = STATE.lock();
     if !state.sockets.contains_key(&real_fd) {
         drop(state);
-        return match super::tcp::bind(real_fd, addr_ptr) {
+        if let Some(result) = super::tcp::bind(real_fd, addr_ptr) {
+            return result;
+        }
+        return match super::icmp::bind(real_fd, addr_ptr) {
             Some(result) => result,
             None => -ENOTSOCK,
         };
@@ -259,7 +297,11 @@ pub extern "C" fn oxidebsd_sys_sendto(fd: u64, buf_ptr: u64, buf_len: u64, addr_
     let local_port = {
         let mut state = STATE.lock();
         if !state.sockets.contains_key(&real_fd) {
-            return -ENOTSOCK;
+            drop(state);
+            return match super::icmp::sendto(real_fd, buf_ptr, buf_len, dest_ip) {
+                Some(result) => result,
+                None => -ENOTSOCK,
+            };
         }
         match state.ensure_bound(real_fd) {
             Some(p) => p,
@@ -299,6 +341,13 @@ pub extern "C" fn oxidebsd_sys_recvfrom(
     super::poll();
 
     let mut state = STATE.lock();
+    if !state.sockets.contains_key(&real_fd) {
+        drop(state);
+        return match super::icmp::recvfrom(real_fd, buf_ptr, buf_len, addr_out_ptr) {
+            Some(result) => result,
+            None => -ENOTSOCK,
+        };
+    }
     let Some(socket) = state.sockets.get_mut(&real_fd) else {
         return -ENOTSOCK;
     };
@@ -325,7 +374,10 @@ pub extern "C" fn oxidebsd_sys_setsockopt(fd: u64, level: u64, optname: u64) -> 
     if STATE.lock().sockets.contains_key(&real_fd) {
         return 0;
     }
-    match super::tcp::setsockopt(real_fd) {
+    if let Some(result) = super::tcp::setsockopt(real_fd) {
+        return result;
+    }
+    match super::icmp::setsockopt(real_fd) {
         Some(result) => result,
         None => -ENOTSOCK,
     }

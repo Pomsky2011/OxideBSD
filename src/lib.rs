@@ -24,6 +24,7 @@ pub mod pipe;
 pub mod pit;
 pub mod process;
 pub mod qemu;
+pub mod random;
 pub mod reboot;
 pub mod rtc;
 pub mod scheduler;
@@ -180,6 +181,20 @@ fn test_syscall_dispatch_routes_registered_handlers() {
 
     assert_eq!(syscall::dispatch(TEST_OK_NUMBER, 1, 2, 3, 4), Ok(10));
     assert_eq!(syscall::dispatch(TEST_ERR_NUMBER, 0, 0, 0, 0), Err(5));
+}
+
+#[test_case]
+fn test_ipv4_next_hop_routes_off_subnet_to_gateway() {
+    use net::ipv4::{self, GATEWAY_IP, GUEST_IP};
+
+    // On-link (same /24 as GUEST_IP, e.g. SLIRP's own DNS relay): ARP the destination directly.
+    assert_eq!(ipv4::next_hop(ipv4::DNS_SERVER_IP), ipv4::DNS_SERVER_IP);
+    assert_eq!(ipv4::next_hop(GUEST_IP), GUEST_IP);
+    // Off-link (any real internet destination, e.g. 1.1.1.1): route via the default gateway --
+    // SLIRP never answers ARP for an address it doesn't itself own, so without this, nothing off
+    // the local subnet could ever be reached at all (see ipv4.rs's own module doc comment).
+    assert_eq!(ipv4::next_hop([1, 1, 1, 1]), GATEWAY_IP);
+    assert_eq!(ipv4::next_hop([8, 8, 8, 8]), GATEWAY_IP);
 }
 
 #[test_case]

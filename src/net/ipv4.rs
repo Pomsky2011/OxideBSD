@@ -1,7 +1,11 @@
 //! Minimal IPv4: parses inbound packets and dispatches by protocol number, builds and sends
-//! outbound ones. No fragmentation, no options, no routing (`GUEST_IP`/`GATEWAY_IP` are the only
-//! two IPs that matter on this Phase 2 network) -- see this repo's networking plan for what's
-//! deferred to later phases.
+//! outbound ones. No fragmentation, no options, no real routing table -- just one default-gateway
+//! rule (`next_hop`, below): anything outside `GUEST_IP`'s own `/24` goes to `GATEWAY_IP`'s MAC
+//! instead of trying (and always failing) to ARP the real destination directly, since SLIRP only
+//! answers ARP for its own virtual IPs. Without that rule, nothing off the local subnet -- which
+//! is to say any real internet destination at all -- could ever be reached, only SLIRP's own
+//! gateway/DNS-relay addresses. See this repo's networking plan for what's deferred to later
+//! phases.
 
 use alloc::vec::Vec;
 
@@ -16,12 +20,22 @@ pub const GUEST_IP: Ipv4Addr = [10, 0, 2, 15];
 /// `tests/icmp_smoke.rs` uses to verify this stack against real (if virtualized) network
 /// behavior without needing host-side raw-socket privileges.
 pub const GATEWAY_IP: Ipv4Addr = [10, 0, 2, 2];
+/// SLIRP's built-in DNS relay (forwards to whatever resolver the host itself uses) -- what
+/// `modules/oxfs`'s seeded `/etc/resolv.conf` points musl's real DNS stub resolver
+/// (`third_party/musl/src/network/`) at. Real UDP, real IPv4, real ICMP-adjacent traffic -- no
+/// DNS protocol logic lives in this kernel at all, matching how `open`/`execve`/`stat` are ported
+/// (make musl's own libc code work over this ABI, don't reimplement it kernel-side).
+pub const DNS_SERVER_IP: Ipv4Addr = [10, 0, 2, 3];
 
 pub const PROTO_ICMP: u8 = 1;
 
 const VERSION_IHL: u8 = 0x45; // version 4, IHL 5 (20-byte header, no options)
 const DEFAULT_TTL: u8 = 64;
-const HEADER_LEN: usize = 20;
+/// `pub(super)`, not private -- `icmp::handle_packet` needs it to strip the IP header back off the
+/// full packet it's handed for raw-socket delivery (see `icmp.rs`'s own doc comment on why a raw
+/// `SOCK_RAW`/`IPPROTO_ICMP` socket needs the IP header included, unlike UDP/TCP's payload-only
+/// delivery).
+pub(super) const HEADER_LEN: usize = 20;
 
 /// Internet checksum (RFC 1071): ones'-complement sum of 16-bit words, carries folded back in,
 /// then complemented. Shared by the IPv4 header itself and, with no pseudo-header (unlike UDP/
@@ -58,20 +72,42 @@ pub fn handle_packet(payload: &[u8]) {
     let ip_payload = &payload[HEADER_LEN..total_length];
 
     match protocol {
-        PROTO_ICMP => icmp::handle_packet(ip_payload, src_ip),
+        // Unlike udp/tcp::handle_packet, icmp::handle_packet gets the *whole* packet (header
+        // included), not just `ip_payload` -- a raw `SOCK_RAW`/`IPPROTO_ICMP` socket needs the
+        // real IP header prepended to what it reads back (matching real Linux raw-socket
+        // semantics, which `ping`'s own receive path directly relies on), not just the ICMP
+        // portion the existing echo-request/reply logic operates on.
+        PROTO_ICMP => icmp::handle_packet(&payload[..total_length], src_ip),
         udp::PROTO_UDP => udp::handle_packet(ip_payload, src_ip),
         tcp::PROTO_TCP => tcp::handle_packet(ip_payload, src_ip),
         _ => {}
     }
 }
 
-/// Builds and sends one IPv4 packet. Resolves `dest_ip`'s MAC via `arp`, sending a request and
-/// giving it a bounded wait if it isn't already known -- callers run in a normal (non-interrupt)
-/// context where a short busy-wait is acceptable, matching how `tests/rtl8139_smoke.rs`'s own
-/// test loop already waits for a reply. A known simplification: a real stack would queue the
-/// packet and retry asynchronously instead of blocking the caller.
+/// Real routing is out of scope (see this file's own doc comment), but a *default gateway* is
+/// the one routing decision every host makes even with an otherwise-empty routing table -- and
+/// without it, nothing off the local `/24` (i.e. anything real internet traffic would ever want to
+/// reach: `ping 1.1.1.1`, DNS to a nameserver other than SLIRP's own relay, ...) could ever ARP-
+/// resolve at all, since SLIRP only answers ARP for its own virtual IPs (`GATEWAY_IP`/
+/// `DNS_SERVER_IP`), never for an arbitrary off-link address. Returns the IP whose *MAC* should
+/// receive the Ethernet frame -- `dest_ip` itself if it's on-link, `GATEWAY_IP` otherwise. The
+/// packet's own IP header destination is never touched here; only the link-layer next hop changes,
+/// same as real IP routing.
+pub(crate) fn next_hop(dest_ip: Ipv4Addr) -> Ipv4Addr {
+    if dest_ip[..3] == GUEST_IP[..3] {
+        dest_ip
+    } else {
+        GATEWAY_IP
+    }
+}
+
+/// Builds and sends one IPv4 packet. Resolves the real next hop's (see `next_hop`) MAC via `arp`,
+/// sending a request and giving it a bounded wait if it isn't already known -- callers run in a
+/// normal (non-interrupt) context where a short busy-wait is acceptable, matching how
+/// `tests/rtl8139_smoke.rs`'s own test loop already waits for a reply. A known simplification: a
+/// real stack would queue the packet and retry asynchronously instead of blocking the caller.
 pub fn send_packet(dest_ip: Ipv4Addr, protocol: u8, payload: &[u8]) -> Option<()> {
-    let dest_mac = resolve_with_retry(dest_ip)?;
+    let dest_mac = resolve_with_retry(next_hop(dest_ip))?;
 
     let total_length = HEADER_LEN + payload.len();
     let mut packet = Vec::with_capacity(total_length);
@@ -100,13 +136,26 @@ fn resolve_with_retry(ip: Ipv4Addr) -> Option<[u8; 6]> {
     arp::send_request(ip);
     // Bounded by PIT ticks, not an arbitrary spin count -- see rtl8139_smoke's own precedent for
     // why a few seconds of budget is generous headroom, not a tight timing assumption.
+    //
+    // `hint::spin_loop()`, not `hlt()`: this function is reachable from a real syscall
+    // (`udp`/`icmp`'s `sendto` handlers), and `src/syscall.rs`'s own SFMASK setup clears
+    // `RFLAGS::INTERRUPT_FLAG` for a syscall's *entire* duration, not just its entry -- `hlt()`
+    // only wakes on an unmasked interrupt or an NMI, so calling it here would freeze the CPU
+    // permanently the instant a reply hadn't already arrived before this loop started (no timer
+    // tick to ever re-check the deadline, no NMI to ever occur under normal operation). A plain
+    // busy-spin still lets `poll()` keep draining the NIC's ring -- packet arrival there is a
+    // hardware DMA-like effect, not gated on this core's interrupt-enable state -- so a real
+    // reply is still found the moment it lands; only the "give up after N ticks" bound goes
+    // uneven (the deadline can't advance either, for the same IF-cleared reason, so an
+    // unreachable destination spins here for the syscall's whole, uninterruptible duration
+    // instead of cleanly timing out -- a real known limitation, not addressed by this fix).
     let deadline = crate::interrupts::ticks() + 500;
     while crate::interrupts::ticks() < deadline {
         super::poll();
         if let Some(mac) = arp::resolve(ip) {
             return Some(mac);
         }
-        x86_64::instructions::hlt();
+        core::hint::spin_loop();
     }
     None
 }

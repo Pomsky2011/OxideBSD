@@ -46,7 +46,16 @@ const CONNECT_TIMEOUT_TICKS: u64 = 500; // ~5s
 const ACCEPT_BACKLOG_MIN: usize = 1;
 const ACCEPT_BACKLOG_MAX: usize = 128;
 
-const EAGAIN: i64 = 35;
+/// `11`, matching musl's own compiled-in value -- not `35` (the real FreeBSD value this ABI is
+/// otherwise meant to follow, see `src/syscall.rs`'s module doc comment), for the same
+/// "must match whatever musl's own `bits/errno.h` actually compares `errno` against" reason
+/// `src/syscall.rs`'s own `EPROTONOSUPPORT`/`EAGAIN`/`ENOTSOCK` were corrected for. Fixed here
+/// specifically because `tcp_read`'s new `O_NONBLOCK` path (below) is a fresh caller of this
+/// constant; `EISCONN`/`ENOTCONN`/`ECONNREFUSED`/`ETIMEDOUT`/`EOPNOTSUPP`/`EADDRINUSE`/
+/// `EHOSTUNREACH` below are real FreeBSD values with the exact same latent mismatch, not yet
+/// audited/fixed (see `src/syscall.rs`'s own doc comment for the full story -- a known,
+/// deliberately-scoped-out issue, not fixed here).
+const EAGAIN: i64 = 11;
 const EISCONN: i64 = 56;
 const ENOTCONN: i64 = 57;
 const ECONNREFUSED: i64 = 61;
@@ -653,6 +662,19 @@ pub fn debug_send_next(real_fd: u64) -> Option<u32> {
     }
 }
 
+/// `None` if `real_fd` isn't a TCP socket at all (caller, `net::oxidebsd_sys_poll`, keeps looking
+/// in the other protocols' tables). `Some(true)` means readable right now: real bytes queued for
+/// an established connection, or a completed handshake waiting on `accept()` for a listener --
+/// the same two events real `poll(POLLIN)` reports for a stream socket.
+pub fn has_data_ready(real_fd: u64) -> Option<bool> {
+    match STATE.lock().sockets.get(&real_fd) {
+        Some(TcpSocket::Connection(conn)) => Some(!conn.recv_buf.is_empty()),
+        Some(TcpSocket::Listener(l)) => Some(!l.pending.is_empty()),
+        Some(TcpSocket::Unbound { .. }) => Some(false),
+        None => None,
+    }
+}
+
 pub fn create_socket() -> u64 {
     let fd = crate::fd::oxidebsd_alloc_fd();
     STATE
@@ -770,7 +792,12 @@ pub extern "C" fn oxidebsd_sys_connect(fd: u64, addr_ptr: u64, len: u64) -> i64 
             teardown(&mut state, real_fd);
             return -ETIMEDOUT;
         }
-        x86_64::instructions::hlt();
+        // `hint::spin_loop()`, not `hlt()` -- this is a real syscall handler (`connect()`), and
+        // interrupts stay masked for a syscall's entire duration (`src/syscall.rs`'s SFMASK
+        // setup), not just its entry. `hlt()` here would freeze the CPU permanently the moment
+        // the handshake hadn't already completed before this loop started, since nothing can
+        // wake it. See `ipv4::resolve_with_retry`'s own doc comment for the fuller explanation.
+        core::hint::spin_loop();
     }
 }
 
@@ -847,23 +874,68 @@ pub extern "C" fn oxidebsd_sys_accept(fd: u64, addr_out_ptr: u64, addrlen_ptr: u
     conn_fd as i64
 }
 
+/// Genuinely blocks (unless `O_NONBLOCK` is set -- `crate::fd::is_nonblocking`, `syscall::
+/// sys_fcntl`) while the connection is still open and simply has nothing buffered *yet* -- only
+/// returns `0` (real EOF) once the peer has actually signaled closure (`CloseWait`/`FinWait2`/
+/// `Closed`, reached via a real FIN, not just an empty buffer). Previously returned `0` the
+/// instant `recv_buf` was momentarily empty regardless of connection state -- indistinguishable
+/// from real EOF to a caller, which is exactly what killed BusyBox's own TLS handshake read
+/// (`tls_xread_record` in `networking/tls.c`, which correctly-by-its-own-logic treated that early
+/// `0` as "abrupt EOF, no TLS shutdown" and gave up, even though the real server's ServerHello
+/// just hadn't arrived yet) -- see CLAUDE.md's own "Real networking" known-gaps entry for the full
+/// trace that found this. Plain HTTP happened not to trigger it in practice (by the time `wget`'s
+/// own body-reading loop gets there, there's usually already been enough round-trip latency for
+/// data to be sitting in the buffer), but it was always a real, latent race.
+///
+/// **Spins (`core::hint::spin_loop()`), does *not* use `process::BlockReason`/
+/// `scheduler::schedule()` the way `crate::pipe`'s own blocking reads do** -- a deliberate,
+/// load-bearing difference, not an oversight: incoming-packet processing on this kernel is
+/// pull-based, driven entirely by whichever process happens to call `super::poll()` (the rtl8139
+/// IRQ handler itself does no heap allocation and touches no protocol state, just sets a flag --
+/// see `src/net/rtl8139.rs`'s own doc comment). If this yielded to the scheduler the way a pipe
+/// read does, nothing would ever call `poll()` again on this connection's behalf once the only
+/// process that cares about it (the one blocked right here) stops running -- a real hang, worse
+/// than the false-EOF bug this replaces. Same reasoning already established for `oxidebsd_sys_
+/// connect`'s own handshake wait and `ipv4::resolve_with_retry`'s ARP wait (see CLAUDE.md's own
+/// "Real networking" section on the `hlt()`-in-syscall freeze those two were fixed for) -- ordinary
+/// interrupts (timer, keyboard) still fire throughout, only a voluntary yield to another
+/// *schedulable* process doesn't happen. No timeout: unlike connection *establishment* (which
+/// reasonably needs an upper bound before giving up), blocking indefinitely for more data on an
+/// already-open connection is correct, ordinary blocking-`read()` behavior -- the same accepted
+/// "spins for the syscall's whole duration against a genuinely unresponsive peer" tradeoff
+/// CLAUDE.md's own `hlt()` fix already documents for this same class of wait.
 extern "C" fn tcp_read(real_fd: u64, ptr: u64, len: u64) -> i64 {
-    super::poll();
-    let bytes = {
-        let mut state = STATE.lock();
-        let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
-            return -(EBADF as i64);
+    loop {
+        super::poll();
+        let bytes = {
+            let mut state = STATE.lock();
+            let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) else {
+                return -(EBADF as i64);
+            };
+            let n = conn.recv_buf.len().min(len as usize);
+            if n > 0 {
+                Some(conn.recv_buf.drain(..n).collect::<Vec<u8>>())
+            } else if matches!(
+                conn.state,
+                ConnState::CloseWait | ConnState::FinWait2 | ConnState::Closed
+            ) {
+                return 0; // real EOF: the peer has actually signaled closure
+            } else if crate::fd::is_nonblocking(real_fd) {
+                return -EAGAIN;
+            } else {
+                None
+            }
         };
-        let n = conn.recv_buf.len().min(len as usize);
-        if n == 0 {
-            return 0; // matches this kernel's established non-blocking-read convention
+        let Some(bytes) = bytes else {
+            core::hint::spin_loop();
+            continue;
+        };
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
         }
-        conn.recv_buf.drain(..n).collect::<Vec<u8>>()
-    };
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        return bytes.len() as i64;
     }
-    bytes.len() as i64
 }
 
 extern "C" fn tcp_write(real_fd: u64, ptr: u64, len: u64) -> i64 {

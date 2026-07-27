@@ -592,6 +592,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::syscall::oxidebsd_sys_set_fs_base as *const () as u64)
         }
         "oxidebsd_sys_writev" => Some(crate::syscall::oxidebsd_sys_writev as *const () as u64),
+        "oxidebsd_sys_readv" => Some(crate::syscall::oxidebsd_sys_readv as *const () as u64),
         "oxidebsd_sys_pipe" => Some(crate::syscall::oxidebsd_sys_pipe as *const () as u64),
         "oxidebsd_sys_dup2" => Some(crate::syscall::oxidebsd_sys_dup2 as *const () as u64),
         "oxidebsd_alloc_fd" => Some(crate::fd::oxidebsd_alloc_fd as *const () as u64),
@@ -611,6 +612,15 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_ioctl" => Some(crate::syscall::oxidebsd_sys_ioctl as *const () as u64),
         "oxidebsd_sys_dup" => Some(crate::syscall::oxidebsd_sys_dup as *const () as u64),
         "oxidebsd_sys_uname" => Some(crate::syscall::oxidebsd_sys_uname as *const () as u64),
+        "oxidebsd_sys_socketpair" => {
+            Some(crate::syscall::oxidebsd_sys_socketpair as *const () as u64)
+        }
+        "oxidebsd_sys_set_tid_address" => {
+            Some(crate::syscall::oxidebsd_sys_set_tid_address as *const () as u64)
+        }
+        "oxidebsd_sys_fcntl" => Some(crate::syscall::oxidebsd_sys_fcntl as *const () as u64),
+        "oxidebsd_sys_shutdown" => Some(crate::syscall::oxidebsd_sys_shutdown as *const () as u64),
+        "oxidebsd_random_bytes" => Some(crate::random::oxidebsd_random_bytes as *const () as u64),
         "oxidebsd_sys_clock_gettime" => {
             Some(crate::syscall::oxidebsd_sys_clock_gettime as *const () as u64)
         }
@@ -623,9 +633,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_proc_stat_line" => {
             Some(crate::process::oxidebsd_proc_stat_line as *const () as u64)
         }
-        "oxidebsd_proc_cmdline" => {
-            Some(crate::process::oxidebsd_proc_cmdline as *const () as u64)
-        }
+        "oxidebsd_proc_cmdline" => Some(crate::process::oxidebsd_proc_cmdline as *const () as u64),
         "oxidebsd_proc_status" => Some(crate::process::oxidebsd_proc_status as *const () as u64),
         "oxidebsd_sys_socket" => Some(crate::net::udp::oxidebsd_sys_socket as *const () as u64),
         "oxidebsd_sys_bind" => Some(crate::net::udp::oxidebsd_sys_bind as *const () as u64),
@@ -637,6 +645,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_connect" => Some(crate::net::tcp::oxidebsd_sys_connect as *const () as u64),
         "oxidebsd_sys_listen" => Some(crate::net::tcp::oxidebsd_sys_listen as *const () as u64),
         "oxidebsd_sys_accept" => Some(crate::net::tcp::oxidebsd_sys_accept as *const () as u64),
+        "oxidebsd_sys_poll" => Some(crate::net::oxidebsd_sys_poll as *const () as u64),
         _ => None,
     }
 }
