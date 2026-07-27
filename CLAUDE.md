@@ -182,8 +182,10 @@ Everything added since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=102`, `SYS_SE
 `SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`, `SYS_NANOSLEEP=139`, `SYS_SOCKET=140`, `SYS_BIND=141`,
 `SYS_SENDTO=142`, `SYS_RECVFROM=143`, `SYS_SETSOCKOPT=144`, `SYS_CONNECT=145`, `SYS_LISTEN=146`,
 `SYS_ACCEPT=147`, `SYS_POLL=148`, `SYS_SOCKETPAIR=149`, `SYS_SET_TID_ADDRESS=150`, `SYS_FCNTL=151`,
-`SYS_SHUTDOWN=152`, `SYS_READV=153`, `SYS_READLINK=154`, `SYS_SYMLINK=155`) is OxideBSD's
-own invention —
+`SYS_SHUTDOWN=152`, `SYS_READV=153`, `SYS_READLINK=154`, `SYS_SYMLINK=155`, `SYS_SETITIMER=156`,
+`SYS_GETITIMER=157`, `SYS_GETUID=158`, `SYS_GETEUID=159`, `SYS_GETGID=160`, `SYS_GETEGID=161`,
+`SYS_SETUID=162`, `SYS_SETGID=163`, `SYS_GETGROUPS=164`, `SYS_CHMOD=165`, `SYS_CHOWN=166`) is
+OxideBSD's own invention —
 numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
 match real wire formats anyway; check `src/syscall.rs` and module sources for the current highest
@@ -542,6 +544,104 @@ Superseded specifically because these limits started actively blocking BusyBox w
 **`src/fd.rs`** (shared by both): a per-process `(Pid, fd)` scoped registry — the only
 coordination channel between independently-loaded modules, since modules can't call each other
 directly. Bump-allocated fd numbers, never reused even after close.
+
+## Permission model (`src/process.rs`, `modules/oxfs/`, `modules/posix_compat/`)
+
+Real uid/gid, real per-inode `mode`/`uid`/`gid`, real `chmod`/`chown`, and real `open()`
+permission enforcement — closing this file's own long-standing "uid/passwd-db model" gap (see the
+BusyBox gap analysis table below). Scoped deliberately: this kernel still has exactly one uid
+that's ever existed (root, `0`) since there's no login mechanism, so every enforcement path this
+adds is real, exercised logic that happens to always evaluate the same way *until* something
+actually calls `setuid` to drop privilege — which the test coverage below does, specifically to
+prove the enforcement isn't just plumbing.
+
+- **`Process` gains `uid`/`gid` fields** (`src/process.rs`) — no separate saved/effective pair,
+  since this kernel has no setuid-bit `execve` support to ever make real vs. effective diverge;
+  `SYS_GETEUID`/`SYS_GETEGID` just echo the same fields `SYS_GETUID`/`SYS_GETGID` do. `0` (root) at
+  `spawn` (pid 1 onward); copied by `fork` (real `fork()` semantics, same as `cwd`/`pgid`/`brk`);
+  preserved by `execve` (which never touches these fields at all, same as `cwd`/`pgid`).
+- **New syscalls**, continuing from `SYS_SYMLINK=155`: `SYS_GETUID=158`/`SYS_GETEUID=159`/
+  `SYS_GETGID=160`/`SYS_GETEGID=161`/`SYS_SETUID=162`/`SYS_SETGID=163`/`SYS_GETGROUPS=164`
+  (`modules/posix_compat` — process-attribute syscalls, same placement `setpgid`/`getpgid` already
+  established) and `SYS_CHMOD=165`/`SYS_CHOWN=166` (`modules/oxfs` — filesystem-owned data, same
+  placement `stat`/`fstat`/`lstat` already established). All seven `posix_compat` ones are real
+  zero/one/two-plain-integer-argument Linux/generic wire formats — only the number needed
+  remapping in musl. `chmod`/`chown` needed the same argument-convention patch `open`/`chdir`/
+  `rename` already did: `third_party/musl/src/stat/chmod.c`/`src/unistd/chown.c` now compute
+  `strlen(path)` explicitly and pass `(path_ptr, path_len, mode)`/`(path_ptr, path_len, uid, gid)`
+  — `chown` is the second syscall (after `rename`/`symlink`) whose real argument count needed all
+  four of this ABI's registers, using `R10` for `gid`.
+- **`process::do_setuid`/`do_setgid`** enforce the real POSIX rule: a caller already running as
+  root (`uid == 0`) may become any uid/gid; anything else may only "become" the uid/gid it already
+  is — a real no-op success, not a privilege-escalation path, matching real `setuid()`'s own
+  allowance for that specific case. Any other target is `EPERM` (`src/syscall.rs`'s new `EPERM=1`
+  constant, identical on Linux/BSD/musl — no divergence to worry about, unlike most of this file's
+  other errno constants).
+- **`process::do_getgroups`** reports a single-element list (the caller's own `gid`) for both the
+  real POSIX `size == 0` ("just the count") and `size >= 1` ("write the list") call shapes — this
+  kernel has no supplementary-group concept at all, so the caller's primary group is the complete,
+  correct answer.
+- **`modules/oxfs`'s `Inode` gains real `mode`/`uid`/`gid` fields** (default `FIXED_PERM=0o755`/
+  `0`/`0`, matching what every inode used to report unconditionally before this field existed, so a
+  freshly seeded boot file behaves identically to the old hardcoded scheme until something actually
+  calls `chmod`/`chown`). `write_stat`'s `st_mode`/`st_uid`/`st_gid` are now backed by these real
+  fields instead of the old fixed placeholders. A freshly **created** file (`oxfs_open` with
+  `O_CREAT`) is owned by its real creator, not always root — `OpenFile::Write` gained an
+  `owner_uid` field, captured at `open()` time and applied to the new inode at `close()` (the point
+  a real inode first gets allocated, same "commit on close" model this filesystem already used for
+  content).
+- **`check_access(inode, uid, gid, want_write)`** (`modules/oxfs`) — real Unix permission logic:
+  `uid == 0` bypasses read/write bits entirely (root); otherwise picks the owner/group/other rwx
+  triplet by comparing against the inode's own `uid`/`gid` (first match wins — being in the owning
+  group doesn't fall through to "other" just because the group bits happen to deny it), then checks
+  the one requested bit. Wired into `oxfs_open`: an existing file/dir needs real permission (the
+  read bit — this module's own `open()` always ends up reading regardless of the caller's
+  `O_WRONLY`/`O_RDWR` intent, a pre-existing simplification this pass didn't change, so read is the
+  one real access an *existing*-file open ever performs); creating a new file needs write
+  permission on the *parent directory*, not the (not-yet-existing) file itself. `do_execve`'s own
+  ELF-loading read goes through this exact `oxfs_open` path (see "User-mode execution" above), so
+  this doubles as an approximate execute-permission check (the read bit, not a separate execute
+  check) — a known, documented simplification, harmless while every seeded file's default mode
+  (`0o755`) sets both bits identically.
+- **`oxfs_chmod`**: only the inode's own owner or root may change its permission bits (`EPERM`
+  otherwise); follows a final symlink (real `chmod(2)` semantics — there's no `lchmod` in POSIX at
+  all). **`oxfs_chown`**: root-only unconditionally (this kernel has no group-membership concept to
+  support real Unix's narrower "owner may change the group to one they belong to" case), real POSIX
+  `(uid_t)-1`/`(gid_t)-1` "leave this field unchanged" convention (`u32::MAX` once truncated through
+  this ABI's `u64` register) so a caller can change just one of the two fields; also follows a final
+  symlink (`lchown` isn't implemented — no target applet in the current roster calls it).
+- **`oxidebsd_current_uid`/`oxidebsd_current_gid`** (`src/process.rs`, exported to modules via
+  `src/module.rs`'s `resolve_external_symbol`) — how `modules/oxfs` learns the calling process's
+  identity without a direct cross-module call (modules can only call kernel-exported functions, see
+  "Dynamic kernel modules" above). `pid == 0` (a module's own boot-time self-check, before any real
+  process exists) reports root, the same identity that self-check's own `chmod`/`chown`/`open`
+  calls need to succeed unconditionally — mirrors `oxidebsd_get_cwd`'s existing `BOOT_CWD` fallback
+  shape.
+- **`/etc/passwd`/`/etc/group`** — seeded by `modules/oxfs`'s own `module_init`, right alongside
+  the existing `/etc/resolv.conf`: a single `root:x:0:0:root:/:/bin/sh` / `root:x:0:` entry, the
+  complete and honest picture on a kernel with no login mechanism. No new syscall needed for
+  `whoami`/`id`-style lookups at all — musl's own `getpwuid`/`getpwnam`/`getgrgid`/`getgrnam`
+  (`third_party/musl/src/passwd/*.c`) parse these files directly via plain `fopen`/`fgets`, the
+  same "port libc's real code, don't reimplement its logic kernel-side" philosophy this file's own
+  musl-port section already documents for DNS resolution.
+- Verified via `tests/uid_syscall_smoke.rs`/`userland/uid-syscall-smoke` (a real spawned pid 1
+  driving all of it through genuine `SYSCALL`/`SYSRETQ`, same reasoning every other real-`SYSCALL`
+  smoke test in this codebase already documents — this feature's correctness depends entirely on
+  `Process::uid`/`gid` being resolved fresh via `scheduler::current_pid()` on every call, exactly
+  the class of per-process state a plain-Rust-function test can't exercise): root identity +
+  `getgroups`, a `chmod`/`chown`/`stat` round trip, then a `fork()`ed child that calls
+  `setuid(1)` to actually drop privilege, confirms `setuid(0)` now fails `EPERM`, confirms
+  `setuid(1)` (becoming itself) still succeeds as a real no-op, and then attempts to `open` a
+  `0o600` file owned by a different uid — the one check in the whole test that exercises
+  `check_access` actually *denying* something, not just the always-true root-bypass path every
+  earlier step ran through. The parent's `wait4()` confirms the child's real exit code.
+- **Not covered by this pass**: real login/session authentication (`su`/`login`/`sulogin`/`getty`),
+  mutating `/etc/passwd`/`/etc/group` (`adduser`/`passwd`/`chpasswd`/... — an applet-level gap now,
+  not a kernel one, since both files are already real, writable oxfs files), `lchown`, `fchmod`/
+  `fchown` (fd-based variants — no target applet in the current roster calls them; `chmod.c`/
+  `chown.c` in BusyBox both call the path-based syscalls directly), and setuid/setgid/sticky mode
+  bits (`oxfs_chmod` masks its input to `0o777`, silently dropping anything above that — nothing in
+  this port's roster sets or checks them).
 
 ## Signal handling module (`modules/signal/`, `src/process.rs`, `src/syscall.rs`)
 
@@ -994,14 +1094,15 @@ at once, so the rows aren't a clean partition.
 | Socket syscalls (`socket`/`bind`/`connect`/`sendto`/`recvfrom`/`poll`/...) + real DNS | done | most of 38 (`NEEDS_NETWORK`) | see this file's own "Real networking" section for the full architecture and the two real bugs (QEMU acceleration, `hlt()`-in-syscall freeze) found getting it working. `ping`/`nslookup`/`wget` (plain HTTP) confirmed working live, including real hostname resolution over musl's own DNS stub resolver; `docs/BUSYBOX_APPLETS.md`'s `NEEDS_NETWORK` list is now stale for those three specifically, not yet regenerated wholesale |
 | `socketpair(AF_UNIX, SOCK_STREAM, ...)` + `fcntl`/`shutdown`/`set_tid_address`/`readv` + `/dev/{u}random`/`null`/`zero` + a real `tcp_read` EOF-vs-empty fix | **done, confirmed live** — `wget` HTTPS completed a real end-to-end download | `wget` HTTPS specifically (plain HTTP already worked) | see "Real networking" section's own known-gaps entry — `SYS_SOCKETPAIR=149`/`SYS_SET_TID_ADDRESS=150`/`SYS_FCNTL=151`/`SYS_SHUTDOWN=152`/`SYS_READV=153` in `posix_compat`/`native_abi`, built on `src/pipe.rs`'s existing blocking-buffer machinery; a synthetic `/dev` in `modules/oxfs` backed by a real SHA-256/ChaCha20 generator (`src/random.rs`); and a real bug in `src/net/tcp.rs`'s own `tcp_read` (returned false EOF instead of blocking) — five real bugs, each surfaced only once the previous fix got live-retested |
 | `alarm`/`setitimer` | done | `ping`'s own real receive-loop timeout (chief motivator); any other program relying on a real `SIGALRM` to bound an otherwise-indefinite wait | `SYS_SETITIMER=156`/`SYS_GETITIMER=157` in `modules/clock` — see "Real networking" section's own known-gaps entry for the full design (why only `ITIMER_REAL`, why expiry only sets `pending_signals` rather than immediately terminating a blocked target, fork/execve semantics) and `tests/itimer_syscall_smoke.rs`'s own real-`SYSCALL` coverage |
-| A specific missing syscall per applet (`chmod`/`chown`/`link`/`mknod`/`flock`/`fsync`/`ftruncate`/`fallocate`/SysV IPC/`setrlimit`/`statfs`/sched-priority/`reboot`/`sync`/`inotify`/`chroot`/namespaces) | not started | 36 (`NEEDS_SYSCALL`) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
+| `chmod`/`chown`/`chgrp` | done | — | `SYS_CHMOD=165`/`SYS_CHOWN=166` in `modules/oxfs` — see this file's own "Filesystem: oxfs" section. BusyBox's own `chown.c` implements `chgrp` as the same `chown()` call restricted to the group field, so one pair of syscalls unblocks all three; `chattr`/`fatattr`/`lsattr`/`setfattr` are a distinct, still-unstarted gap (real ext2 `ioctl`s / `setxattr`, not chmod/chown, despite `docs/BUSYBOX_APPLETS.md`'s original probe bucketing them together — corrected there this pass) |
+| A specific missing syscall per applet (`link`/`mknod`/`flock`/`fsync`/`ftruncate`/`fallocate`/SysV IPC/`setrlimit`/`statfs`/sched-priority/`reboot`/`sync`/`inotify`/`chroot`/namespaces/ext2 `ioctl`s/`xattr`) | not started | 33 (`NEEDS_SYSCALL`, down from 36) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
 | `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
 | `/proc` filesystem — system-wide files (`/proc/meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | three new system-wide (not per-pid) kernel accessors (`oxidebsd_proc_meminfo`/`_uptime`/`_stat_global` in `src/process.rs`), routed as siblings of the numeric pid entries at `/proc`'s own top level. `MemFree`/`MemAvailable` are set equal to `MemTotal` (no free-memory/dealloc tracking exists anywhere in this kernel); `/proc/stat`'s `cpu` line is all-zero except `idle` (`ticks()` itself — no per-tick user/system accounting exists), so any CPU%-computing tool (`top`) reads permanently ~0% used, an honest placeholder, not a bug. `chdir(2)` into `/proc` needed a real sentinel encoding for `Process::cwd` (still a fully kernel-opaque `u64`, zero kernel-side changes) — the top bit tags it as a synthetic `/proc` location (`CWD_PROC_TAG`) rather than a real inode number, reusing `ProcDirKind` itself as the "which synthetic directory" representation; every path-taking oxfs syscall handler (`open`/`chdir`/`getcwd`/`stat`/`lstat`/`readlink`, plus a hard `-EROFS` reject for `mkdir`/`unlink`/`rmdir`/`rename` attempted relative to a synthetic cwd) got a matching branch. **Load-bearing fix along the way**: `current_cwd()`/`set_current_cwd()` used to truncate the kernel's own `u64` cwd value to `u32` immediately — harmless while `cwd` only ever held a small real inode index, but would have silently discarded this new tag; both were replaced by a `Cwd` enum-returning pair. Confirmed via `modules/oxfs`'s own boot self-check (system files, chdir in/out of `/proc`, the `EROFS` guard) and `tests/proc_smoke.rs`/`userland/proc-smoke` (a real spawned pid 1 driving all of it through genuine `SYSCALL`/`SYSRETQ`, since the boot self-check itself runs as pid 0 before any real process exists and can't exercise `/proc/<pid>/...` navigation). BusyBox's own `procps/top.c` source confirms `top` is the concrete applet this combination targets (`chdir("/proc")` once at startup, then relative `open("stat")`/`open("meminfo")`) — not yet confirmed live end to end. `free`/`uptime` turn out to call the Linux-only `sysinfo(2)` for their *primary* numbers (confirmed via BusyBox's own `procps/{free,uptime}.c` source) — these two new files don't unblock them; `sysinfo(2)` itself remains a distinct, unimplemented gap |
 | `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | done (enumeration only) | subset of the above | `src/fd.rs`'s new `oxidebsd_fd_at(pid, index)` (mirrors `oxidebsd_proc_pid_at`'s own "loop until -1" shape, a bounded range scan over the `(pid, fd)`-keyed fd table) backs a new `ProcDirKind::FdList`. Real directory listing, real fd numbers — but each entry is a plain placeholder (`DT_REG`, no real content), **not** a real symlink to its target, since real Linux's own `/proc/<pid>/fd/N` entries are symlinks and this kernel had zero symlink support at all until this same pass added one (see the `SYS_SYMLINK`/`SYS_READLINK` row below). Making these entries real target-bearing symlinks needs a separate, cross-module "describe this fd" mechanism (oxfs doesn't know what a pipe/socket fd actually is; only `src/pipe.rs`/`src/net/*` do) — a known, deliberate limitation, not solved by guessing. Unlocks the enumeration half of `lsof`/`fuser`, not the full readlink-target behavior |
 | Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_SYSCALL` row | added alongside the `/proc` work above once it became clear `lsof`/`fuser`'s own real need was `readlink(2)`, not just directory enumeration — steered by an explicit user call to prioritize real POSIX primitives over narrowly chasing one BusyBox applet's own behavior. New `InodeKind::Symlink` in `modules/oxfs` (target string stored exactly like a regular file's content — no new storage mechanism); `resolve_path`/`resolve_path_nofollow_last` (a shared `resolve_path_impl(cwd, path, follow_last, depth)`) now transparently follow a symlink for every intermediate path component always, and for the final component only when `follow_last` is set — the one real difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't), bounded by `MAX_SYMLINK_DEPTH=8` (`-ELOOP=40`, musl's real compiled value — not FreeBSD's `62`, the same errno-divergence class this file's syscall-ABI section already warns about). `SYS_SYMLINK=155`/`SYS_READLINK=154` (next after `SYS_READV=153`), wire format `(target_ptr, target_len, linkpath_ptr, linkpath_len)`/`(path_ptr, path_len, buf_ptr, bufsize)` — `third_party/musl/src/unistd/{symlink,readlink}.c` patched the same way `rename.c` already was, to compute string lengths explicitly. Confirmed live via `modules/oxfs`'s own boot self-check: create, `readlink` round-trip, `stat` follows to the real target while `lstat` reports `S_IFLNK`/the link's own size, `open` follows and reads the target's real content, `unlink` removes only the link |
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | each needs a real device/driver this kernel doesn't model — not one gap, several unrelated small ones (see `docs/BUSYBOX_APPLETS.md`) |
 | Real block device driver + mount table | not started | 20 (`NEEDS_BLOCKDEV`) | `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... — not applet-specific, would matter for actual persistence too, not just more applets |
-| uid/passwd-db model | not started, trivial stub possible | 16 (`NEEDS_UID`) | fully module-able, no-op stubs get partway there (`modules/posix_compat`) — `adduser`/`passwd`/`su`/`login`/... need a real `/etc/passwd`-equivalent to go further |
+| uid/passwd-db model (process-attribute half + `/etc/passwd`+`/etc/group` lookups) | done | most of 16 (`NEEDS_UID`) | see this file's own "Permission model" section below for the full design. `whoami`/`groups`/`logname` should now work end-to-end (musl's `getpwuid`/`getgrgid` parse the new `/etc/passwd`/`/etc/group` in pure userspace, no new syscall needed for that half); `su`/`login`/`sulogin`/`getty` still need a real login/session-authentication flow, and `adduser`/`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` need real *mutation* of those two files (an applet-level gap now, not a kernel one — both files are already real, writable oxfs files) |
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` — see this file's own "Real-time clock" section |
 | `nanosleep` | done | 9 (`NEEDS_CLOCK`), several also needed the clock read above | `SYS_NANOSLEEP=139` — see this file's own "Real-time clock" section. `date`/`hwclock`/`rtcwake`/`adjtimex`/`crond`/`crontab` needed the clock read more than a real sleep; not re-probed against the current roster to confirm which now fully work end to end |
 | Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | `runsv`/`svlogd`/`bootchartd`/... — this kernel has no init framework to plug into at all |

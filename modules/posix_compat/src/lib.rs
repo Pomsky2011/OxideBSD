@@ -63,6 +63,19 @@
 //! half-close semantics for a `crate::pipe`-backed socketpair endpoint, not a real TCP/UDP socket.
 //! Real logic (`src/syscall.rs`'s `sys_fcntl`/`sys_shutdown`) is kernel-resident, same reasoning as
 //! everything else this module only ever calls through to.
+//!
+//! `SYS_GETUID = 158`/`SYS_GETEUID = 159`/`SYS_GETGID = 160`/`SYS_GETEGID = 161`/
+//! `SYS_SETUID = 162`/`SYS_SETGID = 163`/`SYS_GETGROUPS = 164` (see CLAUDE.md's "BusyBox gap
+//! analysis" -- the "uid/passwd-db model" gap) continue the sequence past `modules/clock`'s own
+//! `SYS_GETITIMER = 157`. All seven are real Linux/generic `getuid(2)`-family wire formats
+//! (zero/one/two plain-integer arguments, no string argument to mismatch), so only the usual
+//! `__NR_*` number remap was needed on the musl side. Real logic (`process::do_getuid`/`do_getgid`/
+//! `do_setuid`/`do_setgid`/`do_getgroups`, a new `Process::uid`/`gid` pair) is kernel-resident,
+//! same reasoning as everything else this module only ever calls through to -- see those
+//! functions' own doc comments for the real POSIX permission rule `setuid`/`setgid` enforce (root
+//! may become any uid/gid, anything else may only "become" what it already is) and why
+//! `getgroups` reporting a single-element list (the caller's own `gid`) is the complete, correct
+//! answer on a kernel with no supplementary-group concept.
 #![no_std]
 
 unsafe extern "C" {
@@ -81,6 +94,13 @@ unsafe extern "C" {
     fn oxidebsd_sys_socketpair(domain: u64, ty: u64, protocol: u64, fds_ptr: u64) -> i64;
     fn oxidebsd_sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64;
     fn oxidebsd_sys_shutdown(fd: u64, how: u64) -> i64;
+    fn oxidebsd_sys_getuid() -> i64;
+    fn oxidebsd_sys_geteuid() -> i64;
+    fn oxidebsd_sys_getgid() -> i64;
+    fn oxidebsd_sys_getegid() -> i64;
+    fn oxidebsd_sys_setuid(uid: u64) -> i64;
+    fn oxidebsd_sys_setgid(gid: u64) -> i64;
+    fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -102,6 +122,13 @@ const SYS_UNAME: u64 = 137;
 const SYS_SOCKETPAIR: u64 = 149;
 const SYS_FCNTL: u64 = 151;
 const SYS_SHUTDOWN: u64 = 152;
+const SYS_GETUID: u64 = 158;
+const SYS_GETEUID: u64 = 159;
+const SYS_GETGID: u64 = 160;
+const SYS_GETEGID: u64 = 161;
+const SYS_SETUID: u64 = 162;
+const SYS_SETGID: u64 = 163;
+const SYS_GETGROUPS: u64 = 164;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -143,6 +170,34 @@ extern "C" fn handle_shutdown(fd: u64, how: u64, _arg2: u64, _arg3: u64) -> i64 
     unsafe { oxidebsd_sys_shutdown(fd, how) }
 }
 
+extern "C" fn handle_getuid(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getuid() }
+}
+
+extern "C" fn handle_geteuid(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_geteuid() }
+}
+
+extern "C" fn handle_getgid(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getgid() }
+}
+
+extern "C" fn handle_getegid(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getegid() }
+}
+
+extern "C" fn handle_setuid(uid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_setuid(uid) }
+}
+
+extern "C" fn handle_setgid(gid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_setgid(gid) }
+}
+
+extern "C" fn handle_getgroups(size: u64, list_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getgroups(size, list_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -156,9 +211,16 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SOCKETPAIR, handle_socketpair);
         oxidebsd_register_syscall(SYS_FCNTL, handle_fcntl);
         oxidebsd_register_syscall(SYS_SHUTDOWN, handle_shutdown);
+        oxidebsd_register_syscall(SYS_GETUID, handle_getuid);
+        oxidebsd_register_syscall(SYS_GETEUID, handle_geteuid);
+        oxidebsd_register_syscall(SYS_GETGID, handle_getgid);
+        oxidebsd_register_syscall(SYS_GETEGID, handle_getegid);
+        oxidebsd_register_syscall(SYS_SETUID, handle_setuid);
+        oxidebsd_register_syscall(SYS_SETGID, handle_setgid);
+        oxidebsd_register_syscall(SYS_GETGROUPS, handle_getgroups);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS)\n",
     );
     0
 }

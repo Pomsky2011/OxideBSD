@@ -21,7 +21,7 @@ use crate::address_space::AddressSpace;
 use crate::elf::{self, Elf};
 use crate::memory::{self, with_frame_allocator};
 use crate::scheduler;
-use crate::syscall::{self, ECHILD, EINVAL, ENOEXEC, ENOMEM, ESRCH, SyscallFrame};
+use crate::syscall::{self, ECHILD, EINVAL, ENOEXEC, ENOMEM, EPERM, ESRCH, SyscallFrame};
 
 pub type Pid = u64;
 
@@ -380,6 +380,16 @@ pub struct Process {
     /// the expiry handler clears `real_timer_deadline` instead of rearming it. Meaningless while
     /// `real_timer_deadline` is `None`.
     pub real_timer_interval_ticks: u64,
+    /// Real uid/gid — no distinct saved/effective pair, since this kernel has no setuid-bit
+    /// `execve` support to ever make them diverge (see `do_execve`'s own doc comment: it never
+    /// touches these fields at all, matching real `execve()`'s "preserved unless the setuid/setgid
+    /// bit is set" semantics collapsing to plain preservation when that bit can never be set).
+    /// `SYS_GETEUID`/`SYS_GETEGID` just echo these same fields back. `0` (root) at `spawn` — this
+    /// kernel has no login mechanism, so pid 1 (and everything downstream) starts as root, matching
+    /// a real single-user embedded/init system more than a real multi-user boot. Copied by `fork`
+    /// (real `fork()` semantics, same as `cwd`/`pgid`/`brk`).
+    pub uid: u32,
+    pub gid: u32,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -484,6 +494,10 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         cmdline,
         real_timer_deadline: None,
         real_timer_interval_ticks: 0,
+        // No login mechanism exists -- pid 1 (and every process descending from it) starts as
+        // root, same reasoning as Process::uid's own doc comment.
+        uid: 0,
+        gid: 0,
     };
 
     {
@@ -572,6 +586,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_signal_saved_blocked,
         parent_comm,
         parent_cmdline,
+        parent_uid,
+        parent_gid,
     ) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
@@ -601,6 +617,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             // own -- same reasoning as brk/fs_base/cwd above.
             parent.comm.clone(),
             parent.cmdline.clone(),
+            // Real fork() semantics: uid/gid are copied, same as cwd/pgid/brk -- see
+            // Process::uid's own doc comment.
+            parent.uid,
+            parent.gid,
         )
     };
 
@@ -637,6 +657,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // semantics: a forked child starts with its own disarmed timer).
         real_timer_deadline: None,
         real_timer_interval_ticks: 0,
+        uid: parent_uid,
+        gid: parent_gid,
     };
 
     {
@@ -1255,6 +1277,79 @@ pub fn do_getpgid(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
     table.get(&target).map(|p| p.pgid).ok_or(ESRCH)
 }
 
+/// `SYS_GETUID`/`SYS_GETEUID` — both echo `Process::uid` back (see that field's own doc comment
+/// for why there's no distinct effective value to report). Real `getuid(2)`/`geteuid(2)` never
+/// fail against the calling process's own table entry, which always exists while this is running.
+pub fn do_getuid(caller_pid: Pid) -> u64 {
+    PROCESS_TABLE
+        .lock()
+        .get(&caller_pid)
+        .map(|p| p.uid as u64)
+        .unwrap_or(0)
+}
+
+/// `SYS_GETGID`/`SYS_GETEGID` — `do_getuid`'s counterpart for `Process::gid`.
+pub fn do_getgid(caller_pid: Pid) -> u64 {
+    PROCESS_TABLE
+        .lock()
+        .get(&caller_pid)
+        .map(|p| p.gid as u64)
+        .unwrap_or(0)
+}
+
+/// `SYS_SETUID`'s real logic — matches real `setuid(uid_t uid)`'s single-argument wire format and
+/// its actual POSIX permission rule: a process running as root (`uid == 0`) may become any uid;
+/// anything else may only "become" the uid it already is (a no-op success, not a privilege
+/// escalation vector) — real `setuid()` allows this specific no-op case even for a non-root caller.
+/// Any other target is `EPERM`. No saved-set-uid/real-vs-effective distinction to update beyond the
+/// single `uid` field itself (see `Process::uid`'s own doc comment).
+pub fn do_setuid(caller_pid: Pid, uid: u32) -> Result<u64, u64> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&caller_pid)
+        .expect("setuid: current process missing from table");
+    if proc.uid != 0 && uid != proc.uid {
+        return Err(EPERM);
+    }
+    proc.uid = uid;
+    Ok(0)
+}
+
+/// `SYS_SETGID`'s real logic — `do_setuid`'s counterpart for `Process::gid`, gated on the caller's
+/// own `uid` (real `setgid()` is likewise a root-only privilege, not gated on the caller's current
+/// `gid`).
+pub fn do_setgid(caller_pid: Pid, gid: u32) -> Result<u64, u64> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&caller_pid)
+        .expect("setgid: current process missing from table");
+    if proc.uid != 0 && gid != proc.gid {
+        return Err(EPERM);
+    }
+    proc.gid = gid;
+    Ok(0)
+}
+
+/// `SYS_GETGROUPS`'s real logic — this kernel has no supplementary-group concept at all, so the
+/// calling process's own single group (`Process::gid`) is the complete, correct group list to
+/// report, matching a real POSIX user with no supplementary groups. `size == 0` is the real
+/// POSIX "just tell me the count" query (must not touch `list_ptr`, which may be null/dangling for
+/// exactly this call shape); `size >= 1` writes that one gid and returns `1`. A `size` too small to
+/// hold the (always-one-element) real list is `EINVAL`, matching real `getgroups(2)`.
+pub fn do_getgroups(caller_pid: Pid, size: i64, list_ptr: u64) -> Result<u64, u64> {
+    if size == 0 {
+        return Ok(1);
+    }
+    if size < 1 {
+        return Err(EINVAL);
+    }
+    let gid = do_getgid(caller_pid) as u32;
+    // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
+    // already has -- list_ptr isn't checked against the caller's actual mappings first.
+    unsafe { (list_ptr as *mut u32).write(gid) };
+    Ok(1)
+}
+
 /// musl's own `struct timespec` on x86_64 -- see `src/syscall.rs`'s `RawTimespec` (duplicated
 /// here rather than shared, same "no shared crate across this internal ABI boundary" convention
 /// this file's own `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE` constants above already follow).
@@ -1480,6 +1575,28 @@ pub(crate) extern "C" fn oxidebsd_set_cwd(inode: u64) {
     if let Some(p) = table().lock().get_mut(&pid) {
         p.cwd = inode;
     }
+}
+
+/// Exposed to `modules/oxfs` (see `src/module.rs`'s `resolve_external_symbol`) for real permission
+/// checks on `open`/`chmod`/`chown` — same "the kernel resolves `current_pid()` itself, no pid
+/// crosses the module boundary" shape `oxidebsd_get_cwd` above already established. `pid == 0`
+/// (oxfs's own `module_init` self-check, running before any real process exists — see
+/// `BOOT_CWD`'s own doc comment) reports root (`0`), the same identity that self-check's own
+/// chmod/chown/open calls need to succeed unconditionally.
+pub(crate) extern "C" fn oxidebsd_current_uid() -> u64 {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        return 0;
+    }
+    do_getuid(pid)
+}
+
+pub(crate) extern "C" fn oxidebsd_current_gid() -> u64 {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        return 0;
+    }
+    do_getgid(pid)
 }
 
 /// Appends `value`'s decimal representation (no leading zeros; `0` prints as `"0"`) -- kernel-side

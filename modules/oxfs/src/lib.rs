@@ -86,6 +86,8 @@ unsafe extern "C" {
     fn oxidebsd_proc_stat_global(buf_ptr: *mut u8, buf_cap: u64) -> i64;
     fn oxidebsd_fd_at(pid: u64, index: u64) -> i64;
     fn oxidebsd_random_bytes(ptr: u64, len: u64) -> i64;
+    fn oxidebsd_current_uid() -> u64;
+    fn oxidebsd_current_gid() -> u64;
 }
 
 const SYS_OPEN: u64 = 5;
@@ -105,16 +107,23 @@ const SYS_GETDENTS: u64 = 129;
 /// `InodeKind::Symlink` support (see `resolve_path_impl`'s own doc comment).
 const SYS_READLINK: u64 = 154;
 const SYS_SYMLINK: u64 = 155;
+/// Next two after `modules/posix_compat`'s own `SYS_GETGROUPS = 164` (`src/syscall.rs`'s highest
+/// at the time this was added) -- real `chmod(2)`/`chown(2)`, backing this module's new per-inode
+/// `mode`/`uid`/`gid` fields. Filesystem-owned data, so these live here rather than in
+/// `posix_compat` (same reasoning `SYS_STAT`/`SYS_FSTAT`/`SYS_LSTAT` already established).
+const SYS_CHMOD: u64 = 165;
+const SYS_CHOWN: u64 = 166;
 
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
 /// `open()` passes real POSIX flag values).
 const O_CREAT: u64 = 0o100;
 
-/// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`/`S_IFLNK`), matched with `FIXED_PERM`
-/// below. There's no permission model in this kernel at all yet (see `CLAUDE.md`'s "uid/permissions
-/// stub" gap) -- every inode reports the same fixed `0755`, real enough to let `test -x`/`ls -l`
-/// work without pretending this filesystem tracks anything it doesn't.
+/// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`/`S_IFLNK`) -- these are the type bits
+/// only, ORed with an inode's own real `mode` field (permission bits) when building a `stat`
+/// result. `FIXED_PERM` remains the default *value* every fresh inode's `mode` starts at
+/// (`0o755`), not a hardcoded stand-in for permissions any more -- see `SYS_CHMOD`'s own doc
+/// comment (`oxfs_chmod`) for how it actually changes now.
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 /// Real POSIX value, no Linux/BSD divergence -- backs `InodeKind::Symlink`.
@@ -154,6 +163,12 @@ const ELOOP: i64 = 40;
 /// (`mkdir`/`unlink`/`rmdir`/`rename`) attempted relative to a synthetic `/proc` cwd (see
 /// `real_cwd_for_mutation`'s own doc comment).
 const EROFS: i64 = 30;
+/// Real value, no Linux/BSD divergence -- returned by `oxfs_chmod`/`oxfs_chown` when the caller
+/// isn't allowed to perform the requested ownership/permission change (see `check_owner_access`'s
+/// own doc comment), and by `oxfs_open`/the create-new-file path when `check_access` denies real
+/// read/write permission.
+const EPERM: i64 = 1;
+const EACCES: i64 = 13;
 
 const BLOCK_SIZE: usize = 4096;
 /// 32 MiB pool (raised from 4 MiB once the BusyBox roster grew from 24 applets to ~300 -- see
@@ -239,6 +254,20 @@ struct Inode {
     size: u32,
     direct: [u32; DIRECT_BLOCKS],
     indirect: u32,
+    /// Real per-inode permission bits (12 bits would cover setuid/setgid/sticky too, but nothing
+    /// in this port's roster sets or checks those, so only the low 9 POSIX rwxrwxrwx bits are ever
+    /// written -- `oxfs_chmod` masks its input to `0o777`). Defaults to `FIXED_PERM` (`0o755`),
+    /// the same fixed value every inode used to report unconditionally before this field existed
+    /// -- so a freshly seeded/created file behaves identically to the old hardcoded-everywhere
+    /// scheme until something actually calls `chmod`.
+    mode: u16,
+    /// Real per-inode ownership -- `0` (root) by default, matching every seeded boot file (there's
+    /// no login mechanism, so root is the only uid that has ever created anything on this
+    /// filesystem so far). See `check_access`'s own doc comment for how these two fields, plus the
+    /// caller's own uid/gid (via `oxidebsd_current_uid`/`_gid`), combine into an actual permission
+    /// decision.
+    uid: u32,
+    gid: u32,
 }
 
 impl Inode {
@@ -247,6 +276,9 @@ impl Inode {
         size: 0,
         direct: [NO_BLOCK; DIRECT_BLOCKS],
         indirect: NO_BLOCK,
+        mode: FIXED_PERM as u16,
+        uid: 0,
+        gid: 0,
     };
 
     fn new(kind: InodeKind) -> Inode {
@@ -255,6 +287,9 @@ impl Inode {
             size: 0,
             direct: [NO_BLOCK; DIRECT_BLOCKS],
             indirect: NO_BLOCK,
+            mode: FIXED_PERM as u16,
+            uid: 0,
+            gid: 0,
         }
     }
 }
@@ -458,33 +493,34 @@ struct MuslStat {
 const _: () = assert!(core::mem::size_of::<MuslStat>() == 144);
 
 /// Builds a `MuslStat` for `inode_num` and writes it into the caller's buffer at `buf_ptr` --
-/// shared by `oxfs_stat`/`oxfs_lstat` (path-based) and `oxfs_fstat` (fd-based). Everything this
-/// filesystem doesn't actually model is a fixed, honestly-fake value rather than a plausible-
-/// looking guess: `st_uid`/`st_gid` are `0` (no uid/permission model exists at all -- see
-/// `CLAUDE.md`'s gap table), `st_mode`'s permission bits are always `FIXED_PERM`, timestamps are
-/// all `0` (no clock/RTC source exists yet -- see the same gap table's "clock + nanosleep" row),
-/// and `st_dev` is a fixed `1` (there's only ever one filesystem). `st_nlink` is `2` for a
-/// directory (`.` plus its parent's entry for it) and `1` for a file -- this filesystem doesn't
-/// track hard links, so a directory's real subdirectory count (which would also bump its parent's
-/// linked-from count) isn't reflected either. `st_ino`/`st_size`/`st_blocks` are the only fields
-/// backed by something real. `write_unaligned` since a userland `struct stat*` has no alignment
-/// guarantee this kernel can rely on (same trust boundary as every other raw user pointer here --
-/// see the module doc comment).
+/// shared by `oxfs_stat`/`oxfs_lstat` (path-based) and `oxfs_fstat` (fd-based). `st_uid`/`st_gid`
+/// and `st_mode`'s permission bits are now real, backed by the inode's own `uid`/`gid`/`mode`
+/// fields (see `Inode`'s own doc comment) -- everything else this filesystem still doesn't model
+/// stays a fixed, honestly-fake value: timestamps are all `0` (no clock/RTC source exists yet --
+/// see the same gap table's "clock + nanosleep" row), and `st_dev` is a fixed `1` (there's only
+/// ever one filesystem). `st_nlink` is `2` for a directory (`.` plus its parent's entry for it)
+/// and `1` for a file -- this filesystem doesn't track hard links, so a directory's real
+/// subdirectory count (which would also bump its parent's linked-from count) isn't reflected
+/// either. `st_ino`/`st_size`/`st_blocks` are the only other fields backed by something real.
+/// `write_unaligned` since a userland `struct stat*` has no alignment guarantee this kernel can
+/// rely on (same trust boundary as every other raw user pointer here -- see the module doc
+/// comment).
 fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     let inode = read_inode(inode_num);
-    let (mode, nlink) = match inode.kind {
-        InodeKind::Dir => (S_IFDIR | FIXED_PERM, 2u64),
-        InodeKind::Symlink => (S_IFLNK | FIXED_PERM, 1u64),
-        _ => (S_IFREG | FIXED_PERM, 1u64),
+    let (type_bits, nlink) = match inode.kind {
+        InodeKind::Dir => (S_IFDIR, 2u64),
+        InodeKind::Symlink => (S_IFLNK, 1u64),
+        _ => (S_IFREG, 1u64),
     };
+    let mode = type_bits | inode.mode as u32;
     let size = inode.size as i64;
     let stat = MuslStat {
         st_dev: 1,
         st_ino: inode_num as u64,
         st_nlink: nlink,
         st_mode: mode,
-        st_uid: 0,
-        st_gid: 0,
+        st_uid: inode.uid,
+        st_gid: inode.gid,
         __pad0: 0,
         st_rdev: 0,
         st_size: size,
@@ -502,6 +538,32 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     // `sizeof(struct stat)` (144 bytes, matching `MuslStat` exactly, checked above).
     unsafe { (buf_ptr as *mut MuslStat).write_unaligned(stat) };
     0
+}
+
+/// Real POSIX permission check: `uid == 0` (root) bypasses read/write bits entirely, same as every
+/// real Unix -- this kernel's own single-user reality (root is the only uid that has ever existed
+/// so far, see `Process::uid`'s own doc comment in `src/process.rs`) means this always evaluates to
+/// `true` today, but the logic is real, not a stub -- it'll start mattering the moment `setuid`
+/// actually gets used to drop privilege. Otherwise picks the owner/group/other rwx triplet by
+/// comparing against the inode's own `uid`/`gid` (first match wins, real Unix semantics: being in
+/// the owning group doesn't fall through to "other" just because the group bits happen to deny
+/// it), then checks the one requested bit (`0o4` read, `0o2` write). No execute-bit check here —
+/// see `oxfs_open`'s own doc comment for why `do_execve`'s reuse of the ordinary read path means
+/// there's no separate execute-permission check to make yet.
+fn check_access(inode: &Inode, uid: u64, gid: u64, want_write: bool) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let mode = inode.mode;
+    let bits = if uid == inode.uid as u64 {
+        (mode >> 6) & 0o7
+    } else if gid == inode.gid as u64 {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    let want = if want_write { 0o2 } else { 0o4 };
+    bits & want != 0
 }
 
 /// `write_stat`'s counterpart for a synthetic `/proc` entry -- no real inode to read, so every
@@ -1235,6 +1297,11 @@ enum OpenFile {
         name_len: u8,
         buffer: [u8; MAX_WRITE_BUFFER],
         len: usize,
+        /// The caller's own uid at `open(O_CREAT)` time -- real Unix ownership semantics (a
+        /// freshly created file is owned by its creator, not always root) -- captured here rather
+        /// than re-queried at `close` time since a real program can `open` in one process and
+        /// (via a shared fd, e.g. across `fork`) close in another.
+        owner_uid: u32,
     },
     /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
     /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
@@ -1747,7 +1814,20 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
             } else {
                 inode_num
             };
-            match read_inode(resolved).kind {
+            // Real permission check -- see check_access's own doc comment. This module's own
+            // open() always ends up reading regardless of the caller's O_WRONLY/O_RDWR intent (a
+            // pre-existing simplification, not something this pass changes), so "read" is the one
+            // real access this call ever performs against an *existing* file/dir; do_execve's own
+            // ELF-loading read (see src/process.rs) goes through this exact path too, so this
+            // doubles as its execute-permission check, approximated by the read bit rather than a
+            // separate execute check -- a known, documented simplification, harmless while every
+            // seeded file's default mode (0o755) sets both bits identically.
+            let inode = read_inode(resolved);
+            let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
+            if !check_access(&inode, uid, gid, false) {
+                return -EACCES;
+            }
+            match inode.kind {
                 InodeKind::Dir => open_dir_listing(resolved),
                 _ => register_open_file(OpenFile::FileRead {
                     inode: resolved,
@@ -1756,6 +1836,11 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
             }
         }
         None if create => {
+            let parent_inode = read_inode(parent);
+            let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
+            if !check_access(&parent_inode, uid, gid, true) {
+                return -EACCES;
+            }
             let mut name = [0u8; NAME_MAX];
             name[..leaf.len()].copy_from_slice(leaf);
             register_open_file(OpenFile::Write {
@@ -1764,6 +1849,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                 name_len: leaf.len() as u8,
                 buffer: [0; MAX_WRITE_BUFFER],
                 len: 0,
+                owner_uid: uid as u32,
             })
         }
         None => -ENOENT,
@@ -1883,12 +1969,15 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
         name_len,
         buffer,
         len,
+        owner_uid,
     } = file
     {
         let Some(new_inode) = alloc_inode() else {
             return -ENOSPC;
         };
-        write_inode(new_inode, Inode::new(InodeKind::File));
+        let mut inode = Inode::new(InodeKind::File);
+        inode.uid = owner_uid;
+        write_inode(new_inode, inode);
         if !write_inode_data(new_inode, &buffer[..len]) {
             return -EIO;
         }
@@ -2252,6 +2341,73 @@ extern "C" fn oxfs_symlink(target_ptr: u64, target_len: u64, linkpath_ptr: u64, 
         Ok(()) => 0,
         Err(e) => errno_for(e),
     }
+}
+
+/// Registered for `SYS_CHMOD`. `(path_ptr, path_len, mode)` -- real `chmod(2)`'s own `(path, mode)`
+/// shape plus the length-prefixed path convention every other path-taking syscall here uses (see
+/// `third_party/musl/src/stat/chmod.c`'s own patch). Follows a final symlink component (real
+/// `chmod(2)` semantics -- there's no `lchmod` in POSIX at all, unlike `chown`/`lchown` below).
+/// Only the inode's own owner or root may change its permission bits (`EPERM` otherwise, matching
+/// real Unix); `mode` is masked to `0o777` -- setuid/setgid/sticky bits aren't modeled (see
+/// `Inode::mode`'s own doc comment), so a caller trying to set them just has those bits silently
+/// dropped rather than rejected, the same "don't pretend to model what isn't there" reasoning
+/// `write_stat`'s own fixed placeholders already follow.
+extern "C" fn oxfs_chmod(path_ptr: u64, path_len: u64, mode: u64, _r10: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let cwd = match real_cwd_for_mutation(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode_num = match resolve_path(cwd, path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let mut inode = read_inode(inode_num);
+    let caller_uid = unsafe { oxidebsd_current_uid() };
+    if caller_uid != 0 && caller_uid != inode.uid as u64 {
+        return -EPERM;
+    }
+    inode.mode = (mode & 0o777) as u16;
+    write_inode(inode_num, inode);
+    0
+}
+
+/// Registered for `SYS_CHOWN`. `(path_ptr, path_len, uid, gid)` -- real `chown(2)`'s own
+/// `(path, uid, gid)` shape, using all four of this ABI's argument registers the same way
+/// `SYS_RENAME`/`SYS_SYMLINK` already do (see `third_party/musl/src/unistd/chown.c`'s own patch).
+/// Follows a final symlink component, matching real `chown(2)` (unlike `lchown(2)`, not
+/// implemented this pass -- no target applet in the current roster calls it). Real POSIX
+/// `(uid_t)-1`/`(gid_t)-1` "leave this field unchanged" convention (`u32::MAX` once truncated
+/// through this ABI's `u64` register), so a caller can change just one of the two. **Root-only**,
+/// unlike `chmod` above -- this kernel has no group-membership concept at all, so there's no way
+/// to support real Unix's narrower "owner may change the group to one they belong to" case; any
+/// non-root caller gets a flat `EPERM`, matching real behavior for the *ownership*-changing case
+/// specifically (real Unix restricts that to root unconditionally too).
+extern "C" fn oxfs_chown(path_ptr: u64, path_len: u64, uid: u64, gid: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let cwd = match real_cwd_for_mutation(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode_num = match resolve_path(cwd, path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let caller_uid = unsafe { oxidebsd_current_uid() };
+    if caller_uid != 0 {
+        return -EPERM;
+    }
+    let mut inode = read_inode(inode_num);
+    if uid != u32::MAX as u64 {
+        inode.uid = uid as u32;
+    }
+    if gid != u32::MAX as u64 {
+        inode.gid = gid as u32;
+    }
+    write_inode(inode_num, inode);
+    0
 }
 
 /// Registered for `SYS_FSTAT`. `fd` here is the calling *process's* own fd number, not this
@@ -3262,6 +3418,15 @@ pub extern "C" fn module_init() -> i32 {
     dir_insert(etc, b"..", root).expect("oxfs: failed to seed /etc's .. entry");
     dir_insert(root, b"etc", etc).expect("oxfs: failed to insert /etc into root");
     ok &= seed_file(etc, b"resolv.conf", b"nameserver 10.0.2.3\n");
+    // /etc/passwd + /etc/group -- musl's own getpwnam/getpwuid/getgrnam/getgrgid
+    // (third_party/musl/src/passwd/*.c) parse these directly via plain fopen/fgets, no syscall of
+    // their own beyond the open/read/readv this filesystem already supports -- same "port libc's
+    // real code, don't reimplement its logic kernel-side" philosophy CLAUDE.md's musl-port section
+    // already documents for DNS resolution. A single root entry is the complete, honest picture:
+    // no login mechanism exists, so root is the only uid/gid that has ever existed on this system
+    // (see Process::uid's own doc comment in src/process.rs).
+    ok &= seed_file(etc, b"passwd", b"root:x:0:0:root:/:/bin/sh\n");
+    ok &= seed_file(etc, b"group", b"root:x:0:\n");
 
     if !ok {
         log("[oxfs] self-check FAILED: seeding embedded files failed\n");
@@ -3723,6 +3888,59 @@ pub extern "C" fn module_init() -> i32 {
         log("[oxfs] self-check FAILED: hello.txt not found for symlink check\n");
     }
 
+    // --- Real chmod/chown, through the real registered handlers (Part E). This runs at pid 0
+    // (module_init's own self-check, before any real process exists), where oxidebsd_current_uid
+    // always reports root -- see oxfs_chmod/oxfs_chown's own doc comments for the real permission
+    // rules this exercises only the always-allowed side of. ---
+    if let Some(hello) = dir_lookup(ROOT_INODE, b"hello.txt") {
+        let path = b"hello.txt";
+        if oxfs_chmod(path.as_ptr() as u64, path.len() as u64, 0o600, 0) != 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: chmod hello.txt failed\n");
+        } else if read_inode(hello).mode != 0o600 {
+            ok = false;
+            log("[oxfs] self-check FAILED: chmod hello.txt didn't stick\n");
+        }
+        if oxfs_chown(path.as_ptr() as u64, path.len() as u64, 7, u32::MAX as u64) != 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: chown hello.txt failed\n");
+        } else {
+            let after = read_inode(hello);
+            // gid passed as u32::MAX ("leave unchanged") must not have moved off its seeded 0.
+            if after.uid != 7 || after.gid != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: chown hello.txt field mismatch\n");
+            }
+        }
+        let mut stat_buf = [0u8; 144];
+        if oxfs_stat(
+            path.as_ptr() as u64,
+            path.len() as u64,
+            stat_buf.as_mut_ptr() as u64,
+            0,
+        ) != 0
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: stat hello.txt after chmod/chown failed\n");
+        } else {
+            let st = unsafe { (stat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+            if st.st_mode & 0o777 != 0o600 || st.st_uid != 7 || st.st_gid != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: stat hello.txt didn't reflect chmod/chown\n");
+            }
+        }
+        // Restore hello.txt's original ownership/mode so later checks in this self-check (and any
+        // real process that opens it after boot) see the same seeded state every other file has.
+        let mut inode = read_inode(hello);
+        inode.mode = FIXED_PERM as u16;
+        inode.uid = 0;
+        inode.gid = 0;
+        write_inode(hello, inode);
+    } else {
+        ok = false;
+        log("[oxfs] self-check FAILED: hello.txt not found for chmod/chown check\n");
+    }
+
     // Back to root, matching the state a booting kernel with no real process yet should leave
     // BOOT_CWD in (a real process's own cwd starts at Process::cwd's default, 0/root, regardless
     // of whatever this self-check did to BOOT_CWD -- see src/process.rs's own doc comment -- but
@@ -3745,6 +3963,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_LSTAT, oxfs_lstat);
         oxidebsd_register_syscall(SYS_FSTAT, oxfs_fstat);
         oxidebsd_register_syscall(SYS_GETDENTS, oxfs_getdents);
+        oxidebsd_register_syscall(SYS_CHMOD, oxfs_chmod);
+        oxidebsd_register_syscall(SYS_CHOWN, oxfs_chown);
     }
 
     if ok {

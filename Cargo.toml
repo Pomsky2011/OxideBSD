@@ -10,6 +10,7 @@ members = [
   "userland/tcp-syscall-smoke",
   "userland/proc-smoke",
   "userland/itimer-syscall-smoke",
+  "userland/uid-syscall-smoke",
   "modules/hello",
   "modules/native_abi",
   "modules/posix_compat",
@@ -105,6 +106,10 @@ harness = false
 
 [[test]]
 name = "itimer_syscall_smoke"
+harness = false
+
+[[test]]
+name = "uid_syscall_smoke"
 harness = false
 
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool

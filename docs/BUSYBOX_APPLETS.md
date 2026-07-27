@@ -113,16 +113,33 @@ vs. what a documented, deliberate gap still blocks.
 
 ### NEEDS_UID (16)
 
-Builds, but needs a real uid/passwd-db model -- see CLAUDE.md's "uid/permissions stub" gap.
+Builds, but needs a real uid/passwd-db model -- see CLAUDE.md's "uid/passwd-db model" gap, **done**
+this pass for the process-attribute half (`getuid`/`geteuid`/`getgid`/`getegid`/`setuid`/`setgid`/
+`getgroups`, real `/etc/passwd`+`/etc/group`) -- `whoami`/`groups`/`logname` should now work
+end-to-end (not yet re-probed against the live roster to confirm), but `su`/`login`/`sulogin`/
+`getty` need a real login/session-authentication flow this pass doesn't add, and `adduser`/
+`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` need
+real *mutation* of `/etc/passwd`/`/etc/group` (parsing them for lookups is a solved, musl-userspace
+problem now; rewriting them isn't a kernel gap at all, just unimplemented applet-level work against
+files that already exist and are already writable via ordinary `open`/`write`).
 
-- no uid/passwd-db model (CLAUDE.md's "uid/permissions stub" gap): `addgroup`, `adduser`, `chpasswd`, `delgroup`, `envuidgid`, `getty`, `groups`, `login`, `logname`, `mkpasswd`, `passwd`, `remove_shell`, `setuidgid`, `su`, `sulogin`, `whoami`
+- no uid/passwd-db model (CLAUDE.md's "uid/passwd-db model" gap): `addgroup`, `adduser`, `chpasswd`, `delgroup`, `envuidgid`, `getty`, `groups`, `login`, `logname`, `mkpasswd`, `passwd`, `remove_shell`, `setuidgid`, `su`, `sulogin`, `whoami`
 
 
-### NEEDS_SYSCALL (36)
+### NEEDS_SYSCALL (33, down from 36 -- chmod/chown/chgrp moved to done this pass)
 
 Builds, but its core function needs a specific syscall OxideBSD hasn't registered (chmod, link, flock, mknod, setrlimit, statfs, sched priority, reboot, ...).
 
-- no SYS_CHMOD/SYS_CHOWN registered (no permission model to enforce): `chattr`, `chgrp`, `chmod`, `chown`, `fatattr`, `lsattr`, `setfattr`
+- `chmod`/`chown`/`chgrp` -- **done** this pass: `SYS_CHMOD=165`/`SYS_CHOWN=166` (`modules/oxfs`),
+  real per-inode `mode`/`uid`/`gid` plus `oxfs_open` permission enforcement. BusyBox's own
+  `coreutils/chown.c` implements `chgrp` as the same `chown()` call restricted to the group field,
+  so all three are unblocked by the same two syscalls. `chattr`/`fatattr`/`lsattr`/`setfattr` are
+  **not** unblocked by this despite the original probe bucketing them together with chmod/chown
+  under one loose "no permission model" reason -- real `chattr`/`fatattr` use Linux-specific
+  `EXT2_IOC_GETFLAGS`/`SETFLAGS` ioctls on a regular file (`e2fsprogs/chattr.c`) and `setfattr`
+  uses `setxattr`/`lsetxattr` (`miscutils/setfattr.c`), neither of which this kernel's `SYS_IOCTL`
+  (tty-only) or syscall table implement at all -- a real, distinct gap, corrected here rather than
+  left mis-attributed: `chattr`, `fatattr`, `lsattr`, `setfattr`
 
 - no SYS_FLOCK: `flock`
 

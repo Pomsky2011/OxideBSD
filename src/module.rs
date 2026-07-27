@@ -658,6 +658,17 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_listen" => Some(crate::net::tcp::oxidebsd_sys_listen as *const () as u64),
         "oxidebsd_sys_accept" => Some(crate::net::tcp::oxidebsd_sys_accept as *const () as u64),
         "oxidebsd_sys_poll" => Some(crate::net::oxidebsd_sys_poll as *const () as u64),
+        "oxidebsd_sys_getuid" => Some(crate::syscall::oxidebsd_sys_getuid as *const () as u64),
+        "oxidebsd_sys_geteuid" => Some(crate::syscall::oxidebsd_sys_geteuid as *const () as u64),
+        "oxidebsd_sys_getgid" => Some(crate::syscall::oxidebsd_sys_getgid as *const () as u64),
+        "oxidebsd_sys_getegid" => Some(crate::syscall::oxidebsd_sys_getegid as *const () as u64),
+        "oxidebsd_sys_setuid" => Some(crate::syscall::oxidebsd_sys_setuid as *const () as u64),
+        "oxidebsd_sys_setgid" => Some(crate::syscall::oxidebsd_sys_setgid as *const () as u64),
+        "oxidebsd_sys_getgroups" => {
+            Some(crate::syscall::oxidebsd_sys_getgroups as *const () as u64)
+        }
+        "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
+        "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         _ => None,
     }
 }

@@ -94,6 +94,10 @@ pub(crate) const EAGAIN: u64 = 11;
 /// needs, not real sockets. `88`, matching musl's own compiled-in value, same reasoning as
 /// `EPROTONOSUPPORT`/`EAGAIN` above.
 pub(crate) const ENOTSOCK: u64 = 88;
+/// Returned by `process::do_setuid`/`do_setgid` when a non-root caller tries to become a uid/gid
+/// other than its own -- identical value on Linux/BSD/musl, no divergence to worry about, unlike
+/// most of this group's other members.
+pub(crate) const EPERM: u64 = 1;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -779,6 +783,46 @@ pub(crate) fn sys_getpgid(pid: u64) -> Result<u64, u64> {
     crate::process::do_getpgid(crate::scheduler::current_pid(), pid as i64)
 }
 
+/// `SYS_GETUID`/`SYS_GETEUID`/`SYS_GETGID`/`SYS_GETEGID` (`158`-`161`, registered by
+/// `modules/posix_compat`, continuing on from `SYS_SETITIMER`/`SYS_GETITIMER = 156`/`157`) — all
+/// four are real zero-argument `getuid(2)`-family calls, so only the number needed remapping on
+/// the musl side. Delegate to `process::do_getuid`/`do_getgid` — see `Process::uid`'s own doc
+/// comment for why there's no distinct effective value to compute.
+pub(crate) fn sys_getuid() -> u64 {
+    crate::process::do_getuid(crate::scheduler::current_pid())
+}
+
+pub(crate) fn sys_geteuid() -> u64 {
+    crate::process::do_getuid(crate::scheduler::current_pid())
+}
+
+pub(crate) fn sys_getgid() -> u64 {
+    crate::process::do_getgid(crate::scheduler::current_pid())
+}
+
+pub(crate) fn sys_getegid() -> u64 {
+    crate::process::do_getgid(crate::scheduler::current_pid())
+}
+
+/// `SYS_SETUID`/`SYS_SETGID` (`162`/`163`) — real single-argument `setuid(2)`/`setgid(2)` wire
+/// format. Delegates to `process::do_setuid`/`do_setgid` for the real POSIX permission rule (root
+/// may become any uid/gid, anything else may only "become" its own current one).
+pub(crate) fn sys_setuid(uid: u64) -> Result<u64, u64> {
+    crate::process::do_setuid(crate::scheduler::current_pid(), uid as u32)
+}
+
+pub(crate) fn sys_setgid(gid: u64) -> Result<u64, u64> {
+    crate::process::do_setgid(crate::scheduler::current_pid(), gid as u32)
+}
+
+/// `SYS_GETGROUPS` (`164`) — real `getgroups(int size, gid_t list[])` wire format, no
+/// argument-convention patch needed (a plain `(size, ptr)` pair, no string argument to mismatch).
+/// See `process::do_getgroups`'s own doc comment for why the caller's own `gid` is the complete,
+/// correct answer on a kernel with no supplementary-group concept.
+pub(crate) fn sys_getgroups(size: u64, list_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_getgroups(crate::scheduler::current_pid(), size as i64, list_ptr)
+}
+
 /// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
 /// this ABI's `SYS_IOCTL` reuses these verbatim as its own `request` argument values (they're
 /// already architecture-generic constants, not syscall numbers, so there's nothing to remap the
@@ -1067,6 +1111,34 @@ pub(crate) extern "C" fn oxidebsd_sys_setpgid(pid: u64, pgid: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_getpgid(pid: u64) -> i64 {
     result_to_ffi(sys_getpgid(pid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getuid() -> i64 {
+    sys_getuid() as i64
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_geteuid() -> i64 {
+    sys_geteuid() as i64
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getgid() -> i64 {
+    sys_getgid() as i64
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getegid() -> i64 {
+    sys_getegid() as i64
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_setuid(uid: u64) -> i64 {
+    result_to_ffi(sys_setuid(uid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_setgid(gid: u64) -> i64 {
+    result_to_ffi(sys_setgid(gid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64 {
+    result_to_ffi(sys_getgroups(size, list_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {
