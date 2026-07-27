@@ -73,6 +73,27 @@ pub(crate) const ESRCH: u64 = 3;
 /// Returned by `sys_ioctl` for a tty-specific request issued against a non-console fd -- identical
 /// on Linux and the BSDs, same as most of this group.
 pub(crate) const ENOTTY: u64 = 25;
+/// Returned by `sys_socketpair` for any domain/type other than `AF_UNIX`/`SOCK_STREAM`. `93`, not
+/// FreeBSD's `43` (unlike this group's other members, Linux and the BSDs actually diverge here) --
+/// matches the value musl's own compiled-in `bits/errno.h` (`third_party/musl/arch/generic/bits/
+/// errno.h`, since no x86_64-specific override exists) will compare `errno` against, which is what
+/// actually matters: whatever this file returns via the carry-flag ABI becomes musl's raw `errno`
+/// value directly (see `third_party/musl/arch/x86_64/syscall_arch.h`'s `jnc`/`neg` conversion), so
+/// it must match musl's *own* macro value, not a real-BSD-authenticity nod like `ENOSYS` below is.
+/// `src/net/udp.rs`'s own local copy of this constant (previously `43`, following this file's now-
+/// corrected mistake) needs the same fix.
+pub(crate) const EPROTONOSUPPORT: u64 = 93;
+/// Returned by `crate::pipe`'s `blocking_read` for a real `O_NONBLOCK` fd (`sys_fcntl`) with
+/// nothing to read yet. `11`, matching musl's own compiled-in value (`EWOULDBLOCK` is the same
+/// value there too) -- same "must match musl's macro, not real-BSD numbering" reasoning as
+/// `EPROTONOSUPPORT` above.
+pub(crate) const EAGAIN: u64 = 11;
+/// Returned by `sys_shutdown` for any fd that isn't one of `crate::pipe`'s `AF_UNIX` socketpair
+/// endpoints (a TCP/UDP socket, a plain pipe end, a regular oxfs file, ...) -- this pass only
+/// implements real half-close semantics for the socketpair shape `wget`'s HTTPS path actually
+/// needs, not real sockets. `88`, matching musl's own compiled-in value, same reasoning as
+/// `EPROTONOSUPPORT`/`EAGAIN` above.
+pub(crate) const ENOTSOCK: u64 = 88;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -505,6 +526,46 @@ pub(crate) fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64>
     Ok(total)
 }
 
+/// `SYS_READV = 153` — OxideBSD's own invention, continuing the sequence past `SYS_SHUTDOWN =
+/// 152`. Added specifically because musl's stdio read path goes through `readv`, not plain
+/// `read`, whenever a `FILE*` has real internal buffering enabled (`third_party/musl`'s
+/// `src/stdio/__stdio_read.c`: a 2-iovec scatter-read, the caller's own buffer plus musl's own
+/// internal `FILE` buffer) — the exact same "musl doesn't call the simpler syscall you'd expect"
+/// story `SYS_WRITEV` already told for the write side, just found much later because nothing had
+/// exercised a *buffered* `fread()`/`fgets()` call against a real, slow-arriving data source until
+/// BusyBox's `wget` actually downloaded a real file over HTTPS (confirmed live: the TLS/TCP fix
+/// chain in this file's own known-gaps entry all worked — real response bytes came through —
+/// then this surfaced on the very next buffered read). `(fd, iov_ptr, iovcnt)` matches real
+/// `readv`'s own argument positions exactly. Calls `sys_read` once per `iovec` entry, stopping at
+/// the first short read (an entry only partially filled) — matches real `readv`'s own contract: a
+/// read returning less than requested ends the whole call there, it doesn't move on to the next
+/// iovec expecting more to somehow still be available. Same partial-success semantics as
+/// `sys_writev`: only propagates `Err` if the very first entry fails with nothing read yet.
+pub(crate) fn sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64> {
+    #[repr(C)]
+    struct IoVec {
+        base: u64,
+        len: u64,
+    }
+
+    let mut total: u64 = 0;
+    for i in 0..iovcnt {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document -- iov_ptr
+        // isn't checked against the caller's actual mappings before it's dereferenced.
+        let iov = unsafe { &*(iov_ptr as *const IoVec).add(i as usize) };
+        match sys_read(fd, iov.base, iov.len) {
+            Ok(n) => {
+                total += n;
+                if n < iov.len {
+                    break; // short read -- real readv stops here, not the next iovec
+                }
+            }
+            Err(errno) => return if total > 0 { Ok(total) } else { Err(errno) },
+        }
+    }
+    Ok(total)
+}
+
 /// `SYS_PIPE` (`105`) — unlike most of this ABI's own inventions, matches real `pipe(2)`'s wire
 /// format exactly (a single pointer to a `[i32; 2]` the kernel fills in): there's no
 /// argument-convention reason to invent anything different the way `open`/`execve` needed to (see
@@ -530,6 +591,111 @@ pub(crate) fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, u64> {
 /// (BusyBox's `hush`, with `CONFIG_HUSH_JOB` on, needs it to set up `G_interactive_fd`).
 pub(crate) fn sys_dup(oldfd: u64) -> Result<u64, u64> {
     crate::fd::dup(oldfd).map_err(|_| EBADF)
+}
+
+/// `SYS_SOCKETPAIR` (`149`) — real `socketpair(2)`'s exact `(domain, type, protocol, sv_ptr)`
+/// wire format, already only 4 arguments so (unlike `open`/`execve`) nothing needed inventing
+/// (see `third_party/musl`'s own `arch/x86_64/bits/syscall.h.in` comment on `__NR_socketpair`).
+/// `AF_UNIX`/`SOCK_STREAM` only — the one shape BusyBox's `wget` needs (see CLAUDE.md's "Real
+/// networking" known-gaps entry on `spawn_ssl_client`); anything else is `EPROTONOSUPPORT`, same
+/// masking convention `net::udp::oxidebsd_sys_socket` already uses for `SOCK_CLOEXEC`/
+/// `SOCK_NONBLOCK`. Delegates to `crate::pipe::do_socketpair` for the real logic — not a real
+/// `AF_UNIX` abstraction, just the same blocking pipe-buffer machinery `sys_pipe` already uses,
+/// cross-wired into a full-duplex pair (see that module's own doc comment).
+const AF_UNIX: u64 = 1;
+const SOCK_STREAM: u64 = 1;
+const SOCK_CLOEXEC: u64 = 0o2000000;
+const SOCK_NONBLOCK: u64 = 0o4000;
+
+pub(crate) fn sys_socketpair(
+    domain: u64,
+    ty: u64,
+    _protocol: u64,
+    fds_ptr: u64,
+) -> Result<u64, u64> {
+    let base_ty = ty & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if domain != AF_UNIX || base_ty != SOCK_STREAM {
+        return Err(EPROTONOSUPPORT);
+    }
+    crate::pipe::do_socketpair(fds_ptr)
+}
+
+/// `SYS_SET_TID_ADDRESS` (`150`) — real `set_tid_address(2)`'s exact single-pointer wire format.
+/// Called unconditionally by every musl-linked program at startup (`third_party/musl/src/env/
+/// __init_tls.c`, storing the result as the main thread's own `tid`) and again after every real
+/// `fork()` (`third_party/musl/src/process/_Fork.c`) -- previously entirely unregistered, so every
+/// process on this kernel silently ran with `tid = -ENOSYS` the whole time (harmless *so far*,
+/// since nothing here reads `pthread_self()->tid` for anything correctness-critical, but a real,
+/// previously undiscovered gap all the same, found while tracing an unrelated `wget` HTTPS
+/// failure). No real threading exists on this kernel (see CLAUDE.md) -- `tid` and `pid` are the
+/// same concept here, so this just echoes `scheduler::current_pid()` back, ignoring `_tidptr`
+/// entirely (no `clear_child_tid`-on-exit futex wake to honor without real `pthread_create`-spawned
+/// threads).
+pub(crate) fn sys_set_tid_address(_tidptr: u64) -> Result<u64, u64> {
+    Ok(crate::scheduler::current_pid())
+}
+
+/// `SYS_FCNTL` (`151`) — real `fcntl(2)`'s `(fd, cmd, arg)` shape, already only 3 arguments (musl's
+/// own wrapper, `third_party/musl/src/fcntl/fcntl.c`, always calls it this way for every command
+/// this kernel implements). Only the commands BusyBox's own `libbb/xfuncs.c` (`ndelay_on`/
+/// `ndelay_off`/`close_on_exec_on`) and musl's `F_DUPFD_CLOEXEC` fallback dance actually reach are
+/// implemented -- everything else is `EINVAL`, matching real `fcntl`'s own behavior for a command
+/// it doesn't recognize.
+///
+/// `F_GETFL`/`F_SETFL` only ever track/report `O_NONBLOCK` (`crate::fd::is_nonblocking`/
+/// `set_nonblocking`) -- real `F_GETFL` also reports the access-mode bits (`O_RDONLY`/`O_WRONLY`/
+/// `O_RDWR`), not tracked here at all, a real simplification nothing in this port's roster needs
+/// yet. `crate::pipe::blocking_read` is the *only* reader that currently consults this flag (see
+/// that module's own doc comment) -- a TCP/UDP socket or oxfs file's own read path already returns
+/// promptly on "no data yet" by a different, pre-existing convention (see `src/net/tcp.rs`'s
+/// `tcp_read`), so `O_NONBLOCK` on one of those is accepted and tracked but doesn't change behavior.
+///
+/// `F_SETFD` only recognizes `FD_CLOEXEC` and accepts it as a pure no-op -- this kernel has no
+/// close-on-exec enforcement in `process::do_execve` at all yet, so tracking the bit would be a
+/// write nobody ever reads. `F_DUPFD`/`F_DUPFD_CLOEXEC` delegate to `crate::fd::dup` (ignoring the
+/// real "minimum fd number" hint in `arg` -- this kernel's bump allocator has no notion of it) --
+/// added mainly so musl's own `F_DUPFD_CLOEXEC` fallback in `fcntl.c` (which always tries that
+/// command first, then falls back through `F_DUPFD`) resolves cleanly instead of chasing `EINVAL`
+/// down every branch.
+const F_DUPFD: u64 = 0;
+const F_GETFD: u64 = 1;
+const F_SETFD: u64 = 2;
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
+const F_DUPFD_CLOEXEC: u64 = 1030;
+const O_NONBLOCK: u64 = 0o4000;
+
+pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
+    let Some(real_fd) = crate::fd::real_fd_of(fd) else {
+        return Err(EBADF);
+    };
+    match cmd {
+        F_GETFL => Ok(if crate::fd::is_nonblocking(real_fd) {
+            O_NONBLOCK
+        } else {
+            0
+        }),
+        F_SETFL => {
+            crate::fd::set_nonblocking(real_fd, arg & O_NONBLOCK != 0);
+            Ok(0)
+        }
+        F_GETFD => Ok(0), // FD_CLOEXEC never actually tracked -- see this function's doc comment
+        F_SETFD => Ok(0),
+        F_DUPFD | F_DUPFD_CLOEXEC => crate::fd::dup(fd).map_err(|_| EBADF),
+        _ => Err(EINVAL),
+    }
+}
+
+/// `SYS_SHUTDOWN` (`152`) — real `shutdown(2)`'s exact `(fd, how)` shape. Resolves the caller's
+/// `fd` to its own `real_fd` first (same pattern `oxfs_fstat` already established for a handler
+/// that isn't routed through `crate::fd::read`/`write`'s own automatic resolution) and delegates
+/// to `crate::pipe::do_shutdown` — real half-close semantics for an `AF_UNIX`/`SOCK_STREAM`
+/// socketpair endpoint only (`ENOTSOCK` for anything else); see that function's own doc comment.
+pub(crate) fn sys_shutdown(fd: u64, how: u64) -> Result<u64, u64> {
+    let Some(real_fd) = crate::fd::real_fd_of(fd) else {
+        return Err(EBADF);
+    };
+    crate::pipe::do_shutdown(real_fd, how)
 }
 
 /// `SYS_SET_FS_BASE` (`103`) — OxideBSD's own invention, not modeled on any real OS's syscall (see
@@ -824,12 +990,45 @@ pub(crate) extern "C" fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64)
     result_to_ffi(sys_writev(fd, iov_ptr, iovcnt))
 }
 
+// `pub`, not `pub(crate)` -- same "kept public for test use" precedent above; `tests/
+// readv_smoke.rs` calls this directly.
+pub extern "C" fn oxidebsd_sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
+    result_to_ffi(sys_readv(fd, iov_ptr, iovcnt))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_pipe(fds_ptr: u64) -> i64 {
     result_to_ffi(sys_pipe(fds_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_dup2(oldfd: u64, newfd: u64) -> i64 {
     result_to_ffi(sys_dup2(oldfd, newfd))
+}
+
+// `pub`, not `pub(crate)` -- same "kept public for test use" precedent `oxidebsd_sys_read`/
+// `oxidebsd_sys_write` already have; `tests/socketpair_smoke.rs` calls this directly.
+pub extern "C" fn oxidebsd_sys_socketpair(
+    domain: u64,
+    ty: u64,
+    protocol: u64,
+    fds_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_socketpair(domain, ty, protocol, fds_ptr))
+}
+
+// `pub`, not `pub(crate)` -- same "kept public for test use" precedent above.
+pub extern "C" fn oxidebsd_sys_set_tid_address(tidptr: u64) -> i64 {
+    result_to_ffi(sys_set_tid_address(tidptr))
+}
+
+// `pub`, not `pub(crate)` -- same "kept public for test use" precedent above; a future smoke test
+// for real O_NONBLOCK behavior would call this directly, the same way tests already do for
+// read/write/socketpair.
+pub extern "C" fn oxidebsd_sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
+    result_to_ffi(sys_fcntl(fd, cmd, arg))
+}
+
+pub extern "C" fn oxidebsd_sys_shutdown(fd: u64, how: u64) -> i64 {
+    result_to_ffi(sys_shutdown(fd, how))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_dup(oldfd: u64) -> i64 {

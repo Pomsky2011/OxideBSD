@@ -43,7 +43,7 @@
 //! `(pid, fd)`) ensures the underlying resource's own `close` callback only actually fires once
 //! every alias — across every process that ever had one — has been closed.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use spin::Mutex;
 
@@ -86,6 +86,27 @@ static TABLE: Mutex<BTreeMap<(u64, u64), FdOps>> = Mutex::new(BTreeMap::new());
 /// across *every* process that has one, currently resolve to this underlying resource. See this
 /// file's module doc comment.
 static REFCOUNTS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+/// `O_NONBLOCK`, as set via `fcntl(F_SETFL, ...)` (`syscall::sys_fcntl`). Keyed by `real_fd`, the
+/// same "open file description" scoping `REFCOUNTS` already uses -- POSIX defines `O_NONBLOCK` as
+/// a property of the *description*, shared correctly across `dup`/`dup2`/`fork_inherit` aliases,
+/// not the individual `(pid, fd)` handle, which is why this isn't a field on `FdOps` itself. Only
+/// `src/pipe.rs`'s `blocking_read` actually consults this today -- a real, deliberate
+/// simplification, not every blocking read path in this kernel honors it yet (see that module's
+/// own doc comment). Never cleaned up on close, consistent with this file's own fd-number/refcount
+/// convention of never reusing/reclaiming identities.
+static NONBLOCKING: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+pub(crate) fn set_nonblocking(real_fd: u64, on: bool) {
+    if on {
+        NONBLOCKING.lock().insert(real_fd);
+    } else {
+        NONBLOCKING.lock().remove(&real_fd);
+    }
+}
+
+pub(crate) fn is_nonblocking(real_fd: u64) -> bool {
+    NONBLOCKING.lock().contains(&real_fd)
+}
 
 pub(crate) extern "C" fn oxidebsd_alloc_fd() -> u64 {
     let mut next = NEXT_FD.lock();
@@ -122,7 +143,12 @@ fn register(pid: u64, fd: u64, read: FdReadWrite, write: FdReadWrite, close: FdC
 /// resource's `close` callback once its refcount (shared across every alias, in every process,
 /// created by `dup2`/`fork_inherit`) reaches zero — see this file's module doc comment. `0` on
 /// success, `-1` if the calling process has no such `fd` registered at all.
-pub(crate) extern "C" fn oxidebsd_close_fd(fd: u64) -> i32 {
+///
+/// `pub`, not `pub(crate)` -- same "kept public for test use" precedent `syscall::
+/// oxidebsd_sys_read`/`oxidebsd_sys_write` already have; `tests/socketpair_smoke.rs` calls this
+/// directly to exercise EOF/EPIPE-on-close without loading a real close-registering module
+/// (`modules/oxfs`'s `SYS_CLOSE` handler is the only other caller).
+pub extern "C" fn oxidebsd_close_fd(fd: u64) -> i32 {
     if close_one(scheduler::current_pid(), fd) {
         0
     } else {

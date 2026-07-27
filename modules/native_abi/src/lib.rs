@@ -24,6 +24,20 @@
 //! `Process.parent` (`src/process.rs`) already exists for `wait4`'s own reparenting logic, so
 //! `do_getppid` just reads it back — `0` for a process with no parent, matching real
 //! `getppid()`'s convention for the boot/init process.
+//!
+//! `SYS_SET_TID_ADDRESS = 150` continues the sequence right past `modules/posix_compat`'s own
+//! `SYS_SOCKETPAIR = 149`, but lives here rather than there: musl's own startup code
+//! (`__init_tls.c`) calls this unconditionally for *every* process, the same "core, not a specific
+//! feature" reasoning `SYS_SET_FS_BASE` above already earned its spot in this module for. Real
+//! logic (`src/syscall.rs`'s `sys_set_tid_address`) just echoes the caller's own pid back — no real
+//! threading exists on this kernel, so tid and pid are the same concept here.
+//!
+//! `SYS_READV = 153` continues the sequence past `modules/posix_compat`'s own `SYS_SHUTDOWN =
+//! 152`, but lives here, right next to `SYS_WRITEV` above -- the exact same "musl's entire stdio
+//! path goes through the `*v` call, not the plain one" story, just for reads: any buffered
+//! `fread()`/`fgets()` call goes through `readv`, not `read`, whenever the `FILE*` has real
+//! internal buffering (`third_party/musl/src/stdio/__stdio_read.c`). Real logic (`src/syscall.rs`'s
+//! `sys_readv`) is kernel-resident, same reasoning as `sys_writev` above.
 #![no_std]
 
 unsafe extern "C" {
@@ -44,6 +58,8 @@ unsafe extern "C" {
     fn oxidebsd_sys_brk(addr: u64) -> i64;
     fn oxidebsd_sys_set_fs_base(base: u64) -> i64;
     fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
+    fn oxidebsd_sys_set_tid_address(tidptr: u64) -> i64;
+    fn oxidebsd_sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
 }
 
 const SYS_EXIT: u64 = 1;
@@ -59,6 +75,8 @@ const SYS_BRK: u64 = 102;
 const SYS_SET_FS_BASE: u64 = 103;
 const SYS_WRITEV: u64 = 104;
 const SYS_GETPPID: u64 = 107;
+const SYS_SET_TID_ADDRESS: u64 = 150;
+const SYS_READV: u64 = 153;
 
 extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
@@ -115,6 +133,14 @@ extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i
     unsafe { oxidebsd_sys_writev(fd, iov_ptr, iovcnt) }
 }
 
+extern "C" fn handle_set_tid_address(tidptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_set_tid_address(tidptr) }
+}
+
+extern "C" fn handle_readv(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_readv(fd, iov_ptr, iovcnt) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -131,6 +157,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_BRK, handle_brk);
         oxidebsd_register_syscall(SYS_SET_FS_BASE, handle_set_fs_base);
         oxidebsd_register_syscall(SYS_WRITEV, handle_writev);
+        oxidebsd_register_syscall(SYS_SET_TID_ADDRESS, handle_set_tid_address);
+        oxidebsd_register_syscall(SYS_READV, handle_readv);
     }
     0
 }

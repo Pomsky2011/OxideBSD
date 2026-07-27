@@ -41,6 +41,28 @@
 //! continues the sequence past `modules/oxfs`'s `SYS_MKDIR = 136`. Real logic (`src/syscall.rs`'s
 //! `sys_uname`, filling in a fixed `struct utsname`) is kernel-resident, same reasoning as
 //! everything else this module only ever calls through to.
+//!
+//! `SYS_SOCKETPAIR = 149` (see CLAUDE.md's "Real networking" known-gaps entry) continues the
+//! sequence right past `modules/net`'s own `SYS_POLL = 148`. Registered here, not in
+//! `modules/net/`, because it never touches the actual network stack at all -- real
+//! `socketpair(2)`'s `(domain, type, protocol, sv_ptr)` shape matches this ABI's 4-register width
+//! whole, so no argument-convention patch was needed on the musl side beyond the usual `__NR_*`
+//! remap. Real logic (`src/syscall.rs`'s `sys_socketpair`, delegating to `crate::pipe::
+//! do_socketpair`) is kernel-resident and pipe-shaped, not socket-shaped -- see that module's own
+//! doc comment for why an `AF_UNIX`/`SOCK_STREAM` pair is just two cross-wired pipe buffers here,
+//! same reasoning as everything else this module only ever calls through to.
+//!
+//! `SYS_FCNTL = 151`/`SYS_SHUTDOWN = 152` continue the sequence past `modules/native_abi`'s own
+//! `SYS_SET_TID_ADDRESS = 150` (itself right past this module's `SYS_SOCKETPAIR = 149`) -- found
+//! missing while tracing BusyBox's `wget` HTTPS path (see CLAUDE.md's "Real networking" known-gaps
+//! entry): `libbb/xfuncs.c`'s `ndelay_on`/`ndelay_off`/`close_on_exec_on` call `fcntl`, and
+//! `wget.c` itself calls `shutdown(fd, SHUT_WR)` on the same kind of socketpair endpoint
+//! `SYS_SOCKETPAIR` already provides. Both `(fd, cmd, arg)`/`(fd, how)` already fit this ABI's
+//! register width whole, no argument-convention patch needed. `SYS_SHUTDOWN` lives here rather
+//! than `modules/net/`, same reasoning as `SYS_SOCKETPAIR` above -- it only implements real
+//! half-close semantics for a `crate::pipe`-backed socketpair endpoint, not a real TCP/UDP socket.
+//! Real logic (`src/syscall.rs`'s `sys_fcntl`/`sys_shutdown`) is kernel-resident, same reasoning as
+//! everything else this module only ever calls through to.
 #![no_std]
 
 unsafe extern "C" {
@@ -56,6 +78,9 @@ unsafe extern "C" {
     fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64;
     fn oxidebsd_sys_dup(oldfd: u64) -> i64;
     fn oxidebsd_sys_uname(uts_ptr: u64) -> i64;
+    fn oxidebsd_sys_socketpair(domain: u64, ty: u64, protocol: u64, fds_ptr: u64) -> i64;
+    fn oxidebsd_sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64;
+    fn oxidebsd_sys_shutdown(fd: u64, how: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -74,6 +99,9 @@ const SYS_GETPGID: u64 = 121;
 const SYS_IOCTL: u64 = 124;
 const SYS_DUP: u64 = 125;
 const SYS_UNAME: u64 = 137;
+const SYS_SOCKETPAIR: u64 = 149;
+const SYS_FCNTL: u64 = 151;
+const SYS_SHUTDOWN: u64 = 152;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -103,6 +131,18 @@ extern "C" fn handle_uname(uts_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> 
     unsafe { oxidebsd_sys_uname(uts_ptr) }
 }
 
+extern "C" fn handle_socketpair(domain: u64, ty: u64, protocol: u64, fds_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_socketpair(domain, ty, protocol, fds_ptr) }
+}
+
+extern "C" fn handle_fcntl(fd: u64, cmd: u64, arg: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_fcntl(fd, cmd, arg) }
+}
+
+extern "C" fn handle_shutdown(fd: u64, how: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_shutdown(fd, how) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -113,7 +153,12 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_IOCTL, handle_ioctl);
         oxidebsd_register_syscall(SYS_DUP, handle_dup);
         oxidebsd_register_syscall(SYS_UNAME, handle_uname);
+        oxidebsd_register_syscall(SYS_SOCKETPAIR, handle_socketpair);
+        oxidebsd_register_syscall(SYS_FCNTL, handle_fcntl);
+        oxidebsd_register_syscall(SYS_SHUTDOWN, handle_shutdown);
     }
-    log("[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP/SYS_UNAME)\n");
+    log(
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN)\n",
+    );
     0
 }
