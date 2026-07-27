@@ -228,6 +228,33 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
                 proc.state = crate::process::ProcState::Ready;
                 crate::scheduler::enqueue_ready(pid);
             }
+
+            // `SYS_SETITIMER`'s `ITIMER_REAL` expiry (also backs real `alarm()`, a thin musl-side
+            // wrapper around it -- see `process::do_setitimer`'s own doc comment). Just sets the
+            // pending bit, the same simple, already-established pattern `process::do_kill`'s own
+            // self-targeting case uses (`me.pending_signals |= ...`) -- real delivery/default
+            // termination happens naturally at this exact process's own next syscall-dispatch tail
+            // (`src/syscall.rs`'s `deliver_pending_signal`), not from here. Deliberately *not* the
+            // stronger immediate-termination path `do_kill`'s cross-process branch uses for a
+            // no-handler target: doing that here would mean re-locking `process::table()` (or
+            // calling `terminate_process`, which does its own locking) while this exact lock is
+            // still held for the surrounding scan -- a real deadlock against `spin::Mutex`'s
+            // non-reentrant guarantee. Sufficient for this kernel's actual use case (`ping`'s own
+            // real usage pattern: a tight loop of individually non-blocking `recvfrom` calls, each
+            // its own syscall) -- a process genuinely blocked elsewhere (`BlockReason::Sleeping`/
+            // `WaitingForPipeData`/...) won't see this promptly, the same documented, accepted gap
+            // `do_kill`'s own doc comment already calls out for a handler-installed cross-process
+            // signal.
+            if let Some(deadline) = proc.real_timer_deadline
+                && now >= deadline
+            {
+                proc.pending_signals |= 1 << (crate::process::SIGALRM - 1);
+                proc.real_timer_deadline = if proc.real_timer_interval_ticks > 0 {
+                    Some(now + proc.real_timer_interval_ticks)
+                } else {
+                    None
+                };
+            }
         }
     }
 

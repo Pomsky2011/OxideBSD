@@ -1089,6 +1089,27 @@ pub(crate) extern "C" fn oxidebsd_sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i
     ))
 }
 
+/// `SYS_SETITIMER = 156`/`SYS_GETITIMER = 157` (registered by `modules/clock`, continuing on from
+/// `SYS_SYMLINK = 155`) — see `process::do_setitimer`'s own doc comment for the real logic and why
+/// this one syscall is enough to back both `setitimer(2)` and real `alarm(2)` (a thin musl-side
+/// wrapper around it).
+pub(crate) extern "C" fn oxidebsd_sys_setitimer(which: u64, new_ptr: u64, old_ptr: u64) -> i64 {
+    result_to_ffi(crate::process::do_setitimer(
+        crate::scheduler::current_pid(),
+        which,
+        new_ptr,
+        old_ptr,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getitimer(which: u64, old_ptr: u64) -> i64 {
+    result_to_ffi(crate::process::do_getitimer(
+        crate::scheduler::current_pid(),
+        which,
+        old_ptr,
+    ))
+}
+
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/
 /// `do_getpid`/`do_mmap`/`do_munmap`/`do_brk` for `modules/native_abi/` to call — same pattern as
 /// the exit/read/write adapters above, real logic kept kernel-side since module code can't use

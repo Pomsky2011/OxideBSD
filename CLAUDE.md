@@ -37,7 +37,7 @@ Current state:
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
 no filesystem persistence, no preemption, no copy-on-write fork, no frame deallocation anywhere,
 `sys_read` on stdin is non-blocking (busy-polled by userland), no real block device driver,
-no `alarm`/`setitimer`, no IPv6, no real routing table (one default-gateway rule
+no IPv6, no real routing table (one default-gateway rule
 only). See "BusyBox gap analysis" below for what's needed to go further. Architecture decisions for
 remaining subsystems haven't been made — discuss with the user before large structural commitments.
 
@@ -709,11 +709,47 @@ future syscall-reachable busy-wait):**
 
 **Known gaps, current as of this pass:**
 
-- **`alarm()`/`setitimer()` are not implemented.** Unrelated to the `hlt()` bug above — this is
-  simply that BusyBox's `ping` (run without `-c N`) has no way to bound its own receive loop if a
-  target never replies at all; it relies entirely on an OS-delivered `SIGALRM` it will never get
-  here, so it hangs indefinitely rather than timing out. `ping -c N <host>` doesn't help either if
-  zero replies ever arrive (the count only bounds *received* replies).
+- **`alarm()`/`setitimer()` — done.** `SYS_SETITIMER = 156`/`SYS_GETITIMER = 157` (`modules/
+  clock/`), backed by `process::do_setitimer`/`do_getitimer` and a new per-process
+  `real_timer_deadline`/`real_timer_interval_ticks` pair on `Process`, checked by
+  `interrupts::timer_interrupt_handler` alongside its existing `BlockReason::Sleeping` scan. Only
+  `ITIMER_REAL` is supported (`EINVAL` for `ITIMER_VIRTUAL`/`ITIMER_PROF` — this kernel tracks no
+  per-process CPU time at all, see this file's real-time-clock section). musl's own `alarm()`
+  (`third_party/musl/src/unistd/alarm.c`) is just a thin wrapper around `setitimer(ITIMER_REAL,
+  ...)`, so this one syscall backs both real libc entry points — no separate `SYS_ALARM` needed,
+  and `__NR_alarm` stays at its inert real-Linux value in the remapped `syscall.h.in`, unreferenced
+  by any musl C code.
+
+  Expiry only ever sets the target's `pending_signals` bit (the same simple pattern `do_kill`'s
+  own *self*-targeting case already used), not the stronger immediate-termination path `do_kill`'s
+  *cross-process* branch uses for a no-handler target — deliberately, since that path re-locks
+  `process::table()` (or calls `terminate_process`, which does its own locking), which would
+  deadlock against `spin::Mutex`'s non-reentrant guarantee from inside the timer IRQ handler's own
+  already-held table lock. Sufficient for the concrete case this closes: `ping`'s own real usage
+  pattern (`networking/ping.c`, both its simple and `FEATURE_FANCY_PING` builds) is a real blocking
+  `recv()` around a tight `while(1)`, expecting `EINTR`-by-signal to break out — but this kernel's
+  own `recvfrom` (`udp::oxidebsd_sys_recvfrom`, and raw-ICMP's `icmp::recvfrom`) is already
+  non-blocking-with-self-poll (returns `0` immediately rather than actually blocking), so that
+  loop is really a tight sequence of *individually completing* syscalls in userland, each one
+  passing through `syscall::deliver_pending_signal`'s dispatch-tail check — pending delivery is
+  picked up essentially immediately. A process genuinely blocked elsewhere
+  (`BlockReason::Sleeping`/`WaitingForPipeData`/...) when its alarm fires won't see it promptly —
+  the same accepted, documented gap `do_kill`'s own doc comment already calls out for a
+  handler-installed cross-process signal.
+
+  Not inherited by `fork` (`None`/`0` in a freshly forked child, matching real POSIX itimer/fork
+  semantics — unlike `cwd`/`brk`/`fs_base`, which *are* copied); preserved across `execve` (real
+  `execve()` doesn't reset a pending itimer, same as `cwd`/`pgid`).
+
+  Verified via `tests/itimer_syscall_smoke.rs` + `userland/itimer-syscall-smoke/` — a real spawned
+  ELF driven through genuine `SYSCALL`/`SYSRETQ` (this feature's own correctness depends entirely
+  on the timer IRQ still firing across a syscall boundary, exactly the class of bug this section's
+  own `hlt()`/`ticks()`-frozen-during-syscall bugs were only ever caught by real-`SYSCALL` tests,
+  never a plain-Rust-function one): a `setitimer`/`getitimer` arm/read-back/disarm round trip, then
+  a `fork()`ed child with no `SIGALRM` handler installed, spinning through individually
+  non-blocking `SYS_GETPID` calls until the kernel's own default-disposition delivery actually
+  terminates it — the parent's `wait4()` confirms via the real BSD/Linux wait-status convention
+  (`status & 0x7f == SIGALRM`).
 - **`socketpair(AF_UNIX, SOCK_STREAM, ...)` — `SYS_SOCKETPAIR = 149`, `modules/posix_compat/`.**
   Real `socketpair(2)`'s exact `(domain, type, protocol, sv_ptr)` shape already fits this ABI's
   4-register width whole (like `bind`/`connect`/`listen` before it), so only a plain `__NR_*`
@@ -957,7 +993,7 @@ at once, so the rows aren't a clean partition.
 | `getdents`/`getdents64` | done | — | `modules/oxfs` (`SYS_GETDENTS=129`; **both** `__NR_getdents` and `__NR_getdents64` had to be remapped to it in musl, not just the former — see this file's musl section's "64-bit-suffixed sibling" gotcha) — real `ls`/`find`/`tree`/`du` confirmed working against it |
 | Socket syscalls (`socket`/`bind`/`connect`/`sendto`/`recvfrom`/`poll`/...) + real DNS | done | most of 38 (`NEEDS_NETWORK`) | see this file's own "Real networking" section for the full architecture and the two real bugs (QEMU acceleration, `hlt()`-in-syscall freeze) found getting it working. `ping`/`nslookup`/`wget` (plain HTTP) confirmed working live, including real hostname resolution over musl's own DNS stub resolver; `docs/BUSYBOX_APPLETS.md`'s `NEEDS_NETWORK` list is now stale for those three specifically, not yet regenerated wholesale |
 | `socketpair(AF_UNIX, SOCK_STREAM, ...)` + `fcntl`/`shutdown`/`set_tid_address`/`readv` + `/dev/{u}random`/`null`/`zero` + a real `tcp_read` EOF-vs-empty fix | **done, confirmed live** — `wget` HTTPS completed a real end-to-end download | `wget` HTTPS specifically (plain HTTP already worked) | see "Real networking" section's own known-gaps entry — `SYS_SOCKETPAIR=149`/`SYS_SET_TID_ADDRESS=150`/`SYS_FCNTL=151`/`SYS_SHUTDOWN=152`/`SYS_READV=153` in `posix_compat`/`native_abi`, built on `src/pipe.rs`'s existing blocking-buffer machinery; a synthetic `/dev` in `modules/oxfs` backed by a real SHA-256/ChaCha20 generator (`src/random.rs`); and a real bug in `src/net/tcp.rs`'s own `tcp_read` (returned false EOF instead of blocking) — five real bugs, each surfaced only once the previous fix got live-retested |
-| `alarm`/`setitimer` | not started | any program (`ping` chief among them) that needs to bound its own wait against a target that never replies | see "Real networking" section's own known-gaps entry — distinct from the `hlt()` bug; even a bug-free busy-wait can't self-terminate without this if nothing ever arrives |
+| `alarm`/`setitimer` | done | `ping`'s own real receive-loop timeout (chief motivator); any other program relying on a real `SIGALRM` to bound an otherwise-indefinite wait | `SYS_SETITIMER=156`/`SYS_GETITIMER=157` in `modules/clock` — see "Real networking" section's own known-gaps entry for the full design (why only `ITIMER_REAL`, why expiry only sets `pending_signals` rather than immediately terminating a blocked target, fork/execve semantics) and `tests/itimer_syscall_smoke.rs`'s own real-`SYSCALL` coverage |
 | A specific missing syscall per applet (`chmod`/`chown`/`link`/`mknod`/`flock`/`fsync`/`ftruncate`/`fallocate`/SysV IPC/`setrlimit`/`statfs`/sched-priority/`reboot`/`sync`/`inotify`/`chroot`/namespaces) | not started | 36 (`NEEDS_SYSCALL`) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
 | `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
 | `/proc` filesystem — system-wide files (`/proc/meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | three new system-wide (not per-pid) kernel accessors (`oxidebsd_proc_meminfo`/`_uptime`/`_stat_global` in `src/process.rs`), routed as siblings of the numeric pid entries at `/proc`'s own top level. `MemFree`/`MemAvailable` are set equal to `MemTotal` (no free-memory/dealloc tracking exists anywhere in this kernel); `/proc/stat`'s `cpu` line is all-zero except `idle` (`ticks()` itself — no per-tick user/system accounting exists), so any CPU%-computing tool (`top`) reads permanently ~0% used, an honest placeholder, not a bug. `chdir(2)` into `/proc` needed a real sentinel encoding for `Process::cwd` (still a fully kernel-opaque `u64`, zero kernel-side changes) — the top bit tags it as a synthetic `/proc` location (`CWD_PROC_TAG`) rather than a real inode number, reusing `ProcDirKind` itself as the "which synthetic directory" representation; every path-taking oxfs syscall handler (`open`/`chdir`/`getcwd`/`stat`/`lstat`/`readlink`, plus a hard `-EROFS` reject for `mkdir`/`unlink`/`rmdir`/`rename` attempted relative to a synthetic cwd) got a matching branch. **Load-bearing fix along the way**: `current_cwd()`/`set_current_cwd()` used to truncate the kernel's own `u64` cwd value to `u32` immediately — harmless while `cwd` only ever held a small real inode index, but would have silently discarded this new tag; both were replaced by a `Cwd` enum-returning pair. Confirmed via `modules/oxfs`'s own boot self-check (system files, chdir in/out of `/proc`, the `EROFS` guard) and `tests/proc_smoke.rs`/`userland/proc-smoke` (a real spawned pid 1 driving all of it through genuine `SYSCALL`/`SYSRETQ`, since the boot self-check itself runs as pid 0 before any real process exists and can't exercise `/proc/<pid>/...` navigation). BusyBox's own `procps/top.c` source confirms `top` is the concrete applet this combination targets (`chdir("/proc")` once at startup, then relative `open("stat")`/`open("meminfo")`) — not yet confirmed live end to end. `free`/`uptime` turn out to call the Linux-only `sysinfo(2)` for their *primary* numbers (confirmed via BusyBox's own `procps/{free,uptime}.c` source) — these two new files don't unblock them; `sysinfo(2)` itself remains a distinct, unimplemented gap |

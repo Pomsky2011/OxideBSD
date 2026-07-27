@@ -27,6 +27,7 @@ fn main() {
     build_userland_crate("poll-syscall-smoke", "POLL_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("tcp-syscall-smoke", "TCP_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("proc-smoke", "PROC_SMOKE_ELF_PATH");
+    build_userland_crate("itimer-syscall-smoke", "ITIMER_SYSCALL_SMOKE_ELF_PATH");
 
     build_module_crate("hello", "HELLO", &[]);
     build_module_crate("native_abi", "NATIVE_ABI", &[]);

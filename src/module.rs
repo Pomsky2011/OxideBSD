@@ -627,6 +627,12 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_nanosleep" => {
             Some(crate::syscall::oxidebsd_sys_nanosleep as *const () as u64)
         }
+        "oxidebsd_sys_setitimer" => {
+            Some(crate::syscall::oxidebsd_sys_setitimer as *const () as u64)
+        }
+        "oxidebsd_sys_getitimer" => {
+            Some(crate::syscall::oxidebsd_sys_getitimer as *const () as u64)
+        }
         "oxidebsd_real_fd_of" => Some(crate::fd::oxidebsd_real_fd_of as *const () as u64),
         "oxidebsd_proc_exists" => Some(crate::process::oxidebsd_proc_exists as *const () as u64),
         "oxidebsd_proc_pid_at" => Some(crate::process::oxidebsd_proc_pid_at as *const () as u64),

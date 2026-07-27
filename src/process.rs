@@ -366,6 +366,20 @@ pub struct Process {
     /// Real `/proc/[pid]/cmdline` wire format: each `argv` entry followed by one NUL byte, no
     /// trailing separator beyond that. Same copy-on-fork/reset-on-exec semantics as `comm`.
     pub cmdline: Vec<u8>,
+    /// `SYS_SETITIMER`'s `ITIMER_REAL` state (`do_setitimer`/`do_getitimer`) — the absolute
+    /// `interrupts::ticks()` deadline this process's next `SIGALRM` fires at, `None` while
+    /// disarmed. Checked by `interrupts::timer_interrupt_handler` alongside its existing
+    /// `BlockReason::Sleeping` scan. Real `alarm(2)` is musl's own `setitimer()` wrapper (see
+    /// `third_party/musl/src/unistd/alarm.c`) — no separate kernel mechanism needed for it.
+    /// **Not inherited by `fork`** (`None`/`0` in a freshly forked child) — matches real POSIX
+    /// itimer semantics (a child starts with its own disarmed timer, unlike `cwd`/`brk`/`fs_base`,
+    /// which *are* copied). `do_execve` leaves both fields untouched (preserved, like `cwd`/`pgid`
+    /// — real `execve()` doesn't reset a pending itimer).
+    pub real_timer_deadline: Option<u64>,
+    /// Reload value in ticks for a periodic (`it_interval != 0`) real-timer; `0` means one-shot —
+    /// the expiry handler clears `real_timer_deadline` instead of rearming it. Meaningless while
+    /// `real_timer_deadline` is `None`.
+    pub real_timer_interval_ticks: u64,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -468,6 +482,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         pgid,
         comm,
         cmdline,
+        real_timer_deadline: None,
+        real_timer_interval_ticks: 0,
     };
 
     {
@@ -617,6 +633,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         pgid: parent_pgid,
         comm: parent_comm,
         cmdline: parent_cmdline,
+        // Not inherited -- see `real_timer_deadline`'s own doc comment (real POSIX itimer/fork
+        // semantics: a forked child starts with its own disarmed timer).
+        real_timer_deadline: None,
+        real_timer_interval_ticks: 0,
     };
 
     {
@@ -1296,6 +1316,137 @@ pub fn do_nanosleep(pid: Pid, req_ptr: u64, rem_ptr: u64) -> Result<u64, u64> {
             }
         };
     }
+    Ok(0)
+}
+
+/// Real `struct itimerval` layout (`{ struct timeval it_interval; struct timeval it_value; }`,
+/// each `timeval` a `{ i64 tv_sec; i64 tv_usec; }` pair on this LP64 target — no padding, matching
+/// what musl's own `setitimer()`/`getitimer()` (`third_party/musl/src/signal/{set,get}itimer.c`)
+/// read/write directly, since `sizeof(time_t) > sizeof(long)` is false here and both fall straight
+/// through to a plain 3-register syscall with no repacking).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawItimerval {
+    it_interval_sec: i64,
+    it_interval_usec: i64,
+    it_value_sec: i64,
+    it_value_usec: i64,
+}
+
+const ITIMER_REAL: u64 = 0;
+
+/// `sec`/`usec` -> ticks, rounded up (never fires *earlier* than requested) — same rounding
+/// discipline `do_nanosleep` already established for its own `TIMER_HZ` conversion.
+fn timeval_to_ticks(sec: i64, usec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return None;
+    }
+    let hz = crate::pit::TIMER_HZ as u64;
+    let whole = sec as u64 * hz;
+    let frac = (usec as u64 * hz).div_ceil(1_000_000);
+    Some(whole + frac)
+}
+
+/// Inverse of `timeval_to_ticks` — floored, since this reports *remaining* time (rounding up here
+/// would claim more time is left than actually is).
+fn ticks_to_timeval(ticks: u64) -> (i64, i64) {
+    let hz = crate::pit::TIMER_HZ as u64;
+    ((ticks / hz) as i64, ((ticks % hz) * 1_000_000 / hz) as i64)
+}
+
+/// `SYS_SETITIMER`'s real logic — real `setitimer(2)`'s exact `(which, new_ptr, old_ptr)` wire
+/// format (musl's own `setitimer()` passes this straight through unmodified on a 64-bit `time_t`
+/// target, and `alarm()` is itself just a thin wrapper around `setitimer(ITIMER_REAL, ...)` — see
+/// `third_party/musl/src/unistd/alarm.c` — so this one syscall backs both real libc entry points).
+///
+/// Only `ITIMER_REAL` is supported (`EINVAL` otherwise) — `ITIMER_VIRTUAL`/`ITIMER_PROF` are
+/// defined in terms of a process's own CPU time, which this kernel doesn't track at all (see
+/// CLAUDE.md's real-time-clock section: "no per-process/per-thread CPU time is tracked").
+///
+/// A zero `it_value` (both fields `0`) disarms any pending timer, matching real `setitimer`'s own
+/// "cancel" convention. `it_interval` (if the resulting deadline is ever reached and is nonzero)
+/// reloads the deadline instead of leaving it disarmed — real periodic-timer semantics, checked by
+/// `interrupts::timer_interrupt_handler` alongside its `BlockReason::Sleeping` scan, which raises
+/// `SIGALRM` the same simple way `do_kill`'s self-targeting case already does (just sets the
+/// pending bit — see that function's own doc comment for why that's sufficient here: unlike an
+/// arbitrary cross-process `kill`, delivery only needs the *next* syscall this exact process makes
+/// to complete, and `ping`'s own real usage pattern — a tight loop of individually non-blocking
+/// `recvfrom` calls — guarantees that happens promptly).
+pub fn do_setitimer(pid: Pid, which: u64, new_ptr: u64, old_ptr: u64) -> Result<u64, u64> {
+    if which != ITIMER_REAL {
+        return Err(EINVAL);
+    }
+    if new_ptr == 0 {
+        return Err(EINVAL);
+    }
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let new = unsafe { *(new_ptr as *const RawItimerval) };
+    let value_ticks = timeval_to_ticks(new.it_value_sec, new.it_value_usec).ok_or(EINVAL)?;
+    let interval_ticks =
+        timeval_to_ticks(new.it_interval_sec, new.it_interval_usec).ok_or(EINVAL)?;
+
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("setitimer: current process missing from table");
+
+    if old_ptr != 0 {
+        let (value_sec, value_usec) = match proc.real_timer_deadline {
+            Some(deadline) => ticks_to_timeval(deadline.saturating_sub(crate::interrupts::ticks())),
+            None => (0, 0),
+        };
+        let (interval_sec, interval_usec) = ticks_to_timeval(proc.real_timer_interval_ticks);
+        // SAFETY: same known pointer-validation gap as above, for a write this time.
+        unsafe {
+            (old_ptr as *mut RawItimerval).write(RawItimerval {
+                it_interval_sec: interval_sec,
+                it_interval_usec: interval_usec,
+                it_value_sec: value_sec,
+                it_value_usec: value_usec,
+            })
+        };
+    }
+
+    if value_ticks == 0 {
+        proc.real_timer_deadline = None;
+        proc.real_timer_interval_ticks = 0;
+    } else {
+        proc.real_timer_deadline = Some(crate::interrupts::ticks() + value_ticks);
+        proc.real_timer_interval_ticks = interval_ticks;
+    }
+    Ok(0)
+}
+
+/// `SYS_GETITIMER`'s real logic — real `getitimer(2)`'s exact `(which, old_ptr)` wire format. Same
+/// `ITIMER_REAL`-only restriction as `do_setitimer`.
+pub fn do_getitimer(pid: Pid, which: u64, old_ptr: u64) -> Result<u64, u64> {
+    if which != ITIMER_REAL {
+        return Err(EINVAL);
+    }
+    if old_ptr == 0 {
+        return Err(EINVAL);
+    }
+    let table = PROCESS_TABLE.lock();
+    let proc = table
+        .get(&pid)
+        .expect("getitimer: current process missing from table");
+
+    let (value_sec, value_usec) = match proc.real_timer_deadline {
+        Some(deadline) => ticks_to_timeval(deadline.saturating_sub(crate::interrupts::ticks())),
+        None => (0, 0),
+    };
+    let (interval_sec, interval_usec) = ticks_to_timeval(proc.real_timer_interval_ticks);
+    // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
+    // already has.
+    unsafe {
+        (old_ptr as *mut RawItimerval).write(RawItimerval {
+            it_interval_sec: interval_sec,
+            it_interval_usec: interval_usec,
+            it_value_sec: value_sec,
+            it_value_usec: value_usec,
+        })
+    };
     Ok(0)
 }
 
