@@ -47,12 +47,14 @@ use oxidebsd::net::udp::{oxidebsd_sys_bind, oxidebsd_sys_socket};
 use oxidebsd::net::{ethernet, ipv4};
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
-use oxidebsd::syscall::{oxidebsd_sys_read, oxidebsd_sys_write};
+use oxidebsd::syscall::{oxidebsd_sys_fcntl, oxidebsd_sys_read, oxidebsd_sys_write};
 
 entry_point!(main);
 
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;
+const F_SETFL: u64 = 4;
+const O_NONBLOCK: u64 = 0o4000;
 
 const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x11, 0x22, 0x33];
 
@@ -68,6 +70,7 @@ const PEER_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xBE, 0xEF, 0x01];
 const CLIENT_DATA: &[u8] = b"hello-tcp";
 const SERVER_DATA: &[u8] = b"echo-back";
 
+const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
 const FLAG_PSH: u8 = 0x08;
 const FLAG_ACK: u8 = 0x10;
@@ -323,6 +326,55 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "tcp_smoke: write() -> {} bytes sent, sequence number advanced for real -- TCP stack \
          verified end to end",
         n
+    );
+
+    // --- read() on an empty-but-still-open connection: with O_NONBLOCK set, must return EAGAIN
+    // immediately, not spin forever (see src/net/tcp.rs's own tcp_read doc comment -- there's
+    // nothing else in this single-process test that would ever call poll() again on our behalf,
+    // so a real hang here would mean the fix regressed, not just a slow test). ---
+    let rc = oxidebsd_sys_fcntl(accepted as u64, F_SETFL, O_NONBLOCK);
+    assert_eq!(rc, 0, "fcntl(F_SETFL, O_NONBLOCK) failed: {rc}");
+    let n = oxidebsd_sys_read(
+        accepted as u64,
+        recv_buf.as_mut_ptr() as u64,
+        recv_buf.len() as u64,
+    );
+    assert!(
+        n < 0,
+        "read() on an empty, still-open, O_NONBLOCK connection should fail (EAGAIN), not block \
+         or return 0: {n}"
+    );
+    serial_println!("tcp_smoke: O_NONBLOCK read() on an empty connection -> real EAGAIN verified");
+
+    // --- Synthetic peer sends a FIN: only *now* should read() report real EOF ---
+    let (fin_seg, fin_len) = build_tcp_frame(
+        our_mac,
+        PEER_MAC,
+        PEER_IP,
+        ipv4::GUEST_IP,
+        PEER_PORT,
+        LISTEN_PORT,
+        PEER_ISN
+            .wrapping_add(1)
+            .wrapping_add(CLIENT_DATA.len() as u32),
+        seq_after,
+        FLAG_FIN | FLAG_ACK,
+        &[],
+    );
+    ethernet::handle_frame(&fin_seg[..fin_len]);
+
+    let n = oxidebsd_sys_read(
+        accepted as u64,
+        recv_buf.as_mut_ptr() as u64,
+        recv_buf.len() as u64,
+    );
+    assert_eq!(
+        n, 0,
+        "read() after a real peer FIN should report EOF (0): {n}"
+    );
+    serial_println!(
+        "tcp_smoke: read() after a real peer FIN -> real EOF verified -- tcp_read's EOF-vs-empty \
+         distinction verified end to end"
     );
 
     exit_qemu(QemuExitCode::Success);
