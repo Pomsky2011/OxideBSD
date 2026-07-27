@@ -635,6 +635,12 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         }
         "oxidebsd_proc_cmdline" => Some(crate::process::oxidebsd_proc_cmdline as *const () as u64),
         "oxidebsd_proc_status" => Some(crate::process::oxidebsd_proc_status as *const () as u64),
+        "oxidebsd_proc_meminfo" => Some(crate::process::oxidebsd_proc_meminfo as *const () as u64),
+        "oxidebsd_proc_uptime" => Some(crate::process::oxidebsd_proc_uptime as *const () as u64),
+        "oxidebsd_proc_stat_global" => {
+            Some(crate::process::oxidebsd_proc_stat_global as *const () as u64)
+        }
+        "oxidebsd_fd_at" => Some(crate::fd::oxidebsd_fd_at as *const () as u64),
         "oxidebsd_sys_socket" => Some(crate::net::udp::oxidebsd_sys_socket as *const () as u64),
         "oxidebsd_sys_bind" => Some(crate::net::udp::oxidebsd_sys_bind as *const () as u64),
         "oxidebsd_sys_sendto" => Some(crate::net::udp::oxidebsd_sys_sendto as *const () as u64),

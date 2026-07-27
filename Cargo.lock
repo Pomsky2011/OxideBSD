@@ -216,7 +216,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73c53b65bbadd653c9d125e745d2659a3a060539b17d96ab1c59f9f5bfdacce5"
 
 [[package]]
+name = "ping-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "poll-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "posix_compat"
+version = "0.1.0"
+
+[[package]]
+name = "proc-smoke"
 version = "0.1.0"
 
 [[package]]
@@ -251,6 +263,10 @@ name = "signal"
 version = "0.1.0"
 
 [[package]]
+name = "socketpair-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -264,10 +280,18 @@ name = "stsh"
 version = "0.1.0"
 
 [[package]]
+name = "tcp-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "udp-syscall-smoke"
+version = "0.1.0"
 
 [[package]]
 name = "version_check"

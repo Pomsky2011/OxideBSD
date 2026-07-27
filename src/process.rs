@@ -1281,7 +1281,8 @@ pub fn do_nanosleep(pid: Pid, req_ptr: u64, rem_ptr: u64) -> Result<u64, u64> {
         let deadline = crate::interrupts::ticks() + requested_ticks;
         {
             let mut table = PROCESS_TABLE.lock();
-            table.get_mut(&pid).unwrap().state = ProcState::Blocked(BlockReason::Sleeping(deadline));
+            table.get_mut(&pid).unwrap().state =
+                ProcState::Blocked(BlockReason::Sleeping(deadline));
         } // lock dropped before schedule() -- see process::table()'s own doc comment
         crate::scheduler::schedule();
     }
@@ -1478,6 +1479,79 @@ pub(crate) extern "C" fn oxidebsd_proc_status(pid: u64, buf_ptr: *mut u8, buf_ca
     out.push(b'\n');
     out.extend_from_slice(b"Threads:\t1\n");
     drop(table);
+    copy_into(&out, buf_ptr, buf_cap)
+}
+
+/// `/proc/meminfo` -- system-wide, not per-pid (named `_meminfo`, not tied to any single process).
+/// `MemTotal` is real (`memory::usable_ram_bytes()`); `MemFree`/`MemAvailable` are set **equal to
+/// `MemTotal`** -- no free-memory/deallocation tracking exists anywhere in this kernel (see
+/// `memory.rs`'s own doc comments: the frame allocator never reclaims a frame), so there is
+/// genuinely nothing more honest to report than "as much as there ever was" -- same documented
+/// fixed-placeholder precedent `write_stat`/`write_proc_stat` already use for `st_uid`/`st_gid`/
+/// timestamps. `Buffers`/`Cached`/`SwapTotal`/`SwapFree` are fixed `0` (no page cache, no swap).
+/// Never fails (no pid-race case the per-pid accessors above have).
+pub(crate) extern "C" fn oxidebsd_proc_meminfo(buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let total_kb = crate::memory::usable_ram_bytes() / 1024;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"MemTotal:       ");
+    push_decimal(&mut out, total_kb);
+    out.extend_from_slice(b" kB\n");
+    out.extend_from_slice(b"MemFree:        ");
+    push_decimal(&mut out, total_kb);
+    out.extend_from_slice(b" kB\n");
+    out.extend_from_slice(b"MemAvailable:   ");
+    push_decimal(&mut out, total_kb);
+    out.extend_from_slice(b" kB\n");
+    out.extend_from_slice(b"Buffers:        0 kB\n");
+    out.extend_from_slice(b"Cached:         0 kB\n");
+    out.extend_from_slice(b"SwapTotal:      0 kB\n");
+    out.extend_from_slice(b"SwapFree:       0 kB\n");
+    copy_into(&out, buf_ptr, buf_cap)
+}
+
+/// `/proc/uptime` -- real Linux's two-field format (`"<uptime> <idle>\n"`, both seconds with two
+/// decimal places). Both fields are identical: no separate idle-time accounting exists in this
+/// kernel (see `oxidebsd_proc_stat_global`'s own doc comment for the same gap), so "idle" here is
+/// just "uptime" again, not a distinct measurement. Same `ticks()`/`TIMER_HZ` conversion
+/// `sys_clock_gettime`'s own `CLOCK_MONOTONIC` arm already uses.
+pub(crate) extern "C" fn oxidebsd_proc_uptime(buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let ticks = crate::interrupts::ticks();
+    let hz = crate::pit::TIMER_HZ as u64;
+    let secs = ticks / hz;
+    let centis = (ticks % hz) * 100 / hz;
+    let mut out = Vec::new();
+    push_decimal(&mut out, secs);
+    out.push(b'.');
+    if centis < 10 {
+        out.push(b'0');
+    }
+    push_decimal(&mut out, centis);
+    out.push(b' ');
+    push_decimal(&mut out, secs);
+    out.push(b'.');
+    if centis < 10 {
+        out.push(b'0');
+    }
+    push_decimal(&mut out, centis);
+    out.push(b'\n');
+    copy_into(&out, buf_ptr, buf_cap)
+}
+
+/// `/proc/stat` -- system-wide (named `_global` to avoid colliding with the existing per-pid
+/// `oxidebsd_proc_stat_line` above). Just the one `cpu` summary line real `top` actually parses
+/// (`user nice system idle iowait irq softirq steal`, real Linux's own field order) -- every field
+/// but `idle` is a fixed `0` (no per-tick user/system/idle breakdown is tracked anywhere in this
+/// kernel). `idle` is `ticks()` itself: a real, monotonically increasing number, so a caller
+/// computing CPU% from two successive reads (`top`'s own delta method) divides by a real,
+/// nonzero, growing denominator instead of two identical samples -- the honest consequence is that
+/// `top`'s CPU% column reads permanently ~0% used / ~100% idle, a truthful reflection of "no real
+/// per-process CPU accounting exists," not a bug to chase.
+pub(crate) extern "C" fn oxidebsd_proc_stat_global(buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let idle = crate::interrupts::ticks();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"cpu  0 0 0 ");
+    push_decimal(&mut out, idle);
+    out.extend_from_slice(b" 0 0 0 0\n");
     copy_into(&out, buf_ptr, buf_cap)
 }
 

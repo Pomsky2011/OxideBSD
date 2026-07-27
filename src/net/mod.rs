@@ -73,10 +73,15 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
     let timeout_ms = timeout_ms as i32 as i64;
     let entries = unsafe { core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds as usize) };
 
-    // TIMER_HZ = 100 (see src/pit.rs) -- one tick is 10ms; round the requested timeout up so this
-    // never returns before the caller asked for, same convention do_nanosleep already uses.
+    // `crate::tsc`, not `crate::interrupts::ticks()`: this is a real syscall handler, and
+    // `ticks()` is driven entirely by the timer IRQ, which can't fire for the syscall's *entire*
+    // duration (`src/syscall.rs`'s SFMASK clears `RFLAGS::INTERRUPT_FLAG` at entry) -- a
+    // tick-based deadline here would be frozen at the value it had when the syscall began and
+    // could never actually elapse. Confirmed live: `tests/poll_syscall_smoke.rs`'s real `SYSCALL`
+    // path hung solid on exactly this before `crate::tsc` existed -- see that module's own doc
+    // comment. RDTSC keeps advancing regardless of the interrupt-enable state.
     let deadline =
-        (timeout_ms >= 0).then(|| crate::interrupts::ticks() + (timeout_ms as u64).div_ceil(10));
+        (timeout_ms >= 0).then(|| crate::tsc::now() + crate::tsc::ms_to_cycles(timeout_ms as u64));
 
     loop {
         poll(); // drain the NIC / run the protocol stack once per pass, same as recvfrom's self-poll
@@ -103,14 +108,14 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
         if ready_count > 0 {
             return ready_count;
         }
-        if deadline.is_some_and(|d| crate::interrupts::ticks() >= d) {
+        if deadline.is_some_and(|d| crate::tsc::now() >= d) {
             return 0;
         }
         // `hint::spin_loop()`, not `hlt()`: this is a real syscall handler, and
         // `src/syscall.rs`'s SFMASK setup clears `RFLAGS::INTERRUPT_FLAG` for the syscall's
         // *entire* duration -- `hlt()` only wakes on an unmasked interrupt or an NMI, so it would
         // freeze the CPU permanently the first time nothing was ready yet (no timer tick to ever
-        // advance `deadline`'s own check, no NMI under normal operation). See
+        // advance a tick-based deadline's own check either, no NMI under normal operation). See
         // `ipv4::resolve_with_retry`'s own doc comment for the fuller explanation and the same
         // fix, applied there for the identical reason.
         core::hint::spin_loop();

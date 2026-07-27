@@ -770,7 +770,14 @@ pub extern "C" fn oxidebsd_sys_connect(fd: u64, addr_ptr: u64, len: u64) -> i64 
         return -EHOSTUNREACH;
     }
 
-    let deadline = crate::interrupts::ticks() + CONNECT_TIMEOUT_TICKS;
+    // `crate::tsc`, not `crate::interrupts::ticks()`: `ticks()` is driven entirely by the timer
+    // IRQ, which can't fire while this syscall has interrupts masked (`src/syscall.rs`'s SFMASK
+    // setup) -- a tick-based deadline here would be frozen at whatever value it had when the
+    // syscall began and could never actually elapse, turning "give up after N ticks" into "never
+    // gives up" for a peer that never completes the handshake. Confirmed live by the identical
+    // bug in `net::oxidebsd_sys_poll` (see `crate::tsc`'s own doc comment) -- fixed here for the
+    // same reason. `CONNECT_TIMEOUT_TICKS` is still the budget, just converted to `tsc` cycles.
+    let deadline = crate::tsc::now() + crate::tsc::ms_to_cycles(CONNECT_TIMEOUT_TICKS * 10);
     loop {
         super::poll();
         let outcome = {
@@ -787,7 +794,7 @@ pub extern "C" fn oxidebsd_sys_connect(fd: u64, addr_ptr: u64, len: u64) -> i64 
         if let Some(result) = outcome {
             return result;
         }
-        if crate::interrupts::ticks() >= deadline {
+        if crate::tsc::now() >= deadline {
             let mut state = STATE.lock();
             teardown(&mut state, real_fd);
             return -ETIMEDOUT;

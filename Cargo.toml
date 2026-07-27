@@ -3,6 +3,12 @@ members = [
   "userland/ring3-smoke",
   "userland/stsh",
   "userland/fork-exec-smoke",
+  "userland/socketpair-syscall-smoke",
+  "userland/ping-syscall-smoke",
+  "userland/udp-syscall-smoke",
+  "userland/poll-syscall-smoke",
+  "userland/tcp-syscall-smoke",
+  "userland/proc-smoke",
   "modules/hello",
   "modules/native_abi",
   "modules/posix_compat",
@@ -70,6 +76,30 @@ harness = false
 
 [[test]]
 name = "readv_smoke"
+harness = false
+
+[[test]]
+name = "socketpair_syscall_smoke"
+harness = false
+
+[[test]]
+name = "ping_syscall_smoke"
+harness = false
+
+[[test]]
+name = "udp_syscall_smoke"
+harness = false
+
+[[test]]
+name = "poll_syscall_smoke"
+harness = false
+
+[[test]]
+name = "tcp_syscall_smoke"
+harness = false
+
+[[test]]
+name = "proc_smoke"
 harness = false
 
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool

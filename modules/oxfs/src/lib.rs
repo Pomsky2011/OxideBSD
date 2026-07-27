@@ -81,6 +81,10 @@ unsafe extern "C" {
     fn oxidebsd_proc_stat_line(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64;
     fn oxidebsd_proc_cmdline(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64;
     fn oxidebsd_proc_status(pid: u64, buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_proc_meminfo(buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_proc_uptime(buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_proc_stat_global(buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_fd_at(pid: u64, index: u64) -> i64;
     fn oxidebsd_random_bytes(ptr: u64, len: u64) -> i64;
 }
 
@@ -96,24 +100,33 @@ const SYS_FSTAT: u64 = 126;
 const SYS_STAT: u64 = 127;
 const SYS_LSTAT: u64 = 128;
 const SYS_GETDENTS: u64 = 129;
+/// Next two syscall numbers after `SYS_READV=153` (`src/syscall.rs`'s own highest at the time this
+/// was added) -- real POSIX `readlink(2)`/`symlink(2)`, backing `modules/oxfs`'s new general
+/// `InodeKind::Symlink` support (see `resolve_path_impl`'s own doc comment).
+const SYS_READLINK: u64 = 154;
+const SYS_SYMLINK: u64 = 155;
 
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
 /// `open()` passes real POSIX flag values).
 const O_CREAT: u64 = 0o100;
 
-/// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`), matched with `FIXED_PERM` below.
-/// There's no permission model in this kernel at all yet (see `CLAUDE.md`'s "uid/permissions
+/// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`/`S_IFLNK`), matched with `FIXED_PERM`
+/// below. There's no permission model in this kernel at all yet (see `CLAUDE.md`'s "uid/permissions
 /// stub" gap) -- every inode reports the same fixed `0755`, real enough to let `test -x`/`ls -l`
 /// work without pretending this filesystem tracks anything it doesn't.
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
+/// Real POSIX value, no Linux/BSD divergence -- backs `InodeKind::Symlink`.
+const S_IFLNK: u32 = 0o120000;
 const FIXED_PERM: u32 = 0o755;
 
 /// Real `d_type` values (`include/dirent.h` on the `oxidebsd` musl branch) for `SYS_GETDENTS`'s
 /// own wire format -- see `write_dirent_record`'s own doc comment.
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
+/// Real value, no Linux/BSD divergence -- reported for an `InodeKind::Symlink` entry.
+const DT_LNK: u8 = 10;
 
 const EBADF: i64 = 9;
 const ENOENT: i64 = 2;
@@ -131,6 +144,16 @@ const ENOTEMPTY: i64 = 66;
 /// Real value (`3`, same on FreeBSD/Linux) -- returned when a `/proc/<pid>/...` path's `pid`
 /// vanishes between `proc_open`'s own existence check and the kernel accessor call that follows it.
 const ESRCH: i64 = 3;
+/// musl's real *compiled* value (`third_party/musl/arch/generic/bits/errno.h:40`) -- **not**
+/// FreeBSD's `62`, which would repeat exactly the errno-divergence bug class `CLAUDE.md`'s
+/// syscall-ABI section already documents at length (a real-BSD-nod value that doesn't match what
+/// musl's own header actually defines the symbolic name as). Returned when `resolve_path_impl`'s
+/// own symlink-following recursion exceeds `MAX_SYMLINK_DEPTH`.
+const ELOOP: i64 = 40;
+/// Real value, no Linux/BSD divergence -- returned by any mutating real-filesystem operation
+/// (`mkdir`/`unlink`/`rmdir`/`rename`) attempted relative to a synthetic `/proc` cwd (see
+/// `real_cwd_for_mutation`'s own doc comment).
+const EROFS: i64 = 30;
 
 const BLOCK_SIZE: usize = 4096;
 /// 32 MiB pool (raised from 4 MiB once the BusyBox roster grew from 24 applets to ~300 -- see
@@ -166,6 +189,24 @@ const PROC_BUFFER: usize = 1024;
 /// need to be distinct and non-zero. Clear of `MAX_INODES`'s real range by a wide margin.
 const PROC_INODE_BASE: u64 = 0x7000_0000;
 
+/// Sentinel tag marking `Process::cwd` (see `src/process.rs`'s own doc comment -- a `u64`, fully
+/// opaque to the kernel) as a synthetic `/proc` location rather than a real inode number. Real
+/// inodes are bounded by `MAX_INODES` (~9 bits), so the top bit is always free.
+///
+/// **Load-bearing detail**: `current_cwd()`/`set_current_cwd()` used to truncate this value to
+/// `u32` immediately (`oxidebsd_get_cwd() as u32`) before this pass -- entirely fine when `cwd`
+/// only ever held a small real inode index, but it would silently discard this tag (and any
+/// pid encoded in the high bits) if that truncation weren't also removed. See `Cwd`/`decode_cwd`
+/// below, which replace that pair wholesale.
+const CWD_PROC_TAG: u64 = 1 << 63;
+const CWD_PROC_KIND_SHIFT: u32 = 32;
+const CWD_PROC_KIND_MASK: u64 = 0xF << CWD_PROC_KIND_SHIFT;
+const CWD_PROC_KIND_ROOT: u64 = 0 << CWD_PROC_KIND_SHIFT;
+const CWD_PROC_KIND_PIDFILES: u64 = 1 << CWD_PROC_KIND_SHIFT;
+const CWD_PROC_KIND_TASKLIST: u64 = 2 << CWD_PROC_KIND_SHIFT;
+const CWD_PROC_KIND_FDLIST: u64 = 3 << CWD_PROC_KIND_SHIFT;
+const CWD_PROC_PID_MASK: u64 = 0xFFFF_FFFF;
+
 const MAX_OPEN_FILES: usize = 8;
 /// Write-side accumulator cap (see `OpenFile::Write`'s own doc comment) -- comfortably past
 /// today's largest embedded binary (`sh.elf`, ~102 KB). Matches `modules/fat32`'s own final,
@@ -185,6 +226,11 @@ enum InodeKind {
     Free,
     File,
     Dir,
+    /// A real symlink -- its target path string is stored exactly like a regular file's content
+    /// (`write_inode_data`/`read_inode_at`, `inode.size` = target byte length), no separate
+    /// storage mechanism needed. See `resolve_path_impl`'s own doc comment for how this is
+    /// followed during path resolution.
+    Symlink,
 }
 
 #[derive(Clone, Copy)]
@@ -428,6 +474,7 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     let inode = read_inode(inode_num);
     let (mode, nlink) = match inode.kind {
         InodeKind::Dir => (S_IFDIR | FIXED_PERM, 2u64),
+        InodeKind::Symlink => (S_IFLNK | FIXED_PERM, 1u64),
         _ => (S_IFREG | FIXED_PERM, 1u64),
     };
     let size = inode.size as i64;
@@ -599,6 +646,10 @@ enum OxfsError {
     NotADirectory,
     InvalidPath,
     DiskFull,
+    /// `resolve_path_impl`'s own symlink-following recursion exceeded `MAX_SYMLINK_DEPTH` -- a
+    /// symlink loop (or just a chain too long to be a real mistake), never actually exercised by
+    /// this kernel's own seed data.
+    TooManyLinks,
 }
 
 fn errno_for(e: OxfsError) -> i64 {
@@ -607,6 +658,7 @@ fn errno_for(e: OxfsError) -> i64 {
         OxfsError::NotADirectory => ENOTDIR,
         OxfsError::InvalidPath => EINVAL,
         OxfsError::DiskFull => ENOSPC,
+        OxfsError::TooManyLinks => ELOOP,
     }
 }
 
@@ -712,13 +764,30 @@ fn dir_nth_used_record(dir_inode: u32, n: usize) -> Option<(u32, [u8; NAME_MAX],
     None
 }
 
+/// How many nested symlinks `resolve_path_impl` will transparently follow before giving up with
+/// `ELOOP` -- generous headroom for any real chain, bounded so a symlink loop (`a -> b -> a`)
+/// can't recurse this kernel into a stack overflow.
+const MAX_SYMLINK_DEPTH: usize = 8;
+
 /// Resolves `path` to a single inode number, starting from `cwd_inode` (or root, if `path` starts
 /// with `/`) and walking every `/`-separated component (`.`/`..`/empty components handled along
 /// the way) -- real multi-component resolution, replacing `modules/fat32`'s single-component-only
-/// `to_short_name`. Every component but the last must itself be a directory; the last may be
-/// anything (a file, a directory, or simply not exist, which callers interested in creating
-/// something use `resolve_parent` to detect instead).
-fn resolve_path(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsError> {
+/// `to_short_name`. Every *intermediate* component is transparently followed if it's itself a
+/// symlink (real Unix behavior -- an intermediate component must resolve to a directory one way
+/// or another). The *final* component is followed too when `follow_last` is set; when it isn't,
+/// a symlink final component is returned as-is (its own inode, not its target's) -- the one
+/// difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't). Recursion
+/// depth is bounded by `MAX_SYMLINK_DEPTH` -- see `resolve_path`/`resolve_path_nofollow_last` for
+/// the two callable wrappers over this.
+fn resolve_path_impl(
+    cwd_inode: u32,
+    path: &[u8],
+    follow_last: bool,
+    depth: usize,
+) -> Result<u32, OxfsError> {
+    if depth > MAX_SYMLINK_DEPTH {
+        return Err(OxfsError::TooManyLinks);
+    }
     let mut current = if path.first() == Some(&b'/') {
         ROOT_INODE
     } else {
@@ -734,12 +803,40 @@ fn resolve_path(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsError> {
             continue;
         }
         let next = dir_lookup(current, component).ok_or(OxfsError::NotFound)?;
-        if !is_last && read_inode(next).kind != InodeKind::Dir {
+        let kind = read_inode(next).kind;
+        if kind == InodeKind::Symlink && (!is_last || follow_last) {
+            let mut target = [0u8; MAX_CWD_PATH];
+            let n = read_inode_at(next, 0, &mut target);
+            let start = if target.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                current
+            };
+            current = resolve_path_impl(start, &target[..n], true, depth + 1)?;
+            if !is_last && read_inode(current).kind != InodeKind::Dir {
+                return Err(OxfsError::NotADirectory);
+            }
+            continue;
+        }
+        if !is_last && kind != InodeKind::Dir {
             return Err(OxfsError::NotADirectory);
         }
         current = next;
     }
     Ok(current)
+}
+
+/// Always follows a symlink final component -- used by `chdir`/`stat`/the parent-prefix half of
+/// `resolve_parent` (real Unix: an intermediate path component is always followed regardless of
+/// caller).
+fn resolve_path(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsError> {
+    resolve_path_impl(cwd_inode, path, true, 0)
+}
+
+/// Never follows a symlink final component (still follows every intermediate one) -- used by
+/// `lstat(2)`/`readlink(2)`, the two real Unix calls that must see the link itself.
+fn resolve_path_nofollow_last(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsError> {
+    resolve_path_impl(cwd_inode, path, false, 0)
 }
 
 /// Resolves `path` to its *parent* directory's inode number plus the final path component's raw
@@ -773,13 +870,269 @@ fn resolve_parent(cwd_inode: u32, path: &[u8]) -> Result<(u32, &[u8]), OxfsError
     Ok((parent_inode, leaf))
 }
 
-fn current_cwd() -> u32 {
-    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
-    unsafe { oxidebsd_get_cwd() as u32 }
+/// The calling process's current-working-directory location: either a real inode number, or a
+/// synthetic `/proc` directory (`ProcDirKind` reused directly -- it already enumerates exactly the
+/// shapes a `/proc` cwd can be: `Root`/`PidFiles`/`TaskList`/`FdList`). See `CWD_PROC_TAG`'s own
+/// doc comment for the encoding this decodes/encodes.
+enum Cwd {
+    Real(u32),
+    Proc(ProcDirKind),
 }
 
-fn set_current_cwd(inode: u32) {
+fn decode_cwd(raw: u64) -> Cwd {
+    if raw & CWD_PROC_TAG == 0 {
+        return Cwd::Real(raw as u32);
+    }
+    let pid = (raw & CWD_PROC_PID_MASK) as u32;
+    match raw & CWD_PROC_KIND_MASK {
+        CWD_PROC_KIND_PIDFILES => Cwd::Proc(ProcDirKind::PidFiles(pid)),
+        CWD_PROC_KIND_TASKLIST => Cwd::Proc(ProcDirKind::TaskList(pid)),
+        CWD_PROC_KIND_FDLIST => Cwd::Proc(ProcDirKind::FdList(pid)),
+        _ => Cwd::Proc(ProcDirKind::Root),
+    }
+}
+
+fn encode_proc_cwd(kind: ProcDirKind) -> u64 {
+    match kind {
+        ProcDirKind::Root => CWD_PROC_TAG | CWD_PROC_KIND_ROOT,
+        ProcDirKind::PidFiles(pid) => CWD_PROC_TAG | CWD_PROC_KIND_PIDFILES | pid as u64,
+        ProcDirKind::TaskList(pid) => CWD_PROC_TAG | CWD_PROC_KIND_TASKLIST | pid as u64,
+        ProcDirKind::FdList(pid) => CWD_PROC_TAG | CWD_PROC_KIND_FDLIST | pid as u64,
+    }
+}
+
+fn current_cwd() -> Cwd {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    decode_cwd(unsafe { oxidebsd_get_cwd() })
+}
+
+fn set_current_cwd_real(inode: u32) {
     unsafe { oxidebsd_set_cwd(inode as u64) };
+}
+
+fn set_current_cwd_proc(kind: ProcDirKind) {
+    unsafe { oxidebsd_set_cwd(encode_proc_cwd(kind)) };
+}
+
+/// `kind`'s own parent, as a `ProcDirKind` -- `None` only for `Root`, whose parent is the *real*
+/// filesystem root, not expressible as a `ProcDirKind` at all (see `proc_relative_chdir`'s own
+/// handling of that transition).
+fn proc_parent_kind(kind: ProcDirKind) -> Option<ProcDirKind> {
+    match kind {
+        ProcDirKind::Root => None,
+        ProcDirKind::PidFiles(_) => Some(ProcDirKind::Root),
+        ProcDirKind::TaskList(pid) | ProcDirKind::FdList(pid) => Some(ProcDirKind::PidFiles(pid)),
+    }
+}
+
+/// Opens `kind` itself as a directory listing -- the cwd-relative counterpart of `proc_open`
+/// dispatching on a full suffix string, used once a caller already has a `ProcDirKind` in hand
+/// (no suffix string to re-parse).
+fn open_proc_dir_kind(kind: ProcDirKind) -> i64 {
+    match kind {
+        ProcDirKind::Root => open_proc_root_dir(),
+        ProcDirKind::PidFiles(pid) => open_proc_pid_dir(pid),
+        ProcDirKind::TaskList(pid) => open_task_dir(pid),
+        ProcDirKind::FdList(pid) => open_fd_dir(pid),
+    }
+}
+
+/// Builds `kind`'s own `/proc`-relative suffix (`""`/`"/3"`/`"/3/task"`/`"/3/fd"`) -- the same
+/// grammar `proc_open`/`proc_kind` parse, used in reverse to let a relative operation performed
+/// while cwd'd inside `/proc` delegate straight back into those two functions.
+fn proc_dir_suffix(kind: ProcDirKind, out: &mut [u8; MAX_CWD_PATH]) -> usize {
+    let mut buf = ByteBuf { buf: out, len: 0 };
+    match kind {
+        ProcDirKind::Root => {}
+        ProcDirKind::PidFiles(pid) => {
+            buf.push_bytes(b"/");
+            buf.push_decimal(pid);
+        }
+        ProcDirKind::TaskList(pid) => {
+            buf.push_bytes(b"/");
+            buf.push_decimal(pid);
+            buf.push_bytes(b"/task");
+        }
+        ProcDirKind::FdList(pid) => {
+            buf.push_bytes(b"/");
+            buf.push_decimal(pid);
+            buf.push_bytes(b"/fd");
+        }
+    }
+    buf.len
+}
+
+/// Writes `/proc` + `kind`'s own suffix into `out` -- `oxfs_getcwd`'s own counterpart of
+/// `build_cwd_path` for a synthetic cwd.
+fn build_proc_cwd_path(kind: ProcDirKind, out: &mut [u8; MAX_CWD_PATH]) -> usize {
+    let mut suffix = [0u8; MAX_CWD_PATH];
+    let suffix_len = proc_dir_suffix(kind, &mut suffix);
+    out[..5].copy_from_slice(b"/proc");
+    out[5..5 + suffix_len].copy_from_slice(&suffix[..suffix_len]);
+    5 + suffix_len
+}
+
+/// The inverse of `proc_dir_suffix` for an arbitrary suffix string (same grammar `proc_kind`
+/// parses) -- returns the concrete `ProcDirKind` a directory-shaped suffix names, or `None` if it
+/// names a leaf file (or nothing at all). A small, near-duplicate, single-purpose parser rather
+/// than a generalized one shared with `proc_open`/`proc_kind` -- matching this file's own existing
+/// precedent for that pair (see their own doc comments).
+fn proc_dir_kind_for(suffix: &[u8]) -> Option<ProcDirKind> {
+    let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    let Some(pid_str) = comps.next() else {
+        return Some(ProcDirKind::Root);
+    };
+    let pid = parse_pid(pid_str)?;
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+    if unsafe { oxidebsd_proc_exists(pid as u64) } == 0 {
+        return None;
+    }
+    match comps.next() {
+        None => Some(ProcDirKind::PidFiles(pid)),
+        Some(b"fd") if comps.next().is_none() => Some(ProcDirKind::FdList(pid)),
+        Some(b"task") => match comps.next() {
+            None => Some(ProcDirKind::TaskList(pid)),
+            // /proc/<pid>/task/<tid> (tid == pid only) behaves like /proc/<pid> itself -- see
+            // ProcDirKind::TaskList's own doc comment.
+            Some(tid_str) if comps.next().is_none() => {
+                let tid = parse_pid(tid_str)?;
+                (tid == pid).then_some(ProcDirKind::PidFiles(pid))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Concatenates `kind`'s own suffix with a relative `path` into a single `/proc`-suffix buffer,
+/// for delegating a relative operation back into `proc_open`/`proc_kind`/`proc_dir_kind_for` --
+/// the shared plumbing every `proc_relative_*` function below uses. Returns `None` if the combined
+/// suffix wouldn't fit `MAX_CWD_PATH` (a real path this deep is not a realistic case this tier
+/// needs to support, not a silent truncation).
+fn proc_join_suffix(kind: ProcDirKind, path: &[u8], out: &mut [u8; MAX_CWD_PATH]) -> Option<usize> {
+    let mut len = proc_dir_suffix(kind, out);
+    if len + 1 + path.len() > out.len() {
+        return None;
+    }
+    out[len] = b'/';
+    len += 1;
+    out[len..len + path.len()].copy_from_slice(path);
+    len += path.len();
+    Some(len)
+}
+
+/// `oxfs_open`'s own cwd-relative delegate once cwd is a synthetic `/proc` location (`kind`) and
+/// `path` is itself relative (an absolute path -- `/proc/...`, `/dev/...`, or a real absolute path
+/// -- is already handled by `oxfs_open` before this is ever called, exactly like today's real-cwd
+/// case). `create` is rejected outright (`-EROFS`) -- nothing under `/proc` can ever be created.
+fn proc_relative_open(kind: ProcDirKind, path: &[u8], create: bool) -> i64 {
+    if create {
+        return -EROFS;
+    }
+    if path.is_empty() || path == b"." {
+        return open_proc_dir_kind(kind);
+    }
+    if path == b".." {
+        return match proc_parent_kind(kind) {
+            Some(parent) => open_proc_dir_kind(parent),
+            None => open_dir_listing(ROOT_INODE),
+        };
+    }
+    let mut suffix = [0u8; MAX_CWD_PATH];
+    match proc_join_suffix(kind, path, &mut suffix) {
+        Some(len) => proc_open(&suffix[..len]),
+        None => -ENOENT,
+    }
+}
+
+/// `oxfs_chdir`'s own cwd-relative delegate, same shape as `proc_relative_open`. A non-`/proc`
+/// absolute target (e.g. `"/"`, `"/etc"`) is handled by `oxfs_chdir` itself before this is called,
+/// exactly like an absolute `/proc/...` target -- this function only ever sees a relative `path`.
+fn proc_relative_chdir(kind: ProcDirKind, path: &[u8]) -> i64 {
+    if path.is_empty() || path == b"." {
+        set_current_cwd_proc(kind);
+        return 0;
+    }
+    if path == b".." {
+        match proc_parent_kind(kind) {
+            Some(parent) => set_current_cwd_proc(parent),
+            None => set_current_cwd_real(ROOT_INODE),
+        }
+        return 0;
+    }
+    let mut suffix = [0u8; MAX_CWD_PATH];
+    let Some(len) = proc_join_suffix(kind, path, &mut suffix) else {
+        return -ENOENT;
+    };
+    match proc_dir_kind_for(&suffix[..len]) {
+        Some(target) => {
+            set_current_cwd_proc(target);
+            0
+        }
+        None => match proc_kind(&suffix[..len]) {
+            Some(false) => -ENOTDIR, // a real leaf file (stat/cmdline/status/a numeric fd entry)
+            _ => -ENOENT,
+        },
+    }
+}
+
+/// `oxfs_stat`/`oxfs_lstat`'s own cwd-relative delegate -- `/proc` has no real symlinks (see
+/// `resolve_path_impl`'s own doc comment), so there's no `stat`-vs-`lstat` divergence to make here
+/// the way there is in real inode space; both call this the same way.
+fn proc_relative_stat(kind: ProcDirKind, path: &[u8], buf_ptr: u64) -> i64 {
+    if path.is_empty() || path == b"." {
+        return write_proc_stat(true, buf_ptr);
+    }
+    if path == b".." {
+        return match proc_parent_kind(kind) {
+            Some(_) => write_proc_stat(true, buf_ptr),
+            None => write_stat(ROOT_INODE, buf_ptr), // a real stat of the real root
+        };
+    }
+    let mut suffix = [0u8; MAX_CWD_PATH];
+    let Some(len) = proc_join_suffix(kind, path, &mut suffix) else {
+        return -ENOENT;
+    };
+    match proc_kind(&suffix[..len]) {
+        Some(is_dir) => write_proc_stat(is_dir, buf_ptr),
+        None => -ENOENT,
+    }
+}
+
+/// `oxfs_readlink`'s own cwd-relative delegate -- nothing under `/proc` is ever a real symlink in
+/// this design (see `ProcDirKind::FdList`'s own doc comment), so a path that resolves to *anything*
+/// existing is `-EINVAL` ("exists, but isn't a symlink"), matching real `readlink(2)`.
+fn proc_relative_readlink(kind: ProcDirKind, path: &[u8]) -> i64 {
+    if path.is_empty() || path == b"." || path == b".." {
+        return -EINVAL;
+    }
+    let mut suffix = [0u8; MAX_CWD_PATH];
+    let Some(len) = proc_join_suffix(kind, path, &mut suffix) else {
+        return -ENOENT;
+    };
+    match proc_kind(&suffix[..len]) {
+        Some(_) => -EINVAL,
+        None => -ENOENT,
+    }
+}
+
+/// The shared guard every mutating real-filesystem operation (`mkdir`/`unlink`/`rmdir`/`rename`)
+/// needs now that `cwd` can be a synthetic `/proc` location: an absolute `path` is unaffected
+/// (resolves against the real root exactly like it always has, regardless of cwd); a *relative*
+/// `path` while cwd is inside `/proc` has no real directory to mutate at all, and must be rejected
+/// outright (`-EROFS`) rather than silently falling through to whatever the raw sentinel bits
+/// would decode to as a bogus real inode index.
+fn real_cwd_for_mutation(path: &[u8]) -> Result<u32, i64> {
+    match current_cwd() {
+        Cwd::Real(inode) => Ok(inode),
+        Cwd::Proc(_) => {
+            if path.first() == Some(&b'/') {
+                Ok(ROOT_INODE)
+            } else {
+                Err(-EROFS)
+            }
+        }
+    }
 }
 
 /// Finds `target`'s own name as recorded in `parent`'s listing (`.`/`..` excluded) -- a directory
@@ -929,6 +1282,14 @@ enum ProcDirKind {
     /// for this tier) unconditionally `opendir()`s this path and silently skips a pid entirely if
     /// it's missing, rather than falling back to treating the pid as single-threaded itself.
     TaskList(u32),
+    /// `/proc/<pid>/fd`: one entry per fd this process currently has open (`oxidebsd_fd_at`).
+    /// Closes the *enumeration* gap for `lsof`/`fuser` -- each entry is a plain `DT_REG`
+    /// placeholder (no real fd-target content, since there's no `readlink`-able target to back it
+    /// with: oxfs doesn't know what a pipe/socket fd actually is, only `src/pipe.rs`/`src/net/*`
+    /// do). A real per-fd target (making these genuine symlinks to the fd's actual resource) needs
+    /// a separate, cross-module "describe this fd" mechanism -- a known, deliberate limitation of
+    /// this pass, not solved by guessing.
+    FdList(u32),
 }
 
 fn register_open_file(open_file: OpenFile) -> i64 {
@@ -1044,6 +1405,7 @@ fn open_proc_root_dir() -> i64 {
             out.push_bytes(b"\n");
             i += 1;
         }
+        out.push_bytes(b"meminfo\nuptime\nstat\n");
         out.len
     };
     register_open_file(OpenFile::ProcDir {
@@ -1097,6 +1459,71 @@ fn open_task_dir(pid: u32) -> i64 {
     })
 }
 
+/// `/proc/<pid>/fd`: one entry per real fd this process has open -- see `ProcDirKind::FdList`'s
+/// own doc comment for why each entry is a plain placeholder rather than a real target-bearing
+/// symlink.
+fn open_fd_dir(pid: u32) -> i64 {
+    let mut content = [0u8; DIR_LISTING_BUFFER];
+    let len = {
+        let mut out = ByteBuf {
+            buf: &mut content,
+            len: 0,
+        };
+        let mut i = 0u64;
+        loop {
+            // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+            let fd = unsafe { oxidebsd_fd_at(pid as u64, i) };
+            if fd < 0 {
+                break;
+            }
+            out.push_decimal(fd as u32);
+            out.push_bytes(b"\n");
+            i += 1;
+        }
+        out.len
+    };
+    register_open_file(OpenFile::ProcDir {
+        kind: ProcDirKind::FdList(pid),
+        content,
+        len,
+        position: 0,
+        dirent_pos: 0,
+    })
+}
+
+/// Which system-wide (not per-pid) synthetic `/proc` file a call to `open_proc_sysfile` should
+/// generate -- siblings of the numeric pid entries at `/proc`'s own top level.
+#[derive(Clone, Copy)]
+enum ProcSysFile {
+    Meminfo,
+    Uptime,
+    Stat,
+}
+
+/// `/proc/{meminfo,uptime,stat}`: same "format once at open time into a fixed buffer" shape
+/// `open_proc_leaf` uses for the per-pid leaves, just backed by the three system-wide kernel
+/// accessors instead of a per-pid one. Unlike `open_proc_leaf`, there's no pid to vanish out from
+/// under this call -- these three never fail.
+fn open_proc_sysfile(kind: ProcSysFile) -> i64 {
+    let mut content = [0u8; PROC_BUFFER];
+    // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures; each
+    // writes at most PROC_BUFFER bytes into content, sized to match.
+    let n = unsafe {
+        match kind {
+            ProcSysFile::Meminfo => oxidebsd_proc_meminfo(content.as_mut_ptr(), PROC_BUFFER as u64),
+            ProcSysFile::Uptime => oxidebsd_proc_uptime(content.as_mut_ptr(), PROC_BUFFER as u64),
+            ProcSysFile::Stat => {
+                oxidebsd_proc_stat_global(content.as_mut_ptr(), PROC_BUFFER as u64)
+            }
+        }
+    };
+    register_open_file(OpenFile::ProcRead {
+        content,
+        len: n as usize,
+        position: 0,
+    })
+}
+
 /// `/proc/<pid>/{stat,cmdline,status}`: calls the matching kernel accessor once, at `open` time,
 /// into a fresh fixed buffer -- same "format once, stream on read" shape `open_dir_listing` uses.
 fn open_proc_leaf(pid: u32, leaf: ProcLeaf) -> i64 {
@@ -1133,6 +1560,15 @@ fn open_proc_leaf(pid: u32, leaf: ProcLeaf) -> i64 {
 /// involved -- every case here is synthesized directly from the live process table via the
 /// `oxidebsd_proc_*` kernel accessors.
 fn proc_open(suffix: &[u8]) -> i64 {
+    // System-wide files, siblings of the numeric pid entries at /proc's own top level -- checked
+    // before any pid parsing (safe: none of these three names is ever a valid pid, so today they
+    // already fall through to -ENOENT; no regression).
+    match suffix {
+        b"/meminfo" => return open_proc_sysfile(ProcSysFile::Meminfo),
+        b"/uptime" => return open_proc_sysfile(ProcSysFile::Uptime),
+        b"/stat" => return open_proc_sysfile(ProcSysFile::Stat),
+        _ => {}
+    }
     let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
     let Some(pid_str) = comps.next() else {
         return open_proc_root_dir();
@@ -1149,6 +1585,7 @@ fn proc_open(suffix: &[u8]) -> i64 {
         Some(b"stat") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Stat),
         Some(b"cmdline") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Cmdline),
         Some(b"status") if comps.next().is_none() => open_proc_leaf(pid, ProcLeaf::Status),
+        Some(b"fd") if comps.next().is_none() => open_fd_dir(pid),
         // /proc/<pid>/task[/<tid>[/stat|cmdline|status]] -- see ProcDirKind::TaskList's doc
         // comment for why this redirect exists. Only tid == pid is ever valid: this kernel has no
         // real threading, so a process's only "task" is itself.
@@ -1185,6 +1622,10 @@ fn proc_open(suffix: &[u8]) -> i64 {
 /// to pick which specific kernel accessor to call for a leaf file's real content, which this
 /// doesn't need.
 fn proc_kind(suffix: &[u8]) -> Option<bool> {
+    match suffix {
+        b"/meminfo" | b"/uptime" | b"/stat" => return Some(false),
+        _ => {}
+    }
     let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
     let Some(pid_str) = comps.next() else {
         return Some(true); // /proc itself
@@ -1197,6 +1638,7 @@ fn proc_kind(suffix: &[u8]) -> Option<bool> {
     match comps.next() {
         None => Some(true), // /proc/<pid>
         Some(b"stat" | b"cmdline" | b"status") if comps.next().is_none() => Some(false),
+        Some(b"fd") if comps.next().is_none() => Some(true),
         Some(b"task") => match comps.next() {
             None => Some(true), // /proc/<pid>/task
             Some(tid_str) => {
@@ -1240,10 +1682,10 @@ fn dev_open(suffix: &[u8]) -> i64 {
     }
 }
 
-/// Registered for `SYS_OPEN`. `/proc/...` (absolute only -- this tier doesn't special-case a
-/// relative `proc` component reached via cwd) is intercepted before any of the real, cwd-relative
-/// special-casing below, since it isn't backed by a real inode at all -- see `proc_open`. `/dev/
-/// ...` gets the same treatment right after -- see `dev_open`.
+/// Registered for `SYS_OPEN`. `/proc/...` (absolute only -- a *relative* path reached while cwd is
+/// already inside `/proc` is `proc_relative_open`'s job, below) is intercepted before any of the
+/// real, cwd-relative special-casing below, since it isn't backed by a real inode at all -- see
+/// `proc_open`. `/dev/...` gets the same treatment right after -- see `dev_open`.
 /// `""`/`"."`/`".."`/`"/"` are special-cased next (mirroring `modules/fat32`'s own handling of
 /// them) before falling into `resolve_parent`, which -- unlike FAT32's single-component
 /// `to_short_name` -- handles an arbitrarily deep path (`sub/inner/file.txt`) in this one call.
@@ -1252,7 +1694,6 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
     // src/syscall.rs -- the caller (ultimately userland, via SYS_OPEN) owns this pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let create = flags & O_CREAT != 0;
-    let cwd = current_cwd();
 
     if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
         return proc_open(&path[5..]);
@@ -1260,6 +1701,17 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
     if path.starts_with(b"/dev/") {
         return dev_open(&path[5..]);
     }
+
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(kind) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return proc_relative_open(kind, path, create);
+            }
+        }
+    };
 
     if path.is_empty() || path == b"." {
         return open_dir_listing(cwd);
@@ -1280,13 +1732,29 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
     };
 
     match dir_lookup(parent, leaf) {
-        Some(inode_num) => match read_inode(inode_num).kind {
-            InodeKind::Dir => open_dir_listing(inode_num),
-            _ => register_open_file(OpenFile::FileRead {
-                inode: inode_num,
-                position: 0,
-            }),
-        },
+        Some(inode_num) => {
+            // Real open() follows a final symlink component by default (no O_NOFOLLOW in this
+            // ABI to opt out) -- resolve_path already knows how, so hand it the symlink's own
+            // stored target relative to its own parent directory. A dangling target surfaces as
+            // the same -ENOENT any other failed resolve_path call already returns.
+            let resolved = if read_inode(inode_num).kind == InodeKind::Symlink {
+                let mut target = [0u8; MAX_CWD_PATH];
+                let n = read_inode_at(inode_num, 0, &mut target);
+                match resolve_path(parent, &target[..n]) {
+                    Ok(v) => v,
+                    Err(e) => return errno_for(e),
+                }
+            } else {
+                inode_num
+            };
+            match read_inode(resolved).kind {
+                InodeKind::Dir => open_dir_listing(resolved),
+                _ => register_open_file(OpenFile::FileRead {
+                    inode: resolved,
+                    position: 0,
+                }),
+            }
+        }
         None if create => {
             let mut name = [0u8; NAME_MAX];
             name[..leaf.len()].copy_from_slice(leaf);
@@ -1440,16 +1908,43 @@ extern "C" fn sys_close(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_close_fd(fd) as i64 }
 }
 
-/// Registered for `SYS_CHDIR`. `resolve_path` already handles every case `chdir` needs
-/// (`""`/`"."`/`".."`/`"/"`/a multi-component path) uniformly -- no separate resolver needed the
-/// way `modules/fat32`'s own single-component-only grammar required.
+/// Registered for `SYS_CHDIR`. An absolute `/proc/...` target is intercepted first (via
+/// `proc_dir_kind_for`, same shape `oxfs_open` uses for `proc_open`) -- it isn't backed by a real
+/// inode at all, so `resolve_path` can't resolve it. Otherwise `resolve_path` already handles every
+/// real-filesystem case `chdir` needs (`""`/`"."`/`".."`/`"/"`/a multi-component path) uniformly --
+/// no separate resolver needed the way `modules/fat32`'s own single-component-only grammar
+/// required. A *relative* target while cwd is already inside `/proc` is `proc_relative_chdir`'s
+/// job.
 extern "C" fn oxfs_chdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let cwd = current_cwd();
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        return match proc_dir_kind_for(&path[5..]) {
+            Some(kind) => {
+                set_current_cwd_proc(kind);
+                0
+            }
+            None => match proc_kind(&path[5..]) {
+                Some(false) => -ENOTDIR,
+                _ => -ENOENT,
+            },
+        };
+    }
+
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(kind) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return proc_relative_chdir(kind, path);
+            }
+        }
+    };
     match resolve_path(cwd, path) {
         Ok(inode_num) if read_inode(inode_num).kind == InodeKind::Dir => {
-            set_current_cwd(inode_num);
+            set_current_cwd_real(inode_num);
             0
         }
         Ok(_) => -ENOTDIR,
@@ -1462,7 +1957,10 @@ extern "C" fn oxfs_chdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 /// if `buf_len` is too small).
 extern "C" fn oxfs_getcwd(buf_ptr: u64, buf_len: u64, _a2: u64, _a3: u64) -> i64 {
     let mut path = [0u8; MAX_CWD_PATH];
-    let len = build_cwd_path(current_cwd(), &mut path);
+    let len = match current_cwd() {
+        Cwd::Real(inode) => build_cwd_path(inode, &mut path),
+        Cwd::Proc(kind) => build_proc_cwd_path(kind, &mut path),
+    };
 
     if buf_len == 0 || (len as u64) + 1 > buf_len {
         return -ERANGE;
@@ -1481,7 +1979,10 @@ extern "C" fn oxfs_getcwd(buf_ptr: u64, buf_len: u64, _a2: u64, _a3: u64) -> i64
 extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let cwd = current_cwd();
+    let cwd = match real_cwd_for_mutation(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     let (parent, leaf) = match resolve_parent(cwd, path) {
         Ok(v) => v,
@@ -1511,7 +2012,10 @@ extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let cwd = current_cwd();
+    let cwd = match real_cwd_for_mutation(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     let (parent, leaf) = match resolve_parent(cwd, path) {
         Ok(v) => v,
@@ -1534,7 +2038,10 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
 extern "C" fn oxfs_rmdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let cwd = current_cwd();
+    let cwd = match real_cwd_for_mutation(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     let (parent, leaf) = match resolve_parent(cwd, path) {
         Ok(v) => v,
@@ -1564,16 +2071,26 @@ extern "C" fn oxfs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let old_path = unsafe { core::slice::from_raw_parts(old_ptr as *const u8, old_len as usize) };
     let new_path = unsafe { core::slice::from_raw_parts(new_ptr as *const u8, new_len as usize) };
-    let cwd = current_cwd();
+    // Checked independently -- old/new can have different relativity (e.g. renaming a relative
+    // name to an absolute destination while cwd is inside /proc must still reject the relative
+    // half).
+    let old_cwd = match real_cwd_for_mutation(old_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_cwd = match real_cwd_for_mutation(new_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
-    let (old_parent, old_leaf) = match resolve_parent(cwd, old_path) {
+    let (old_parent, old_leaf) = match resolve_parent(old_cwd, old_path) {
         Ok(v) => v,
         Err(e) => return errno_for(e),
     };
     let Some(target) = dir_lookup(old_parent, old_leaf) else {
         return -ENOENT;
     };
-    let (new_parent, new_leaf) = match resolve_parent(cwd, new_path) {
+    let (new_parent, new_leaf) = match resolve_parent(new_cwd, new_path) {
         Ok(v) => v,
         Err(e) => return errno_for(e),
     };
@@ -1596,11 +2113,12 @@ extern "C" fn oxfs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64
     }
 }
 
-/// Registered for `SYS_STAT`. No symlinks exist in this filesystem at all, so unlike real
-/// `stat`/`lstat`, there's no "follow the final component" distinction to make -- `oxfs_lstat`
-/// below just calls this same resolver. `/proc/...` is intercepted the same way `oxfs_open` does
-/// (see `proc_kind`) -- needed for `ls`/`pstree`, both of which `stat()` a path before deciding
-/// whether to list it.
+/// Registered for `SYS_STAT`. Follows a final symlink component (`resolve_path`'s own default) --
+/// `oxfs_lstat` below no longer just aliases this, now that real symlinks exist (see
+/// `resolve_path_impl`'s own doc comment for the two functions' actual difference). `/proc/...` is
+/// intercepted the same way `oxfs_open` does (see `proc_kind`) -- needed for `ls`/`pstree`, both of
+/// which `stat()` a path before deciding whether to list it. A relative path while cwd is inside
+/// `/proc` delegates to `proc_relative_stat`.
 extern "C" fn oxfs_stat(path_ptr: u64, path_len: u64, buf_ptr: u64, _r10: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -1612,17 +2130,128 @@ extern "C" fn oxfs_stat(path_ptr: u64, path_len: u64, buf_ptr: u64, _r10: u64) -
         };
     }
 
-    let cwd = current_cwd();
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(kind) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return proc_relative_stat(kind, path, buf_ptr);
+            }
+        }
+    };
     match resolve_path(cwd, path) {
         Ok(inode_num) => write_stat(inode_num, buf_ptr),
         Err(e) => errno_for(e),
     }
 }
 
-/// Registered for `SYS_LSTAT` -- see `oxfs_stat`'s own doc comment for why this is just an alias
-/// rather than a separate implementation.
-extern "C" fn oxfs_lstat(path_ptr: u64, path_len: u64, buf_ptr: u64, r10: u64) -> i64 {
-    oxfs_stat(path_ptr, path_len, buf_ptr, r10)
+/// Registered for `SYS_LSTAT`. Unlike `oxfs_stat`, never follows a final symlink component --
+/// reports the link itself (`S_IFLNK`, `st_size` = target length), the one real difference between
+/// the two now that symlinks exist. `/proc` has none, so its own interception is identical to
+/// `oxfs_stat`'s.
+extern "C" fn oxfs_lstat(path_ptr: u64, path_len: u64, buf_ptr: u64, _r10: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        return match proc_kind(&path[5..]) {
+            Some(is_dir) => write_proc_stat(is_dir, buf_ptr),
+            None => -ENOENT,
+        };
+    }
+
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(kind) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return proc_relative_stat(kind, path, buf_ptr);
+            }
+        }
+    };
+    match resolve_path_nofollow_last(cwd, path) {
+        Ok(inode_num) => write_stat(inode_num, buf_ptr),
+        Err(e) => errno_for(e),
+    }
+}
+
+/// Registered for `SYS_READLINK`. `(path_ptr, path_len, buf_ptr, bufsize)` -- real `readlink(2)`'s
+/// own two non-string args plus the length-prefixed path shape every other path-taking syscall
+/// here uses (see `third_party/musl/src/unistd/readlink.c`'s own patch). Never NUL-terminates the
+/// output (real `readlink(2)` semantics) -- returns the byte count actually copied.
+extern "C" fn oxfs_readlink(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_cap: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        // Nothing under /proc is a real symlink in this design (see ProcDirKind::FdList's own
+        // doc comment) -- an existing path is "exists, but isn't a symlink", not "no such file".
+        return match proc_kind(&path[5..]) {
+            Some(_) => -EINVAL,
+            None => -ENOENT,
+        };
+    }
+
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(kind) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return proc_relative_readlink(kind, path);
+            }
+        }
+    };
+    let inode_num = match resolve_path_nofollow_last(cwd, path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let inode = read_inode(inode_num);
+    if inode.kind != InodeKind::Symlink {
+        return -EINVAL;
+    }
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_cap as usize) };
+    read_inode_at(inode_num, 0, out) as i64
+}
+
+/// Registered for `SYS_SYMLINK`. `(target_ptr, target_len, linkpath_ptr, linkpath_len)` -- mirrors
+/// `oxfs_rename`'s own 4-register shape exactly (two path strings, no other args); see
+/// `third_party/musl/src/unistd/symlink.c`'s own patch for why `target`/`linkpath` need explicit
+/// lengths where real `symlink(2)` doesn't. `target` is stored verbatim, unvalidated and
+/// unresolved (matching real `symlink(2)`: a dangling or even syntactically-nonsensical target is
+/// perfectly legal to create, only resolving it later can fail).
+extern "C" fn oxfs_symlink(target_ptr: u64, target_len: u64, linkpath_ptr: u64, linkpath_len: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let target =
+        unsafe { core::slice::from_raw_parts(target_ptr as *const u8, target_len as usize) };
+    let linkpath =
+        unsafe { core::slice::from_raw_parts(linkpath_ptr as *const u8, linkpath_len as usize) };
+    let cwd = match real_cwd_for_mutation(linkpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let (parent, leaf) = match resolve_parent(cwd, linkpath) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    if dir_lookup(parent, leaf).is_some() {
+        return -EEXIST;
+    }
+    let Some(new_inode) = alloc_inode() else {
+        return -ENOSPC;
+    };
+    write_inode(new_inode, Inode::new(InodeKind::Symlink));
+    if !write_inode_data(new_inode, target) {
+        return -EIO;
+    }
+    match dir_insert(parent, leaf, new_inode) {
+        Ok(()) => 0,
+        Err(e) => errno_for(e),
+    }
 }
 
 /// Registered for `SYS_FSTAT`. `fd` here is the calling *process's* own fd number, not this
@@ -1669,8 +2298,23 @@ fn decimal_into(buf: &mut [u8], value: u64) -> usize {
 fn proc_dir_nth_entry(kind: ProcDirKind, n: usize) -> Option<(u64, [u8; NAME_MAX], u8, u8)> {
     match kind {
         ProcDirKind::Root => {
+            // The three system-wide files come first (indices 0-2), so no live-pid count needs
+            // computing up front -- pid entries simply start at index 3.
+            const SYS_NAMES: [&[u8]; 3] = [b"meminfo", b"uptime", b"stat"];
+            if let Some(name_bytes) = SYS_NAMES.get(n) {
+                let mut name = [0u8; NAME_MAX];
+                name[..name_bytes.len()].copy_from_slice(name_bytes);
+                // Distinct, cosmetic-only d_ino (see PROC_INODE_BASE's own doc comment) -- clear
+                // of both MAX_INODES's real range and every pid-derived d_ino below it.
+                return Some((
+                    PROC_INODE_BASE - 1 - n as u64,
+                    name,
+                    name_bytes.len() as u8,
+                    DT_REG,
+                ));
+            }
             // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
-            let pid = unsafe { oxidebsd_proc_pid_at(n as u64) };
+            let pid = unsafe { oxidebsd_proc_pid_at((n - SYS_NAMES.len()) as u64) };
             if pid < 0 {
                 return None;
             }
@@ -1697,6 +2341,22 @@ fn proc_dir_nth_entry(kind: ProcDirKind, n: usize) -> Option<(u64, [u8; NAME_MAX
             let mut name = [0u8; NAME_MAX];
             let name_len = decimal_into(&mut name, pid as u64);
             Some((PROC_INODE_BASE + pid as u64, name, name_len as u8, DT_DIR))
+        }
+        ProcDirKind::FdList(pid) => {
+            // SAFETY: FFI call to a kernel-exported function, matching its declared signature.
+            let fd = unsafe { oxidebsd_fd_at(pid as u64, n as u64) };
+            if fd < 0 {
+                return None;
+            }
+            let mut name = [0u8; NAME_MAX];
+            let name_len = decimal_into(&mut name, fd as u64);
+            // Disjoint from PidFiles' own `* 8` stride -- cosmetic only, see PROC_INODE_BASE's doc.
+            Some((
+                PROC_INODE_BASE + (pid as u64) * 1024 + fd as u64 + 1,
+                name,
+                name_len as u8,
+                DT_REG,
+            ))
         }
     }
 }
@@ -1736,10 +2396,10 @@ extern "C" fn oxfs_getdents(fd: u64, buf_ptr: u64, buf_len: u64, _a3: u64) -> i6
                 if written + reclen > out.len() {
                     break;
                 }
-                let dtype = if read_inode(child_inode).kind == InodeKind::Dir {
-                    DT_DIR
-                } else {
-                    DT_REG
+                let dtype = match read_inode(child_inode).kind {
+                    InodeKind::Dir => DT_DIR,
+                    InodeKind::Symlink => DT_LNK,
+                    _ => DT_REG,
                 };
                 write_dirent_record(
                     &mut out[written..written + reclen],
@@ -2865,11 +3525,209 @@ pub extern "C" fn module_init() -> i32 {
         }
     }
 
+    // --- /proc system-wide files (meminfo/uptime/stat), through the real registered handlers. ---
+    // No real process exists yet at this point in boot, but these three don't need one (unlike
+    // ProcDirKind::PidFiles/TaskList/FdList navigation, which does -- covered by tests/
+    // proc_smoke.rs's own real-SYSCALL test instead, since it needs a real spawned process).
+    for (path, needle) in [
+        (b"/proc/meminfo".as_slice(), b"MemTotal".as_slice()),
+        (b"/proc/uptime".as_slice(), b".".as_slice()),
+        (b"/proc/stat".as_slice(), b"cpu".as_slice()),
+    ] {
+        let mut buf = [0u8; PROC_BUFFER];
+        let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, 0, 0);
+        if fd < 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: open /proc system file failed\n");
+            continue;
+        }
+        let n = oxfs_read(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        oxfs_close(fd as u64);
+        if n <= 0 || !buf[..n as usize].windows(needle.len()).any(|w| w == needle) {
+            ok = false;
+            log("[oxfs] self-check FAILED: /proc system file content mismatch\n");
+        }
+    }
+
+    // --- chdir into/out of /proc, through the real registered handlers (Part C). ---
+    {
+        let proc_path = b"/proc";
+        if oxfs_chdir(proc_path.as_ptr() as u64, proc_path.len() as u64, 0, 0) != 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: chdir /proc failed\n");
+        } else {
+            // Relative "" (list cwd) should match the absolute /proc listing's own content.
+            let empty = b"";
+            let dfd = oxfs_open(empty.as_ptr() as u64, 0, 0, 0);
+            if dfd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: relative open(\"\") inside /proc failed\n");
+            } else {
+                let mut buf = [0u8; DIR_LISTING_BUFFER];
+                let n = oxfs_read(dfd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+                oxfs_close(dfd as u64);
+                if n <= 0 || !buf[..n as usize].windows(7).any(|w| w == b"meminfo") {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: relative /proc listing missing meminfo\n");
+                }
+            }
+
+            // Relative "meminfo" should match the absolute /proc/meminfo read.
+            let rel = b"meminfo";
+            let rfd = oxfs_open(rel.as_ptr() as u64, rel.len() as u64, 0, 0);
+            let abs = b"/proc/meminfo";
+            let afd = oxfs_open(abs.as_ptr() as u64, abs.len() as u64, 0, 0);
+            if rfd < 0 || afd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: relative/absolute /proc/meminfo open failed\n");
+            } else {
+                let mut rbuf = [0u8; PROC_BUFFER];
+                let mut abuf = [0u8; PROC_BUFFER];
+                let rn = oxfs_read(rfd as u64, rbuf.as_mut_ptr() as u64, rbuf.len() as u64);
+                let an = oxfs_read(afd as u64, abuf.as_mut_ptr() as u64, abuf.len() as u64);
+                if rn != an || rbuf != abuf {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: relative /proc/meminfo content mismatch\n");
+                }
+            }
+            if rfd >= 0 {
+                oxfs_close(rfd as u64);
+            }
+            if afd >= 0 {
+                oxfs_close(afd as u64);
+            }
+
+            // EROFS guard: nothing can be created while cwd is inside /proc.
+            let x = b"x";
+            if oxfs_mkdir(x.as_ptr() as u64, x.len() as u64, 0, 0) != -EROFS {
+                ok = false;
+                log("[oxfs] self-check FAILED: mkdir inside /proc should have failed with EROFS\n");
+            }
+
+            // Back out to the real root -- getcwd must report "/", and a real op must still work.
+            let dotdot = b"..";
+            if oxfs_chdir(dotdot.as_ptr() as u64, dotdot.len() as u64, 0, 0) != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: chdir .. out of /proc failed\n");
+            }
+            let mut cwd_buf = [0u8; 64];
+            let n = oxfs_getcwd(cwd_buf.as_mut_ptr() as u64, cwd_buf.len() as u64, 0, 0);
+            if n <= 0 || &cwd_buf[..(n as usize - 1)] != b"/" {
+                ok = false;
+                log("[oxfs] self-check FAILED: getcwd after leaving /proc mismatch\n");
+            }
+            let real_path = b"hello.txt";
+            let real_fd = oxfs_open(real_path.as_ptr() as u64, real_path.len() as u64, 0, 0);
+            if real_fd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: real open after leaving /proc failed\n");
+            } else {
+                oxfs_close(real_fd as u64);
+            }
+        }
+    }
+
+    // --- Real symlinks, through the real registered handlers (Part D). ---
+    if let Some(hello) = dir_lookup(ROOT_INODE, b"hello.txt") {
+        let target = b"hello.txt";
+        let linkpath = b"hello_link";
+        if oxfs_symlink(
+            target.as_ptr() as u64,
+            target.len() as u64,
+            linkpath.as_ptr() as u64,
+            linkpath.len() as u64,
+        ) != 0
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: symlink hello_link failed\n");
+        } else {
+            let mut rbuf = [0u8; 64];
+            let n = oxfs_readlink(
+                linkpath.as_ptr() as u64,
+                linkpath.len() as u64,
+                rbuf.as_mut_ptr() as u64,
+                rbuf.len() as u64,
+            );
+            if n != target.len() as i64 || &rbuf[..n as usize] != target {
+                ok = false;
+                log("[oxfs] self-check FAILED: readlink hello_link mismatch\n");
+            }
+
+            let mut stat_buf = [0u8; 144];
+            if oxfs_stat(
+                linkpath.as_ptr() as u64,
+                linkpath.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+                0,
+            ) != 0
+            {
+                ok = false;
+                log("[oxfs] self-check FAILED: stat hello_link (follow) failed\n");
+            } else {
+                let st = unsafe { (stat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+                if st.st_mode & S_IFREG == 0 || st.st_ino != hello as u64 {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: stat hello_link didn't follow to hello.txt\n");
+                }
+            }
+
+            let mut lstat_buf = [0u8; 144];
+            if oxfs_lstat(
+                linkpath.as_ptr() as u64,
+                linkpath.len() as u64,
+                lstat_buf.as_mut_ptr() as u64,
+                0,
+            ) != 0
+            {
+                ok = false;
+                log("[oxfs] self-check FAILED: lstat hello_link failed\n");
+            } else {
+                let st = unsafe { (lstat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+                if st.st_mode & S_IFLNK != S_IFLNK || st.st_size != target.len() as i64 {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: lstat hello_link should report S_IFLNK\n");
+                }
+            }
+
+            // open() follows the link -- content must match hello.txt's own real content.
+            let fd = oxfs_open(linkpath.as_ptr() as u64, linkpath.len() as u64, 0, 0);
+            if fd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: open hello_link (follow) failed\n");
+            } else {
+                let expected_size = read_inode(hello).size as usize;
+                let mut buf = [0u8; 64];
+                let n = oxfs_read(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+                oxfs_close(fd as u64);
+                if n < 0 || n as usize != expected_size {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: open hello_link content length mismatch\n");
+                }
+            }
+
+            if oxfs_unlink(linkpath.as_ptr() as u64, linkpath.len() as u64, 0, 0) != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: unlink hello_link failed\n");
+            }
+            if dir_lookup(ROOT_INODE, b"hello_link").is_some() {
+                ok = false;
+                log("[oxfs] self-check FAILED: hello_link still present after unlink\n");
+            }
+            if dir_lookup(ROOT_INODE, b"hello.txt").is_none() {
+                ok = false;
+                log("[oxfs] self-check FAILED: hello.txt disappeared after unlinking its link\n");
+            }
+        }
+    } else {
+        ok = false;
+        log("[oxfs] self-check FAILED: hello.txt not found for symlink check\n");
+    }
+
     // Back to root, matching the state a booting kernel with no real process yet should leave
     // BOOT_CWD in (a real process's own cwd starts at Process::cwd's default, 0/root, regardless
     // of whatever this self-check did to BOOT_CWD -- see src/process.rs's own doc comment -- but
     // leaving this tidy avoids any confusion reading a boot log).
-    set_current_cwd(ROOT_INODE);
+    set_current_cwd_real(ROOT_INODE);
 
     // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures exactly.
     unsafe {
@@ -2881,6 +3739,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_UNLINK, oxfs_unlink);
         oxidebsd_register_syscall(SYS_RMDIR, oxfs_rmdir);
         oxidebsd_register_syscall(SYS_RENAME, oxfs_rename);
+        oxidebsd_register_syscall(SYS_READLINK, oxfs_readlink);
+        oxidebsd_register_syscall(SYS_SYMLINK, oxfs_symlink);
         oxidebsd_register_syscall(SYS_STAT, oxfs_stat);
         oxidebsd_register_syscall(SYS_LSTAT, oxfs_lstat);
         oxidebsd_register_syscall(SYS_FSTAT, oxfs_fstat);

@@ -254,11 +254,7 @@ impl Writer {
     /// display's own default *is* 0, so the two cases coincide there too).
     fn csi_param(&self, index: usize, default: u16) -> u16 {
         let raw = self.csi_params.get(index).copied().unwrap_or(0);
-        if raw == 0 {
-            default
-        } else {
-            raw
-        }
+        if raw == 0 { default } else { raw }
     }
 
     fn execute_csi(&mut self, final_byte: u8) {

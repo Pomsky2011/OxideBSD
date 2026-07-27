@@ -14,6 +14,19 @@ fn main() {
     let ring3_smoke_elf_path = build_userland_crate("ring3-smoke", "RING3_SMOKE_ELF_PATH");
     build_userland_crate("stsh", "STSH_ELF_PATH");
     build_userland_crate("fork-exec-smoke", "FORK_EXEC_SMOKE_ELF_PATH");
+    // Real-SYSCALL counterparts to the direct-call network smoke tests -- see CLAUDE.md's "Real
+    // networking" section for the blind spot these close (every prior network test called kernel
+    // handlers as plain Rust functions, never through a genuine SYSCALL with interrupts actually
+    // masked).
+    build_userland_crate(
+        "socketpair-syscall-smoke",
+        "SOCKETPAIR_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate("ping-syscall-smoke", "PING_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("udp-syscall-smoke", "UDP_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("poll-syscall-smoke", "POLL_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("tcp-syscall-smoke", "TCP_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("proc-smoke", "PROC_SMOKE_ELF_PATH");
 
     build_module_crate("hello", "HELLO", &[]);
     build_module_crate("native_abi", "NATIVE_ABI", &[]);
@@ -453,18 +466,20 @@ fn main() {
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..jobs {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(&(applet_symbol, out_name, load_addr)) = all_applets.get(i) else {
-                    break;
-                };
-                build_busybox_applet(
-                    applet_symbol,
-                    out_name,
-                    load_addr,
-                    &musl_sysroot,
-                    busybox_source_mtime,
-                );
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(applet_symbol, out_name, load_addr)) = all_applets.get(i) else {
+                        break;
+                    };
+                    build_busybox_applet(
+                        applet_symbol,
+                        out_name,
+                        load_addr,
+                        &musl_sysroot,
+                        busybox_source_mtime,
+                    );
+                }
             });
         }
     });

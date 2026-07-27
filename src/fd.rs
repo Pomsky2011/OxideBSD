@@ -336,6 +336,21 @@ pub(crate) extern "C" fn oxidebsd_real_fd_of(fd: u64) -> i64 {
     }
 }
 
+/// The `index`-th fd number (this *process's own* numbering, not `real_fd`) currently open for
+/// `pid`, ascending, `-1` once `index` is past the end -- mirrors `process::oxidebsd_proc_pid_at`'s
+/// identical "loop until -1" shape, for `modules/oxfs`'s own `/proc/<pid>/fd/` directory listing.
+/// `TABLE`'s key is `(pid, fd)`, a plain tuple `Ord` (lexicographic: `pid` first, `fd` second), so a
+/// bounded range scan over just this `pid`'s own slice is enough -- no separate per-pid index
+/// needed.
+pub(crate) extern "C" fn oxidebsd_fd_at(pid: u64, index: u64) -> i64 {
+    TABLE
+        .lock()
+        .range((pid, 0)..(pid.saturating_add(1), 0))
+        .nth(index as usize)
+        .map(|(&(_, fd), _)| fd as i64)
+        .unwrap_or(-1)
+}
+
 extern "C" fn stdin_read(_real_fd: u64, ptr: u64, len: u64) -> i64 {
     // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
     // already has -- [ptr, ptr+len) isn't checked against the caller's actual mappings first.

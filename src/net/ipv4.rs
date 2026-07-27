@@ -134,23 +134,27 @@ fn resolve_with_retry(ip: Ipv4Addr) -> Option<[u8; 6]> {
         return Some(mac);
     }
     arp::send_request(ip);
-    // Bounded by PIT ticks, not an arbitrary spin count -- see rtl8139_smoke's own precedent for
-    // why a few seconds of budget is generous headroom, not a tight timing assumption.
+    // Bounded by `crate::tsc`, not `crate::interrupts::ticks()`/an arbitrary spin count -- see
+    // rtl8139_smoke's own precedent for why a few seconds of budget is generous headroom, not a
+    // tight timing assumption.
     //
     // `hint::spin_loop()`, not `hlt()`: this function is reachable from a real syscall
     // (`udp`/`icmp`'s `sendto` handlers), and `src/syscall.rs`'s own SFMASK setup clears
     // `RFLAGS::INTERRUPT_FLAG` for a syscall's *entire* duration, not just its entry -- `hlt()`
     // only wakes on an unmasked interrupt or an NMI, so calling it here would freeze the CPU
-    // permanently the instant a reply hadn't already arrived before this loop started (no timer
-    // tick to ever re-check the deadline, no NMI to ever occur under normal operation). A plain
+    // permanently the instant a reply hadn't already arrived before this loop started. A plain
     // busy-spin still lets `poll()` keep draining the NIC's ring -- packet arrival there is a
     // hardware DMA-like effect, not gated on this core's interrupt-enable state -- so a real
-    // reply is still found the moment it lands; only the "give up after N ticks" bound goes
-    // uneven (the deadline can't advance either, for the same IF-cleared reason, so an
-    // unreachable destination spins here for the syscall's whole, uninterruptible duration
-    // instead of cleanly timing out -- a real known limitation, not addressed by this fix).
-    let deadline = crate::interrupts::ticks() + 500;
-    while crate::interrupts::ticks() < deadline {
+    // reply is still found the moment it lands.
+    //
+    // The deadline itself must use `crate::tsc`, not `ticks()`: `ticks()` is driven entirely by
+    // the timer IRQ, which can't fire while this syscall has interrupts masked -- a tick-based
+    // deadline here would be frozen at whatever value it had when the syscall began and could
+    // never actually elapse, turning "give up after N ticks" into "never gives up" for a
+    // genuinely unreachable destination. Confirmed live by the identical bug in `net::
+    // oxidebsd_sys_poll` (see `crate::tsc`'s own doc comment) -- fixed here for the same reason.
+    let deadline = crate::tsc::now() + crate::tsc::ms_to_cycles(5000);
+    while crate::tsc::now() < deadline {
         super::poll();
         if let Some(mac) = arp::resolve(ip) {
             return Some(mac);

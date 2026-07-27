@@ -70,11 +70,45 @@ shaped ioctls, etc.) even though "no socket syscalls at all" is no longer the re
 
 ### NEEDS_PROC (26)
 
-Builds, but reads /proc -- no /proc filesystem exists.
+Builds, but reads /proc -- **`/proc` is now essentially complete for what this roster needs** (see
+CLAUDE.md's own "BusyBox gap analysis" table and "Filesystem: oxfs" section): per-pid `stat`/
+`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`, a `task/<tid>/` redirect, **plus, added this
+pass**: system-wide `/proc/{meminfo,uptime,stat}`, per-fd `/proc/<pid>/fd/` enumeration, and real
+`chdir(2)` into `/proc` (with a relative-path-aware `open`/`stat`/`getdents` to match). Not
+wholesale re-probed against the live roster; the entries below split into what's actually unlocked
+vs. what a documented, deliberate gap still blocks.
 
-- no /proc filesystem: `bb_sysctl`, `dmesg`, `free`, `fuser`, `iostat`, `killall5`, `lsof`, `lspci`, `lsscsi`, `lsusb`, `mpstat`, `nmeter`, `nproc`, `pgrep`, `pidof`, `pkill`, `pmap`, `powertop`, `pstree`, `renice`, `smemcap`, `taskset`, `top`, `uptime`, `watch`
+- unlocked by the per-process /proc (per-pid `stat`/`cmdline`/`status` + dir listing); `pstree`
+  confirmed live (including the `task/<tid>/` redirect fix needed for its own uid/gid `stat()`
+  calls), the rest share the same underlying mechanism but haven't been individually re-run:
+  `pidof`, `pgrep`, `pkill`, `pstree`, `minips`
 
-- reads /proc/[pid]/stat: `minips`
+- likely unlocked by system-wide `/proc/{meminfo,uptime,stat}` + real chdir-into-`/proc`: `top`
+  (confirmed via BusyBox's own source, `procps/top.c`: it `chdir("/proc")` once at startup, then
+  does relative `open("stat")`/`open("meminfo")` against that cwd -- both now real). Its own CPU%/
+  mem% columns will read as permanently ~0% used, an honest reflection of "no real per-process CPU
+  or free-memory accounting exists" (see `oxidebsd_proc_stat_global`'s/`oxidebsd_proc_meminfo`'s own
+  doc comments in `src/process.rs`), not a bug -- not yet confirmed live end to end.
+
+- still blocked -- `free`/`uptime` turn out to call the Linux-only `sysinfo(2)` syscall for their
+  *primary* numbers (confirmed via BusyBox's own source, `procps/{free,uptime}.c`); `/proc/meminfo`/
+  `/proc/uptime` (both now real) only back `free`'s own optional `Cached`/`MemAvailable` fields and
+  aren't consulted by `uptime` at all. `sysinfo(2)` itself remains unimplemented -- a distinct,
+  still-open gap, not fixed by this pass: `free`, `uptime`
+
+- partially unlocked -- `/proc/<pid>/fd/` enumeration now works (real directory listing, real fd
+  numbers), but each entry is a plain placeholder, not a real symlink to its target (real Linux
+  `lsof`/`fuser` also `readlink()` each entry to show what it points at -- this kernel now has real
+  `readlink(2)`/`symlink(2)` in general, but no mechanism yet for oxfs to describe what a pipe/
+  socket/other-module's fd actually is). A real per-fd target needs a separate, cross-module
+  "describe this fd" mechanism -- a known, deliberate limitation of this pass, not solved by
+  guessing: `lsof`, `fuser`
+
+- not yet re-probed against the current /proc support -- may need more than plain per-pid /proc
+  (`/proc/bus/pci`-style paths, sysctl-shaped interfaces, procps-specific parsing not checked
+  against this kernel's fixed-placeholder fields): `bb_sysctl`, `dmesg`, `iostat`, `killall5`,
+  `lspci`, `lsscsi`, `lsusb`, `mpstat`, `nmeter`, `nproc`, `pmap`, `powertop`, `renice`,
+  `smemcap`, `taskset`, `watch`
 
 
 ### NEEDS_UID (16)
@@ -112,7 +146,10 @@ Builds, but its core function needs a specific syscall OxideBSD hasn't registere
 
 - oxfs has no FIFO/special-file inode kind: `mkfifo`
 
-- oxfs has no symlinks / no SYS_LINK (hard links): `link`, `ln`, `readlink`
+- oxfs has no hard links / no SYS_LINK -- **`ln -s`/`readlink` moved to done this pass** (real
+  `InodeKind::Symlink`, `SYS_SYMLINK`/`SYS_READLINK`, `stat`/`lstat` divergence, confirmed live via
+  `modules/oxfs`'s own boot self-check -- symlinks and hard links are different mechanisms, and
+  only the former exists now): `link`
 
 
 ### NEEDS_HARDWARE (24)
@@ -141,9 +178,14 @@ Builds, but needs a real block device driver or mount table -- neither exists.
 
 ### NEEDS_CLOCK (9)
 
-Builds, but needs a real wall clock/RTC/nanosleep -- see CLAUDE.md's "clock + nanosleep" gap.
+Builds, but needs a real wall clock/RTC/nanosleep -- **stale as of `clock_gettime`/`nanosleep`
+landing (see CLAUDE.md's own "Real-time clock" section) -- not wholesale re-probed.**
 
-- no gettimeofday/nanosleep/RTC (CLAUDE.md's "clock + nanosleep" gap): `adjtimex`, `crond`, `crontab`, `date`, `hwclock`, `rtcwake`, `sleep`, `timeout`, `usleep`
+- need only `nanosleep` (already implemented) -- likely unlocked, not individually re-run:
+  `sleep`, `usleep`, `timeout`
+
+- need the clock read more than a real sleep; not re-probed against the current roster to
+  confirm they fully work end to end: `date`, `hwclock`, `rtcwake`, `adjtimex`, `crond`, `crontab`
 
 
 ### NEEDS_INIT (6)

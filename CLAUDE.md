@@ -182,7 +182,7 @@ Everything added since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=102`, `SYS_SE
 `SYS_UNAME=137`, `SYS_CLOCK_GETTIME=138`, `SYS_NANOSLEEP=139`, `SYS_SOCKET=140`, `SYS_BIND=141`,
 `SYS_SENDTO=142`, `SYS_RECVFROM=143`, `SYS_SETSOCKOPT=144`, `SYS_CONNECT=145`, `SYS_LISTEN=146`,
 `SYS_ACCEPT=147`, `SYS_POLL=148`, `SYS_SOCKETPAIR=149`, `SYS_SET_TID_ADDRESS=150`, `SYS_FCNTL=151`,
-`SYS_SHUTDOWN=152`, `SYS_READV=153`) is OxideBSD's
+`SYS_SHUTDOWN=152`, `SYS_READV=153`, `SYS_READLINK=154`, `SYS_SYMLINK=155`) is OxideBSD's
 own invention —
 numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
@@ -287,8 +287,9 @@ Key gotchas:
   `src/process/execve.c` builds real `argv`/`envp` as length-prefixed `RawArgvEntry{ptr, len}`
   arrays (zero-entry-terminated) instead of NUL-terminated `char**`, using the real 4th syscall
   argument (`R10`) for `envp_ptr`. The same length-prefix pattern recurs for `unlink`/`rmdir`/
-  `rename` (oxfs) and `chdir`/`mkdir` — **any future libc call ported here needs the same audit**:
-  matching the syscall *number* isn't sufficient if the argument shape differs.
+  `rename`/`readlink`/`symlink` (oxfs) and `chdir`/`mkdir` — **any future libc call ported here
+  needs the same audit**: matching the syscall *number* isn't sufficient if the argument shape
+  differs.
 - Syscalls from this pass: `SYS_MMAP=100` (`(addr_hint, len, prot)` — matches musl's actual
   `mmap()` call site, not an idealized layout; always anonymous+private, bump-allocated from a
   fixed VA window, never reclaimed), `SYS_MUNMAP=101` (no-op success), `SYS_BRK=102` (grows/
@@ -513,8 +514,9 @@ Root is fixed inode `0`, self-referencing `.`/`..`.
   (`MuslStat` in `modules/oxfs/src/lib.rs`, checked against `struct stat`'s real x86_64 layout via
   `third_party/musl/arch/x86_64/bits/stat.h`). `st_uid`/`st_gid`/timestamps are fixed placeholders
   (no uid model or clock source exists yet); `st_mode`'s permission bits are a fixed `0755` for
-  every inode. `oxfs_lstat` is a plain alias of `oxfs_stat` — no symlinks exist in this filesystem,
-  so there's no "don't follow the final component" behavior to differ on. `oxfs_fstat` resolves the
+  every inode. `oxfs_lstat` was a plain alias of `oxfs_stat` until real symlinks landed (see this
+  file's own gap table's "Real symlinks" row) — now the one place `stat`/`lstat` actually differ:
+  `oxfs_stat` follows a final symlink component, `oxfs_lstat` doesn't. `oxfs_fstat` resolves the
   caller's fd to oxfs's own `real_fd` via a new kernel-exported `oxidebsd_real_fd_of` (`src/fd.rs`)
   before looking it up in `OPEN_FILES` — the first module syscall handler that needs fd resolution
   done for it explicitly, rather than getting it for free the way `SYS_READ`/`SYS_WRITE` do via
@@ -894,6 +896,45 @@ future syscall-reachable busy-wait):**
   validate certificate chains — a limitation of that vendored code itself (it logs a "note", not an
   error, and proceeds), not something a kernel-side fix could address.
 
+**Real-`SYSCALL` counterparts to the network smoke tests, and a sixth real bug found closing that
+gap.** Every network smoke test above (`icmp_smoke`, `udp_smoke`, `tcp_smoke`, `ping_smoke`,
+`poll_smoke`, `socketpair_smoke`) calls kernel handlers (`oxidebsd_sys_socket`, `_sendto`, ...) as
+plain Rust functions from its own `main()` — interrupts enabled throughout, never inside a real
+`SYSCALL` with `RFLAGS::INTERRUPT_FLAG` actually masked. That's exactly the blind spot that let the
+`hlt()`-in-syscall freeze (this section, above) ship undetected — only `tests/fork_wait.rs` (a real
+spawned ELF) ever exercised the genuine ring-3 path. Added five real-`SYSCALL` counterparts —
+`tests/{udp,poll,ping,socketpair,tcp}_syscall_smoke.rs`, each spawning a small freestanding ELF
+(`userland/*-syscall-smoke/`) as pid 1 that drives the identical scenario through genuine
+`SYSCALL`/`SYSRETQ`, reporting pass/fail via the same test-only `SYS_TEST_EXIT = 9999` convention
+`tests/fork_wait.rs` established. `icmp_smoke.rs` has no real-`SYSCALL` counterpart: it calls
+`icmp::send_echo_request`/`take_echo_reply` directly, with no syscall surface at all —
+`ping_syscall_smoke` (via a real `SOCK_RAW`+`IPPROTO_ICMP` socket) is its actual counterpart.
+Where a test needs to simulate an inbound packet or a synthetic peer's handshake (the old tests
+already did this via `ethernet::handle_frame`/ARP-reply injection from their own linear `main()`),
+that trigger now lives behind a **test-only** syscall the child calls at the scripted moment
+(`SYS_TEST_INJECT_UDP_FRAME = 9998`; TCP's own multi-step script, needing `tcp::debug_send_next`/
+`debug_connection_for` to build valid segments, behind a step-dispatched `SYS_TEST_TCP_STEP =
+9997`) — the functions actually under test still only ever run via the child's own real `SYSCALL`.
+
+This conversion immediately caught a real, previously-invisible bug: `tests/poll_syscall_smoke.rs`
+hung solid on a `poll()` call that should have timed out after 200ms. `net::oxidebsd_sys_poll`'s
+deadline (and, identically, `ipv4::resolve_with_retry`'s ARP wait and `tcp::
+oxidebsd_sys_connect`'s handshake wait — all three already converted from `hlt()` to
+`spin_loop()` for the freeze bug above) checked `crate::interrupts::ticks()`, which only advances
+via the timer IRQ — an IRQ that cannot fire for a syscall's *entire* duration once `SFMASK` has
+masked it. Called as a plain Rust function (every prior test's style), `ticks()` advances
+normally; called via a genuine `SYSCALL`, it's frozen at whatever value it had when the syscall
+began, so a tick-based deadline inside one can never elapse — not "goes uneven," as
+`resolve_with_retry`'s own comment used to say, but a permanent hang against any target that never
+answers. Fixed by **`src/tsc.rs`**: a `RDTSC`-based (plain CPU cycle counter, immune to
+`RFLAGS::INTERRUPT_FLAG`, same "no CPUID gate needed" property `src/random.rs` already uses)
+deadline, calibrated once at boot (`crate::init`, right after interrupts are enabled) against
+`ticks()`'s own known `TIMER_HZ` rate. All three call sites now use `crate::tsc::now()`/
+`ms_to_cycles()` instead of `ticks()` for their own spin-deadlines. Confirmed fixed: the same test
+now passes; the full existing suite re-verified green afterward (this bug was latent in
+`resolve_with_retry`/`connect` too, just never triggered there since every prior test's ARP/
+handshake happened to succeed before hitting its own deadline).
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
@@ -918,8 +959,10 @@ at once, so the rows aren't a clean partition.
 | `socketpair(AF_UNIX, SOCK_STREAM, ...)` + `fcntl`/`shutdown`/`set_tid_address`/`readv` + `/dev/{u}random`/`null`/`zero` + a real `tcp_read` EOF-vs-empty fix | **done, confirmed live** — `wget` HTTPS completed a real end-to-end download | `wget` HTTPS specifically (plain HTTP already worked) | see "Real networking" section's own known-gaps entry — `SYS_SOCKETPAIR=149`/`SYS_SET_TID_ADDRESS=150`/`SYS_FCNTL=151`/`SYS_SHUTDOWN=152`/`SYS_READV=153` in `posix_compat`/`native_abi`, built on `src/pipe.rs`'s existing blocking-buffer machinery; a synthetic `/dev` in `modules/oxfs` backed by a real SHA-256/ChaCha20 generator (`src/random.rs`); and a real bug in `src/net/tcp.rs`'s own `tcp_read` (returned false EOF instead of blocking) — five real bugs, each surfaced only once the previous fix got live-retested |
 | `alarm`/`setitimer` | not started | any program (`ping` chief among them) that needs to bound its own wait against a target that never replies | see "Real networking" section's own known-gaps entry — distinct from the `hlt()` bug; even a bug-free busy-wait can't self-terminate without this if nothing ever arrives |
 | A specific missing syscall per applet (`chmod`/`chown`/`link`/`mknod`/`flock`/`fsync`/`ftruncate`/`fallocate`/SysV IPC/`setrlimit`/`statfs`/sched-priority/`reboot`/`sync`/`inotify`/`chroot`/namespaces) | not started | 36 (`NEEDS_SYSCALL`) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
-| `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips`. `chdir` into `/proc` and system-wide files (`/proc/meminfo`/`uptime`/`stat`, for `top`/`free`/`uptime`) remain explicit known gaps of this pass, not implemented |
-| `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | not started | subset of the above | needs `src/fd.rs` to support enumeration (currently lookup-only) — would unlock `lsof`/`fuser` specifically |
+| `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
+| `/proc` filesystem — system-wide files (`/proc/meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | three new system-wide (not per-pid) kernel accessors (`oxidebsd_proc_meminfo`/`_uptime`/`_stat_global` in `src/process.rs`), routed as siblings of the numeric pid entries at `/proc`'s own top level. `MemFree`/`MemAvailable` are set equal to `MemTotal` (no free-memory/dealloc tracking exists anywhere in this kernel); `/proc/stat`'s `cpu` line is all-zero except `idle` (`ticks()` itself — no per-tick user/system accounting exists), so any CPU%-computing tool (`top`) reads permanently ~0% used, an honest placeholder, not a bug. `chdir(2)` into `/proc` needed a real sentinel encoding for `Process::cwd` (still a fully kernel-opaque `u64`, zero kernel-side changes) — the top bit tags it as a synthetic `/proc` location (`CWD_PROC_TAG`) rather than a real inode number, reusing `ProcDirKind` itself as the "which synthetic directory" representation; every path-taking oxfs syscall handler (`open`/`chdir`/`getcwd`/`stat`/`lstat`/`readlink`, plus a hard `-EROFS` reject for `mkdir`/`unlink`/`rmdir`/`rename` attempted relative to a synthetic cwd) got a matching branch. **Load-bearing fix along the way**: `current_cwd()`/`set_current_cwd()` used to truncate the kernel's own `u64` cwd value to `u32` immediately — harmless while `cwd` only ever held a small real inode index, but would have silently discarded this new tag; both were replaced by a `Cwd` enum-returning pair. Confirmed via `modules/oxfs`'s own boot self-check (system files, chdir in/out of `/proc`, the `EROFS` guard) and `tests/proc_smoke.rs`/`userland/proc-smoke` (a real spawned pid 1 driving all of it through genuine `SYSCALL`/`SYSRETQ`, since the boot self-check itself runs as pid 0 before any real process exists and can't exercise `/proc/<pid>/...` navigation). BusyBox's own `procps/top.c` source confirms `top` is the concrete applet this combination targets (`chdir("/proc")` once at startup, then relative `open("stat")`/`open("meminfo")`) — not yet confirmed live end to end. `free`/`uptime` turn out to call the Linux-only `sysinfo(2)` for their *primary* numbers (confirmed via BusyBox's own `procps/{free,uptime}.c` source) — these two new files don't unblock them; `sysinfo(2)` itself remains a distinct, unimplemented gap |
+| `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | done (enumeration only) | subset of the above | `src/fd.rs`'s new `oxidebsd_fd_at(pid, index)` (mirrors `oxidebsd_proc_pid_at`'s own "loop until -1" shape, a bounded range scan over the `(pid, fd)`-keyed fd table) backs a new `ProcDirKind::FdList`. Real directory listing, real fd numbers — but each entry is a plain placeholder (`DT_REG`, no real content), **not** a real symlink to its target, since real Linux's own `/proc/<pid>/fd/N` entries are symlinks and this kernel had zero symlink support at all until this same pass added one (see the `SYS_SYMLINK`/`SYS_READLINK` row below). Making these entries real target-bearing symlinks needs a separate, cross-module "describe this fd" mechanism (oxfs doesn't know what a pipe/socket fd actually is; only `src/pipe.rs`/`src/net/*` do) — a known, deliberate limitation, not solved by guessing. Unlocks the enumeration half of `lsof`/`fuser`, not the full readlink-target behavior |
+| Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_SYSCALL` row | added alongside the `/proc` work above once it became clear `lsof`/`fuser`'s own real need was `readlink(2)`, not just directory enumeration — steered by an explicit user call to prioritize real POSIX primitives over narrowly chasing one BusyBox applet's own behavior. New `InodeKind::Symlink` in `modules/oxfs` (target string stored exactly like a regular file's content — no new storage mechanism); `resolve_path`/`resolve_path_nofollow_last` (a shared `resolve_path_impl(cwd, path, follow_last, depth)`) now transparently follow a symlink for every intermediate path component always, and for the final component only when `follow_last` is set — the one real difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't), bounded by `MAX_SYMLINK_DEPTH=8` (`-ELOOP=40`, musl's real compiled value — not FreeBSD's `62`, the same errno-divergence class this file's syscall-ABI section already warns about). `SYS_SYMLINK=155`/`SYS_READLINK=154` (next after `SYS_READV=153`), wire format `(target_ptr, target_len, linkpath_ptr, linkpath_len)`/`(path_ptr, path_len, buf_ptr, bufsize)` — `third_party/musl/src/unistd/{symlink,readlink}.c` patched the same way `rename.c` already was, to compute string lengths explicitly. Confirmed live via `modules/oxfs`'s own boot self-check: create, `readlink` round-trip, `stat` follows to the real target while `lstat` reports `S_IFLNK`/the link's own size, `open` follows and reads the target's real content, `unlink` removes only the link |
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | each needs a real device/driver this kernel doesn't model — not one gap, several unrelated small ones (see `docs/BUSYBOX_APPLETS.md`) |
 | Real block device driver + mount table | not started | 20 (`NEEDS_BLOCKDEV`) | `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... — not applet-specific, would matter for actual persistence too, not just more applets |
 | uid/passwd-db model | not started, trivial stub possible | 16 (`NEEDS_UID`) | fully module-able, no-op stubs get partway there (`modules/posix_compat`) — `adduser`/`passwd`/`su`/`login`/... need a real `/etc/passwd`-equivalent to go further |

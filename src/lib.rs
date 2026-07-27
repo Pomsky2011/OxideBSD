@@ -31,6 +31,7 @@ pub mod scheduler;
 pub mod serial;
 pub mod stdin;
 pub mod syscall;
+pub mod tsc;
 pub mod user_stack;
 pub mod usermode;
 pub mod vga;
@@ -67,6 +68,8 @@ pub fn init(
 
     serial_println!("[boot] enabling interrupts");
     x86_64::instructions::interrupts::enable();
+
+    tsc::init();
 
     let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
