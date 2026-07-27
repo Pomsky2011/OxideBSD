@@ -9,3 +9,14 @@ panic-abort-tests = true
 
 [target.'cfg(target_os = "none")']
 runner = "bootimage runner"
+
+[target.x86_64-oxidebsd]
+# Forces `chacha20`'s own runtime-cpufeatures-detected SIMD backend selection (avx2/sse2, chosen
+# via `cfg_if!` in that crate's own `src/backends.rs`) down to its plain scalar "soft" backend --
+# this target disables SSE/MMX entirely (see CLAUDE.md's custom-target-spec section), and without
+# this, `rustc`'s own vector-op legalization has nothing to lower those SIMD code paths to at all
+# (a real, not just theoretical, `rustc-LLVM ERROR: Do not know how to split the result of this
+# operator!` -- found bringing up src/random.rs's ChaCha20-backed /dev/urandom). `sha2`'s own
+# analogous flag (`force-soft`, see this crate's own Cargo.toml) is a real Cargo feature instead of
+# a raw `--cfg`, so it doesn't need duplicating here.
+rustflags = ["--cfg", "chacha20_backend=\"soft\""]
