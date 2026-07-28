@@ -29,6 +29,10 @@ fn main() {
     build_userland_crate("proc-smoke", "PROC_SMOKE_ELF_PATH");
     build_userland_crate("itimer-syscall-smoke", "ITIMER_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("uid-syscall-smoke", "UID_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate(
+        "oxfs-persistence-syscall-smoke",
+        "OXFS_PERSISTENCE_SYSCALL_SMOKE_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -545,6 +549,11 @@ fn main() {
             .map(|(k, v)| (k.as_str(), v.as_str())),
     );
     build_module_crate("oxfs", "OXFS", &oxfs_extra_env);
+
+    // Real disk persistence (see src/ata.rs and modules/oxfs's own "Real disk persistence"
+    // section): the two raw disk image *files* QEMU's `-drive` attaches, as opposed to everything
+    // above, which gets embedded into the kernel/module binaries themselves via `include_bytes!`.
+    write_data_disk_images();
 }
 
 fn oxfs_env_var_name(out_name: &str) -> String {
@@ -1286,6 +1295,52 @@ fn write_fat32_image(
     std::fs::write(&path, &image)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     path
+}
+
+/// Mirrors `modules/oxfs/src/lib.rs`'s own on-disk block-layout constants (see that file's "Real
+/// disk persistence" section) -- duplicated here, not imported, since a `build.rs` can't depend on
+/// a `#![no_std]` module crate. Must be kept in sync by hand if oxfs's own constants ever change --
+/// the same "two things that must agree, flagged rather than shared" duplication this codebase
+/// already accepts elsewhere (e.g. `Cargo.toml`'s `test-success-exit-code` vs. `src/qemu.rs`'s
+/// `QemuExitCode`).
+const OXFS_BLOCK_SIZE: u64 = 4096;
+const OXFS_NUM_BLOCKS: u64 = 8192;
+/// 1 superblock + 16 inode-table blocks (512 inodes at a 128-byte stride) + 1 block-used bitmap.
+const OXFS_METADATA_BLOCKS: u64 = 18;
+const OXFS_DISK_IMAGE_BYTES: u64 = (OXFS_METADATA_BLOCKS + OXFS_NUM_BLOCKS) * OXFS_BLOCK_SIZE;
+
+/// Writes the two raw disk images `Cargo.toml`'s `run-args`/`test-args` attach to QEMU as
+/// `src/ata.rs`'s fixed data-disk target (see that module's own doc comment for why secondary
+/// channel/master specifically).
+///
+/// `oxfs_disk.img` is the real, persistent dev disk `cargo run` uses -- created **only if it
+/// doesn't already exist**. That's load-bearing, not an optimization: this is what makes it
+/// survive across `cargo run` invocations at all, the entire point of real disk persistence. A
+/// rebuild must never re-zero it, or there would be nothing left to prove "install OxideBSD"
+/// actually works (see the implementation plan's own manual verification steps).
+///
+/// `oxfs_test_disk.img` is the opposite: always freshly regenerated (zeroed) on every build, so
+/// `tests/ata_smoke.rs`/`tests/oxfs_persistence_syscall_smoke.rs` always start from the same
+/// known-empty state, independent of whatever a previous test run left behind.
+fn write_data_disk_images() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let target_dir = Path::new(manifest_dir).join("target");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/");
+    let zeroed = vec![0u8; OXFS_DISK_IMAGE_BYTES as usize];
+
+    let dev_disk_path = target_dir.join("oxfs_disk.img");
+    if !dev_disk_path.exists() {
+        std::fs::write(&dev_disk_path, &zeroed)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", dev_disk_path.display()));
+        println!(
+            "cargo:warning=oxfs: created a fresh persistent dev disk at {}",
+            dev_disk_path.display()
+        );
+    }
+
+    let test_disk_path = target_dir.join("oxfs_test_disk.img");
+    std::fs::write(&test_disk_path, &zeroed)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", test_disk_path.display()));
 }
 
 const FAT32_BYTES_PER_SECTOR: usize = 512;

@@ -11,6 +11,7 @@ members = [
   "userland/proc-smoke",
   "userland/itimer-syscall-smoke",
   "userland/uid-syscall-smoke",
+  "userland/oxfs-persistence-syscall-smoke",
   "userland/lsoxmod",
   "modules/hello",
   "modules/native_abi",
@@ -113,6 +114,14 @@ harness = false
 name = "uid_syscall_smoke"
 harness = false
 
+[[test]]
+name = "ata_smoke"
+harness = false
+
+[[test]]
+name = "oxfs_persistence_syscall_smoke"
+harness = false
+
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool
 # grew to 32 MiB once the BusyBox roster grew to ~300 applets (see CLAUDE.md's BusyBox section),
 # and -- since src/memory.rs's frame allocator never reclaims and this kernel maps every module
@@ -140,6 +149,18 @@ harness = false
 # target, so this also boots basic_boot/fork_wait with the device present -- harmless, since
 # neither calls oxidebsd::net::rtl8139::init. See tests/rtl8139_smoke.rs and this repo's
 # networking plan.
+#
+# -drive if=none,id=oxfsdisk,... -device ide-hd,drive=oxfsdisk,bus=ide.1,unit=0: real disk
+# persistence (see src/ata.rs and modules/oxfs's own "Real disk persistence" section). `bootimage`
+# always attaches this kernel's own boot image as `-drive format=raw,file=<image>` with no explicit
+# `if=`, which QEMU resolves to the *primary* IDE master (`ide.0`, unit 0) on this project's
+# implicit `i440fx` machine type -- so this pins the data disk explicitly to the *secondary*
+# channel's master (`ide.1`, unit 0) by bus name, rather than a second bare `-drive` and hoping
+# QEMU's own index-assignment heuristics land somewhere that doesn't collide. `target/
+# oxfs_test_disk.img` (build.rs, always freshly zeroed) here vs. `target/oxfs_disk.img` (build.rs,
+# created once and left alone) in run-args below -- same "shared across every test target,
+# harmless for the ones that don't use it" reasoning as `-nic` above, but tests get their own
+# disposable disk rather than sharing `cargo run`'s real persistent one.
 test-args = [
   "-accel", "kvm",
   "-accel", "tcg",
@@ -148,6 +169,8 @@ test-args = [
   "-display", "none",
   "-m", "1024",
   "-nic", "user,model=rtl8139",
+  "-drive", "if=none,id=oxfsdisk,format=raw,file=target/oxfs_test_disk.img",
+  "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
 ]
 test-success-exit-code = 33
 test-timeout = 300
@@ -157,6 +180,8 @@ run-args = [
   "-serial", "stdio",
   "-m", "1024",
   "-nic", "user,model=rtl8139",
+  "-drive", "if=none,id=oxfsdisk,format=raw,file=target/oxfs_disk.img",
+  "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
 ]
 
 [profile.dev]

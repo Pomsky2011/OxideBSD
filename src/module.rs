@@ -86,9 +86,12 @@ struct LoadedModuleInfo {
     base: u64,
     size: u64,
     /// Whether a panic anywhere in this module's code should reboot the whole system
-    /// (`module_panic_trampoline` below) rather than just halting. `true` for filesystem modules
-    /// (their entire state -- the in-memory filesystem itself -- has no backing store, so there's
-    /// nothing safe to resume into); `false` for everything else, pending real per-module restart.
+    /// (`module_panic_trampoline` below) rather than just halting. `true` for filesystem modules:
+    /// with no disk attached their entire state is the in-memory filesystem itself, nothing safe
+    /// to resume into; with one attached (see `src/ata.rs`), a panic mid-mount/mid-format risks a
+    /// torn superblock/inode-table write, which is worse to resume past than a purely in-memory
+    /// panic ever was -- so `true` is if anything more justified once a backing store exists, not
+    /// less. `false` for everything else, pending real per-module restart.
     fatal_on_panic: bool,
 }
 
@@ -785,6 +788,11 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         }
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
+        "oxidebsd_block_device_present" => {
+            Some(crate::ata::oxidebsd_block_device_present as *const () as u64)
+        }
+        "oxidebsd_block_read" => Some(crate::ata::oxidebsd_block_read as *const () as u64),
+        "oxidebsd_block_write" => Some(crate::ata::oxidebsd_block_write as *const () as u64),
         _ => None,
     }
 }

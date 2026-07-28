@@ -205,6 +205,10 @@ name = "oxfs"
 version = "0.1.0"
 
 [[package]]
+name = "oxfs-persistence-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "oxidebsd"
 version = "0.1.0"
 dependencies = [

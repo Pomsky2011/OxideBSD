@@ -35,8 +35,11 @@ Current state:
   networking" section.
 
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
-no filesystem persistence, no preemption, no copy-on-write fork, no frame deallocation anywhere,
-`sys_read` on stdin is non-blocking (busy-polled by userland), no real block device driver,
+no preemption, no copy-on-write fork, no frame deallocation anywhere,
+`sys_read` on stdin is non-blocking (busy-polled by userland), no real mount table/VFS layer (a
+real ATA disk driver and real oxfs mount/format persistence exist now — see this file's own "Real
+disk persistence" section — but only for oxfs's own fixed backing store, not a general
+block-device-agnostic filesystem interface),
 no IPv6, no real routing table (one default-gateway rule
 only). See "BusyBox gap analysis" below for what's needed to go further. Architecture decisions for
 remaining subsystems haven't been made — discuss with the user before large structural commitments.
@@ -542,9 +545,13 @@ subsystem in the kernel (~500+ LOC).
   picks one of two outcomes — **per-module, via a `fatal_on_panic: bool` passed to
   `module::load`** (`false` for every module except `oxfs`). `false` just `hlt_loop()`s (no
   per-module restart exists yet, but nothing else about kernel state is known to be untrustworthy
-  either). `true` (`oxfs` only) reboots the whole system instead: a filesystem module's entire
-  state *is* the in-memory filesystem, with no backing store — resuming past an unrecovered panic
-  there would mean silently reverting every file to empty, a worse outcome than a clean reboot.
+  either). `true` (`oxfs` only) reboots the whole system instead: with no disk attached, a
+  filesystem module's entire state *is* the in-memory filesystem, and resuming past an unrecovered
+  panic there would mean silently reverting every file to empty; with a real disk attached (see
+  this file's own "Real disk persistence" section), a panic mid-mount/mid-format risks a torn
+  superblock/inode-table write instead — worse to resume past than a purely in-memory panic ever
+  was, so `true` is if anything more justified once a backing store exists, not less. Either way, a
+  clean reboot beats resuming into untrusted state.
   `module::CURRENT_MODULE_FATAL` (a `static mut`, same single-core/no-concurrent-writer reasoning
   as `gdt.rs`'s `CURRENT_RSP0`) is set immediately before every call into module code — `load`'s
   own `module_init` call, and `syscall::dispatch`'s call into a registered handler (via
@@ -562,8 +569,9 @@ subsystem in the kernel (~500+ LOC).
 
 ## Filesystem: oxfs (live) and FAT32 (superseded)
 
-**`modules/oxfs/`** is the live filesystem — a real Unix-shaped inode/block filesystem, in-memory
-only (no block device driver exists). Fixed-size `static mut` pools: `NUM_BLOCKS=8192` ×
+**`modules/oxfs/`** is the live filesystem — a real Unix-shaped inode/block filesystem. In-memory
+by default, with real optional persistence to an attached ATA disk now — see this file's own "Real
+disk persistence" section, below. Fixed-size `static mut` pools: `NUM_BLOCKS=8192` ×
 `BLOCK_SIZE=4096` (32 MiB total, raised from 4 MiB once the BusyBox roster grew to ~300 applets —
 see this file's own BusyBox section — a real physical-memory commitment from module-load time on,
 not paged in on demand; `Cargo.toml`'s QEMU `-m` was bumped to `1024` MiB at the same time),
@@ -619,6 +627,106 @@ Superseded specifically because these limits started actively blocking BusyBox w
 **`src/fd.rs`** (shared by both): a per-process `(Pid, fd)` scoped registry — the only
 coordination channel between independently-loaded modules, since modules can't call each other
 directly. Bump-allocated fd numbers, never reused even after close.
+
+## Real disk persistence (`src/ata.rs`, `modules/oxfs`)
+
+OxideBSD's first real block device driver, and the mechanism that finally lets oxfs survive a
+reboot — the last piece missing before "install OxideBSD" meant anything. Scoped deliberately:
+this closes real disk I/O and real oxfs mount/format persistence specifically, not a general VFS/
+mount-table layer (`mount`/`umount`/a real block-device-agnostic filesystem interface remain
+unstarted — see this file's own BusyBox gap table).
+
+- **`src/ata.rs`**: a hand-rolled ATA PIO (Programmable I/O) driver, kernel-resident (boot-wired
+  from `main.rs`, like `rtl8139::init()`, not a dynamically loaded `modules/*` crate) — classic
+  legacy IDE, LBA28, **polling only, no IRQ**. Fixed legacy ports (0x1F0/0x3F6 primary,
+  0x170/0x376 secondary — QEMU's default `i440fx` PIIX3 IDE controller exposes these regardless of
+  PCI enumeration, so unlike `rtl8139` there's no PCI probing at all). Every BSY/DRQ wait is
+  bounded by a real `crate::tsc`-based deadline (never `hlt()`, never an unbounded poll) —
+  load-bearing, not defensive: `oxidebsd_block_read`/`_write` (below) are reachable from inside a
+  real syscall handler with interrupts masked, exactly the class of context CLAUDE.md's own
+  "Real networking" section already documents two real freeze bugs for (`hlt()`-in-syscall,
+  `ticks()`-frozen-during-syscall) — PIO's synchronous, CPU-driven nature (no DMA, the CPU itself
+  shuttles every word) is what makes polling-only correct here at all, an IRQ-driven design would
+  need the same `IRQ_HANDLERS`/`without_interrupts` treatment `rtl8139` already established instead.
+- **One fixed target: secondary channel, master.** `bootimage` always attaches this kernel's own
+  boot image as `-drive format=raw,file=<image>` with no explicit `if=`, which QEMU resolves to the
+  *primary* IDE master by default — so `oxidebsd_block_read`/`_write`/`_device_present` (the
+  kernel-exported API `modules/oxfs` calls, registered in `src/module.rs`'s
+  `resolve_external_symbol` the same way `oxidebsd_alloc_fd`/`oxidebsd_proc_*` already are) target
+  the secondary channel's master drive specifically, and `Cargo.toml`'s `run-args`/`test-args` pin
+  the data disk there explicitly (`-drive if=none,id=oxfsdisk,... -device
+  ide-hd,drive=oxfsdisk,bus=ide.1,unit=0`), never a second bare `-drive` relying on QEMU's own
+  index-assignment heuristics. `run-args` points at `target/oxfs_disk.img` (`build.rs`, created
+  **only if it doesn't already exist** — the entire mechanism by which it survives across `cargo
+  run` invocations); `test-args` points at `target/oxfs_test_disk.img` (`build.rs`, always freshly
+  zeroed), applied globally like the existing `-nic` device — every test gets it, only
+  `tests/ata_smoke.rs`/`tests/oxfs_persistence_syscall_smoke.rs` call `ata::init()` at all, so every
+  other existing test's `oxidebsd_block_device_present()` stays `0` and behaves exactly as before
+  this pass.
+- **On-disk layout**: physical disk block `0` is the superblock (magic `b"OXFS"` + version +
+  `NUM_BLOCKS`/`MAX_INODES`/root-inode fields); blocks `1..17` are the packed inode table (512
+  inodes at a fixed 128-byte stride — real content is 67 bytes, rounded up to a stride that divides
+  `BLOCK_SIZE` evenly — exactly 16 blocks); block `17` is the block-used bitmap (`NUM_BLOCKS` bits =
+  1024 bytes, one block). Real data starts at block `18`: oxfs's own in-memory block number `i` maps
+  to physical disk block `18 + i`. **Never a raw transmute/memcpy of `Inode`** — it isn't
+  `#[repr(C)]` and `InodeKind` has no explicit discriminant, so true layout isn't guaranteed across
+  compiler versions/profiles; `pack_inode`/`unpack_inode` serialize by hand instead, the same
+  raw-byte-offset idiom `write_dir_record`/`dir_record_inode` already established for directory
+  records.
+- **Mount-or-format, decided once in `module_init`**: no disk attached (most tests) → today's
+  exact original in-memory-only behavior, byte for byte unchanged. Disk attached, superblock magic
+  matches → **mount**: load the bitmap + inode table wholesale, then eager-load only the data
+  blocks the bitmap marks used (not an unconditional sweep of all `NUM_BLOCKS` — see the
+  performance note below), skipping the entire seed-everything/self-check path. Disk attached,
+  magic mismatch (fresh/zeroed disk, including every real first boot) → **format**: run the
+  original seed-everything + self-check exactly as before, then `flush_all_to_disk` writes the
+  superblock, full bitmap, full inode table, and every used data block out once, so the *next* boot
+  mounts instead of reformatting. The self-check (asserts `hello.txt`'s literal bytes, `big.txt`'s
+  formula, chmod/chown round trips, ...) only ever runs on the format path — deliberate: mount never
+  re-validates seeded content, so a real user session that later edits/deletes those files is
+  expected and fine on every subsequent boot.
+- **Write-through persistence, centralized at three confirmed choke points**: `write_block`,
+  `write_inode`, `set_block_used` (`modules/oxfs/src/lib.rs`) are the *only* functions that ever
+  touch `BLOCKS`/`INODES`/`BLOCK_USED` — verified exhaustively before this landed, no bypass exists
+  anywhere in the file — so persisting there catches every mutation (`dir_insert`, `unlink`,
+  `oxfs_close`, `chmod`/`chown`, `mkdir`, `symlink`, ...) with no dirty-tracking/sync-on-shutdown
+  scheme needed (there's no clean shutdown hook to hang one off anyway). `write_inode`/
+  `set_block_used`'s own persist helpers repack the *entire* inode-table block / bitmap fresh from
+  the in-memory arrays (already the complete source of truth) rather than a real read-modify-write —
+  no disk read needed on a write at all.
+- **`PERSISTENCE_READY`** (`modules/oxfs/src/lib.rs`, a `static mut` gate alongside device
+  presence): deliberately `false` for the *entire* duration of both `format_fresh_filesystem`'s
+  seeding and `mount_from_disk`'s own load, even though both call `write_block`/`write_inode`/
+  `set_block_used` heavily — without this, formatting (~300 applets' worth of churn) and mounting
+  (reading data back into these exact same structures) would each trigger thousands of redundant
+  block-sized disk writes: data already correct on disk, or not yet meant to be there at all.
+  `module_init` sets it `true` exactly once, right after its own mount-or-format branch completes
+  and before any real syscall becomes reachable — from that point on, every further write really is
+  a live mutation from a running process and belongs on disk immediately.
+- **Known, accepted limitation: mount-time load is bitmap-filtered, not true lazy fault-in.** The
+  `x86_64` crate (0.15.5, this project's pinned version) has no `rep insw`/`outsw` wrapper, so every
+  512-byte sector transfer is 256 individually-trapped port reads under QEMU's software TCG —
+  comparable in class to the O(n²) frame-allocator and `invlpg` stalls this file's own Memory
+  Management section documents. Loading only used blocks (not an unconditional full 32 MiB sweep)
+  is this pass's mitigation; true on-demand fault-in (extending `read_block` itself with a
+  per-block "loaded yet" flag) is the natural next step if that still measures badly.
+- **`fatal_on_panic` stays `true` for oxfs** (see this file's own Dynamic Kernel Modules section) —
+  if anything more justified now than before real persistence existed: a panic mid-mount/mid-format
+  risks a torn superblock/inode-table write, worse to resume past than a purely in-memory panic ever
+  was.
+- **No raw block device is exposed to userland** (no `/dev/sda`-style node) — the disk is purely an
+  internal implementation detail of oxfs's own persistence for now.
+- Verified via `tests/ata_smoke.rs` (direct-function-call sector read/write round-trip at several
+  LBAs plus a byte-order sweep — no real syscall surface exists for raw block I/O in this phase) and
+  `tests/oxfs_persistence_syscall_smoke.rs` + `userland/oxfs-persistence-syscall-smoke/` (a real
+  spawned ELF via genuine `SYSCALL`/`SYSRETQ` that creates+writes+closes a file, proving the
+  write-through path is safe to run with interrupts masked — the exact class of bug this file's own
+  `hlt()`-in-syscall/`ticks()`-frozen-during-syscall history was only ever caught by real-`SYSCALL`
+  tests, never a plain-Rust-function one). **Not covered by automated testing**: persistence
+  actually surviving a real QEMU restart, inherently two separate `cargo run` invocations — a
+  manual, user-driven check (create a file at the hush prompt, exit QEMU, `cargo run` again, confirm
+  the file is still there), the same "hand off anything needing a live interactive QEMU session"
+  precedent this project already follows elsewhere.
 
 ## Permission model (`src/process.rs`, `modules/oxfs/`, `modules/posix_compat/`)
 
@@ -1196,7 +1304,7 @@ at once, so the rows aren't a clean partition.
 | `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | done (enumeration only) | subset of the above | `src/fd.rs`'s new `oxidebsd_fd_at(pid, index)` (mirrors `oxidebsd_proc_pid_at`'s own "loop until -1" shape, a bounded range scan over the `(pid, fd)`-keyed fd table) backs a new `ProcDirKind::FdList`. Real directory listing, real fd numbers — but each entry is a plain placeholder (`DT_REG`, no real content), **not** a real symlink to its target, since real Linux's own `/proc/<pid>/fd/N` entries are symlinks and this kernel had zero symlink support at all until this same pass added one (see the `SYS_SYMLINK`/`SYS_READLINK` row below). Making these entries real target-bearing symlinks needs a separate, cross-module "describe this fd" mechanism (oxfs doesn't know what a pipe/socket fd actually is; only `src/pipe.rs`/`src/net/*` do) — a known, deliberate limitation, not solved by guessing. Unlocks the enumeration half of `lsof`/`fuser`, not the full readlink-target behavior |
 | Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_SYSCALL` row | added alongside the `/proc` work above once it became clear `lsof`/`fuser`'s own real need was `readlink(2)`, not just directory enumeration — steered by an explicit user call to prioritize real POSIX primitives over narrowly chasing one BusyBox applet's own behavior. New `InodeKind::Symlink` in `modules/oxfs` (target string stored exactly like a regular file's content — no new storage mechanism); `resolve_path`/`resolve_path_nofollow_last` (a shared `resolve_path_impl(cwd, path, follow_last, depth)`) now transparently follow a symlink for every intermediate path component always, and for the final component only when `follow_last` is set — the one real difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't), bounded by `MAX_SYMLINK_DEPTH=8` (`-ELOOP=40`, musl's real compiled value — not FreeBSD's `62`, the same errno-divergence class this file's syscall-ABI section already warns about). `SYS_SYMLINK=155`/`SYS_READLINK=154` (next after `SYS_READV=153`), wire format `(target_ptr, target_len, linkpath_ptr, linkpath_len)`/`(path_ptr, path_len, buf_ptr, bufsize)` — `third_party/musl/src/unistd/{symlink,readlink}.c` patched the same way `rename.c` already was, to compute string lengths explicitly. Confirmed live via `modules/oxfs`'s own boot self-check: create, `readlink` round-trip, `stat` follows to the real target while `lstat` reports `S_IFLNK`/the link's own size, `open` follows and reads the target's real content, `unlink` removes only the link |
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | each needs a real device/driver this kernel doesn't model — not one gap, several unrelated small ones (see `docs/BUSYBOX_APPLETS.md`) |
-| Real block device driver + mount table | not started | 20 (`NEEDS_BLOCKDEV`) | `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... — not applet-specific, would matter for actual persistence too, not just more applets |
+| Real block device driver + oxfs persistence | done (mount table/VFS layer still not started) | subset of 20 (`NEEDS_BLOCKDEV`) | see this file's own "Real disk persistence" section for the full design — `src/ata.rs` (ATA PIO), real superblock/inode-table/bitmap format, mount-or-format boot logic, write-through persistence. Doesn't unblock `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... themselves — those need a real, block-device-agnostic mount-table/VFS concept this kernel still doesn't have, oxfs's own disk is a fixed, hardcoded backing store, not a mountable one |
 | uid/passwd-db model (process-attribute half + `/etc/passwd`+`/etc/group` lookups) | done | most of 16 (`NEEDS_UID`) | see this file's own "Permission model" section below for the full design. `whoami`/`groups`/`logname` should now work end-to-end (musl's `getpwuid`/`getgrgid` parse the new `/etc/passwd`/`/etc/group` in pure userspace, no new syscall needed for that half); `su`/`login`/`sulogin`/`getty` still need a real login/session-authentication flow, and `adduser`/`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` need real *mutation* of those two files (an applet-level gap now, not a kernel one — both files are already real, writable oxfs files) |
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` — see this file's own "Real-time clock" section |
 | `nanosleep` | done | 9 (`NEEDS_CLOCK`), several also needed the clock read above | `SYS_NANOSLEEP=139` — see this file's own "Real-time clock" section. `date`/`hwclock`/`rtcwake`/`adjtimex`/`crond`/`crontab` needed the clock read more than a real sleep; not re-probed against the current roster to confirm which now fully work end to end |

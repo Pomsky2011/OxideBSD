@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod address_space;
 pub mod allocator;
+pub mod ata;
 pub mod context_switch;
 pub mod elf;
 pub mod fd;

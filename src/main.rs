@@ -126,16 +126,25 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     )
     .unwrap_or_else(|e| panic!("failed to load the clock module: {e:?}"));
 
+    // Probes for a real ATA disk (see src/ata.rs's own doc comment) before oxfs loads, below --
+    // oxfs's module_init needs to know whether a data disk is attached to decide between its
+    // mount-existing-disk and format-fresh-disk/pure-in-memory paths. Never fatal: absence just
+    // means oxfs falls back to its original 100%-in-memory behavior for this boot.
+    oxidebsd::ata::init();
+
     // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
     // (still built and self-checked by build.rs on every `cargo build`) but deliberately not
     // loaded here anymore.
     //
     // `fatal_on_panic = true`: unlike every other module here, a filesystem module's state *is*
-    // the entire in-memory filesystem -- there's no backing store, so a "restart the module and
-    // keep going" recovery would just mean silently reverting every file to empty. That's a worse
-    // outcome than stopping, so a panic anywhere in oxfs reboots the whole system instead (see
-    // `module_panic_trampoline` in `src/module.rs`). The same reasoning will apply to fat32/ext4/
-    // xfs/... once any of them load at boot again.
+    // the entire in-memory filesystem (plus, now, whatever's mid-flight to its real backing disk
+    // when a data disk is attached -- see src/ata.rs and this module's own on-disk persistence
+    // logic). There's no way to safely resume past a panic in either case: with no disk, "restart
+    // the module and keep going" would silently revert every file to empty; with one attached, a
+    // panic mid-mount or mid-format risks leaving a torn superblock/inode-table write behind,
+    // which is worse to resume past than a purely in-memory panic ever was. So a panic anywhere in
+    // oxfs reboots the whole system instead (see `module_panic_trampoline` in `src/module.rs`).
+    // The same reasoning will apply to fat32/ext4/xfs/... once any of them load at boot again.
     const OXFS_MOD: &[u8] = include_bytes!(env!("OXFS_MOD_PATH"));
     const OXFS_PANIC_SYMBOL: &str = env!("OXFS_MOD_PANIC_SYMBOL");
     oxidebsd::module::load(

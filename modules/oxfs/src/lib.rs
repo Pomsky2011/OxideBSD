@@ -89,6 +89,17 @@ unsafe extern "C" {
     fn oxidebsd_random_bytes(ptr: u64, len: u64) -> i64;
     fn oxidebsd_current_uid() -> u64;
     fn oxidebsd_current_gid() -> u64;
+    /// `1`/`0` -- whether `src/ata.rs`'s fixed data-disk channel/drive responded to `IDENTIFY` at
+    /// boot. `false` (`0`) means every mutation stays purely in-memory this boot, same as before
+    /// this pass existed at all -- see `module_init`'s own doc comment.
+    fn oxidebsd_block_device_present() -> i64;
+    /// Reads/writes one `BLOCK_SIZE`-byte oxfs block (`block_no`, this module's own block-number
+    /// space -- NOT a raw disk LBA) from/to `buf_ptr`, an already-allocated `BLOCK_SIZE`-byte
+    /// buffer in this module's own memory. `0` on success, `-1` on any failure (no device,
+    /// timeout, device error). See `src/ata.rs`'s own doc comment for the real sector-level I/O
+    /// this translates into.
+    fn oxidebsd_block_read(block_no: u64, buf_ptr: u64) -> i64;
+    fn oxidebsd_block_write(block_no: u64, buf_ptr: u64) -> i64;
 }
 
 const SYS_OPEN: u64 = 5;
@@ -203,6 +214,63 @@ const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
 const NO_BLOCK: u32 = u32::MAX;
 
 const ROOT_INODE: u32 = 0;
+
+// --- Real disk persistence (see src/ata.rs) --------------------------------------------------
+//
+// Physical disk block layout: block `0` is the superblock, `[INODE_TABLE_START,
+// INODE_TABLE_START + INODE_TABLE_BLOCKS)` is the packed inode table, `BITMAP_BLOCK` is the
+// block-used bitmap, and real data starts at `DATA_BLOCK_OFFSET` -- this module's own in-memory
+// block number `i` maps to physical disk block `DATA_BLOCK_OFFSET + i`. Sizing: 512 inodes at a
+// fixed 128-byte stride (real content is 67 bytes -- 1 tag + 4 size + 48 direct + 4 indirect + 2
+// mode + 4 uid + 4 gid -- rounded up to a power-of-two stride that divides BLOCK_SIZE evenly,
+// leaving headroom for future fields) is exactly 16 4096-byte blocks; `NUM_BLOCKS` (8192) bits is
+// exactly 1. Total metadata region: 18 blocks.
+
+/// Marks a real, formatted oxfs disk. Absence/mismatch (an unformatted/all-zero disk, or one some
+/// other filesystem wrote) means the same thing either way: format fresh rather than try to
+/// interpret unknown content -- see `mount_from_disk`.
+const SUPERBLOCK_MAGIC: [u8; 4] = *b"OXFS";
+const SUPERBLOCK_VERSION: u32 = 1;
+
+const INODE_TABLE_START: u32 = 1;
+/// Real packed size (see the section doc comment above) -- **never** a raw transmute/memcpy of
+/// `Inode` itself, since it isn't `#[repr(C)]` and `InodeKind` has no explicit discriminant, so its
+/// true in-memory layout isn't guaranteed across compiler versions/profiles. `pack_inode`/
+/// `unpack_inode` do this by hand instead, the same raw-byte-offset idiom `write_dir_record`/
+/// `dir_record_inode` already established for directory records.
+const INODE_STRIDE: usize = 128;
+const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_STRIDE;
+const INODE_TABLE_BLOCKS: u32 = ((MAX_INODES * INODE_STRIDE + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+const BITMAP_BLOCK: u32 = INODE_TABLE_START + INODE_TABLE_BLOCKS;
+const DATA_BLOCK_OFFSET: u32 = BITMAP_BLOCK + 1;
+
+/// Gates `write_block`/`write_inode`/`set_block_used`'s own write-through persistence (see those
+/// functions below). Deliberately `false` for the *entire* duration of `format_fresh_filesystem`
+/// and `mount_from_disk`, even though both call those same three functions heavily -- without this,
+/// formatting (~300 applets' worth of block/inode/bitmap churn) and mounting (reading data back
+/// into these exact same in-memory structures) would each trigger thousands of redundant
+/// block-sized disk writes: data already correct on disk, or not yet meant to be there at all.
+/// `module_init` sets this to `true` exactly once, right after its own mount-or-format branch
+/// completes (`flush_all_to_disk` having just performed the real, one-time bulk write formatting
+/// needs, or `mount_from_disk` having confirmed the disk already matches memory) and before any
+/// real syscall becomes reachable -- from that point on, every further write really is a live
+/// mutation from a running process, and belongs on disk immediately.
+static mut PERSISTENCE_READY: bool = false;
+
+fn persistence_ready() -> bool {
+    unsafe { *core::ptr::addr_of!(PERSISTENCE_READY) }
+}
+
+fn set_persistence_ready(ready: bool) {
+    unsafe { *core::ptr::addr_of_mut!(PERSISTENCE_READY) = ready };
+}
+
+/// Whether a real data disk is attached this boot at all -- the outer gate `persist_*_if_present`
+/// (below) checks alongside `persistence_ready()`. A plain wrapper around the kernel-exported probe
+/// result so call sites read naturally.
+fn block_device_present() -> bool {
+    unsafe { oxidebsd_block_device_present() != 0 }
+}
 
 const DIR_RECORD_SIZE: usize = 32;
 const NAME_MAX: usize = 26;
@@ -326,6 +394,7 @@ fn read_block(n: u32) -> [u8; BLOCK_SIZE] {
 
 fn write_block(n: u32, data: &[u8; BLOCK_SIZE]) {
     unsafe { (*core::ptr::addr_of_mut!(BLOCKS))[n as usize] = *data };
+    persist_data_block_if_ready(n, data);
 }
 
 fn block_used(n: u32) -> bool {
@@ -334,6 +403,7 @@ fn block_used(n: u32) -> bool {
 
 fn set_block_used(n: u32, used: bool) {
     unsafe { (*core::ptr::addr_of_mut!(BLOCK_USED))[n as usize] = used };
+    persist_bitmap_if_ready();
 }
 
 fn read_inode(n: u32) -> Inode {
@@ -342,6 +412,7 @@ fn read_inode(n: u32) -> Inode {
 
 fn write_inode(n: u32, inode: Inode) {
     unsafe { (*core::ptr::addr_of_mut!(INODES))[n as usize] = inode };
+    persist_inode_block_if_ready(n);
 }
 
 /// Linear scan for the first free block -- fine at this module's scale (`NUM_BLOCKS = 1024`), same
@@ -2747,6 +2818,291 @@ impl ByteBuf<'_> {
     }
 }
 
+// --- Real disk persistence: on-disk (de)serialization, mount, format-flush, write-through ------
+//
+// See this file's own "Real disk persistence" constants section (near `ROOT_INODE`) for the
+// physical block layout these functions read/write.
+
+/// Packs one `Inode` into `out` (exactly `INODE_STRIDE` bytes) using explicit byte offsets, the
+/// same idiom `write_dir_record` already established for directory records -- see
+/// `INODE_STRIDE`'s own doc comment for why this can't be a raw transmute/memcpy.
+fn pack_inode(inode: &Inode, out: &mut [u8]) {
+    out[0] = match inode.kind {
+        InodeKind::Free => 0,
+        InodeKind::File => 1,
+        InodeKind::Dir => 2,
+        InodeKind::Symlink => 3,
+    };
+    out[1..5].copy_from_slice(&inode.size.to_le_bytes());
+    for (i, d) in inode.direct.iter().enumerate() {
+        let off = 5 + i * 4;
+        out[off..off + 4].copy_from_slice(&d.to_le_bytes());
+    }
+    let indirect_off = 5 + DIRECT_BLOCKS * 4;
+    out[indirect_off..indirect_off + 4].copy_from_slice(&inode.indirect.to_le_bytes());
+    let mode_off = indirect_off + 4;
+    out[mode_off..mode_off + 2].copy_from_slice(&inode.mode.to_le_bytes());
+    let uid_off = mode_off + 2;
+    out[uid_off..uid_off + 4].copy_from_slice(&inode.uid.to_le_bytes());
+    let gid_off = uid_off + 4;
+    out[gid_off..gid_off + 4].copy_from_slice(&inode.gid.to_le_bytes());
+    for b in &mut out[gid_off + 4..] {
+        *b = 0;
+    }
+}
+
+/// `pack_inode`'s inverse.
+fn unpack_inode(data: &[u8]) -> Inode {
+    let kind = match data[0] {
+        1 => InodeKind::File,
+        2 => InodeKind::Dir,
+        3 => InodeKind::Symlink,
+        _ => InodeKind::Free,
+    };
+    let size = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+    let mut direct = [NO_BLOCK; DIRECT_BLOCKS];
+    for (i, d) in direct.iter_mut().enumerate() {
+        let off = 5 + i * 4;
+        *d = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+    }
+    let indirect_off = 5 + DIRECT_BLOCKS * 4;
+    let indirect = u32::from_le_bytes([
+        data[indirect_off],
+        data[indirect_off + 1],
+        data[indirect_off + 2],
+        data[indirect_off + 3],
+    ]);
+    let mode_off = indirect_off + 4;
+    let mode = u16::from_le_bytes([data[mode_off], data[mode_off + 1]]);
+    let uid_off = mode_off + 2;
+    let uid = u32::from_le_bytes([
+        data[uid_off],
+        data[uid_off + 1],
+        data[uid_off + 2],
+        data[uid_off + 3],
+    ]);
+    let gid_off = uid_off + 4;
+    let gid = u32::from_le_bytes([
+        data[gid_off],
+        data[gid_off + 1],
+        data[gid_off + 2],
+        data[gid_off + 3],
+    ]);
+    Inode {
+        kind,
+        size,
+        direct,
+        indirect,
+        mode,
+        uid,
+        gid,
+    }
+}
+
+/// Write-through hook for `write_block` -- persists the single physical data block `n` maps to,
+/// gated on both a disk being attached and `persistence_ready()` (see that flag's own doc comment
+/// for why format/mount themselves must not trigger this).
+fn persist_data_block_if_ready(n: u32, data: &[u8; BLOCK_SIZE]) {
+    if !persistence_ready() || !block_device_present() {
+        return;
+    }
+    let phys = DATA_BLOCK_OFFSET as u64 + n as u64;
+    unsafe {
+        oxidebsd_block_write(phys, data.as_ptr() as u64);
+    }
+}
+
+/// Write-through hook for `write_inode` -- repacks the *entire* physical inode-table block `n`
+/// belongs to from the in-memory `INODES` array (which already holds the correct value for every
+/// inode in that block, `n` included, by the time this runs) and writes it whole. No
+/// read-before-write needed: memory is always the complete source of truth here, unlike a real
+/// on-disk filesystem recovering from a crash mid-write.
+fn persist_inode_block_if_ready(n: u32) {
+    if !persistence_ready() || !block_device_present() {
+        return;
+    }
+    let block_idx = n as usize / INODES_PER_BLOCK;
+    let mut block = [0u8; BLOCK_SIZE];
+    for slot in 0..INODES_PER_BLOCK {
+        let ino = block_idx * INODES_PER_BLOCK + slot;
+        if ino >= MAX_INODES {
+            break;
+        }
+        let inode = read_inode(ino as u32);
+        pack_inode(
+            &inode,
+            &mut block[slot * INODE_STRIDE..(slot + 1) * INODE_STRIDE],
+        );
+    }
+    let phys = INODE_TABLE_START as u64 + block_idx as u64;
+    unsafe {
+        oxidebsd_block_write(phys, block.as_ptr() as u64);
+    }
+}
+
+/// Write-through hook for `set_block_used` -- repacks the *entire* bitmap from the in-memory
+/// `BLOCK_USED` array and writes it whole, same "memory is the complete source of truth, no
+/// read-modify-write needed" reasoning as `persist_inode_block_if_ready`.
+fn persist_bitmap_if_ready() {
+    if !persistence_ready() || !block_device_present() {
+        return;
+    }
+    let mut block = [0u8; BLOCK_SIZE];
+    for i in 0..NUM_BLOCKS {
+        if block_used(i as u32) {
+            block[i / 8] |= 1 << (i % 8);
+        }
+    }
+    unsafe {
+        oxidebsd_block_write(BITMAP_BLOCK as u64, block.as_ptr() as u64);
+    }
+}
+
+fn write_superblock() {
+    let mut block = [0u8; BLOCK_SIZE];
+    block[0..4].copy_from_slice(&SUPERBLOCK_MAGIC);
+    block[4..8].copy_from_slice(&SUPERBLOCK_VERSION.to_le_bytes());
+    block[8..12].copy_from_slice(&(NUM_BLOCKS as u32).to_le_bytes());
+    block[12..16].copy_from_slice(&(MAX_INODES as u32).to_le_bytes());
+    block[16..20].copy_from_slice(&ROOT_INODE.to_le_bytes());
+    unsafe {
+        oxidebsd_block_write(0, block.as_ptr() as u64);
+    }
+}
+
+/// Attempts to mount an already-formatted disk: reads the superblock, and if its magic matches,
+/// loads the bitmap and inode table wholesale, then eager-loads only the data blocks the bitmap
+/// marks used (not an unconditional full sweep of `NUM_BLOCKS` -- see this file's own
+/// `PERSISTENCE_READY` doc comment and CLAUDE.md's own notes on this class of PIO-under-emulation
+/// cost). Returns `false` on a missing/mismatched superblock (an unformatted disk -- the expected,
+/// common first-boot case) or on any real read failure partway through, in which case the caller
+/// falls back to `format_fresh_filesystem` -- a partially-readable disk gets cleanly reformatted
+/// rather than the kernel trying to recover a partial mount, a deliberate simplification for this
+/// phase (see the implementation plan's own "known limitations" list).
+fn mount_from_disk() -> bool {
+    let mut sb = [0u8; BLOCK_SIZE];
+    if unsafe { oxidebsd_block_read(0, sb.as_mut_ptr() as u64) } != 0 {
+        return false;
+    }
+    if sb[0..4] != SUPERBLOCK_MAGIC {
+        return false;
+    }
+
+    let mut bitmap_block = [0u8; BLOCK_SIZE];
+    if unsafe { oxidebsd_block_read(BITMAP_BLOCK as u64, bitmap_block.as_mut_ptr() as u64) } != 0 {
+        log("[oxfs] mount: failed to read block-used bitmap -- falling back to format\n");
+        return false;
+    }
+    for i in 0..NUM_BLOCKS {
+        let used = (bitmap_block[i / 8] >> (i % 8)) & 1 != 0;
+        set_block_used(i as u32, used);
+    }
+
+    for block_idx in 0..INODE_TABLE_BLOCKS as usize {
+        let mut block = [0u8; BLOCK_SIZE];
+        let phys = INODE_TABLE_START as u64 + block_idx as u64;
+        if unsafe { oxidebsd_block_read(phys, block.as_mut_ptr() as u64) } != 0 {
+            log("[oxfs] mount: failed to read an inode table block -- falling back to format\n");
+            return false;
+        }
+        for slot in 0..INODES_PER_BLOCK {
+            let ino = block_idx * INODES_PER_BLOCK + slot;
+            if ino >= MAX_INODES {
+                break;
+            }
+            let off = slot * INODE_STRIDE;
+            write_inode(ino as u32, unpack_inode(&block[off..off + INODE_STRIDE]));
+        }
+    }
+
+    let mut loaded: u32 = 0;
+    for i in 0..NUM_BLOCKS as u32 {
+        if block_used(i) {
+            let mut data = [0u8; BLOCK_SIZE];
+            let phys = DATA_BLOCK_OFFSET as u64 + i as u64;
+            if unsafe { oxidebsd_block_read(phys, data.as_mut_ptr() as u64) } != 0 {
+                log("[oxfs] mount: failed to read a data block -- falling back to format\n");
+                return false;
+            }
+            write_block(i, &data);
+            loaded += 1;
+        }
+    }
+
+    let mut msg_buf = [0u8; 96];
+    let mut msg = ByteBuf {
+        buf: &mut msg_buf,
+        len: 0,
+    };
+    msg.push_bytes(b"[oxfs] mounted existing filesystem from disk (");
+    msg.push_decimal(loaded);
+    msg.push_bytes(b" data blocks loaded)\n");
+    let len = msg.len;
+    log_bytes(&msg_buf[..len]);
+    true
+}
+
+/// Performs the one-time bulk write a freshly formatted filesystem needs: superblock, the full
+/// bitmap, the full inode table, and every block the bitmap marks used. Called once, right after
+/// `format_fresh_filesystem` completes, while `PERSISTENCE_READY` is still `false` (see that flag's
+/// own doc comment for why the format pass itself doesn't write through block-by-block) -- so every
+/// subsequent boot mounts this disk instead of reformatting it.
+fn flush_all_to_disk() {
+    write_superblock();
+
+    let mut bitmap_block = [0u8; BLOCK_SIZE];
+    for i in 0..NUM_BLOCKS {
+        if block_used(i as u32) {
+            bitmap_block[i / 8] |= 1 << (i % 8);
+        }
+    }
+    unsafe {
+        oxidebsd_block_write(BITMAP_BLOCK as u64, bitmap_block.as_ptr() as u64);
+    }
+
+    for block_idx in 0..INODE_TABLE_BLOCKS as usize {
+        let mut block = [0u8; BLOCK_SIZE];
+        for slot in 0..INODES_PER_BLOCK {
+            let ino = block_idx * INODES_PER_BLOCK + slot;
+            if ino >= MAX_INODES {
+                break;
+            }
+            let inode = read_inode(ino as u32);
+            pack_inode(
+                &inode,
+                &mut block[slot * INODE_STRIDE..(slot + 1) * INODE_STRIDE],
+            );
+        }
+        let phys = INODE_TABLE_START as u64 + block_idx as u64;
+        unsafe {
+            oxidebsd_block_write(phys, block.as_ptr() as u64);
+        }
+    }
+
+    let mut flushed: u32 = 0;
+    for i in 0..NUM_BLOCKS as u32 {
+        if block_used(i) {
+            let data = read_block(i);
+            let phys = DATA_BLOCK_OFFSET as u64 + i as u64;
+            unsafe {
+                oxidebsd_block_write(phys, data.as_ptr() as u64);
+            }
+            flushed += 1;
+        }
+    }
+
+    let mut msg_buf = [0u8; 96];
+    let mut msg = ByteBuf {
+        buf: &mut msg_buf,
+        len: 0,
+    };
+    msg.push_bytes(b"[oxfs] formatted fresh filesystem and flushed to disk (");
+    msg.push_decimal(flushed);
+    msg.push_bytes(b" data blocks)\n");
+    let len = msg.len;
+    log_bytes(&msg_buf[..len]);
+}
+
 /// Allocates a fresh file inode under `parent` named `name` with `content` as its complete
 /// contents -- the `module_init`-time equivalent of `open(O_CREAT)` + `write` + `close`, used to
 /// seed every embedded file without going through the fd/syscall machinery.
@@ -2770,8 +3126,13 @@ fn seed_symlink(parent: u32, name: &[u8], target: &[u8]) -> bool {
     write_inode_data(inode, target) && dir_insert(parent, name, inode).is_ok()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn module_init() -> i32 {
+/// Populates a completely fresh (never-before-formatted) in-memory filesystem: root/`bin`/`etc`,
+/// every seed file/BusyBox applet, and the self-check. Runs unconditionally when no data disk is
+/// attached; runs once, the first time a real disk is attached with no valid superblock on it yet
+/// (see `module_init`, below, for the mount-or-format decision and `flush_all_to_disk`, which
+/// follows a successful run of this function so every *subsequent* boot mounts instead of
+/// reformatting). Returns whether the self-check passed.
+fn format_fresh_filesystem() -> bool {
     let root = alloc_inode().expect("oxfs: failed to allocate root inode");
     debug_assert_eq!(
         root, ROOT_INODE,
@@ -4166,10 +4527,43 @@ pub extern "C" fn module_init() -> i32 {
         log("[oxfs] self-check FAILED: hello.txt not found for chmod/chown check\n");
     }
 
+    if ok {
+        log("[oxfs] self-check passed\n");
+    }
+    ok
+}
+
+/// Real module entry point (`#[unsafe(no_mangle)]`, discovered by `build.rs`'s relocatable-link
+/// step and called by `src/module.rs::load`). Decides between mounting an already-formatted disk
+/// and formatting a fresh one (or running purely in-memory, if no data disk is attached at all --
+/// see `src/ata.rs`), then performs the state every path needs regardless: resetting the boot-time
+/// cwd and registering every syscall this module owns. Must never early-return before that tail --
+/// skipping syscall registration on any path would silently ship a filesystem no process could
+/// actually use.
+#[unsafe(no_mangle)]
+pub extern "C" fn module_init() -> i32 {
+    let has_disk = block_device_present();
+
+    let ok = if has_disk && mount_from_disk() {
+        true
+    } else {
+        let ok = format_fresh_filesystem();
+        if has_disk {
+            flush_all_to_disk();
+        }
+        ok
+    };
+
+    // Both the mount and the format-then-flush path above leave PERSISTENCE_READY false
+    // throughout their own bulk work (see that flag's own doc comment) -- flipped here, once,
+    // right before real syscalls become reachable, so every write a running process makes from
+    // this point on is persisted immediately.
+    set_persistence_ready(true);
+
     // Back to root, matching the state a booting kernel with no real process yet should leave
     // BOOT_CWD in (a real process's own cwd starts at Process::cwd's default, 0/root, regardless
-    // of whatever this self-check did to BOOT_CWD -- see src/process.rs's own doc comment -- but
-    // leaving this tidy avoids any confusion reading a boot log).
+    // of whatever format_fresh_filesystem's self-check did to BOOT_CWD -- see src/process.rs's own
+    // doc comment -- but leaving this tidy avoids any confusion reading a boot log).
     set_current_cwd_real(ROOT_INODE);
 
     // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures exactly.
@@ -4193,10 +4587,5 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_UTIMENSAT, oxfs_utimensat);
     }
 
-    if ok {
-        log("[oxfs] self-check passed\n");
-        0
-    } else {
-        -1
-    }
+    if ok { 0 } else { -1 }
 }
