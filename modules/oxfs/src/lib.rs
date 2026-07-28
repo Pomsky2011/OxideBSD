@@ -129,6 +129,28 @@ const SYS_CHOWN: u64 = 166;
 /// does (a real existence check, no real timestamp storage) and why that's enough to unblock
 /// BusyBox's `touch.c`.
 const SYS_UTIMENSAT: u64 = 167;
+/// The mount table (see this module's own "Mount table" section above `MAX_MOUNTS`). Real
+/// `mount(2)` takes 5 conceptual args (`special, dir, fstype, flags, data`), which doesn't fit
+/// this ABI's 4 registers -- rather than force one idealized shape, this splits into the two
+/// concrete shapes BusyBox's own `mount.c` actually needs (`--bind`/`-t tmpfs`), matching the
+/// existing precedent of patching the musl call site instead (`open`/`execve`/`rename`/`chown`
+/// already do this; see `third_party/musl/src/linux/mount.c`'s own patch, which dispatches to
+/// whichever of these two applies based on its own real `fstype` argument). **Not** the next three
+/// numbers after `SYS_UTIMENSAT=167` (168/169/170), despite every recent addition otherwise just
+/// continuing that sequence: those three real-Linux slots are `swapoff`/`reboot`/`sethostname`,
+/// all three already-seeded, already-built BusyBox applets in this port's roster that currently
+/// `ENOSYS` cleanly -- claiming those numbers would have silently misrouted a real call from any
+/// of them into the mount table instead. Landed on 174-176 instead (real Linux
+/// `create_module`/`init_module`/`delete_module` -- long-obsolete even on real Linux, and `insmod`/
+/// `rmmod`/`modprobe` never became build candidates in this port at all, see
+/// `docs/BUSYBOX_APPLETS.md`'s own note on `lsmod`), matching the musl-side patch's own explanation
+/// (`third_party/musl/arch/x86_64/bits/syscall.h.in`).
+const SYS_MOUNT_BIND: u64 = 174;
+const SYS_MOUNT_TMPFS: u64 = 175;
+/// Real `umount2(2)`'s own wire format fits this ABI's 4 registers whole (just the length-prefixed
+/// path convention added, same as every other path-taking syscall here) -- no shape change needed,
+/// unlike `mount` above.
+const SYS_UMOUNT2: u64 = 176;
 
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
@@ -214,6 +236,23 @@ const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
 const NO_BLOCK: u32 = u32::MAX;
 
 const ROOT_INODE: u32 = 0;
+
+/// A second, purely in-memory pool reserved for tmpfs mounts (see `MountKind::Tmpfs`) -- 4 MiB,
+/// modest on purpose (scratch space, not a real persisted store). Block/inode numbers `>=
+/// NUM_BLOCKS`/`>= MAX_INODES` fall in this range; `BLOCKS`/`BLOCK_USED`/`INODES` below are simply
+/// extended to cover it, so every existing accessor (`read_block`/`write_block`/`read_inode`/
+/// `write_inode`/`dir_lookup`/`dir_insert`/`resolve_path_impl`/...) keeps working unmodified over
+/// the unified index space -- only `inode_ensure_block_at` (the sole allocation chokepoint, see its
+/// own doc comment) and the disk-persistence hooks (`persist_data_block_if_ready`/
+/// `persist_inode_block_if_ready`) need to know this range exists at all. Every whole-pool disk
+/// loop (format/mount-from-disk/the three persist hooks) already iterates `0..NUM_BLOCKS`/
+/// `0..MAX_INODES` by the named constant rather than `BLOCKS.len()`/`INODES.len()` -- verified
+/// before this was added -- so none of that code needs to change to stay correctly bounded to the
+/// real, persisted range only. Deliberately never reclaimed when a tmpfs mount is unmounted (its
+/// inodes/blocks stay marked used forever) -- matches this module's existing "no deallocation
+/// anywhere" stance (`unlink`/`rmdir` already only clear a directory record's `used` byte).
+const TMPFS_NUM_BLOCKS: usize = 1024;
+const TMPFS_MAX_INODES: usize = 128;
 
 // --- Real disk persistence (see src/ata.rs) --------------------------------------------------
 //
@@ -380,9 +419,12 @@ impl Inode {
 /// syscall-reachable functions, whose results feed observably into `oxidebsd_log`/syscall return
 /// values, so the optimizer can't treat any write as an unobservable dead store. All-zero initial
 /// values place these in `.bss` (not baked into the merged object's own size).
-static mut BLOCKS: [[u8; BLOCK_SIZE]; NUM_BLOCKS] = [[0; BLOCK_SIZE]; NUM_BLOCKS];
-static mut BLOCK_USED: [bool; NUM_BLOCKS] = [false; NUM_BLOCKS];
-static mut INODES: [Inode; MAX_INODES] = [Inode::FREE; MAX_INODES];
+const TOTAL_BLOCKS: usize = NUM_BLOCKS + TMPFS_NUM_BLOCKS;
+const TOTAL_INODES: usize = MAX_INODES + TMPFS_MAX_INODES;
+
+static mut BLOCKS: [[u8; BLOCK_SIZE]; TOTAL_BLOCKS] = [[0; BLOCK_SIZE]; TOTAL_BLOCKS];
+static mut BLOCK_USED: [bool; TOTAL_BLOCKS] = [false; TOTAL_BLOCKS];
+static mut INODES: [Inode; TOTAL_INODES] = [Inode::FREE; TOTAL_INODES];
 static mut OPEN_FILES: [Option<(u64, OpenFile)>; MAX_OPEN_FILES] = [None; MAX_OPEN_FILES];
 
 fn read_block(n: u32) -> [u8; BLOCK_SIZE] {
@@ -442,6 +484,50 @@ fn alloc_inode() -> Option<u32> {
     (0..MAX_INODES as u32).find(|&i| read_inode(i).kind == InodeKind::Free)
 }
 
+/// `alloc_block`'s tmpfs-pool counterpart -- same linear scan, over the tail range reserved by
+/// `TMPFS_NUM_BLOCKS` instead of `0..NUM_BLOCKS`. Only ever called from `inode_ensure_block_at`,
+/// which picks this over `alloc_block` based on which pool `inode_num` falls in -- see that
+/// function's own doc comment for why it's the sole call site that needs to know this pool exists.
+fn alloc_tmpfs_block() -> Option<u32> {
+    for i in NUM_BLOCKS as u32..TOTAL_BLOCKS as u32 {
+        if !block_used(i) {
+            set_block_used(i, true);
+            write_block(i, &[0u8; BLOCK_SIZE]);
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn alloc_tmpfs_indirect_block() -> Option<u32> {
+    let n = alloc_tmpfs_block()?;
+    write_block(n, &[0xFFu8; BLOCK_SIZE]);
+    Some(n)
+}
+
+/// `alloc_inode`'s tmpfs-pool counterpart -- see `alloc_tmpfs_block`'s own doc comment. Called
+/// directly by the tmpfs-mount-creation path (`oxfs_mount_tmpfs`, which has no parent directory to
+/// check -- it's creating the mount's own root) and by `alloc_inode_in` below for everything else.
+fn alloc_tmpfs_inode() -> Option<u32> {
+    (MAX_INODES as u32..TOTAL_INODES as u32).find(|&i| read_inode(i).kind == InodeKind::Free)
+}
+
+/// Picks `alloc_inode`/`alloc_tmpfs_inode` based on which pool `parent` (the directory the new
+/// entry is being created in) belongs to -- a new file/dir/symlink created inside a tmpfs-mounted
+/// directory must itself come from the tmpfs pool, or it would silently end up persisted (real
+/// pool inodes are write-through to disk) and report the wrong `st_dev`. The shared chokepoint for
+/// all three "create a new named entry" sites (`oxfs_mkdir`, `oxfs_open`'s `O_CREAT`-via-`oxfs_close`
+/// commit, `oxfs_symlink`) -- found missing via `tests/mount_syscall_smoke.rs`, which caught the
+/// `O_CREAT` case specifically (a file created inside a tmpfs mount reported the real filesystem's
+/// `st_dev` instead of the tmpfs one).
+fn alloc_inode_in(parent: u32) -> Option<u32> {
+    if parent >= MAX_INODES as u32 {
+        alloc_tmpfs_inode()
+    } else {
+        alloc_inode()
+    }
+}
+
 /// Reads the block number backing `inode`'s logical block `index` (direct or, past
 /// `DIRECT_BLOCKS`, via the single-indirect block), or `None` if that block was never allocated.
 fn inode_block_at(inode: &Inode, index: usize) -> Option<u32> {
@@ -465,11 +551,23 @@ fn inode_block_at(inode: &Inode, index: usize) -> Option<u32> {
 /// Takes an inode *number*, not `&mut Inode`: every access to `INODES`/`BLOCKS` in this module
 /// goes through the copy-in/copy-out helpers above, so no reference to either static is ever held
 /// across a nested call (`alloc_block` here) that itself touches them.
+///
+/// **The one place block allocation needs to know about the tmpfs pool** (see `TMPFS_NUM_BLOCKS`'s
+/// own doc comment): `dir_insert`'s directory-growth path and every real file write both funnel
+/// through this single function (confirmed by grep -- `alloc_block`/`alloc_indirect_block` have no
+/// other caller), so picking the allocator by whether `inode_num` falls in the tmpfs range here is
+/// sufficient to make a tmpfs file/directory's own growth land in the tmpfs pool, with no other
+/// call site needing to change.
 fn inode_ensure_block_at(inode_num: u32, index: usize) -> Option<u32> {
+    let tmpfs = inode_num >= MAX_INODES as u32;
     let mut inode = read_inode(inode_num);
     let result = if index < DIRECT_BLOCKS {
         if inode.direct[index] == NO_BLOCK {
-            inode.direct[index] = alloc_block()?;
+            inode.direct[index] = if tmpfs {
+                alloc_tmpfs_block()?
+            } else {
+                alloc_block()?
+            };
         }
         Some(inode.direct[index])
     } else {
@@ -478,13 +576,21 @@ fn inode_ensure_block_at(inode_num: u32, index: usize) -> Option<u32> {
             return None;
         }
         if inode.indirect == NO_BLOCK {
-            inode.indirect = alloc_indirect_block()?;
+            inode.indirect = if tmpfs {
+                alloc_tmpfs_indirect_block()?
+            } else {
+                alloc_indirect_block()?
+            };
         }
         let mut ib = read_block(inode.indirect);
         let off = indirect_index * 4;
         let existing = u32::from_le_bytes([ib[off], ib[off + 1], ib[off + 2], ib[off + 3]]);
         if existing == NO_BLOCK {
-            let nb = alloc_block()?;
+            let nb = if tmpfs {
+                alloc_tmpfs_block()?
+            } else {
+                alloc_block()?
+            };
             ib[off..off + 4].copy_from_slice(&nb.to_le_bytes());
             write_block(inode.indirect, &ib);
             Some(nb)
@@ -581,8 +687,16 @@ const _: () = assert!(core::mem::size_of::<MuslStat>() == 144);
 /// and `st_mode`'s permission bits are now real, backed by the inode's own `uid`/`gid`/`mode`
 /// fields (see `Inode`'s own doc comment) -- everything else this filesystem still doesn't model
 /// stays a fixed, honestly-fake value: timestamps are all `0` (no clock/RTC source exists yet --
-/// see the same gap table's "clock + nanosleep" row), and `st_dev` is a fixed `1` (there's only
-/// ever one filesystem). `st_nlink` is `2` for a directory (`.` plus its parent's entry for it)
+/// see the same gap table's "clock + nanosleep" row). `st_dev` is `1` for the one real, persisted
+/// filesystem and `2` for anything in the tmpfs pool (`inode_num >= MAX_INODES`, see
+/// `TMPFS_NUM_BLOCKS`'s own doc comment) -- derivable from the inode number alone, and just enough
+/// for `mountpoint`'s real `st_dev(path) != st_dev(parent)` check to detect a tmpfs mount. A bind
+/// mount deliberately keeps `st_dev == 1` (same underlying superblock, matching real Linux's own
+/// same-filesystem bind-mount behavior), so `mountpoint` can't distinguish a bind-mounted directory
+/// from an ordinary one -- a known, honest limitation, not something this field could fix without a
+/// real per-mount identity this design doesn't build.
+///
+/// `st_nlink` is `2` for a directory (`.` plus its parent's entry for it)
 /// and `1` for a file -- this filesystem doesn't track hard links, so a directory's real
 /// subdirectory count (which would also bump its parent's linked-from count) isn't reflected
 /// either. `st_ino`/`st_size`/`st_blocks` are the only other fields backed by something real.
@@ -598,8 +712,9 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     };
     let mode = type_bits | inode.mode as u32;
     let size = inode.size as i64;
+    let dev = if inode_num >= MAX_INODES as u32 { 2 } else { 1 };
     let stat = MuslStat {
-        st_dev: 1,
+        st_dev: dev,
         st_ino: inode_num as u64,
         st_nlink: nlink,
         st_mode: mode,
@@ -915,6 +1030,73 @@ fn dir_nth_used_record(dir_inode: u32, n: usize) -> Option<(u32, [u8; NAME_MAX],
 /// can't recurse this kernel into a stack overflow.
 const MAX_SYMLINK_DEPTH: usize = 8;
 
+// --- Mount table -------------------------------------------------------------------------------
+//
+// A real, but deliberately scoped, mount table: `mount --bind`/`mount -t tmpfs` only, no general
+// pluggable-filesystem-type VFS (there is exactly one real block device and one real filesystem in
+// this kernel, and modules can't call each other directly -- nothing else exists to plug in). See
+// CLAUDE.md's own "Mount table" section for the full design and its known limitations.
+
+const MAX_MOUNTS: usize = 8;
+const MAX_MOUNT_PATH: usize = 64;
+
+#[derive(Clone, Copy, PartialEq)]
+enum MountKind {
+    Bind,
+    Tmpfs,
+}
+
+#[derive(Clone, Copy)]
+struct MountEntry {
+    used: bool,
+    /// The real inode `dir_lookup` would otherwise have returned for this mountpoint -- shadowed
+    /// by `active_mount_for` while this entry is active. Recovered directly (bypassing the
+    /// redirect) by `oxfs_umount2` to find which entry to remove.
+    mountpoint_inode: u32,
+    /// Where a lookup reaching `mountpoint_inode` redirects to instead: the source directory's own
+    /// inode for a bind mount, or a freshly allocated tmpfs root directory for a tmpfs mount.
+    target_root_inode: u32,
+    kind: MountKind,
+    /// Display only (`/proc/mounts`) -- matching by inode, not by this string, is what
+    /// `oxfs_umount2` actually uses to find the entry to remove.
+    path: [u8; MAX_MOUNT_PATH],
+    path_len: u8,
+    source: [u8; MAX_MOUNT_PATH],
+    source_len: u8,
+}
+
+impl MountEntry {
+    const EMPTY: MountEntry = MountEntry {
+        used: false,
+        mountpoint_inode: 0,
+        target_root_inode: 0,
+        kind: MountKind::Bind,
+        path: [0; MAX_MOUNT_PATH],
+        path_len: 0,
+        source: [0; MAX_MOUNT_PATH],
+        source_len: 0,
+    };
+}
+
+static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [MountEntry::EMPTY; MAX_MOUNTS];
+
+fn mounts() -> &'static mut [MountEntry; MAX_MOUNTS] {
+    // SAFETY: same single-core, syscall-serialized access as every other `static mut` in this
+    // module (see BLOCKS's own doc comment).
+    unsafe { &mut *core::ptr::addr_of_mut!(MOUNTS) }
+}
+
+/// Returns the currently active mount shadowing `inode`, if any -- scanned from the end so a mount
+/// stacked on top of an already-mounted directory wins (real Unix LIFO stacking), and so
+/// `oxfs_umount2` removing the most recent one exposes whatever was mounted there before it.
+fn active_mount_for(inode: u32) -> Option<MountEntry> {
+    mounts()
+        .iter()
+        .rev()
+        .find(|m| m.used && m.mountpoint_inode == inode)
+        .copied()
+}
+
 /// Resolves `path` to a single inode number, starting from `cwd_inode` (or root, if `path` starts
 /// with `/`) and walking every `/`-separated component (`.`/`..`/empty components handled along
 /// the way) -- real multi-component resolution, replacing `modules/fat32`'s single-component-only
@@ -949,6 +1131,11 @@ fn resolve_path_impl(
             continue;
         }
         let next = dir_lookup(current, component).ok_or(OxfsError::NotFound)?;
+        // A mounted directory shadows whatever real inode was already there -- applies to every
+        // component, not just the last, matching real Unix (`stat`ing a mountpoint itself reports
+        // the mounted fs's root). See MountEntry's own doc comment for `..`'s behavior from inside
+        // each mount kind.
+        let next = active_mount_for(next).map_or(next, |m| m.target_root_inode);
         let kind = read_inode(next).kind;
         if kind == InodeKind::Symlink && (!is_last || follow_last) {
             let mut target = [0u8; MAX_CWD_PATH];
@@ -1660,27 +1847,63 @@ enum ProcSysFile {
     Uptime,
     Stat,
     Modules,
+    Mounts,
 }
 
-/// `/proc/{meminfo,uptime,stat,modules}`: same "format once at open time into a fixed buffer"
-/// shape `open_proc_leaf` uses for the per-pid leaves, just backed by the four system-wide kernel
-/// accessors instead of a per-pid one. Unlike `open_proc_leaf`, there's no pid to vanish out from
-/// under this call -- these four never fail.
+/// Formats `MOUNTS` as standard mtab-shaped lines (`<source> <target> <fstype> <opts> 0 0`) for
+/// `/proc/mounts` -- unlike the other `ProcSysFile` variants, this needs no kernel FFI accessor:
+/// the mount table is this module's own state. A fixed `oxfs / oxfs rw 0 0` line always comes
+/// first (the one real, always-mounted filesystem), followed by one line per active `MountEntry`.
+/// Read by BusyBox's own `mount.c` (with no arguments) and `mountpoint`/`umount`'s own mtab
+/// lookups -- the same "prefer /proc/mounts when present" convention real Linux userland follows.
+fn format_mounts(buf: &mut [u8; PROC_BUFFER]) -> usize {
+    let mut n = 0;
+    let mut push = |bytes: &[u8]| {
+        let room = buf.len() - n;
+        let take = bytes.len().min(room);
+        buf[n..n + take].copy_from_slice(&bytes[..take]);
+        n += take;
+    };
+    push(b"oxfs / oxfs rw 0 0\n");
+    for m in mounts().iter().filter(|m| m.used) {
+        push(&m.source[..m.source_len as usize]);
+        push(b" ");
+        push(&m.path[..m.path_len as usize]);
+        match m.kind {
+            MountKind::Bind => push(b" none rw,bind 0 0\n"),
+            MountKind::Tmpfs => push(b" tmpfs rw 0 0\n"),
+        }
+    }
+    n
+}
+
+/// `/proc/{meminfo,uptime,stat,modules,mounts}`: same "format once at open time into a fixed
+/// buffer" shape `open_proc_leaf` uses for the per-pid leaves, just backed by the system-wide
+/// kernel accessors (or, for `Mounts`, this module's own state) instead of a per-pid one. Unlike
+/// `open_proc_leaf`, there's no pid to vanish out from under this call -- none of these ever fail.
 fn open_proc_sysfile(kind: ProcSysFile) -> i64 {
     let mut content = [0u8; PROC_BUFFER];
-    // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures; each
-    // writes at most PROC_BUFFER bytes into content, sized to match.
-    let n = unsafe {
-        match kind {
-            ProcSysFile::Meminfo => oxidebsd_proc_meminfo(content.as_mut_ptr(), PROC_BUFFER as u64),
-            ProcSysFile::Uptime => oxidebsd_proc_uptime(content.as_mut_ptr(), PROC_BUFFER as u64),
-            ProcSysFile::Stat => {
-                oxidebsd_proc_stat_global(content.as_mut_ptr(), PROC_BUFFER as u64)
+    let n = match kind {
+        ProcSysFile::Mounts => format_mounts(&mut content) as i64,
+        // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures;
+        // each writes at most PROC_BUFFER bytes into content, sized to match.
+        _ => unsafe {
+            match kind {
+                ProcSysFile::Meminfo => {
+                    oxidebsd_proc_meminfo(content.as_mut_ptr(), PROC_BUFFER as u64)
+                }
+                ProcSysFile::Uptime => {
+                    oxidebsd_proc_uptime(content.as_mut_ptr(), PROC_BUFFER as u64)
+                }
+                ProcSysFile::Stat => {
+                    oxidebsd_proc_stat_global(content.as_mut_ptr(), PROC_BUFFER as u64)
+                }
+                ProcSysFile::Modules => {
+                    oxidebsd_proc_modules(content.as_mut_ptr(), PROC_BUFFER as u64)
+                }
+                ProcSysFile::Mounts => unreachable!(),
             }
-            ProcSysFile::Modules => {
-                oxidebsd_proc_modules(content.as_mut_ptr(), PROC_BUFFER as u64)
-            }
-        }
+        },
     };
     register_open_file(OpenFile::ProcRead {
         content,
@@ -1733,6 +1956,7 @@ fn proc_open(suffix: &[u8]) -> i64 {
         b"/uptime" => return open_proc_sysfile(ProcSysFile::Uptime),
         b"/stat" => return open_proc_sysfile(ProcSysFile::Stat),
         b"/modules" => return open_proc_sysfile(ProcSysFile::Modules),
+        b"/mounts" => return open_proc_sysfile(ProcSysFile::Mounts),
         _ => {}
     }
     let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
@@ -1789,7 +2013,7 @@ fn proc_open(suffix: &[u8]) -> i64 {
 /// doesn't need.
 fn proc_kind(suffix: &[u8]) -> Option<bool> {
     match suffix {
-        b"/meminfo" | b"/uptime" | b"/stat" | b"/modules" => return Some(false),
+        b"/meminfo" | b"/uptime" | b"/stat" | b"/modules" | b"/mounts" => return Some(false),
         _ => {}
     }
     let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
@@ -1899,6 +2123,16 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
 
     match dir_lookup(parent, leaf) {
         Some(inode_num) => {
+            // `dir_lookup` is a bare lookup -- unlike `resolve_path`, it doesn't apply the mount
+            // redirect `resolve_path_impl`'s own loop does for every *intermediate* component.
+            // That's correct when `leaf` is being checked for an EEXIST-style presence test
+            // (`oxfs_mkdir`/`oxfs_symlink`), but here `leaf` is the thing actually being opened --
+            // if it's itself an active mountpoint (e.g. `open("/mnttest")`, not
+            // `open("/mnttest/f")`, where "mnttest" is an *intermediate* component `resolve_path`
+            // inside `resolve_parent` already redirected), it needs the same redirect or a plain
+            // `open`/`getdents` on the mountpoint's own path would see the real, shadowed
+            // directory instead of the mounted one. Found live via `tests/mount_syscall_smoke.rs`.
+            let inode_num = active_mount_for(inode_num).map_or(inode_num, |m| m.target_root_inode);
             // Real open() follows a final symlink component by default (no O_NOFOLLOW in this
             // ABI to opt out) -- resolve_path already knows how, so hand it the symlink's own
             // stored target relative to its own parent directory. A dangling target surfaces as
@@ -2112,7 +2346,12 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
                 -EIO
             };
         }
-        let Some(new_inode) = alloc_inode() else {
+        // A new file created inside a tmpfs-mounted directory must itself come from the tmpfs
+        // pool -- see `alloc_inode_in` below for why this is the one call site of the three
+        // "create a new named entry" ones (mkdir/open-O_CREAT/symlink) that had a live bug here
+        // (found via `tests/mount_syscall_smoke.rs`): the other two check `parent`/`cwd` directly,
+        // but this one only learns `parent_inode` this late, at close-time commit.
+        let Some(new_inode) = alloc_inode_in(parent_inode) else {
             return -ENOSPC;
         };
         let mut inode = Inode::new(InodeKind::File);
@@ -2220,7 +2459,7 @@ extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
     if dir_lookup(parent, leaf).is_some() {
         return -EEXIST;
     }
-    let Some(new_inode) = alloc_inode() else {
+    let Some(new_inode) = alloc_inode_in(parent) else {
         return -ENOSPC;
     };
     write_inode(new_inode, Inode::new(InodeKind::Dir));
@@ -2470,7 +2709,7 @@ extern "C" fn oxfs_symlink(target_ptr: u64, target_len: u64, linkpath_ptr: u64, 
     if dir_lookup(parent, leaf).is_some() {
         return -EEXIST;
     }
-    let Some(new_inode) = alloc_inode() else {
+    let Some(new_inode) = alloc_inode_in(parent) else {
         return -ENOSPC;
     };
     write_inode(new_inode, Inode::new(InodeKind::Symlink));
@@ -2587,6 +2826,175 @@ extern "C" fn oxfs_utimensat(path_ptr: u64, path_len: u64, _times_ptr: u64, _fla
     match resolve_path(cwd, path) {
         Ok(_) => 0,
         Err(e) => errno_for(e),
+    }
+}
+
+/// Copies `src` into a fixed `[u8; MAX_MOUNT_PATH]` for `MountEntry`'s own display-only `path`/
+/// `source` fields, truncating if `src` is longer -- these are never compared against (matching by
+/// inode, see `oxfs_umount2`), only ever formatted back out for `/proc/mounts`, so silent
+/// truncation of a pathologically long path is a cosmetic degradation, not a correctness bug.
+fn copy_mount_path(src: &[u8]) -> ([u8; MAX_MOUNT_PATH], u8) {
+    let mut buf = [0u8; MAX_MOUNT_PATH];
+    let n = src.len().min(MAX_MOUNT_PATH);
+    buf[..n].copy_from_slice(&src[..n]);
+    (buf, n as u8)
+}
+
+/// Finds the first free `MountEntry` slot, or `None` if `MAX_MOUNTS` are all active.
+fn free_mount_slot() -> Option<usize> {
+    mounts().iter().position(|m| !m.used)
+}
+
+/// Registered for `SYS_MOUNT_BIND`. `(source_ptr, source_len, target_ptr, target_len)` -- see
+/// `SYS_MOUNT_BIND`'s own doc comment for why `mount(2)` splits into two syscalls here. `target`
+/// must already exist and be a real directory (the thing being shadowed); `source` is resolved
+/// through any mount already active on it (real behavior: binding from inside another mount binds
+/// the *effective* view, not the raw underlying inode) and must also be a directory -- this design
+/// only supports directory bind mounts, matching what every applet in this port's roster actually
+/// does with `--bind`.
+extern "C" fn oxfs_mount_bind(
+    source_ptr: u64,
+    source_len: u64,
+    target_ptr: u64,
+    target_len: u64,
+) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let source =
+        unsafe { core::slice::from_raw_parts(source_ptr as *const u8, source_len as usize) };
+    let target =
+        unsafe { core::slice::from_raw_parts(target_ptr as *const u8, target_len as usize) };
+
+    let source_cwd = match real_cwd_for_mutation(source) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let target_cwd = match real_cwd_for_mutation(target) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let source_inode = match resolve_path(source_cwd, source) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    if read_inode(source_inode).kind != InodeKind::Dir {
+        return -ENOTDIR;
+    }
+
+    let (parent, leaf) = match resolve_parent(target_cwd, target) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let Some(mountpoint_inode) = dir_lookup(parent, leaf) else {
+        return -ENOENT;
+    };
+    if read_inode(mountpoint_inode).kind != InodeKind::Dir {
+        return -ENOTDIR;
+    }
+    let Some(slot) = free_mount_slot() else {
+        return -ENOSPC;
+    };
+    let (path, path_len) = copy_mount_path(target);
+    let (src_buf, src_len) = copy_mount_path(source);
+    mounts()[slot] = MountEntry {
+        used: true,
+        mountpoint_inode,
+        target_root_inode: source_inode,
+        kind: MountKind::Bind,
+        path,
+        path_len,
+        source: src_buf,
+        source_len: src_len,
+    };
+    0
+}
+
+/// Registered for `SYS_MOUNT_TMPFS`. `(target_ptr, target_len, _, _)` -- `target` must already
+/// exist and be a real directory, same requirement as the bind-mount case above. Allocates a fresh
+/// directory from the tmpfs pool (`alloc_tmpfs_inode`, see `TMPFS_NUM_BLOCKS`'s own doc comment)
+/// and gives it real `.`/`..` records the same way `oxfs_mkdir` does -- `..` points at the
+/// mountpoint's own real parent, so `cd ..` from inside this tmpfs mount escapes back to the real
+/// tree with no special-casing anywhere else in this file.
+extern "C" fn oxfs_mount_tmpfs(target_ptr: u64, target_len: u64, _a2: u64, _a3: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let target =
+        unsafe { core::slice::from_raw_parts(target_ptr as *const u8, target_len as usize) };
+
+    let target_cwd = match real_cwd_for_mutation(target) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent, leaf) = match resolve_parent(target_cwd, target) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let Some(mountpoint_inode) = dir_lookup(parent, leaf) else {
+        return -ENOENT;
+    };
+    if read_inode(mountpoint_inode).kind != InodeKind::Dir {
+        return -ENOTDIR;
+    }
+    let Some(slot) = free_mount_slot() else {
+        return -ENOSPC;
+    };
+    let Some(new_root) = alloc_tmpfs_inode() else {
+        return -ENOSPC;
+    };
+    write_inode(new_root, Inode::new(InodeKind::Dir));
+    if dir_insert(new_root, b".", new_root).is_err()
+        || dir_insert(new_root, b"..", parent).is_err()
+    {
+        return -EIO;
+    }
+    let (path, path_len) = copy_mount_path(target);
+    let (source, source_len) = copy_mount_path(b"tmpfs");
+    mounts()[slot] = MountEntry {
+        used: true,
+        mountpoint_inode,
+        target_root_inode: new_root,
+        kind: MountKind::Tmpfs,
+        path,
+        path_len,
+        source,
+        source_len,
+    };
+    0
+}
+
+/// Registered for `SYS_UMOUNT2`. `(target_ptr, target_len, flags, _)` -- `flags` accepted but
+/// ignored, matching `TIOCSWINSZ`'s existing "accepted but not enforced" precedent (no
+/// `MNT_FORCE`/`MNT_DETACH` distinction). Recovers the *raw* shadowed inode at `target` via a bare
+/// `dir_lookup` (deliberately not `resolve_path`, which would apply the mount redirect and hand
+/// back the mounted target's own root instead of the mountpoint itself), then finds and clears
+/// whichever `MountEntry` was shadowing it -- searched from the end, so unmounting removes the most
+/// recently stacked mount first (real LIFO stacking). `EINVAL` if `target` isn't a currently active
+/// mountpoint, matching real `umount2(2)`.
+extern "C" fn oxfs_umount2(target_ptr: u64, target_len: u64, _flags: u64, _r10: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let target =
+        unsafe { core::slice::from_raw_parts(target_ptr as *const u8, target_len as usize) };
+
+    let target_cwd = match real_cwd_for_mutation(target) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent, leaf) = match resolve_parent(target_cwd, target) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let Some(raw_inode) = dir_lookup(parent, leaf) else {
+        return -ENOENT;
+    };
+    match mounts()
+        .iter_mut()
+        .rev()
+        .find(|m| m.used && m.mountpoint_inode == raw_inode)
+    {
+        Some(entry) => {
+            entry.used = false;
+            0
+        }
+        None => -EINVAL,
     }
 }
 
@@ -2903,7 +3311,9 @@ fn unpack_inode(data: &[u8]) -> Inode {
 /// gated on both a disk being attached and `persistence_ready()` (see that flag's own doc comment
 /// for why format/mount themselves must not trigger this).
 fn persist_data_block_if_ready(n: u32, data: &[u8; BLOCK_SIZE]) {
-    if !persistence_ready() || !block_device_present() {
+    // Tmpfs-pool blocks (see TMPFS_NUM_BLOCKS's own doc comment) are never persisted -- they have
+    // no physical counterpart in the on-disk layout, which is sized to NUM_BLOCKS exactly.
+    if n >= NUM_BLOCKS as u32 || !persistence_ready() || !block_device_present() {
         return;
     }
     let phys = DATA_BLOCK_OFFSET as u64 + n as u64;
@@ -2918,7 +3328,10 @@ fn persist_data_block_if_ready(n: u32, data: &[u8; BLOCK_SIZE]) {
 /// read-before-write needed: memory is always the complete source of truth here, unlike a real
 /// on-disk filesystem recovering from a crash mid-write.
 fn persist_inode_block_if_ready(n: u32) {
-    if !persistence_ready() || !block_device_present() {
+    // Tmpfs-pool inodes are never persisted, same reasoning as persist_data_block_if_ready above
+    // -- without this, `block_idx` below would be computed from a bogus, out-of-range `n` and
+    // corrupt some unrelated physical inode-table block.
+    if n >= MAX_INODES as u32 || !persistence_ready() || !block_device_present() {
         return;
     }
     let block_idx = n as usize / INODES_PER_BLOCK;
@@ -4585,6 +4998,9 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_CHMOD, oxfs_chmod);
         oxidebsd_register_syscall(SYS_CHOWN, oxfs_chown);
         oxidebsd_register_syscall(SYS_UTIMENSAT, oxfs_utimensat);
+        oxidebsd_register_syscall(SYS_MOUNT_BIND, oxfs_mount_bind);
+        oxidebsd_register_syscall(SYS_MOUNT_TMPFS, oxfs_mount_tmpfs);
+        oxidebsd_register_syscall(SYS_UMOUNT2, oxfs_umount2);
     }
 
     if ok { 0 } else { -1 }

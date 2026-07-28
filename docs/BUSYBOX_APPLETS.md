@@ -186,11 +186,25 @@ Builds, but needs a real console/VT, serial device, framebuffer, pty pair, or sy
 - no VT/console ioctl support (real Linux vt.h ioctls): `chvt`, `deallocvt`, `dumpkmap`, `fgconsole`, `loadkmap`, `setconsole`, `setkeycodes`, `setlogcons`
 
 
-### NEEDS_BLOCKDEV (20)
+### NEEDS_BLOCKDEV (17, down from 20 -- mount/mountpoint/umount moved to done this pass)
 
-Builds, but needs a real block device driver or mount table -- neither exists.
+Builds, but needs a real block device driver or mount table -- **stale as of both landing**: a
+real ATA PIO driver + oxfs mount/format persistence closed the driver half (see CLAUDE.md's own
+"Real disk persistence" section), and a real, deliberately scoped mount table (`mount --bind`/
+`mount -t tmpfs`, `SYS_MOUNT_BIND`/`SYS_MOUNT_TMPFS`/`SYS_UMOUNT2` in `modules/oxfs`, see that
+file's own "Mount table" section) closed enough of the mount-table half to unblock `mount`/
+`mountpoint`/`umount` specifically. Everything else below still needs either a real block-device-
+agnostic mount table (this design only ever redirects within oxfs's own single, already-mounted
+filesystem -- no second real device or on-disk format is ever attached) or a real partition-table/
+multiple-on-disk-format concept neither pass adds:
 
-- no real block device driver or mount table: `blkid`, `devmem`, `eject`, `fdformat`, `fdisk`, `findfs`, `freeramdisk`, `fsck`, `fsck_minix`, `hd`, `mkfs_minix`, `mkswap`, `mount`, `mountpoint`, `pivot_root`, `rdev`, `readprofile`, `swapoff`, `switch_root`, `umount`
+- needs a real, block-device-agnostic mount table this design doesn't add (only oxfs's own single,
+  fixed backing store is ever "mounted" at all): `pivot_root`, `switch_root`
+- needs a real partition table / multiple on-disk filesystem formats: `blkid`, `fdformat`, `fdisk`,
+  `findfs`, `fsck`, `fsck_minix`, `mkfs_minix`, `mkswap`, `rdev`
+- needs a real swap concept (no paging/virtual-memory swap infrastructure exists at all): `swapoff`
+- needs a real device-memory/hardware-profile mechanism, unrelated to the mount table: `devmem`,
+  `eject`, `freeramdisk`, `hd`, `readprofile`
 
 
 ### NEEDS_CLOCK (9)

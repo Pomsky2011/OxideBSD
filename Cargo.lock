@@ -193,6 +193,10 @@ name = "lsoxmod"
 version = "0.1.0"
 
 [[package]]
+name = "mount-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "native_abi"
 version = "0.1.0"
 

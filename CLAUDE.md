@@ -728,6 +728,125 @@ unstarted — see this file's own BusyBox gap table).
   the file is still there), the same "hand off anything needing a live interactive QEMU session"
   precedent this project already follows elsewhere.
 
+## Mount table (`modules/oxfs/`)
+
+A real, but deliberately scoped, mount table — `mount --bind`/`mount -t tmpfs` only, closing the
+`mount`/`umount`/`mountpoint` row of the BusyBox gap table. Not a general pluggable-filesystem-type
+VFS: there is exactly one real block device and one real filesystem in this kernel, and modules
+can't call each other directly, so there's nothing else to plug in. `mount`/`umount`/`mountpoint`
+were already-seeded, already-built BusyBox applets before this — the driver/persistence half of
+"real block device" was already done (see "Real disk persistence" above); only the mount-table
+concept itself was missing.
+
+- **A second, purely in-memory inode/block pool for tmpfs**, reusing oxfs's existing accessors
+  rather than threading a "which pool" parameter through the file: `BLOCKS`/`BLOCK_USED`/`INODES`
+  are simply extended with a tail region (`TMPFS_NUM_BLOCKS=1024`/`TMPFS_MAX_INODES=128`, 4 MiB) —
+  every whole-pool disk-persistence loop already iterated `0..NUM_BLOCKS`/`0..MAX_INODES` by the
+  named constant rather than `BLOCKS.len()`/`INODES.len()` (verified before this landed), so that
+  code stays correctly bounded to the real, persisted range with zero changes. `write_block`/
+  `write_inode`'s own persist hooks (`persist_data_block_if_ready`/`persist_inode_block_if_ready`)
+  get a one-line early return for an index past the real range — a tmpfs mount is never written to
+  disk at all, matching real tmpfs semantics (nothing to persist it to). *Block* allocation only
+  needs to know this second pool exists in one place, `inode_ensure_block_at` (confirmed via grep
+  to be the sole caller of `alloc_block`/`alloc_indirect_block`, covering both real file writes and
+  directory growth) — it picks `alloc_tmpfs_block`/`alloc_tmpfs_inode` instead based on whether
+  `inode_num >= MAX_INODES`. *Inode* allocation for a newly **created** entry needed its own
+  chokepoint, `alloc_inode_in(parent)`, added only after `tests/mount_syscall_smoke.rs` caught a
+  real bug live: `oxfs_mkdir`/`oxfs_symlink`/`oxfs_open`'s `O_CREAT`-via-`oxfs_close` commit path
+  all called plain `alloc_inode()` unconditionally, so a file created *inside* a tmpfs-mounted
+  directory still got a real-pool inode — reporting the wrong `st_dev` and (worse) being silently
+  write-through-persisted to disk despite living inside a supposedly non-persistent tmpfs mount.
+  `alloc_inode_in` picks `alloc_inode`/`alloc_tmpfs_inode` by the same `parent >= MAX_INODES` test,
+  now the single shared call site for all three "create a new named entry" operations. Every other
+  function (`read_inode`, `dir_lookup`, `dir_insert`, `resolve_path_impl`, ...) works unmodified
+  over the unified index space. Deliberately **never reclaimed on unmount** (a tmpfs mount's
+  inodes/blocks stay marked used forever) — matches this
+  module's existing "no deallocation anywhere" stance (`unlink`/`rmdir` already only clear a
+  directory record's `used` byte).
+- **The mount table itself** (`MountEntry`/`MOUNTS`, `MAX_MOUNTS=8`): each entry records the real
+  inode a mountpoint path resolved to (`mountpoint_inode`, shadowed while the mount is active) and
+  where lookups redirect to instead (`target_root_inode` — the source directory's own inode for a
+  bind mount, a freshly allocated tmpfs root directory for a tmpfs mount). `resolve_path_impl`
+  gets exactly one inserted line, checking `active_mount_for` right after each component's
+  `dir_lookup` and before the existing symlink-follow check — applies to every component, not just
+  the last, matching real Unix (`stat`ing a mountpoint itself reports the mounted fs's root).
+  Scanned from the end, so a mount stacked on top of an already-mounted directory wins and
+  unmounting removes the most recent one first (real LIFO stacking).
+  - **Tmpfs mount root** gets real `.`/`..` directory records the same way `oxfs_mkdir` already
+    creates them, with `..` pointing at the *mountpoint's own real parent* — `cd ..` from inside a
+    tmpfs mount therefore escapes back to the real tree for free, no special-casing anywhere else.
+  - **Bind mount** reuses the source directory's own real inode directly — no new inode allocated.
+    Known, documented limitation: since it reuses the source's own real directory records verbatim,
+    `cd ..` from inside a bind-mounted directory follows the *source's* real parent, not the new
+    mountpoint's parent (real Linux gets this right via a per-mount dentry view this design doesn't
+    build). Acceptable — no target applet needs it.
+  - `st_dev` (`write_stat`) is `1` for the real, persisted filesystem and `2` for anything in the
+    tmpfs pool — derivable from the inode number alone, and just enough for `mountpoint`'s real
+    `st_dev(path) != st_dev(parent)` check to detect a tmpfs mount. A bind mount deliberately keeps
+    `st_dev == 1` (same underlying superblock, matching real Linux's own same-filesystem
+    bind-mount behavior), so `mountpoint` can't distinguish a bind-mounted directory from an
+    ordinary one — a known, honest limitation, not fixable without a real per-mount identity this
+    design doesn't build.
+  - **The redirect only fires where `resolve_path_impl`'s own per-component loop actually runs.**
+    That covers every *intermediate* path component unconditionally, and a *final* component too
+    for any handler that resolves the whole path via `resolve_path`/`resolve_path_nofollow_last`
+    directly (`oxfs_stat`/`oxfs_lstat`/`oxfs_chdir` all already do). It does **not** cover a handler
+    that instead calls `resolve_parent` (which only walks the *parent* portion through
+    `resolve_path`) and then does its own bare `dir_lookup(parent, leaf)` for the final component —
+    correct for an EEXIST-style presence check (`oxfs_mkdir`/`oxfs_symlink`) or a raw-entry mutation
+    (`oxfs_unlink`/`oxfs_rmdir`, which must act on the real, unmounted directory record), but wrong
+    for `oxfs_open`'s "existing path" branch, which needs the *resolved* target. Found live via
+    `tests/mount_syscall_smoke.rs`: `open("/mnttest/f")` worked (`"mnttest"` is an *intermediate*
+    component there, redirected inside `resolve_parent`'s own internal `resolve_path` call), but
+    `open("/mnttest")` alone (`"mnttest"` as the *leaf*) returned the real, shadowed directory
+    instead of the tmpfs one — a real `getdents` on the mountpoint's own path silently showed the
+    wrong content. Fixed with the same one-line `active_mount_for` redirect, applied to `oxfs_open`'s
+    own `dir_lookup(parent, leaf)` result specifically (not a change to `dir_lookup` itself, which
+    stays a true raw lookup for the mutation call sites that need it).
+- **`SYS_MOUNT_BIND=174`/`SYS_MOUNT_TMPFS=175`/`SYS_UMOUNT2=176`** (`modules/oxfs`, registered
+  alongside `SYS_UTIMENSAT=167`). Real `mount(2)` takes 5 conceptual args (`special, dir, fstype,
+  flags, data`), which doesn't fit this ABI's 4 registers — rather than force one idealized shape,
+  `third_party/musl/src/linux/mount.c`'s `mount()` is patched to dispatch to one of two syscalls
+  based on its own real `fstype`/`flags` arguments, the only two shapes BusyBox's own
+  `util-linux/mount.c` actually issues (`mount(source, target, NULL, MS_BIND, NULL)` for `--bind`,
+  `mount("tmpfs", target, "tmpfs", flags, options)` for `-t tmpfs`); any other shape fails with
+  `ENODEV` in musl itself, never reaching the kernel. **Deliberately not the next three numbers
+  after `SYS_UTIMENSAT=167`** (168/169/170), despite every prior addition otherwise just continuing
+  that sequence: those three real-Linux slots are `swapoff`/`reboot`/`sethostname`, all three
+  already-seeded, already-built BusyBox applets in this port's roster that currently `ENOSYS`
+  cleanly and honestly — claiming those numbers would have silently misrouted a real call from any
+  of them into the mount table instead, caught during review rather than live, but the exact bug
+  class this file's own musl-port section documents at length (`getdents`/`getdents64`, `ENOSYS`'s
+  real value, ...). Landed on real Linux's `create_module`/`init_module`/`delete_module` (174-176)
+  instead — real syscalls, but ones no code in this tree references at all (`insmod`/`rmmod`/
+  `modprobe` never even became BusyBox build candidates in this port, see
+  `docs/BUSYBOX_APPLETS.md`'s own "missing-from-this-list" note on `lsmod`), and all three are
+  themselves long-obsolete on modern real Linux too. `umount()`/`umount2()` are patched the same
+  way, reusing `delete_module`'s slot — this file's own, original `__NR_umount2` macro (166) stays
+  at its inert real-Linux value, unreferenced from here on. Both syscalls' own `bits/syscall.h.in`
+  comments avoid writing the literal `__NR_` prefix in prose (using `SYS_`-style naming instead) —
+  the file's own sed-based `__NR_`-to-`SYS_` generator (the Makefile rule that builds
+  `obj/include/bits/syscall.h`) matches any line *containing* that substring, including inside a
+  comment, and duplicates it verbatim into the generated header outside any comment block; a prose
+  mention of a real macro name broke the build this way while this passed landed, found immediately
+  via `cargo build`, not live.
+- **`/proc/mounts`** (`ProcSysFile::Mounts`, alongside `Meminfo`/`Uptime`/`Stat`/`Modules`): unlike
+  those four, backed by no kernel FFI accessor at all — the mount table is oxfs's own state, so a
+  local formatter produces standard mtab-shaped lines directly. Read by BusyBox's own bare `mount`
+  (no arguments, listing current mounts) and by `mountpoint`/`umount`'s own real mtab-lookup
+  conventions.
+- Verified via `tests/mount_syscall_smoke.rs` + `userland/mount-syscall-smoke/` (a real spawned ELF
+  through genuine `SYSCALL`/`SYSRETQ`, same reasoning every other real-`SYSCALL` smoke test in this
+  codebase documents): a tmpfs mount's real create/write/read/`getdents`/`st_dev` round trip, a
+  bind mount exposing a real BusyBox applet, `/proc/mounts` showing both while active, and both
+  reverting cleanly on `umount` (the real, empty directories underneath reappear untouched, a
+  repeat `umount` of the same path fails `EINVAL`, the bind-mounted applet is no longer reachable).
+- **Not covered by this pass**: a real, block-device-agnostic mount table (`pivot_root`/
+  `switch_root` need this — this design only ever redirects within oxfs's own single, already-
+  mounted filesystem, never a second real device or on-disk format), and everything in
+  `docs/BUSYBOX_APPLETS.md`'s `NEEDS_BLOCKDEV` row that needs a real partition table or multiple
+  on-disk filesystem formats (`blkid`/`fdisk`/`fsck`/`mkswap`/...).
+
 ## Permission model (`src/process.rs`, `modules/oxfs/`, `modules/posix_compat/`)
 
 Real uid/gid, real per-inode `mode`/`uid`/`gid`, real `chmod`/`chown`, and real `open()`
@@ -1304,7 +1423,8 @@ at once, so the rows aren't a clean partition.
 | `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | done (enumeration only) | subset of the above | `src/fd.rs`'s new `oxidebsd_fd_at(pid, index)` (mirrors `oxidebsd_proc_pid_at`'s own "loop until -1" shape, a bounded range scan over the `(pid, fd)`-keyed fd table) backs a new `ProcDirKind::FdList`. Real directory listing, real fd numbers — but each entry is a plain placeholder (`DT_REG`, no real content), **not** a real symlink to its target, since real Linux's own `/proc/<pid>/fd/N` entries are symlinks and this kernel had zero symlink support at all until this same pass added one (see the `SYS_SYMLINK`/`SYS_READLINK` row below). Making these entries real target-bearing symlinks needs a separate, cross-module "describe this fd" mechanism (oxfs doesn't know what a pipe/socket fd actually is; only `src/pipe.rs`/`src/net/*` do) — a known, deliberate limitation, not solved by guessing. Unlocks the enumeration half of `lsof`/`fuser`, not the full readlink-target behavior |
 | Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_SYSCALL` row | added alongside the `/proc` work above once it became clear `lsof`/`fuser`'s own real need was `readlink(2)`, not just directory enumeration — steered by an explicit user call to prioritize real POSIX primitives over narrowly chasing one BusyBox applet's own behavior. New `InodeKind::Symlink` in `modules/oxfs` (target string stored exactly like a regular file's content — no new storage mechanism); `resolve_path`/`resolve_path_nofollow_last` (a shared `resolve_path_impl(cwd, path, follow_last, depth)`) now transparently follow a symlink for every intermediate path component always, and for the final component only when `follow_last` is set — the one real difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't), bounded by `MAX_SYMLINK_DEPTH=8` (`-ELOOP=40`, musl's real compiled value — not FreeBSD's `62`, the same errno-divergence class this file's syscall-ABI section already warns about). `SYS_SYMLINK=155`/`SYS_READLINK=154` (next after `SYS_READV=153`), wire format `(target_ptr, target_len, linkpath_ptr, linkpath_len)`/`(path_ptr, path_len, buf_ptr, bufsize)` — `third_party/musl/src/unistd/{symlink,readlink}.c` patched the same way `rename.c` already was, to compute string lengths explicitly. Confirmed live via `modules/oxfs`'s own boot self-check: create, `readlink` round-trip, `stat` follows to the real target while `lstat` reports `S_IFLNK`/the link's own size, `open` follows and reads the target's real content, `unlink` removes only the link |
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | each needs a real device/driver this kernel doesn't model — not one gap, several unrelated small ones (see `docs/BUSYBOX_APPLETS.md`) |
-| Real block device driver + oxfs persistence | done (mount table/VFS layer still not started) | subset of 20 (`NEEDS_BLOCKDEV`) | see this file's own "Real disk persistence" section for the full design — `src/ata.rs` (ATA PIO), real superblock/inode-table/bitmap format, mount-or-format boot logic, write-through persistence. Doesn't unblock `mount`/`umount`/`fsck`/`mkswap`/`fdisk`/`blkid`/... themselves — those need a real, block-device-agnostic mount-table/VFS concept this kernel still doesn't have, oxfs's own disk is a fixed, hardcoded backing store, not a mountable one |
+| Real block device driver + oxfs persistence | done | subset of 17 (`NEEDS_BLOCKDEV`, down from 20) | see this file's own "Real disk persistence" section for the full design — `src/ata.rs` (ATA PIO), real superblock/inode-table/bitmap format, mount-or-format boot logic, write-through persistence. oxfs's own disk is still a fixed, hardcoded backing store, not a mountable one — see the mount-table row below for what that did and didn't unblock |
+| Mount table (`mount --bind`/`mount -t tmpfs`) | done | `mount`/`umount`/`mountpoint` in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_BLOCKDEV` row | see this file's own "Mount table" section for the full design — `SYS_MOUNT_BIND`/`SYS_MOUNT_TMPFS`/`SYS_UMOUNT2` in `modules/oxfs`, a second in-memory-only tmpfs inode/block pool, `resolve_path_impl`'s redirect hook, `/proc/mounts`. Deliberately scoped, not a general pluggable-filesystem-type VFS (there's exactly one real block device/filesystem, nothing else to plug in) — doesn't unblock `pivot_root`/`switch_root` (need a real block-device-agnostic mount table) or anything needing a real partition table/multiple on-disk formats (`blkid`/`fdisk`/`fsck`/`mkswap`/...) |
 | uid/passwd-db model (process-attribute half + `/etc/passwd`+`/etc/group` lookups) | done | most of 16 (`NEEDS_UID`) | see this file's own "Permission model" section below for the full design. `whoami`/`groups`/`logname` should now work end-to-end (musl's `getpwuid`/`getgrgid` parse the new `/etc/passwd`/`/etc/group` in pure userspace, no new syscall needed for that half); `su`/`login`/`sulogin`/`getty` still need a real login/session-authentication flow, and `adduser`/`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` need real *mutation* of those two files (an applet-level gap now, not a kernel one — both files are already real, writable oxfs files) |
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` — see this file's own "Real-time clock" section |
 | `nanosleep` | done | 9 (`NEEDS_CLOCK`), several also needed the clock read above | `SYS_NANOSLEEP=139` — see this file's own "Real-time clock" section. `date`/`hwclock`/`rtcwake`/`adjtimex`/`crond`/`crontab` needed the clock read more than a real sleep; not re-probed against the current roster to confirm which now fully work end to end |
