@@ -11,6 +11,7 @@ members = [
   "userland/proc-smoke",
   "userland/itimer-syscall-smoke",
   "userland/uid-syscall-smoke",
+  "userland/lsoxmod",
   "modules/hello",
   "modules/native_abi",
   "modules/posix_compat",

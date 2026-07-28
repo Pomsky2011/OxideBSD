@@ -299,3 +299,26 @@ The `//applet:` marker my candidate-extraction grep matched isn't live source --
 
 - libbb/parse_config.c's applet marker is commented out (////applet:, not //applet:) -- example code, not a real applet: `parse`
 
+
+### missing-from-this-list entirely (known, at least 1)
+
+The mirror-image problem from `not-a-real-applet` above: a real, live applet with a real
+`//applet:` marker that this list's own candidate extraction simply never caught, rather than
+correctly excluding. `287 + 83 = 370` against a claimed 393 candidates means there's a real gap
+here beyond the one instance actually chased down -- nothing else has been individually
+identified.
+
+- `lsmod` (`modutils/lsmod.c`) -- real marker
+  (`//applet:IF_LSMOD(IF_NOT_MODPROBE_SMALL(APPLET_NOEXEC(lsmod, lsmod, BB_DIR_SBIN,
+  BB_SUID_DROP, lsmod)))`), never probed at all; the nested `IF_LSMOD(IF_NOT_MODPROBE_SMALL(...))`
+  wrapping likely slipped past whatever grep built the original candidate list. Would build cleanly
+  today (`allnoconfig` + `LSMOD`, no exotic dependencies) and, now that `/proc/modules` exists (see
+  CLAUDE.md's oxfs section), would even find a real file to read -- but it parses real Linux kernel
+  modules' own format (dependency lists, reference counts, `insmod`/`rmmod` semantics), a concept
+  that doesn't actually exist on this kernel. Deliberately left unbuilt in favor of a real
+  purpose-built native tool instead: `userland/lsoxmod/`, seeded into oxfs at `/bin/lsoxmod` with
+  `/bin/lsmod` as a real symlink alias, reads that same `/proc/modules` file and formats it
+  honestly for what it actually is -- OxideBSD's own `src/module.rs` loader's state, not Linux
+  kernel modules. Same "builds is a much weaker bar than works correctly" reasoning this file's own
+  intro already states, just caught before wiring the applet up at all rather than after.
+

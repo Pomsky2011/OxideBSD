@@ -29,6 +29,10 @@ fn main() {
     build_userland_crate("proc-smoke", "PROC_SMOKE_ELF_PATH");
     build_userland_crate("itimer-syscall-smoke", "ITIMER_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("uid-syscall-smoke", "UID_SYSCALL_SMOKE_ELF_PATH");
+    // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
+    // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
+    // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
+    let lsoxmod_elf_path = build_userland_crate("lsoxmod", "LSOXMOD_ELF_PATH");
 
     build_module_crate("hello", "HELLO", &[]);
     build_module_crate("native_abi", "NATIVE_ABI", &[]);
@@ -530,6 +534,10 @@ fn main() {
             ring3_smoke_elf_path.to_str().unwrap(),
         ),
         ("OXFS_MUSL_ELF_PATH", musl_smoke_elf_path.to_str().unwrap()),
+        (
+            "OXFS_LSOXMOD_ELF_PATH",
+            lsoxmod_elf_path.to_str().unwrap(),
+        ),
     ];
     oxfs_extra_env.extend(
         oxfs_applet_paths

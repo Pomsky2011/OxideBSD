@@ -1617,8 +1617,11 @@ pub(crate) extern "C" fn oxidebsd_current_gid() -> u64 {
 
 /// Appends `value`'s decimal representation (no leading zeros; `0` prints as `"0"`) -- kernel-side
 /// equivalent of `modules/oxfs`'s own `ByteBuf::push_decimal`, duplicated rather than shared since
-/// modules can't depend on kernel-crate internals and vice versa.
-fn push_decimal(out: &mut Vec<u8>, value: u64) {
+/// modules can't depend on kernel-crate internals and vice versa. `pub(crate)` (not private) so
+/// `src/module.rs`'s own `oxidebsd_proc_modules` can reuse it too -- that's ordinary
+/// within-the-kernel-crate sharing, not the module<->kernel boundary the doc comment above is
+/// actually warning about.
+pub(crate) fn push_decimal(out: &mut Vec<u8>, value: u64) {
     if value == 0 {
         out.push(b'0');
         return;
@@ -1637,8 +1640,9 @@ fn push_decimal(out: &mut Vec<u8>, value: u64) {
 /// Copies `min(content.len(), buf_cap)` bytes into the caller-owned `buf_ptr`, returning that
 /// count -- the shape every `/proc` accessor below returns content through, since modules can't
 /// receive a `Vec`/`&str` directly across the FFI boundary (same raw pointer+len convention
-/// `oxidebsd_log` and oxfs's own `write_stat` already use).
-fn copy_into(content: &[u8], buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+/// `oxidebsd_log` and oxfs's own `write_stat` already use). `pub(crate)`, same reasoning as
+/// `push_decimal` above.
+pub(crate) fn copy_into(content: &[u8], buf_ptr: *mut u8, buf_cap: u64) -> i64 {
     let n = content.len().min(buf_cap as usize);
     // SAFETY: the caller (modules/oxfs, via the FFI boundary these functions are exported across)
     // owns buf_ptr for at least buf_cap bytes -- same trust boundary as every other module<->kernel

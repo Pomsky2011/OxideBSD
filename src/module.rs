@@ -76,6 +76,19 @@ const MODULE_REGION_CEILING: u64 = 0x_8000_0000;
 
 static NEXT_MODULE_PAGE: Mutex<u64> = Mutex::new(MODULE_VA_BASE);
 
+/// One entry per successfully relocated module, in load order -- backs `/proc/modules`
+/// (`oxidebsd_proc_modules` below, synthesized by `modules/oxfs`) the same way real Linux's own
+/// `/proc/modules` reflects its loaded-module list. `name` is `&'static str` rather than an owned
+/// `String`: every call site in `src/main.rs` passes a string literal, so there's never a real
+/// owned string to store in the first place.
+struct LoadedModuleInfo {
+    name: &'static str,
+    base: u64,
+    size: u64,
+}
+
+static LOADED_MODULES: Mutex<Vec<LoadedModuleInfo>> = Mutex::new(Vec::new());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleError {
     TooShort,
@@ -313,7 +326,7 @@ fn align_up(value: u64, align: u64) -> u64 {
 /// module's merged panic-entry reference (empty string if the module's code never references
 /// one) -- see `resolve_external_symbol`.
 pub fn load(
-    name: &str,
+    name: &'static str,
     object_bytes: &[u8],
     panic_symbol: &str,
     mapper: &mut impl Mapper<Size4KiB>,
@@ -441,6 +454,14 @@ pub fn load(
         name,
         base
     );
+    // Recorded before module_init runs, not after -- matches real Linux's own "present in
+    // /proc/modules the instant relocation finishes" timing, and lets a module's own boot
+    // self-check (see modules/oxfs's) see itself already listed.
+    LOADED_MODULES.lock().push(LoadedModuleInfo {
+        name,
+        base,
+        size: region_size,
+    });
     // SAFETY: init_addr was computed above from module_init's own symbol table entry plus this
     // module's now-fully-relocated base -- every relocation touching its code has already been
     // applied, and module_init's real signature (established by every module crate's own
@@ -450,6 +471,50 @@ pub fn load(
     serial_println!("[module] {}: module_init returned {}", name, result);
 
     Ok(result)
+}
+
+/// `/proc/modules` -- real Linux's own seven-space-separated-field format per line (`name size
+/// refcount deps state address`), just with fixed placeholders for the three fields this loader
+/// has no equivalent concept for: `refcount` (no module ever tracks how many things reference it),
+/// `deps` (no inter-module dependency graph -- see `CLAUDE.md`'s own "no inter-module direct
+/// calls" note), and `state` (always `Live` -- no module unload exists, so nothing is ever
+/// `Unloading`). Listed most-recently-loaded first, matching real `lsmod`/`/proc/modules`
+/// ordering (real `insmod` prepends to the kernel's own module list). `size` is the mapped region
+/// size in bytes (`region_size` at load time -- page-aligned, includes the GOT), not the raw
+/// object-file size `[module] name: loading (N byte object)` logs at boot -- the real Linux
+/// "Size" column is a memory footprint, not an on-disk size, and this is the closer analog.
+pub(crate) extern "C" fn oxidebsd_proc_modules(buf_ptr: *mut u8, buf_cap: u64) -> i64 {
+    let modules = LOADED_MODULES.lock();
+    let mut out = Vec::new();
+    for entry in modules.iter().rev() {
+        out.extend_from_slice(entry.name.as_bytes());
+        out.push(b' ');
+        crate::process::push_decimal(&mut out, entry.size);
+        out.extend_from_slice(b" 0 - Live 0x");
+        push_hex(&mut out, entry.base);
+        out.push(b'\n');
+    }
+    drop(modules);
+    crate::process::copy_into(&out, buf_ptr, buf_cap)
+}
+
+/// Appends `value`'s lowercase hex representation (no leading zeros, no `0x` prefix -- callers add
+/// that themselves, matching real `/proc/modules`' own `0x...` address column).
+fn push_hex(out: &mut Vec<u8>, value: u64) {
+    if value == 0 {
+        out.push(b'0');
+        return;
+    }
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut digits = [0u8; 16];
+    let mut n = 0;
+    let mut v = value;
+    while v > 0 {
+        digits[n] = DIGITS[(v % 16) as usize];
+        v /= 16;
+        n += 1;
+    }
+    out.extend(digits[..n].iter().rev());
 }
 
 /// Claims `size` bytes of the kernel-module virtual address region, bump-allocator style --
@@ -646,6 +711,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_proc_stat_global" => {
             Some(crate::process::oxidebsd_proc_stat_global as *const () as u64)
         }
+        "oxidebsd_proc_modules" => Some(oxidebsd_proc_modules as *const () as u64),
         "oxidebsd_fd_at" => Some(crate::fd::oxidebsd_fd_at as *const () as u64),
         "oxidebsd_sys_socket" => Some(crate::net::udp::oxidebsd_sys_socket as *const () as u64),
         "oxidebsd_sys_bind" => Some(crate::net::udp::oxidebsd_sys_bind as *const () as u64),

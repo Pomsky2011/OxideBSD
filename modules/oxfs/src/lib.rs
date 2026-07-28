@@ -84,6 +84,7 @@ unsafe extern "C" {
     fn oxidebsd_proc_meminfo(buf_ptr: *mut u8, buf_cap: u64) -> i64;
     fn oxidebsd_proc_uptime(buf_ptr: *mut u8, buf_cap: u64) -> i64;
     fn oxidebsd_proc_stat_global(buf_ptr: *mut u8, buf_cap: u64) -> i64;
+    fn oxidebsd_proc_modules(buf_ptr: *mut u8, buf_cap: u64) -> i64;
     fn oxidebsd_fd_at(pid: u64, index: u64) -> i64;
     fn oxidebsd_random_bytes(ptr: u64, len: u64) -> i64;
     fn oxidebsd_current_uid() -> u64;
@@ -1494,7 +1495,7 @@ fn open_proc_root_dir() -> i64 {
             out.push_bytes(b"\n");
             i += 1;
         }
-        out.push_bytes(b"meminfo\nuptime\nstat\n");
+        out.push_bytes(b"meminfo\nuptime\nstat\nmodules\n");
         out.len
     };
     register_open_file(OpenFile::ProcDir {
@@ -1587,12 +1588,13 @@ enum ProcSysFile {
     Meminfo,
     Uptime,
     Stat,
+    Modules,
 }
 
-/// `/proc/{meminfo,uptime,stat}`: same "format once at open time into a fixed buffer" shape
-/// `open_proc_leaf` uses for the per-pid leaves, just backed by the three system-wide kernel
+/// `/proc/{meminfo,uptime,stat,modules}`: same "format once at open time into a fixed buffer"
+/// shape `open_proc_leaf` uses for the per-pid leaves, just backed by the four system-wide kernel
 /// accessors instead of a per-pid one. Unlike `open_proc_leaf`, there's no pid to vanish out from
-/// under this call -- these three never fail.
+/// under this call -- these four never fail.
 fn open_proc_sysfile(kind: ProcSysFile) -> i64 {
     let mut content = [0u8; PROC_BUFFER];
     // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures; each
@@ -1603,6 +1605,9 @@ fn open_proc_sysfile(kind: ProcSysFile) -> i64 {
             ProcSysFile::Uptime => oxidebsd_proc_uptime(content.as_mut_ptr(), PROC_BUFFER as u64),
             ProcSysFile::Stat => {
                 oxidebsd_proc_stat_global(content.as_mut_ptr(), PROC_BUFFER as u64)
+            }
+            ProcSysFile::Modules => {
+                oxidebsd_proc_modules(content.as_mut_ptr(), PROC_BUFFER as u64)
             }
         }
     };
@@ -1656,6 +1661,7 @@ fn proc_open(suffix: &[u8]) -> i64 {
         b"/meminfo" => return open_proc_sysfile(ProcSysFile::Meminfo),
         b"/uptime" => return open_proc_sysfile(ProcSysFile::Uptime),
         b"/stat" => return open_proc_sysfile(ProcSysFile::Stat),
+        b"/modules" => return open_proc_sysfile(ProcSysFile::Modules),
         _ => {}
     }
     let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
@@ -1712,7 +1718,7 @@ fn proc_open(suffix: &[u8]) -> i64 {
 /// doesn't need.
 fn proc_kind(suffix: &[u8]) -> Option<bool> {
     match suffix {
-        b"/meminfo" | b"/uptime" | b"/stat" => return Some(false),
+        b"/meminfo" | b"/uptime" | b"/stat" | b"/modules" => return Some(false),
         _ => {}
     }
     let mut comps = suffix.split(|&b| b == b'/').filter(|c| !c.is_empty());
@@ -2557,9 +2563,9 @@ fn decimal_into(buf: &mut [u8], value: u64) -> usize {
 fn proc_dir_nth_entry(kind: ProcDirKind, n: usize) -> Option<(u64, [u8; NAME_MAX], u8, u8)> {
     match kind {
         ProcDirKind::Root => {
-            // The three system-wide files come first (indices 0-2), so no live-pid count needs
-            // computing up front -- pid entries simply start at index 3.
-            const SYS_NAMES: [&[u8]; 3] = [b"meminfo", b"uptime", b"stat"];
+            // The system-wide files come first (indices 0..SYS_NAMES.len()), so no live-pid count
+            // needs computing up front -- pid entries simply start right after them.
+            const SYS_NAMES: [&[u8]; 4] = [b"meminfo", b"uptime", b"stat", b"modules"];
             if let Some(name_bytes) = SYS_NAMES.get(n) {
                 let mut name = [0u8; NAME_MAX];
                 name[..name_bytes.len()].copy_from_slice(name_bytes);
@@ -2752,6 +2758,18 @@ fn seed_file(parent: u32, name: &[u8], content: &[u8]) -> bool {
     write_inode_data(inode, content) && dir_insert(parent, name, inode).is_ok()
 }
 
+/// `seed_file`'s symlink counterpart -- allocates a fresh `InodeKind::Symlink` inode under
+/// `parent` named `name`, pointing at `target` (stored verbatim, exactly like `oxfs_symlink`
+/// itself stores a real caller's target -- see that function's own doc comment). Used to seed
+/// `/bin/lsmod` as an alias of `/bin/lsoxmod` without needing two copies of the same binary.
+fn seed_symlink(parent: u32, name: &[u8], target: &[u8]) -> bool {
+    let Some(inode) = alloc_inode() else {
+        return false;
+    };
+    write_inode(inode, Inode::new(InodeKind::Symlink));
+    write_inode_data(inode, target) && dir_insert(parent, name, inode).is_ok()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     let root = alloc_inode().expect("oxfs: failed to allocate root inode");
@@ -2801,6 +2819,17 @@ pub extern "C" fn module_init() -> i32 {
 
     ok &= seed_file(bin, b"smoke", include_bytes!(env!("OXFS_SMOKE_ELF_PATH")));
     ok &= seed_file(bin, b"musl", include_bytes!(env!("OXFS_MUSL_ELF_PATH")));
+    // lsoxmod: a real standalone Rust userland ELF (userland/lsoxmod/, same "freestanding,
+    // raw-SYSCALL, no musl/BusyBox involved" category as smoke/musl above), not a BusyBox applet
+    // -- lists OxideBSD's own dynamically loaded kernel modules by reading the real /proc/modules
+    // this pass added, the same "port real format, read real data" approach the rest of this
+    // filesystem's /proc support already uses. `lsmod` is seeded as a real symlink to it rather
+    // than a second copy of the same bytes -- real BusyBox has its own `lsmod` (see CLAUDE.md's
+    // BusyBox gap analysis), but that one reads Linux's own `/proc/modules` format expecting real
+    // Linux kernel modules, not this kernel's own module system, so the name is intentionally
+    // pointed at the OxideBSD-native tool instead of BusyBox's applet of the same name.
+    ok &= seed_file(bin, b"lsoxmod", include_bytes!(env!("OXFS_LSOXMOD_ELF_PATH")));
+    ok &= seed_symlink(bin, b"lsmod", b"lsoxmod");
     ok &= seed_file(bin, b"true", include_bytes!(env!("OXFS_TRUE_ELF_PATH")));
     ok &= seed_file(bin, b"echo", include_bytes!(env!("OXFS_ECHO_ELF_PATH")));
     ok &= seed_file(bin, b"cat", include_bytes!(env!("OXFS_CAT_ELF_PATH")));
@@ -3881,14 +3910,19 @@ pub extern "C" fn module_init() -> i32 {
         }
     }
 
-    // --- /proc system-wide files (meminfo/uptime/stat), through the real registered handlers. ---
-    // No real process exists yet at this point in boot, but these three don't need one (unlike
-    // ProcDirKind::PidFiles/TaskList/FdList navigation, which does -- covered by tests/
+    // --- /proc system-wide files (meminfo/uptime/stat/modules), through the real registered
+    // handlers. No real process exists yet at this point in boot, but these four don't need one
+    // (unlike ProcDirKind::PidFiles/TaskList/FdList navigation, which does -- covered by tests/
     // proc_smoke.rs's own real-SYSCALL test instead, since it needs a real spawned process).
+    // `/proc/modules` in particular can only be checked here for "oxfs is listed" -- src/
+    // module.rs's `load()` records this module's own entry *before* calling `module_init` (this
+    // very function), specifically so a module's own self-check can see itself already present,
+    // matching real Linux's own "present in /proc/modules the instant relocation finishes" timing.
     for (path, needle) in [
         (b"/proc/meminfo".as_slice(), b"MemTotal".as_slice()),
         (b"/proc/uptime".as_slice(), b".".as_slice()),
         (b"/proc/stat".as_slice(), b"cpu".as_slice()),
+        (b"/proc/modules".as_slice(), b"oxfs".as_slice()),
     ] {
         let mut buf = [0u8; PROC_BUFFER];
         let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, 0, 0);
