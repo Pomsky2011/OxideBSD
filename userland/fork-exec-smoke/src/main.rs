@@ -90,7 +90,10 @@ pub extern "C" fn _start() -> ! {
             let mut status: i32 = -1;
             let wait_result =
                 unsafe { syscall(SYS_WAIT4, child_pid, &mut status as *mut i32 as u64, 0) };
-            let ok = wait_result == Ok(child_pid) && status == CHILD_EXIT_CODE as i32;
+            // Real WEXITSTATUS encoding -- see `src/syscall.rs`'s `oxidebsd_sys_exit` doc comment
+            // for why the reported status is the raw exit code shifted into bits 8-15, not the
+            // raw code itself.
+            let ok = wait_result == Ok(child_pid) && status == (CHILD_EXIT_CODE as i32) << 8;
             if ok {
                 write_bytes(b"fork-exec-smoke: PASS\n");
             } else {

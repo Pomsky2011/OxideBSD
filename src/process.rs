@@ -1029,13 +1029,29 @@ fn terminate_process(pid: Pid, code: i32) {
 ///   a handler installed won't see the signal promptly. Acceptable for this pass: the common,
 ///   high-value case (killing something with no handler) works correctly and immediately.
 pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
-    if !(1..=31).contains(&sig) {
+    if !(0..=31).contains(&sig) {
         return Err(EINVAL);
     }
     if target_pid <= 0 {
         return Err(EINVAL);
     }
     let target = target_pid as u64;
+
+    // Real kill(pid, 0): no signal is actually sent -- only existence (real kill(2) also checks
+    // permission, which this kernel's own do_kill doesn't check for any signal, see this
+    // function's own doc comment) is checked. The standard POSIX idiom for "is this pid still
+    // alive" (`kill -0 $pid`) depends on this, and would otherwise always fail EINVAL since 0
+    // isn't a real signal number.
+    if sig == 0 {
+        if target == caller_pid {
+            return Ok(0);
+        }
+        let table = PROCESS_TABLE.lock();
+        return match table.get(&target) {
+            Some(_) => Ok(0), // zombie counts too -- still "exists" until reaped
+            None => Err(ESRCH),
+        };
+    }
     let sig = sig as u64;
 
     if target == caller_pid {

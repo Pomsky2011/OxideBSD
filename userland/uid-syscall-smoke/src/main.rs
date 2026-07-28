@@ -24,8 +24,9 @@
 //!    regardless) grant it anything, so this must fail `EACCES`: the one check in this whole test
 //!    that exercises `check_access` denying something for real, not just the always-true root-
 //!    bypass path every earlier step ran through. The parent `wait4()`s the child and checks its
-//!    real exit code (raw, unshifted -- see `process::do_wait4`'s own status-write, unlike real
-//!    Linux's `WEXITSTATUS` shift) for `0`.
+//!    real exit code (via the real `WEXITSTATUS` encoding -- see `src/syscall.rs`'s
+//!    `oxidebsd_sys_exit` doc comment -- for `0`, which is shift-invariant so this check needed no
+//!    change when that encoding was fixed).
 #![no_std]
 #![no_main]
 

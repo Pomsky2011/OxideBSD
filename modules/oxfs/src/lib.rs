@@ -113,11 +113,23 @@ const SYS_SYMLINK: u64 = 155;
 /// `posix_compat` (same reasoning `SYS_STAT`/`SYS_FSTAT`/`SYS_LSTAT` already established).
 const SYS_CHMOD: u64 = 165;
 const SYS_CHOWN: u64 = 166;
+/// Next after `SYS_CHOWN=166` -- see `oxfs_utimensat`'s own doc comment for what this actually
+/// does (a real existence check, no real timestamp storage) and why that's enough to unblock
+/// BusyBox's `touch.c`.
+const SYS_UTIMENSAT: u64 = 167;
 
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
 /// `open()` passes real POSIX flag values).
 const O_CREAT: u64 = 0o100;
+
+/// Real generic (this target has no x86_64-specific override, see `third_party/musl/arch/
+/// generic/bits/fcntl.h`) POSIX values, backing real write-to-an-existing-file support in
+/// `oxfs_open` -- see that function's own doc comment for why these matter now (they didn't
+/// before: every open of an existing path used to always end up read-only regardless of what the
+/// caller actually asked for).
+const O_ACCMODE: u64 = 0o3;
+const O_APPEND: u64 = 0o2000;
 
 /// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`/`S_IFLNK`) -- these are the type bits
 /// only, ORed with an inode's own real `mode` field (permission bits) when building a `stat`
@@ -1289,8 +1301,7 @@ enum OpenFile {
         dirent_pos: usize,
     },
     /// A file opened for writing -- accumulates across possibly-multiple `write` calls, committed
-    /// to a real inode only at `close` time (same all-at-once-on-close model
-    /// `modules/fat32` already uses).
+    /// only at `close` time (same all-at-once-on-close model `modules/fat32` already uses).
     Write {
         parent_inode: u32,
         name: [u8; NAME_MAX],
@@ -1300,8 +1311,19 @@ enum OpenFile {
         /// The caller's own uid at `open(O_CREAT)` time -- real Unix ownership semantics (a
         /// freshly created file is owned by its creator, not always root) -- captured here rather
         /// than re-queried at `close` time since a real program can `open` in one process and
-        /// (via a shared fd, e.g. across `fork`) close in another.
+        /// (via a shared fd, e.g. across `fork`) close in another. Unused (but still populated,
+        /// for a fresh file) when `existing_inode` is `Some` -- overwriting/appending to a file
+        /// that already exists never changes its owner, matching real POSIX `open()`/`write()`.
         owner_uid: u32,
+        /// `None`: no inode exists yet for `name` -- `close` allocates a fresh one and inserts it
+        /// (the original, only-ever-create behavior this filesystem had before real O_TRUNC/
+        /// O_APPEND/O_WRONLY support on an *existing* path existed). `Some(inode)`: `name` already
+        /// resolves to `inode` -- `close` overwrites that inode's own content in place via
+        /// `write_inode_data` instead of allocating a second inode and re-inserting the directory
+        /// entry (which would either collide with or orphan the original). Real POSIX overwrite/
+        /// append semantics for an existing file need this distinction: same inode number, same
+        /// owner/mode, same directory entry, just new content.
+        existing_inode: Option<u32>,
     },
     /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
     /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
@@ -1814,21 +1836,49 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
             } else {
                 inode_num
             };
-            // Real permission check -- see check_access's own doc comment. This module's own
-            // open() always ends up reading regardless of the caller's O_WRONLY/O_RDWR intent (a
-            // pre-existing simplification, not something this pass changes), so "read" is the one
-            // real access this call ever performs against an *existing* file/dir; do_execve's own
-            // ELF-loading read (see src/process.rs) goes through this exact path too, so this
-            // doubles as its execute-permission check, approximated by the read bit rather than a
-            // separate execute check -- a known, documented simplification, harmless while every
-            // seeded file's default mode (0o755) sets both bits identically.
+            // Real permission check -- see check_access's own doc comment. `want_write` is real
+            // now (see this function's own doc comment for the history: every open of an existing
+            // path used to always end up read-only regardless of O_WRONLY/O_RDWR); do_execve's own
+            // ELF-loading read (see src/process.rs) always opens read-only, so its own approximate
+            // execute-permission-via-read-bit check (a known, documented simplification, harmless
+            // while every seeded file's default mode 0o755 sets both bits identically) is
+            // unaffected by this.
             let inode = read_inode(resolved);
             let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
-            if !check_access(&inode, uid, gid, false) {
+            // Real O_RDONLY is 0 -- "anything but that" in the low two bits means O_WRONLY/O_RDWR.
+            let want_write = flags & O_ACCMODE != 0;
+            if !check_access(&inode, uid, gid, want_write) {
                 return -EACCES;
             }
             match inode.kind {
+                InodeKind::Dir if want_write => -EISDIR,
                 InodeKind::Dir => open_dir_listing(resolved),
+                _ if want_write => {
+                    let mut name = [0u8; NAME_MAX];
+                    name[..leaf.len()].copy_from_slice(leaf);
+                    let mut buffer = [0u8; MAX_WRITE_BUFFER];
+                    let mut len = 0;
+                    // O_APPEND: start from the file's real existing content, so subsequent writes
+                    // land after it rather than replacing it -- otherwise (plain O_WRONLY/O_RDWR,
+                    // with or without an explicit O_TRUNC) start empty, real POSIX truncate-on-
+                    // write-open semantics (this filesystem has no way to write only *part* of a
+                    // file in place -- see write_inode_data's own doc comment -- so there's no
+                    // separate "O_WRONLY without O_TRUNC" case to support here; the last real
+                    // difference O_TRUNC would make, leaving the old content until the write
+                    // actually happens, doesn't matter for any caller in this port's roster).
+                    if flags & O_APPEND != 0 {
+                        len = read_inode_at(resolved, 0, &mut buffer);
+                    }
+                    register_open_file(OpenFile::Write {
+                        parent_inode: parent,
+                        name,
+                        name_len: leaf.len() as u8,
+                        buffer,
+                        len,
+                        owner_uid: inode.uid,
+                        existing_inode: Some(resolved),
+                    })
+                }
                 _ => register_open_file(OpenFile::FileRead {
                     inode: resolved,
                     position: 0,
@@ -1850,6 +1900,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                 buffer: [0; MAX_WRITE_BUFFER],
                 len: 0,
                 owner_uid: uid as u32,
+                existing_inode: None,
             })
         }
         None => -ENOENT,
@@ -1970,8 +2021,20 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
         buffer,
         len,
         owner_uid,
+        existing_inode,
     } = file
     {
+        // Overwriting/appending to a file that already exists: write the new content into its own
+        // existing inode -- same inode number, same directory entry, same owner/mode -- rather
+        // than allocating a second inode and re-inserting the name (which would either collide
+        // with or orphan the original entry; see OpenFile::Write's own doc comment).
+        if let Some(inode_num) = existing_inode {
+            return if write_inode_data(inode_num, &buffer[..len]) {
+                0
+            } else {
+                -EIO
+            };
+        }
         let Some(new_inode) = alloc_inode() else {
             return -ENOSPC;
         };
@@ -2410,6 +2473,46 @@ extern "C" fn oxfs_chown(path_ptr: u64, path_len: u64, uid: u64, gid: u64) -> i6
     0
 }
 
+/// Registered for `SYS_UTIMENSAT`. `(path_ptr, path_len, _times_ptr, _flags)` -- see
+/// `third_party/musl/src/stat/utimensat.c`'s own patch comment for the real wire-format story
+/// (dropped the always-`AT_FDCWD` `fd` argument, computed `path_len` explicitly). This filesystem
+/// has no real per-inode timestamp fields at all yet (`write_stat`'s own `st_*time*` fields are
+/// still fixed placeholders) -- so this is a real existence check (`ENOENT` for a path that
+/// doesn't resolve, matching real `utimensat(2)`) with a no-op success otherwise, not a real
+/// timestamp update. That's the one thing BusyBox's `touch.c` actually needs from this call
+/// working correctly: it treats `ENOENT` specifically as "the file doesn't exist yet" and falls
+/// back to `open(O_CREAT)` to create it (already fully working) -- an unconditional success here
+/// (with no existence check at all) would have broken that fallback by making `touch newfile`
+/// silently do nothing instead of creating `newfile`. `_times_ptr`/`_flags` are read by nothing
+/// here (no timestamps to set), but still accepted in the wire format for a future real
+/// implementation to use.
+extern "C" fn oxfs_utimensat(path_ptr: u64, path_len: u64, _times_ptr: u64, _flags: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        return match proc_kind(&path[5..]) {
+            Some(_) => 0,
+            None => -ENOENT,
+        };
+    }
+
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        // cwd inside /proc, and a *relative* (non-`/`-leading) target: no real caller in this
+        // port's roster does this (touch.c always operates on a real filesystem path), so this
+        // deliberately doesn't grow a dedicated proc-relative-existence helper just for it --
+        // ENOENT is the honest, real POSIX answer for "this doesn't resolve to anything," not a
+        // dodge for something the ELF-loading-relevant paths above still handle for real.
+        Cwd::Proc(_) if path.first() != Some(&b'/') => return -ENOENT,
+        Cwd::Proc(_) => ROOT_INODE,
+    };
+    match resolve_path(cwd, path) {
+        Ok(_) => 0,
+        Err(e) => errno_for(e),
+    }
+}
+
 /// Registered for `SYS_FSTAT`. `fd` here is the calling *process's* own fd number, not this
 /// module's `real_fd` -- `oxidebsd_real_fd_of` (see its own doc comment in `src/fd.rs`) resolves
 /// that first, the same way `SYS_READ`/`SYS_WRITE` get it resolved for them automatically by
@@ -2675,6 +2778,18 @@ pub extern "C" fn module_init() -> i32 {
         *b = b'A' + (i % 26) as u8;
     }
     ok &= seed_file(root, b"big.txt", &big);
+
+    // A real applet self-test, meant to be run by hand at the hush prompt (`sh /test_busybox.sh`)
+    // -- see that file's own header comment for why it's written the way it is: this kernel's
+    // actual `sh` build has HUSH_IF/HUSH_LOOPS/HUSH_CASE/HUSH_FUNCTIONS/HUSH_TICK all off (checked
+    // against the real generated target/busybox-sh/.config, not assumed from BusyBox's own
+    // Kconfig defaults), so it's a flat sequence of real applet invocations using only
+    // redirection/pipes/`&&`/`||`, not an if/for-based test harness.
+    ok &= seed_file(
+        root,
+        b"test_busybox.sh",
+        include_bytes!("test_busybox.sh"),
+    );
 
     // All executables live under /bin, not root -- matches `src/process.rs`'s pid-1 `PATH=/bin`
     // envp, so a bare command name (`ls`, not `/ls`) resolves via musl's real `execvp` search.
@@ -3690,6 +3805,82 @@ pub extern "C" fn module_init() -> i32 {
         }
     }
 
+    // --- Real write-to-an-existing-file support (O_WRONLY overwrite/truncate, O_APPEND, EISDIR
+    // on a directory) -- see this pass's own CLAUDE.md entry for why this used to be impossible:
+    // any open of an existing path always came back read-only, so a file could only ever be
+    // written once, for its entire lifetime.
+    {
+        const O_WRONLY: u64 = 0o1;
+        const O_APPEND: u64 = 0o2000;
+        let path = b"/overwrite_test.txt";
+
+        let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, O_CREAT, 0);
+        if fd < 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: create overwrite_test.txt failed\n");
+        } else {
+            let fd = fd as u64;
+            oxfs_write(fd, b"AAAAA".as_ptr() as u64, 5);
+            oxfs_close(fd);
+
+            // Plain O_WRONLY on an existing path: real overwrite-from-scratch, including a real
+            // truncate (writing fewer bytes than before must not leave the old tail behind).
+            let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, O_WRONLY, 0);
+            if fd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: O_WRONLY reopen of an existing file failed\n");
+            } else {
+                let fd = fd as u64;
+                oxfs_write(fd, b"BB".as_ptr() as u64, 2);
+                oxfs_close(fd);
+
+                let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, 0, 0);
+                let mut buf = [0u8; 16];
+                let n = oxfs_read(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+                oxfs_close(fd as u64);
+                if fd < 0 || n != 2 || &buf[..2] != b"BB" {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: O_WRONLY overwrite did not truncate correctly\n");
+                }
+            }
+
+            // O_APPEND: new writes land after the real existing content, not replacing it.
+            let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, O_WRONLY | O_APPEND, 0);
+            if fd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: O_APPEND reopen of an existing file failed\n");
+            } else {
+                let fd = fd as u64;
+                oxfs_write(fd, b"CC".as_ptr() as u64, 2);
+                oxfs_close(fd);
+
+                let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, 0, 0);
+                let mut buf = [0u8; 16];
+                let n = oxfs_read(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+                oxfs_close(fd as u64);
+                if fd < 0 || n != 4 || &buf[..4] != b"BBCC" {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: O_APPEND did not preserve existing content\n");
+                }
+            }
+
+            oxfs_unlink(path.as_ptr() as u64, path.len() as u64, 0, 0);
+        }
+
+        // Opening a real directory (not the "/" special case) for writing is a real EISDIR now.
+        let dir_path = b"/writetest_dir";
+        if oxfs_mkdir(dir_path.as_ptr() as u64, dir_path.len() as u64, 0, 0) != 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: mkdir /writetest_dir failed\n");
+        } else {
+            if oxfs_open(dir_path.as_ptr() as u64, dir_path.len() as u64, O_WRONLY, 0) != -EISDIR {
+                ok = false;
+                log("[oxfs] self-check FAILED: O_WRONLY on a directory should be EISDIR\n");
+            }
+            oxfs_rmdir(dir_path.as_ptr() as u64, dir_path.len() as u64, 0, 0);
+        }
+    }
+
     // --- /proc system-wide files (meminfo/uptime/stat), through the real registered handlers. ---
     // No real process exists yet at this point in boot, but these three don't need one (unlike
     // ProcDirKind::PidFiles/TaskList/FdList navigation, which does -- covered by tests/
@@ -3965,6 +4156,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_GETDENTS, oxfs_getdents);
         oxidebsd_register_syscall(SYS_CHMOD, oxfs_chmod);
         oxidebsd_register_syscall(SYS_CHOWN, oxfs_chown);
+        oxidebsd_register_syscall(SYS_UTIMENSAT, oxfs_utimensat);
     }
 
     if ok {

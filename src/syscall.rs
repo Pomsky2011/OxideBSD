@@ -732,8 +732,9 @@ pub(crate) fn sys_set_fs_base(base: u64) -> Result<u64, u64> {
 /// `SYS_KILL` (`116`) — matches real `kill(2)`'s exact `(pid, sig)` wire format, same
 /// "no argument-convention patch needed" story `sys_pipe`/`sys_dup2` already established.
 /// Delegates to `process::do_kill` — see that function's own doc comment for what's and isn't
-/// supported (no process-group/broadcast targeting, signals 1-31 only, no `EINTR` for a signal
-/// that arrives while the target is already blocked on something else).
+/// supported (no process-group/broadcast targeting, signals 0-31 -- `0` is the real POSIX
+/// existence-check convention, no signal actually sent -- no `EINTR` for a signal that arrives
+/// while the target is already blocked on something else).
 pub(crate) fn sys_kill(pid: u64, sig: u64) -> Result<u64, u64> {
     crate::process::do_kill(crate::scheduler::current_pid(), pid as i64, sig as i64)
 }
@@ -1014,8 +1015,34 @@ pub(crate) fn sys_clock_gettime(clockid: u64, ts_ptr: u64) -> Result<u64, u64> {
 /// `oxidebsd_sys_exit` goes through `process::do_exit` — real, per-process termination that hands
 /// control to whatever the scheduler picks next, only falling back to a full `hlt_loop()` when
 /// nothing else is runnable.
+///
+/// **The exit code is shifted into bits 8-15 before reaching `do_exit`, matching real
+/// `wait(2)`'s status-word encoding** (`WIFEXITED(status)` is `(status & 0x7f) == 0`;
+/// `WEXITSTATUS(status)` is `(status >> 8) & 0xff`) — found live, the hard way: an earlier
+/// version stored the caller's raw exit code unshifted, which happened to round-trip fine
+/// against this kernel's own test suite (every test that checks `wait4`'s reported status against
+/// a raw exit code agreed with itself, since both the write side and the read side used the same
+/// wrong convention) but is real POSIX-incompatible ABI breakage for a real caller checking the
+/// status the standard way. Confirmed live: BusyBox's `hush`, driving real applets through this
+/// exact wait4/status path, uses the real `WIFSIGNALED`/`WTERMSIG` macros
+/// (`third_party/busybox/shell/hush.c`'s `checkjobs`) to decide whether to print a
+/// `strsignal()`-derived death message -- with the unshifted encoding, *any* applet exiting
+/// normally with a nonzero code (extremely common: `touch`/`tee`/`rm`/... all do this on their own
+/// ordinary internal errors) had its raw low byte misread as "terminated by signal N", e.g. exit
+/// code `1` decoded as `WTERMSIG == 1 == SIGHUP` -- printing a spurious "Hangup" after essentially
+/// any failing command and (per `checkjobs`' own default-signal-death handling) corrupting later
+/// commands in the same interactive session. Signal-based termination (`process::do_kill`'s
+/// `Terminate` branch, and `SignalDelivery::Terminate`'s own self-delivery path in this same file)
+/// already passes `terminate_process`/`do_exit` a pre-encoded `128 + sig` value directly -- *not*
+/// shifted here, and must stay that way: its low 7 bits already equal the real signal number
+/// (`(128 + sig) & 0x7f == sig` for `sig < 128`), which is everything `WIFSIGNALED`/`WTERMSIG`
+/// actually look at, so it was already real-wait-status-compatible before this fix and shifting it
+/// again here would corrupt it. This function is the *only* place a genuine user-supplied
+/// `exit(code)` value becomes a `Zombie` status, which is why the shift belongs here and not
+/// inside `do_exit`/`terminate_process` themselves (shared by both conventions).
 pub(crate) extern "C" fn oxidebsd_sys_exit(code: u64) -> ! {
-    crate::process::do_exit(crate::scheduler::current_pid(), code as i32)
+    let status = ((code as i32) & 0xff) << 8;
+    crate::process::do_exit(crate::scheduler::current_pid(), status)
 }
 
 // `pub`, not `pub(crate)` -- same "kept public for test use" precedent `oxidebsd_register_syscall`

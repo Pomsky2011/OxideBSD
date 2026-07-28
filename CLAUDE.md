@@ -292,6 +292,27 @@ Key gotchas:
   `rename`/`readlink`/`symlink` (oxfs) and `chdir`/`mkdir` — **any future libc call ported here
   needs the same audit**: matching the syscall *number* isn't sufficient if the argument shape
   differs.
+- **A hand-written asm stub can bypass the `__NR_*` remap table entirely.** `src/process/x86_64/
+  vfork.s` doesn't go through `syscall(SYS_vfork, ...)` at all — it's raw x86_64 asm hardcoding the
+  real Linux syscall number (`58`) directly (`third_party/musl` ships several architectures' worth
+  of hand-written `vfork.s`, this project only touches the `x86_64` one). Editing
+  `bits/syscall.h.in`'s `__NR_vfork` entry has zero effect on it — found live via `xargs` (whose
+  own child-spawn path calls `vfork()` directly), failing with `ENOSYS`/`echo: No child process`.
+  Fixed by hardcoding OxideBSD's own `SYS_FORK` number (`2`) directly in the asm instead — a real
+  fork(), not true vfork() share-until-exec semantics, but a real, POSIX-legal implementation
+  vfork() is explicitly allowed to be. **Any future syscall with its own hand-written arch-specific
+  asm stub (check `third_party/musl/src/*/x86_64/*.s`) needs this same direct-patch treatment, not
+  just a header remap.**
+- **`utimensat` (`SYS_UTIMENSAT=167`, `modules/oxfs`)** — same call-site patch pattern as `chown`/
+  `rename`: `src/stat/utimensat.c` drops the always-`AT_FDCWD` `fd` argument (this port has no real
+  dirfd-relative resolution, same limitation every other `*at()`-shaped call already accepts) and
+  computes `path_len` via `strlen()`, passing `(path_ptr, path_len, times_ptr, flags)`. The kernel
+  side is a real *existence check* only (`ENOENT` for a path that doesn't resolve, success
+  otherwise) — oxfs has no per-inode timestamp fields at all yet, so there's nothing to actually
+  update. That's still enough to unblock BusyBox's `touch.c`: it treats `ENOENT` specifically as
+  "must create the file" and falls back to `open(O_CREAT)`, which already worked — an
+  unconditional-success stub (no existence check at all) would have silently broken that fallback
+  instead, making `touch newfile` a no-op rather than creating anything.
 - Syscalls from this pass: `SYS_MMAP=100` (`(addr_hint, len, prot)` — matches musl's actual
   `mmap()` call site, not an idealized layout; always anonymous+private, bump-allocated from a
   fixed VA window, never reclaimed), `SYS_MUNMAP=101` (no-op success), `SYS_BRK=102` (grows/
@@ -320,7 +341,15 @@ every built applet tagged with what it's still missing (`NEEDS_NETWORK`/`NEEDS_P
 `NEEDS_CLOCK`/`NEEDS_UID`/`NEEDS_SYSCALL`/`NEEDS_HARDWARE`/`NEEDS_BLOCKDEV`/`NEEDS_INIT`, or
 `WORKS` if it needs nothing this kernel doesn't already have), plus every candidate that didn't
 build at all and why (almost entirely missing Linux uapi headers musl doesn't vendor — framebuffer/
-VT/MTD/I2C/netlink ioctl tools with no portable equivalent). `build_busybox_applet` is also now
+VT/MTD/I2C/netlink ioctl tools with no portable equivalent). `modules/oxfs/src/test_busybox.sh`
+(seeded into oxfs at `/test_busybox.sh`, run by hand via `sh /test_busybox.sh` at the hush prompt —
+see its own header comment for why it's a flat sequence of real applet invocations, not an
+if/for-based test harness: this kernel's actual `sh` build has no shell control flow at all, see
+this file's own musl-port section) exercises ~20 real applets against hand-written expected output
+and found three real, now-fixed bugs this way, none visible from `cargo test`/`clippy` staying
+green: the `wait4`/exit-status encoding bug and the `kill(pid, 0)` gap (see this file's own
+Process/scheduler section) and the missing `vfork`/`utimensat` syscalls (see this file's own
+musl-port section). `build_busybox_applet` is also now
 staleness-checked (skips its own `allnoconfig`/`oldconfig`/`make` sequence if that applet's already-
 built binary is newer than both `third_party/busybox` and `build.rs` itself) and the whole roster
 builds in parallel across a worker pool sized to `available_parallelism()` — both load-bearing at
@@ -438,8 +467,39 @@ copy), no SMP, no frame deallocation anywhere.
 - `gdt::set_kernel_stack` repoints `TSS.RSP0` on every context switch, via a raw pointer (not
   `&mut`, since `spin::Lazy` has no `DerefMut`) — sound only because nothing else holds a live
   reference across the call (single-core, interrupts disabled during scheduling).
+- **`do_wait4`'s reported status is real `wait(2)`-encoded now — `oxidebsd_sys_exit` shifts a
+  normal exit code into bits 8-15** (`WEXITSTATUS`'s own bit position; low 7 bits zero, matching
+  `WIFEXITED`), not the raw code. Found live, the hard way, via `modules/oxfs/src/test_busybox.sh`
+  (a real applet self-test run interactively through `hush`): the old, unshifted convention was
+  self-consistent against every prior test here (both the write side and every test's own read
+  side agreed on it), but real POSIX-compliant code checking status via `WIFSIGNALED`/`WTERMSIG`
+  the standard way — BusyBox `hush`'s own `checkjobs()` in `third_party/busybox/shell/hush.c` — got
+  it completely wrong: *any* applet exiting normally with a nonzero code (`touch`/`tee`/`rm`/...
+  erroring for their own ordinary reasons, extremely common) had its raw low byte misread as
+  "terminated by signal N" (`exit(1)` decoded as `WTERMSIG == SIGHUP`), printing a spurious
+  "Hangup" after nearly any failing command and — per `checkjobs`' own default-signal-death
+  handling — corrupting later commands in the same interactive session, cascading into
+  increasingly garbled output. Signal-based termination (`process::do_kill`'s `Terminate` branch,
+  and `SignalDelivery::Terminate`'s self-delivery path in `src/syscall.rs`) already passes
+  `terminate_process`/`do_exit` a pre-encoded `128 + sig` value directly — *not* shifted by this
+  fix, and must stay that way: its low 7 bits already equal the real signal number, everything
+  `WIFSIGNALED`/`WTERMSIG` actually look at, so it was already real-wait-status-compatible.
+  `oxidebsd_sys_exit` is the *only* place a genuine user `exit(code)` value becomes a `Zombie`
+  status, which is why the shift belongs there and not inside `do_exit`/`terminate_process`
+  themselves (shared by both conventions). `userland/fork-exec-smoke`'s own status check
+  (`CHILD_EXIT_CODE = 77`) updated to `77 << 8` to match; `uid-syscall-smoke`'s `status == 0` check
+  needed no change (shift-invariant).
+- **`kill(pid, 0)`** — the real POSIX "does this process exist" existence-check convention (send no
+  signal, just check) used to be a flat `EINVAL` (`do_kill` only accepted `1..=31`). Found the same
+  way, via the same self-test's own `kill -0 $$` check. Fixed: `sig == 0` now does a real
+  existence-only check (self or cross-process; a zombie still counts as "exists" until reaped),
+  bypassing the pending-signal bitmask entirely rather than computing a bogus `1 << (0 - 1)`.
 - `tests/fork_wait.rs` + `userland/fork-exec-smoke/` is the automated coverage for this subsystem
   (fork/wait4/exit round trip, no filesystem/execve involved) — see Test architecture above.
+  `modules/oxfs/src/test_busybox.sh` (see the BusyBox section below) is a real, much broader
+  applet-level self-test meant to be run by hand at the hush prompt (`sh /test_busybox.sh`) — it
+  found both bugs above and can't be automated the way `fork_wait.rs` is, since OxideBSD's stdin is
+  real PS/2 keyboard input only, with no way to script keystrokes into a real interactive session.
 
 ## Dynamic kernel modules (`src/module.rs`, `modules/*`)
 
@@ -594,15 +654,35 @@ prove the enforcement isn't just plumbing.
   `uid == 0` bypasses read/write bits entirely (root); otherwise picks the owner/group/other rwx
   triplet by comparing against the inode's own `uid`/`gid` (first match wins — being in the owning
   group doesn't fall through to "other" just because the group bits happen to deny it), then checks
-  the one requested bit. Wired into `oxfs_open`: an existing file/dir needs real permission (the
-  read bit — this module's own `open()` always ends up reading regardless of the caller's
-  `O_WRONLY`/`O_RDWR` intent, a pre-existing simplification this pass didn't change, so read is the
-  one real access an *existing*-file open ever performs); creating a new file needs write
-  permission on the *parent directory*, not the (not-yet-existing) file itself. `do_execve`'s own
-  ELF-loading read goes through this exact `oxfs_open` path (see "User-mode execution" above), so
-  this doubles as an approximate execute-permission check (the read bit, not a separate execute
-  check) — a known, documented simplification, harmless while every seeded file's default mode
-  (`0o755`) sets both bits identically.
+  the one requested bit. Wired into `oxfs_open`: an existing file/dir needs the real bit its
+  `O_WRONLY`/`O_RDWR`/`O_RDONLY` intent actually asks for (`want_write = flags & O_ACCMODE != 0`)
+  — creating a new file needs write permission on the *parent directory*, not the (not-yet-
+  existing) file itself. `do_execve`'s own ELF-loading read goes through this exact `oxfs_open`
+  path (see "User-mode execution" above) always read-only, so it still doubles as an approximate
+  execute-permission check (the read bit, not a separate execute check) — a known, documented
+  simplification, harmless while every seeded file's default mode (`0o755`) sets both bits
+  identically.
+- **Real write-to-an-existing-file support** (`oxfs_open`/`oxfs_close`, found live via
+  `modules/oxfs/src/test_busybox.sh`'s own applet self-test): `oxfs_open` used to always return a
+  read-only fd for a path that already existed, regardless of `O_WRONLY`/`O_RDWR`/`O_APPEND`/
+  `O_TRUNC` — meaning a file could only ever be written once, for its entire lifetime, from the
+  moment it was created; a plain `echo x >> file` a second time (or even a second plain `echo x >
+  file`) silently got a read-only fd and failed the write with `EBADF`. Confirmed live: BusyBox
+  `hush`'s own real `WIFSIGNALED`/`WTERMSIG`-based job reporting made this externally visible for
+  the first time (see the wait-status fix two entries below) once a script's *second* write to the
+  same path started failing outright instead of just producing wrong content. `OpenFile::Write`
+  gained an `existing_inode: Option<u32>` field: `None` is the original create-a-new-file path
+  (allocate a fresh inode, insert a new directory entry at `close`); `Some(inode)` means `close`
+  overwrites that *existing* inode's content in place via `write_inode_data` instead — same inode
+  number, same directory entry, same owner/mode, just new content, avoiding either a duplicate-name
+  directory entry or an orphaned original. `O_APPEND` preloads the write buffer with the file's
+  real existing content (via `read_inode_at`) before any new `write()` calls land; plain
+  `O_WRONLY`/`O_RDWR` (with or without an explicit `O_TRUNC`) starts the buffer empty — this
+  filesystem's only write primitive (`write_inode_data`) always replaces a file's *complete*
+  contents in one shot (matching `modules/fat32`'s own original simplification), so there's no way
+  to support "open for writing but don't truncate until the first actual write" as a distinct case,
+  and nothing in this port's roster needs that distinction. Opening a directory with
+  `O_WRONLY`/`O_RDWR` is now a real `EISDIR` instead of silently succeeding as a directory listing.
 - **`oxfs_chmod`**: only the inode's own owner or root may change its permission bits (`EPERM`
   otherwise); follows a final symlink (real `chmod(2)` semantics — there's no `lchmod` in POSIX at
   all). **`oxfs_chown`**: root-only unconditionally (this kernel has no group-membership concept to
