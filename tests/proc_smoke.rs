@@ -48,6 +48,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "native_abi",
         NATIVE_ABI_MOD,
         NATIVE_ABI_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -59,6 +60,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "oxfs",
         OXFS_MOD,
         OXFS_PANIC_SYMBOL,
+        true,
         &mut mapper,
         &mut frame_allocator,
     )

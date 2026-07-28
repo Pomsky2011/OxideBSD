@@ -49,6 +49,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "hello",
         HELLO_MOD,
         HELLO_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -62,6 +63,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "native_abi",
         NATIVE_ABI_MOD,
         NATIVE_ABI_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )

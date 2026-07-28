@@ -85,9 +85,54 @@ struct LoadedModuleInfo {
     name: &'static str,
     base: u64,
     size: u64,
+    /// Whether a panic anywhere in this module's code should reboot the whole system
+    /// (`module_panic_trampoline` below) rather than just halting. `true` for filesystem modules
+    /// (their entire state -- the in-memory filesystem itself -- has no backing store, so there's
+    /// nothing safe to resume into); `false` for everything else, pending real per-module restart.
+    fatal_on_panic: bool,
 }
 
 static LOADED_MODULES: Mutex<Vec<LoadedModuleInfo>> = Mutex::new(Vec::new());
+
+/// Whether the module code currently executing (if any) should reboot the whole system on panic --
+/// set right before every call into module code (`load`'s own `module_init` call below, and
+/// `syscall::dispatch`'s call into a registered `SyscallHandler`) and read by
+/// `module_panic_trampoline` if that call panics. `static mut`, not a `Mutex`: same reasoning as
+/// `gdt.rs`'s `CURRENT_RSP0` -- a lock held across the very call that might panic would still be
+/// held (spin locks don't unwind) when the trampoline tried to read it. Sound only because this
+/// kernel is single-core and every call site sets this immediately before a call that either
+/// returns normally (nothing else touches this flag in between) or panics (handled by the
+/// trampoline before anything else runs) -- no real concurrent access is possible. Starts `true`
+/// (reboot) so that any call path that forgot to set this defensively fails toward safety rather
+/// than toward silently hanging.
+static mut CURRENT_MODULE_FATAL: bool = true;
+
+/// Records `fatal` as the "should this panic reboot the system" answer for whatever module code
+/// is about to run. See `CURRENT_MODULE_FATAL`'s own doc comment for why this is safe despite
+/// being a bare `static mut`.
+fn set_current_module_fatal(fatal: bool) {
+    unsafe {
+        CURRENT_MODULE_FATAL = fatal;
+    }
+}
+
+/// Same as `set_current_module_fatal`, but looks the answer up from `handler_addr` (an
+/// already-resolved `SyscallHandler` function pointer) by finding which loaded module's
+/// `[base, base+size)` range contains it -- used by `syscall::dispatch` right before calling a
+/// registered handler, since dispatch only has the function pointer, not which module registered
+/// it. Defaults to `true` (reboot) if no loaded module's range contains the address: every real
+/// `SyscallHandler` was resolved from a loaded module's own relocated code, so this should never
+/// actually happen, but a fatal default is the safe direction for a case that "can't happen".
+pub(crate) fn mark_active_module_by_address(handler_addr: u64) {
+    let modules = LOADED_MODULES.lock();
+    let fatal = modules
+        .iter()
+        .find(|m| handler_addr >= m.base && handler_addr < m.base + m.size)
+        .map(|m| m.fatal_on_panic)
+        .unwrap_or(true);
+    drop(modules);
+    set_current_module_fatal(fatal);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleError {
@@ -324,11 +369,14 @@ fn align_up(value: u64, align: u64) -> u64 {
 /// applies its relocations, then calls its `module_init` entry point and returns whatever it
 /// returned. `panic_symbol` is the exact mangled name `build.rs` discovered for this specific
 /// module's merged panic-entry reference (empty string if the module's code never references
-/// one) -- see `resolve_external_symbol`.
+/// one) -- see `resolve_external_symbol`. `fatal_on_panic` is recorded on this module's
+/// `LoadedModuleInfo` entry and consulted by `module_panic_trampoline` -- see
+/// `CURRENT_MODULE_FATAL`'s own doc comment.
 pub fn load(
     name: &'static str,
     object_bytes: &[u8],
     panic_symbol: &str,
+    fatal_on_panic: bool,
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<i32, ModuleError> {
@@ -461,12 +509,14 @@ pub fn load(
         name,
         base,
         size: region_size,
+        fatal_on_panic,
     });
     // SAFETY: init_addr was computed above from module_init's own symbol table entry plus this
     // module's now-fully-relocated base -- every relocation touching its code has already been
     // applied, and module_init's real signature (established by every module crate's own
     // #[unsafe(no_mangle)] pub extern "C" fn module_init() -> i32) matches this transmute.
     let module_init: extern "C" fn() -> i32 = unsafe { core::mem::transmute(init_addr) };
+    set_current_module_fatal(fatal_on_panic);
     let result = module_init();
     serial_println!("[module] {}: module_init returned {}", name, result);
 
@@ -764,8 +814,19 @@ extern "C" fn oxidebsd_log(ptr: *const u8, len: u64) {
 /// up by `resolve_external_symbol`, keyed off the exact mangled name `build.rs` discovers per
 /// module). A module can't define its own `#[panic_handler]` -- only `bin` crates may, and this
 /// target's `panic-strategy = "abort"` means there's no unwinding to reason about regardless -- so
-/// a panic inside module code is exactly as fatal as a kernel panic, just logged with a different
-/// prefix.
+/// there's no way to resume the syscall (or `module_init` call) that was in progress.
+///
+/// The only decision left is what happens *next*: `CURRENT_MODULE_FATAL` (set immediately before
+/// every call into module code -- see its own doc comment) says whether the module that just
+/// panicked is one whose state can't be safely discarded (today, only filesystem modules --
+/// `oxfs`'s entire in-memory filesystem, with no backing store to fall back to). If so, this
+/// reboots the same way the fatal exception handlers in `interrupts.rs`
+/// (`page_fault_handler`/`general_protection_fault_handler`/...) already do: kernel state after an
+/// unrecovered panic can't be trusted, so restarting clean is the safer default. Otherwise it
+/// falls back to `hlt_loop()` -- still fully fatal (no per-module restart exists yet), just not
+/// worth resetting the whole system over. Restarting only the crashed module in place, without
+/// either of these, is a real future direction but needs a saved recovery point to return control
+/// to (this trampoline is `-> !`, it never returns today) -- not attempted here.
 ///
 /// `extern "Rust"` (not `"C"`) to match how `core::panicking` itself declares this symbol --
 /// relying on both sides being compiled by the very same rustc invocation's ABI for a plain
@@ -773,5 +834,10 @@ extern "C" fn oxidebsd_log(ptr: *const u8, len: u64) {
 /// practice within one compiler version, same toolchain on both sides.
 extern "Rust" fn module_panic_trampoline(info: &core::panic::PanicInfo<'_>) -> ! {
     serial_println!("[module] panic: {}", info);
-    crate::hlt_loop();
+    // SAFETY: single-core, no concurrent writer -- see CURRENT_MODULE_FATAL's own doc comment.
+    if unsafe { CURRENT_MODULE_FATAL } {
+        crate::reboot::reboot();
+    } else {
+        crate::hlt_loop();
+    }
 }

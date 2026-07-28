@@ -116,6 +116,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "native_abi",
         NATIVE_ABI_MOD,
         NATIVE_ABI_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -127,6 +128,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "net",
         NET_MOD,
         NET_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )

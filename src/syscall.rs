@@ -455,7 +455,14 @@ pub(crate) fn dispatch(
 ) -> Result<u64, u64> {
     let handler = SYSCALL_TABLE.lock().get(&number).copied();
     match handler {
-        Some(handler) => ffi_result_to_result(handler(arg0, arg1, arg2, arg3)),
+        Some(handler) => {
+            // Tells module_panic_trampoline whether a panic inside this specific call should
+            // reboot the system or just halt -- see CURRENT_MODULE_FATAL's own doc comment in
+            // src/module.rs. Must happen right before the call: this flag has no meaning except
+            // for whatever module code is currently executing.
+            crate::module::mark_active_module_by_address(handler as usize as u64);
+            ffi_result_to_result(handler(arg0, arg1, arg2, arg3))
+        }
         None => {
             // Only the first occurrence of a given number is logged -- see LOGGED_UNRECOGNIZED's
             // own doc comment. Still the intended tool for discovering what a program's startup

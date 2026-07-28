@@ -58,6 +58,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "hello",
         HELLO_MOD,
         HELLO_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -72,6 +73,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "native_abi",
         NATIVE_ABI_MOD,
         NATIVE_ABI_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -88,6 +90,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "posix_compat",
         POSIX_COMPAT_MOD,
         POSIX_COMPAT_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -102,6 +105,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "signal",
         SIGNAL_MOD,
         SIGNAL_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -116,6 +120,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "clock",
         CLOCK_MOD,
         CLOCK_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -124,12 +129,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
     // (still built and self-checked by build.rs on every `cargo build`) but deliberately not
     // loaded here anymore.
+    //
+    // `fatal_on_panic = true`: unlike every other module here, a filesystem module's state *is*
+    // the entire in-memory filesystem -- there's no backing store, so a "restart the module and
+    // keep going" recovery would just mean silently reverting every file to empty. That's a worse
+    // outcome than stopping, so a panic anywhere in oxfs reboots the whole system instead (see
+    // `module_panic_trampoline` in `src/module.rs`). The same reasoning will apply to fat32/ext4/
+    // xfs/... once any of them load at boot again.
     const OXFS_MOD: &[u8] = include_bytes!(env!("OXFS_MOD_PATH"));
     const OXFS_PANIC_SYMBOL: &str = env!("OXFS_MOD_PANIC_SYMBOL");
     oxidebsd::module::load(
         "oxfs",
         OXFS_MOD,
         OXFS_PANIC_SYMBOL,
+        true,
         &mut mapper,
         &mut frame_allocator,
     )
@@ -145,6 +158,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "net",
         NET_MOD,
         NET_PANIC_SYMBOL,
+        false,
         &mut mapper,
         &mut frame_allocator,
     )
