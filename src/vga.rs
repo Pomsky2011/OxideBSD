@@ -1,11 +1,33 @@
 use core::fmt;
 
+use alloc::boxed::Box;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::interrupts;
+use x86_64::instructions::port::Port;
 
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
 const VGA_BUFFER_ADDR: usize = 0xb8000;
+
+/// CRTC index/data port pair (standard VGA, unchanged since the original IBM CGA/MDA days) --
+/// used only to move/show/hide the real blinking hardware cursor. Text content itself never goes
+/// through these ports (that's the direct VRAM write in `write_char_at`); this is purely "where's
+/// the cursor" state a real terminal always keeps in sync, which this writer didn't do at all
+/// until now -- `cursor_row`/`cursor_col` were pure internal bookkeeping for text placement math,
+/// invisible to anyone actually looking at the QEMU display.
+const CRTC_INDEX_PORT: u16 = 0x3d4;
+const CRTC_DATA_PORT: u16 = 0x3d5;
+const CRTC_CURSOR_LOCATION_HIGH: u8 = 0x0e;
+const CRTC_CURSOR_LOCATION_LOW: u8 = 0x0f;
+const CRTC_CURSOR_START: u8 = 0x0a;
+const CRTC_CURSOR_END: u8 = 0x0b;
+/// Bit 5 of the "cursor start" register disables the cursor entirely -- the standard VGA idiom
+/// for hiding it (there's no separate on/off register).
+const CURSOR_DISABLE_BIT: u8 = 0x20;
+/// A conventional block-ish underline cursor shape (scanlines 14-15 of a 16-scanline glyph cell,
+/// the BIOS text-mode default) -- restored whenever the cursor is shown again.
+const CURSOR_SHAPE_START: u8 = 0x0e;
+const CURSOR_SHAPE_END: u8 = 0x0f;
 
 /// Longest CSI parameter list this writer tracks (e.g. `ESC[24;80H`'s row/col pair). Real ANSI
 /// sequences this kernel actually receives (BusyBox `vi`'s cursor moves/erases/SGR) never need
@@ -102,6 +124,10 @@ struct Buffer {
     chars: [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT],
 }
 
+/// A full screen's worth of content, detached from `Buffer`'s own fixed VRAM address -- what
+/// `enter_alt_screen`/`exit_alt_screen` snapshot to/from the heap.
+type ScreenGrid = [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT];
+
 /// Where a byte stream sits relative to an ANSI/VT100 escape sequence. Only `CSI` (`ESC [ ... `)
 /// is actually interpreted -- see `handle_escape_byte`/`handle_csi_byte`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,9 +137,25 @@ enum EscState {
     Csi,
 }
 
+/// DECSC/DECRC (`ESC 7`/`ESC 8`, also the ANSI.SYS-style `CSI s`/`CSI u`) snapshot -- position plus
+/// the SGR state a real terminal saves alongside it, not just the two coordinates.
+#[derive(Debug, Clone, Copy)]
+struct SavedCursorState {
+    row: usize,
+    col: usize,
+    sgr_fg: Color,
+    sgr_bg: Color,
+    sgr_bold: bool,
+    sgr_reverse: bool,
+}
+
 struct Writer {
     cursor_row: usize,
     cursor_col: usize,
+    /// Whether the hardware cursor should actually be drawn (`ESC[?25l`/`h`) -- tracked
+    /// separately from position since a hidden cursor still needs its position kept up to date
+    /// for the moment it's shown again.
+    cursor_visible: bool,
     /// The color actually written into the VGA buffer -- derived from `sgr_*` below by
     /// `recompute_color_code` every time an SGR sequence changes them.
     color_code: ColorCode,
@@ -126,6 +168,21 @@ struct Writer {
     csi_param_count: usize,
     csi_cur: u16,
     csi_cur_present: bool,
+    /// Set when a CSI sequence's first byte after `[` is `?` -- disambiguates DEC private modes
+    /// (`ESC[?25l`, `ESC[?1049h`) from standard ANSI `SM`/`RM` (`ESC[4h`, ...), which share the
+    /// same final bytes but different parameter numbering. Only the private ones are implemented;
+    /// a non-private `h`/`l` is silently swallowed, same as before.
+    csi_private: bool,
+    /// DECSTBM scroll margins (0-based, inclusive), defaulting to the whole screen -- `line_feed`/
+    /// `reverse_index`/IL/DL/SU/SD all scroll within this range instead of the full buffer.
+    scroll_top: usize,
+    scroll_bottom: usize,
+    saved_cursor: Option<SavedCursorState>,
+    /// Set only while an alternate-screen app (`vi`, `hexedit`, ...) is active -- holds the main
+    /// screen's real content plus its cursor, both restored verbatim on `ESC[?1049l`. A `Box`
+    /// because this writer otherwise holds no heap state at all; the buffer's home page is a
+    /// static VRAM pointer, not something that can just be swapped for a second static one.
+    alt_screen_saved: Option<Box<(ScreenGrid, usize, usize)>>,
     buffer: &'static mut Buffer,
 }
 
@@ -145,11 +202,17 @@ impl Writer {
 
     fn write_byte(&mut self, byte: u8) {
         match self.esc_state {
-            EscState::Ground => {}
-            EscState::Escape => return self.handle_escape_byte(byte),
-            EscState::Csi => return self.handle_csi_byte(byte),
+            EscState::Ground => self.write_byte_ground(byte),
+            EscState::Escape => self.handle_escape_byte(byte),
+            EscState::Csi => self.handle_csi_byte(byte),
         }
+        // Every byte can potentially move the cursor (a plain glyph, a control character, or a
+        // CSI/escape final byte) -- rather than call this from each of those individually, just
+        // resync once per byte. Two `outb` pairs is trivial next to VRAM writes at this scale.
+        self.sync_hw_cursor();
+    }
 
+    fn write_byte_ground(&mut self, byte: u8) {
         match byte {
             0x1b => {
                 self.reset_csi();
@@ -190,23 +253,38 @@ impl Writer {
         }
     }
 
-    /// The very first byte after `ESC`. Only `[` (starting a CSI sequence) is understood; any
-    /// other escape (e.g. a charset-select `ESC ( B`, or a bare `ESC c` reset) is swallowed as a
-    /// single unrecognized byte rather than echoed as garbage -- full-screen programs like `vi`
-    /// depend on unhandled sequences disappearing silently, not corrupting the display.
+    /// The very first byte after `ESC`. `[` starts a CSI sequence; `7`/`8` (DECSC/DECRC) and `M`
+    /// (RI) are handled directly here since they're complete two-byte escapes with no CSI
+    /// involved. Any other escape (e.g. a charset-select `ESC ( B`, or a bare `ESC c` reset) is
+    /// swallowed as a single unrecognized byte rather than echoed as garbage -- full-screen
+    /// programs like `vi` depend on unhandled sequences disappearing silently, not corrupting the
+    /// display.
     fn handle_escape_byte(&mut self, byte: u8) {
-        if byte == b'[' {
-            self.esc_state = EscState::Csi;
-        } else {
-            self.esc_state = EscState::Ground;
+        match byte {
+            b'[' => {
+                self.esc_state = EscState::Csi;
+                return;
+            }
+            // DECSC/DECRC: save/restore cursor position + SGR state. Not CSI-prefixed (no `[`),
+            // a bare two-byte escape -- `reset`'s own `ESC c ESC(B ESC[m ESC[J ESC[?25h` sequence
+            // doesn't use these, but real vttest-style full-screen apps commonly do.
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_cursor(),
+            // RI (reverse index): cursor up one line, scrolling the region down if already at its
+            // top margin -- the inverse of a line feed. Paired with DECSTBM the same way a normal
+            // line feed is paired with the bottom margin.
+            b'M' => self.reverse_index(),
+            _ => {}
         }
+        self.esc_state = EscState::Ground;
     }
 
     /// One byte of a `CSI` sequence's parameter/intermediate/final bytes (ECMA-48): digits and
-    /// `;` accumulate parameters, `?` (a private-mode marker, e.g. `ESC[?1049h`) is ignored since
-    /// none of the private modes it introduces are implemented, and a final byte in `@`..=`~`
-    /// dispatches and returns to `Ground`. Anything else (rare intermediate bytes) is ignored in
-    /// place, matching real terminals' tolerance of unexpected sequences.
+    /// `;` accumulate parameters, `?` (a private-mode marker, e.g. `ESC[?1049h`) just records
+    /// that this is a DEC private-mode sequence (see `csi_private`/`set_private_modes`), and a
+    /// final byte in `@`..=`~` dispatches and returns to `Ground`. Anything else (rare
+    /// intermediate bytes) is ignored in place, matching real terminals' tolerance of unexpected
+    /// sequences.
     fn handle_csi_byte(&mut self, byte: u8) {
         match byte {
             b'0'..=b'9' => {
@@ -217,7 +295,7 @@ impl Writer {
                 self.csi_cur_present = true;
             }
             b';' => self.push_csi_param(),
-            b'?' => {}
+            b'?' => self.csi_private = true,
             0x40..=0x7e => {
                 self.push_csi_param();
                 self.execute_csi(byte);
@@ -246,6 +324,7 @@ impl Writer {
         self.csi_param_count = 0;
         self.csi_cur = 0;
         self.csi_cur_present = false;
+        self.csi_private = false;
     }
 
     /// A parsed CSI parameter, with `default` substituted both when the parameter was omitted
@@ -288,8 +367,39 @@ impl Writer {
             b'J' => self.erase_in_display(self.csi_param(0, 0)),
             b'K' => self.erase_in_line(self.csi_param(0, 0)),
             b'm' => self.apply_sgr(),
-            // Everything else (device status reports, private-mode set/reset like the alternate
-            // screen buffer, ...) has no effect on this plain scrolling console -- swallow it.
+            // DECSTBM: set scroll margins.
+            b'r' => self.set_scroll_region(),
+            // IL/DL: insert/delete whole lines at the cursor row, within the scroll region.
+            b'L' => self.insert_lines(self.csi_param(0, 1) as usize),
+            b'M' => self.delete_lines(self.csi_param(0, 1) as usize),
+            // ICH/DCH: insert/delete characters within the current line.
+            b'@' => self.insert_chars(self.csi_param(0, 1) as usize),
+            b'P' => self.delete_chars(self.csi_param(0, 1) as usize),
+            // SU/SD: scroll the region without moving the cursor.
+            b'S' => {
+                let n = self.csi_param(0, 1) as usize;
+                self.scroll_region_up_by(self.scroll_top, self.scroll_bottom, n);
+            }
+            b'T' => {
+                let n = self.csi_param(0, 1) as usize;
+                self.scroll_region_down_by(self.scroll_top, self.scroll_bottom, n);
+            }
+            // ANSI.SYS-style save/restore cursor (no `?` prefix, no parameters) -- the CSI
+            // sibling of DECSC/DECRC (`ESC 7`/`ESC 8`).
+            b's' => self.save_cursor(),
+            b'u' => self.restore_cursor(),
+            // DSR: device status report. Only mode 6 (CPR, "where's the cursor") has a real
+            // caller anywhere in the roster (`less`'s own `ESC[999;999H ESC[6n` fallback, taken
+            // only when `TIOCGWINSZ` itself fails, which it doesn't here -- implemented anyway
+            // since it's cheap and any future full-screen program that queries it unconditionally
+            // would otherwise hang forever waiting for a reply that never arrives).
+            b'n' => self.device_status_report(self.csi_param(0, 0)),
+            // DEC private mode set/reset -- only meaningful with the `?` prefix (`ESC[?25h`,
+            // `ESC[?1049h`); a bare `ESC[4h` (ANSI IRM) has no VGA-text-mode equivalent to honor.
+            b'h' if self.csi_private => self.set_private_modes(true),
+            b'l' if self.csi_private => self.set_private_modes(false),
+            // Everything else (device status reports, non-private mode set/reset, ...) has no
+            // effect on this plain scrolling console -- swallow it.
             _ => {}
         }
     }
@@ -378,6 +488,159 @@ impl Writer {
         self.color_code = ColorCode::new(fg, bg);
     }
 
+    /// DECSC/DECRC and their CSI-form siblings (`ESC 7`/`ESC[s`, `ESC 8`/`ESC[u`) -- real
+    /// terminals treat both spellings as the same single save slot, not two independent ones.
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some(SavedCursorState {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            sgr_fg: self.sgr_fg,
+            sgr_bg: self.sgr_bg,
+            sgr_bold: self.sgr_bold,
+            sgr_reverse: self.sgr_reverse,
+        });
+    }
+
+    /// Restoring with nothing saved is a real, POSIX-legal no-op (matches every real terminal --
+    /// there's no error to report over this byte stream anyway).
+    fn restore_cursor(&mut self) {
+        if let Some(saved) = self.saved_cursor {
+            self.cursor_row = saved.row.min(BUFFER_HEIGHT - 1);
+            self.cursor_col = saved.col.min(BUFFER_WIDTH - 1);
+            self.sgr_fg = saved.sgr_fg;
+            self.sgr_bg = saved.sgr_bg;
+            self.sgr_bold = saved.sgr_bold;
+            self.sgr_reverse = saved.sgr_reverse;
+            self.recompute_color_code();
+        }
+    }
+
+    /// DEC private mode set (`h`)/reset (`l`) -- dispatches every parameter in the sequence (real
+    /// terminals allow e.g. `ESC[?1049;25h` combining several). Only `25` (cursor visibility) and
+    /// `1049` (alternate screen, save/restore cursor included) have any real effect here; anything
+    /// else is silently accepted and ignored, matching this writer's existing tolerance for
+    /// unsupported sequences elsewhere.
+    fn set_private_modes(&mut self, enable: bool) {
+        for i in 0..self.csi_param_count {
+            match self.csi_params[i] {
+                25 => self.set_cursor_visible(enable),
+                1049 => {
+                    if enable {
+                        self.enter_alt_screen();
+                    } else {
+                        self.exit_alt_screen();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor_visible = visible;
+        self.apply_hw_cursor_visibility();
+    }
+
+    /// `ESC[?1049h`: snapshot the real, currently-visible screen content and cursor, then clear
+    /// to a blank canvas for the alternate-screen app. A second `h` while already in the
+    /// alternate screen is a no-op (matches real terminals -- there's only one save slot, and
+    /// overwriting it with the app's *own* in-progress alt-screen content would lose the real
+    /// main screen underneath).
+    fn enter_alt_screen(&mut self) {
+        if self.alt_screen_saved.is_some() {
+            return;
+        }
+        let mut saved = [[ScreenChar {
+            ascii_character: b' ',
+            color_code: self.color_code,
+        }; BUFFER_WIDTH]; BUFFER_HEIGHT];
+        for (row, row_slice) in saved.iter_mut().enumerate() {
+            for (col, cell) in row_slice.iter_mut().enumerate() {
+                *cell = self.read_char_at(row, col);
+            }
+        }
+        self.alt_screen_saved = Some(Box::new((saved, self.cursor_row, self.cursor_col)));
+        self.erase_in_display(2);
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    /// `ESC[?1049l`: restore whatever `enter_alt_screen` snapshotted. Exiting without a matching
+    /// enter (no save slot present) is a no-op, same reasoning as `restore_cursor`.
+    fn exit_alt_screen(&mut self) {
+        let Some(saved) = self.alt_screen_saved.take() else {
+            return;
+        };
+        let (content, row, col) = *saved;
+        for (r, row_slice) in content.iter().enumerate() {
+            for (c, &character) in row_slice.iter().enumerate() {
+                self.write_char_at(r, c, character);
+            }
+        }
+        self.cursor_row = row;
+        self.cursor_col = col;
+    }
+
+    /// Push the software cursor position out to the real CRTC registers. Cheap (two port-index
+    /// writes plus two data writes) and called after every byte (`write_byte`), so the hardware
+    /// cursor is never more than one byte behind what a full-screen app like `vi` thinks it just
+    /// drew.
+    fn sync_hw_cursor(&self) {
+        if !self.cursor_visible {
+            return;
+        }
+        let position = (self.cursor_row * BUFFER_WIDTH + self.cursor_col) as u16;
+        let mut index_port: Port<u8> = Port::new(CRTC_INDEX_PORT);
+        let mut data_port: Port<u8> = Port::new(CRTC_DATA_PORT);
+        // SAFETY: 0x3D4/0x3D5 are the standard VGA CRTC index/data ports, always present on this
+        // target (no more exotic display hardware exists here) -- ordinary MMIO-equivalent port
+        // I/O, not memory-unsafe on its own.
+        unsafe {
+            index_port.write(CRTC_CURSOR_LOCATION_HIGH);
+            data_port.write((position >> 8) as u8);
+            index_port.write(CRTC_CURSOR_LOCATION_LOW);
+            data_port.write((position & 0xff) as u8);
+        }
+    }
+
+    /// CPR: report the cursor's 1-based `row;col` position by writing `ESC[row;colR` straight
+    /// into the stdin ring buffer, exactly as if it had been typed -- the real mechanism every
+    /// terminal uses to answer this query (the reply travels back over the *input* side, not
+    /// this writer's own output). `crate::stdin::push_byte` is already `pub` and already the sole
+    /// producer the keyboard IRQ handler uses, so this is just a second, synthetic producer of
+    /// the same stream.
+    fn device_status_report(&self, mode: u16) {
+        if mode != 6 {
+            return;
+        }
+        let reply = alloc::format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+        for byte in reply.bytes() {
+            crate::stdin::push_byte(byte);
+        }
+    }
+
+    /// Toggles the CRTC's own cursor-disable bit, and restores a normal cursor shape when turning
+    /// it back on (the disable bit lives in the same register as the shape's start scanline, so
+    /// re-enabling has to rewrite a real shape, not just clear the bit blindly).
+    fn apply_hw_cursor_visibility(&self) {
+        let mut index_port: Port<u8> = Port::new(CRTC_INDEX_PORT);
+        let mut data_port: Port<u8> = Port::new(CRTC_DATA_PORT);
+        // SAFETY: see sync_hw_cursor.
+        unsafe {
+            index_port.write(CRTC_CURSOR_START);
+            if self.cursor_visible {
+                data_port.write(CURSOR_SHAPE_START);
+                index_port.write(CRTC_CURSOR_END);
+                data_port.write(CURSOR_SHAPE_END);
+            } else {
+                data_port.write(CURSOR_DISABLE_BIT);
+            }
+        }
+        if self.cursor_visible {
+            self.sync_hw_cursor();
+        }
+    }
+
     /// Write one visible glyph at the cursor and advance it, wrapping (and scrolling, if already
     /// on the last row) at the end of a line.
     fn put_char(&mut self, byte: u8) {
@@ -413,25 +676,159 @@ impl Writer {
         }
     }
 
-    /// Advance to column 0 of the next row, scrolling the whole screen up if already on the last
-    /// row. Used both for an explicit `\n` and for wrapping a line that ran off the right edge.
+    /// Advance to column 0 of the next row, scrolling the active DECSTBM region up if already at
+    /// its bottom margin (the whole screen, by default -- matches the pre-scroll-region
+    /// behavior exactly when `scroll_top`/`scroll_bottom` are still at their defaults). Used both
+    /// for an explicit `\n` and for wrapping a line that ran off the right edge.
     fn line_feed(&mut self) {
         self.cursor_col = 0;
-        if self.cursor_row + 1 >= BUFFER_HEIGHT {
-            self.scroll_up();
-        } else {
+        if self.cursor_row == self.scroll_bottom {
+            self.scroll_region_up_by(self.scroll_top, self.scroll_bottom, 1);
+        } else if self.cursor_row + 1 < BUFFER_HEIGHT {
             self.cursor_row += 1;
         }
     }
 
-    fn scroll_up(&mut self) {
-        for row in 1..BUFFER_HEIGHT {
-            for col in 0..BUFFER_WIDTH {
-                let character = self.read_char_at(row, col);
-                self.write_char_at(row - 1, col, character);
-            }
+    /// RI: cursor up one line, scrolling the region down (inserting a blank line at the top
+    /// margin) if already there instead of moving above it.
+    fn reverse_index(&mut self) {
+        if self.cursor_row == self.scroll_top {
+            self.scroll_region_down_by(self.scroll_top, self.scroll_bottom, 1);
+        } else {
+            self.cursor_row = self.cursor_row.saturating_sub(1);
         }
-        self.clear_row(BUFFER_HEIGHT - 1);
+    }
+
+    /// Shifts rows `top+1..=bottom` up by one (into `top..=bottom-1`), blanking `bottom` --
+    /// repeated `n` times. `n` is capped at the region's own height since scrolling a k-row
+    /// region more than k times can only ever produce a fully blank region, same as any real
+    /// terminal.
+    fn scroll_region_up_by(&mut self, top: usize, bottom: usize, n: usize) {
+        if top > bottom {
+            return;
+        }
+        // A single-row region (or IL/DL landing exactly on the bottom margin) has nothing to
+        // shift -- the real terminal behavior is just "blank that one row".
+        if top == bottom {
+            if n > 0 {
+                self.clear_row(bottom);
+            }
+            return;
+        }
+        let n = n.min(bottom - top + 1);
+        for _ in 0..n {
+            for row in (top + 1)..=bottom {
+                for col in 0..BUFFER_WIDTH {
+                    let character = self.read_char_at(row, col);
+                    self.write_char_at(row - 1, col, character);
+                }
+            }
+            self.clear_row(bottom);
+        }
+    }
+
+    /// The mirror image of `scroll_region_up_by`: shifts `top..=bottom-1` down by one (into
+    /// `top+1..=bottom`), blanking `top`.
+    fn scroll_region_down_by(&mut self, top: usize, bottom: usize, n: usize) {
+        if top > bottom {
+            return;
+        }
+        if top == bottom {
+            if n > 0 {
+                self.clear_row(top);
+            }
+            return;
+        }
+        let n = n.min(bottom - top + 1);
+        for _ in 0..n {
+            let mut row = bottom;
+            while row > top {
+                for col in 0..BUFFER_WIDTH {
+                    let character = self.read_char_at(row - 1, col);
+                    self.write_char_at(row, col, character);
+                }
+                row -= 1;
+            }
+            self.clear_row(top);
+        }
+    }
+
+    /// DECSTBM: set the scrolling margins (1-based, inclusive `top;bottom`; `r` alone resets to
+    /// the whole screen). An invalid range (`top >= bottom`) is ignored the same way real
+    /// terminals reject it, rather than producing a zero/negative-height region. Real terminals
+    /// also home the cursor after this -- there's no DECOM (origin mode) here, so that's always
+    /// absolute `0,0`.
+    fn set_scroll_region(&mut self) {
+        let top = (self.csi_param(0, 1).saturating_sub(1) as usize).min(BUFFER_HEIGHT - 1);
+        let bottom =
+            (self.csi_param(1, BUFFER_HEIGHT as u16).saturating_sub(1) as usize).min(BUFFER_HEIGHT - 1);
+        if top < bottom {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        } else {
+            self.scroll_top = 0;
+            self.scroll_bottom = BUFFER_HEIGHT - 1;
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    /// IL: insert `n` blank lines at the cursor row, pushing existing lines down within the
+    /// scroll region (lines pushed past the bottom margin are discarded). A no-op outside the
+    /// region, matching real terminal behavior.
+    fn insert_lines(&mut self, n: usize) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        // `scroll_region_down_by(cursor_row, scroll_bottom, n)` shifts `cursor_row..bottom-1`
+        // down into `cursor_row+1..bottom` and blanks `cursor_row` itself -- exactly IL's
+        // contract, with the cursor's own row as the region's top boundary.
+        self.scroll_region_down_by(self.cursor_row, self.scroll_bottom, n);
+    }
+
+    /// DL: delete `n` lines at the cursor row, pulling lines below up within the scroll region
+    /// (blank lines appear at the bottom margin). A no-op outside the region.
+    fn delete_lines(&mut self, n: usize) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        // Mirror of insert_lines: `scroll_region_up_by(cursor_row, scroll_bottom, n)` shifts
+        // `cursor_row+1..bottom` up into `cursor_row..bottom-1` and blanks `scroll_bottom`.
+        self.scroll_region_up_by(self.cursor_row, self.scroll_bottom, n);
+    }
+
+    /// ICH: insert `n` blank characters at the cursor column, shifting the rest of the line right
+    /// (characters pushed past the right edge are discarded).
+    fn insert_chars(&mut self, n: usize) {
+        let row = self.cursor_row;
+        let from_col = self.cursor_col;
+        if from_col >= BUFFER_WIDTH {
+            return;
+        }
+        let n = n.min(BUFFER_WIDTH - from_col);
+        let mut col = BUFFER_WIDTH;
+        while col > from_col + n {
+            col -= 1;
+            let character = self.read_char_at(row, col - n);
+            self.write_char_at(row, col, character);
+        }
+        self.clear_row_range(row, from_col, from_col + n);
+    }
+
+    /// DCH: delete `n` characters at the cursor column, shifting the rest of the line left (blank
+    /// fill at the right edge).
+    fn delete_chars(&mut self, n: usize) {
+        let row = self.cursor_row;
+        let from_col = self.cursor_col;
+        if from_col >= BUFFER_WIDTH {
+            return;
+        }
+        let n = n.min(BUFFER_WIDTH - from_col);
+        for col in from_col..(BUFFER_WIDTH - n) {
+            let character = self.read_char_at(row, col + n);
+            self.write_char_at(row, col, character);
+        }
+        self.clear_row_range(row, BUFFER_WIDTH - n, BUFFER_WIDTH);
     }
 
     fn clear_row(&mut self, row: usize) {
@@ -457,9 +854,10 @@ impl fmt::Write for Writer {
 }
 
 static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
-    Mutex::new(Writer {
+    let writer = Writer {
         cursor_row: 0,
         cursor_col: 0,
+        cursor_visible: true,
         color_code: ColorCode::new(Color::LightGray, Color::Black),
         sgr_fg: Color::LightGray,
         sgr_bg: Color::Black,
@@ -470,10 +868,19 @@ static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
         csi_param_count: 0,
         csi_cur: 0,
         csi_cur_present: false,
+        csi_private: false,
+        scroll_top: 0,
+        scroll_bottom: BUFFER_HEIGHT - 1,
+        saved_cursor: None,
+        alt_screen_saved: None,
         // SAFETY: 0xb8000 is the VGA text-mode buffer's physical address, identity-mapped by the
         // bootloader; this Writer is the only thing that ever accesses it.
         buffer: unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) },
-    })
+    };
+    // Establish a known cursor shape/position at boot -- the BIOS's own leftover cursor state is
+    // otherwise whatever it happened to be, not necessarily even at 0,0.
+    writer.apply_hw_cursor_visibility();
+    Mutex::new(writer)
 });
 
 #[doc(hidden)]
