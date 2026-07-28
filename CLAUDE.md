@@ -536,9 +536,24 @@ subsystem in the kernel (~500+ LOC).
   read back from an exported/syscall-reachable function to survive optimization.
 - Modules are mapped kernel-only (no `USER_ACCESSIBLE`) and every page is `WRITABLE` regardless of
   section (relocation must patch code bytes; no W^X anywhere in this kernel yet).
-- A module panic is fatal, same as a kernel panic: `build.rs`'s `discover_panic_symbol` finds each
-  module's toolchain-hashed panic-entry symbol via `llvm-nm`, and the loader's resolver points it
-  at `module_panic_trampoline` (logs, `hlt_loop()`).
+- A module panic is always fatal to that call (no unwinding, `panic-strategy = "abort"`):
+  `build.rs`'s `discover_panic_symbol` finds each module's toolchain-hashed panic-entry symbol via
+  `llvm-nm`, and the loader's resolver points it at `module_panic_trampoline`, which logs and then
+  picks one of two outcomes — **per-module, via a `fatal_on_panic: bool` passed to
+  `module::load`** (`false` for every module except `oxfs`). `false` just `hlt_loop()`s (no
+  per-module restart exists yet, but nothing else about kernel state is known to be untrustworthy
+  either). `true` (`oxfs` only) reboots the whole system instead: a filesystem module's entire
+  state *is* the in-memory filesystem, with no backing store — resuming past an unrecovered panic
+  there would mean silently reverting every file to empty, a worse outcome than a clean reboot.
+  `module::CURRENT_MODULE_FATAL` (a `static mut`, same single-core/no-concurrent-writer reasoning
+  as `gdt.rs`'s `CURRENT_RSP0`) is set immediately before every call into module code — `load`'s
+  own `module_init` call, and `syscall::dispatch`'s call into a registered handler (via
+  `module::mark_active_module_by_address`, which maps the handler's function pointer back to
+  whichever loaded module's `[base, base+size)` range contains it, since dispatch only has the
+  pointer, not which module registered it) — and read by the trampoline if that call panics.
+  Defaults fatal (reboot) wherever the answer can't be determined, the safe direction for a case
+  that "can't happen." The same `true` treatment will apply to `fat32`/a future `ext4`/`xfs`/...
+  once any of them load at boot again.
 - `serial_println!` can't take implicit `{name}`-style captures (its `concat!`-based expansion
   blocks it) — always use explicit positional args; `serial_print!` doesn't have this restriction.
 - Known limits: no module unload/reload, no versioning, no inter-module direct calls (only
