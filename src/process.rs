@@ -359,6 +359,16 @@ pub struct Process {
     /// calls `setpgid` itself). `do_execve` deliberately leaves this untouched, same reasoning as
     /// `cwd` — real `execve()` preserves the caller's process group.
     pub pgid: Pid,
+    /// This process's session ID — same "ordinary `Pid`, not a distinct namespace" shape as `pgid`.
+    /// A freshly `spawn`ed process becomes its own session leader (`sid == pid`), same as `pgid`;
+    /// a forked child inherits the parent's live `sid` unchanged (real `fork()` semantics — a child
+    /// stays in its parent's session until it calls `setsid` itself, and `setsid` itself refuses a
+    /// caller that's already a process-group leader — see `do_setsid`). `do_execve` leaves this
+    /// untouched, same reasoning as `cwd`/`pgid`. Paired with `stdin::CONTROLLING_SESSION` (a
+    /// single global, not a per-session table — this kernel has exactly one real console/tty, so
+    /// "which session owns the controlling tty" only ever needs one slot, the same simplification
+    /// already accepted for `stdin::TERMIOS`).
+    pub sid: Pid,
     /// Executable basename (no path, no parens) — populated by `do_execve`/`spawn`, copied
     /// verbatim by `fork` (real `fork()` semantics: a child keeps its parent's `comm`/`cmdline`
     /// until it execs its own). Backs `/proc/[pid]/stat`'s `(comm)` field and `status`'s `Name:`.
@@ -490,6 +500,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         signal_saved_blocked: 0,
         priority: 0,
         pgid,
+        sid: pid,
         comm,
         cmdline,
         real_timer_deadline: None,
@@ -580,6 +591,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_fs_base,
         parent_cwd,
         parent_pgid,
+        parent_sid,
         parent_blocked_signals,
         parent_sigactions,
         parent_signal_saved_frame,
@@ -604,6 +616,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             parent.fs_base,
             parent.cwd,
             parent.pgid,
+            parent.sid,
             // Real fork() semantics: signal disposition and the blocked-signal mask are
             // inherited; pending signals are not (the child starts with an empty pending set —
             // see the child's own construction below). signal_saved_frame/signal_saved_blocked
@@ -651,6 +664,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         signal_saved_blocked: parent_signal_saved_blocked,
         priority: 0,
         pgid: parent_pgid,
+        sid: parent_sid,
         comm: parent_comm,
         cmdline: parent_cmdline,
         // Not inherited -- see `real_timer_deadline`'s own doc comment (real POSIX itimer/fork
@@ -1101,6 +1115,57 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// Delivers `sig` to every live (non-zombie) process whose `pgid` equals `pgid` — the real tty
+/// "INTR character signals the whole foreground process group" contract, driven by
+/// `interrupts::keyboard_interrupt_handler`'s own Ctrl+C handling once a real foreground group has
+/// actually been claimed (`TIOCSCTTY`/`TIOCSPGRP` — see CLAUDE.md's session/controlling-tty
+/// notes). Reuses the exact same Discard/Terminate/SetPending logic `do_kill`'s own cross-process
+/// branch already established per target (including its own documented gap: an installed-handler
+/// target only gets a deferred pending bit, not forced-immediate delivery) — just applied to every
+/// matching pid instead of one. Two passes (collect targets+actions under one lock, then act) for
+/// the same reason `do_kill` drops its own read lock before `terminate_process`/re-locking for
+/// `SetPending`: `terminate_process` takes the table lock itself, and `spin::Mutex` isn't
+/// reentrant.
+pub fn signal_foreground_group(pgid: Pid, sig: u64) {
+    enum Action {
+        Discard,
+        Terminate,
+        SetPending,
+    }
+
+    let targets: Vec<(Pid, Action)> = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|(_, p)| p.pgid == pgid && !matches!(p.state, ProcState::Zombie(_)))
+            .map(|(&pid, proc)| {
+                let action = match proc.sigactions[sig as usize].handler {
+                    1 => Action::Discard, // SIG_IGN
+                    0 => match default_disposition(sig) {
+                        DefaultDisposition::Ignore => Action::Discard,
+                        DefaultDisposition::Terminate => Action::Terminate,
+                    },
+                    _ => Action::SetPending,
+                };
+                (pid, action)
+            })
+            .collect()
+    };
+
+    for (pid, action) in targets {
+        match action {
+            Action::Discard => {}
+            Action::Terminate => terminate_process(pid, 128 + sig as i32),
+            Action::SetPending => {
+                let mut table = PROCESS_TABLE.lock();
+                if let Some(proc) = table.get_mut(&pid) {
+                    proc.pending_signals |= 1 << (sig - 1);
+                }
+            }
+        }
+    }
+}
+
 /// `SYS_SIGACTION`'s real logic (`sig` already validated — `1..=31`, not `SIGKILL`/`SIGSTOP` — by
 /// `src/syscall.rs`'s `sys_sigaction` before this is reached). Reads/writes a real musl
 /// `struct k_sigaction` (`handler`, `flags`, `restorer`, then `mask` as a plain `u64` — matching
@@ -1266,8 +1331,9 @@ pub fn do_getppid() -> u64 {
 /// (see CLAUDE.md's BusyBox gap analysis — "uid/permissions stub" is its own, separate,
 /// unimplemented gap), so unlike real `setpgid`, any live pid can retarget any other live pid's
 /// group — there's no restriction to "only the caller itself, or a child that hasn't `execve`'d
-/// yet" the way real `setpgid` enforces, and no session-membership check on `pgid` either (this
-/// kernel has no session concept at all). Good enough for the case that actually matters here: a
+/// yet" the way real `setpgid` enforces, and no session-membership check on `pgid` either (a real
+/// `Process::sid` field exists now — see `do_setsid` — but nothing here cross-checks `pgid`
+/// against it). Good enough for the case that actually matters here: a
 /// shell with job control calling `setpgid` on its own freshly forked children right after `fork`,
 /// the same "value now, correctness later" tradeoff `do_kill`'s own cross-process case already
 /// documents.
@@ -1291,6 +1357,48 @@ pub fn do_getpgid(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
     let target = if pid == 0 { caller_pid } else { pid as u64 };
     let table = PROCESS_TABLE.lock();
     table.get(&target).map(|p| p.pgid).ok_or(ESRCH)
+}
+
+/// `SYS_SETSID`'s real logic — matches real `setsid(void)`'s exact no-argument wire format (real
+/// Linux's own syscall number, `66`, trivial enough to reuse verbatim, same as `uname`/
+/// `getgroups` before it — see CLAUDE.md's syscall-ABI section). Real POSIX rule: fails `EPERM` if
+/// the caller is already a process-group leader (`pgid == caller_pid`) — the same "can't start a
+/// new session while still leading the old group" check real `setsid()` enforces (a session leader
+/// is always also its new group's leader, and a pid can't lead two groups at once). On success the
+/// caller becomes leader of both a fresh session and a fresh process group (`sid = pgid =
+/// caller_pid`). Deliberately doesn't touch `stdin::CONTROLLING_SESSION` at all: that global is
+/// keyed by *session id*, not by pid, so a caller landing on a brand-new `sid` is automatically not
+/// its owner without any explicit release step — real `setsid()`'s own "detaches from any
+/// controlling terminal" contract falls out for free. The *old* session (and any other processes
+/// still in it) keeps whatever controlling-tty claim it already had; nothing here revokes it, the
+/// same way a real non-leader process calling `setsid()` doesn't drag its former session's tty away
+/// from the processes staying behind.
+pub fn do_setsid(caller_pid: Pid) -> Result<u64, u64> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.get_mut(&caller_pid).ok_or(ESRCH)?;
+    if proc.pgid == caller_pid {
+        return Err(EPERM);
+    }
+    proc.sid = caller_pid;
+    proc.pgid = caller_pid;
+    Ok(caller_pid)
+}
+
+/// `SYS_GETSID`'s real logic — matches real `getsid(pid_t pid)`'s exact wire format and
+/// `pid == 0` "use the caller" convention. Added specifically for `getty`'s own real, documented
+/// fallback path (`third_party/busybox/loginutils/getty.c`): when `setsid()` fails (real POSIX
+/// rule — the caller is already a process-group leader, the common case for `getty` launched as a
+/// job-control shell's own foreground child, since the shell puts it in a fresh pgroup *before*
+/// `getty` gets to call `setsid()` itself), real `getty` calls `getsid(0)` to double-check whether
+/// it's already the session leader it needs to be before giving up. Without this, that fallback
+/// path would see a spurious `ENOSYS` instead of a real answer.
+pub fn do_getsid(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
+    if pid < 0 {
+        return Err(EINVAL);
+    }
+    let target = if pid == 0 { caller_pid } else { pid as u64 };
+    let table = PROCESS_TABLE.lock();
+    table.get(&target).map(|p| p.sid).ok_or(ESRCH)
 }
 
 /// `SYS_GETUID`/`SYS_GETEUID` — both echo `Process::uid` back (see that field's own doc comment
@@ -1364,6 +1472,30 @@ pub fn do_getgroups(caller_pid: Pid, size: i64, list_ptr: u64) -> Result<u64, u6
     // already has -- list_ptr isn't checked against the caller's actual mappings first.
     unsafe { (list_ptr as *mut u32).write(gid) };
     Ok(1)
+}
+
+/// `SYS_SETGROUPS`'s real logic — real `setgroups(2)` requires `CAP_SYS_ADMIN`/root unconditionally
+/// (unlike `setuid`/`setgid`, there's no "become what you already are" no-op allowance for a
+/// non-root caller, since a group *list* isn't a single value to trivially compare for equality).
+/// A root caller's call is accepted as a real, honest no-op — this kernel has no supplementary-
+/// group concept to actually store the list in (see `do_getgroups`'s own doc comment), so there's
+/// nothing to do beyond confirming the caller was allowed to ask. Exists specifically so
+/// `su`/`login`'s own `initgroups()` → `setgroups()` call (always issued while still root, right
+/// before `change_identity` drops privilege) succeeds outright rather than needing BusyBox's own
+/// narrower `errno == ENOSYS && target_uid == getuid()` fallback (`libbb/change_identity.c`) to
+/// carry it — that fallback only covers "switching to the uid you already are," not a genuine
+/// `su otheruser`. Doesn't read `list_ptr` at all (nothing to do with the contents), but does
+/// require a real `EPERM` for anything a non-root caller attempts, matching real Linux's own
+/// unconditional permission check rather than silently no-op-succeeding for everyone.
+pub fn do_setgroups(caller_pid: Pid, _count: u64, _list_ptr: u64) -> Result<u64, u64> {
+    let table = PROCESS_TABLE.lock();
+    let proc = table
+        .get(&caller_pid)
+        .expect("setgroups: current process missing from table");
+    if proc.uid != 0 {
+        return Err(EPERM);
+    }
+    Ok(0)
 }
 
 /// musl's own `struct timespec` on x86_64 -- see `src/syscall.rs`'s `RawTimespec` (duplicated

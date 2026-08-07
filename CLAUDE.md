@@ -193,24 +193,26 @@ numbers/shapes picked for what porting musl/BusyBox
 actually needed, not copied from FreeBSD/Linux (a few, like `pipe`/`dup2`/signal numbers, happen to
 match real wire formats anyway; check `src/syscall.rs` and module sources for the current highest
 number before assigning a new one). errno **is meant to** use FreeBSD's values where Linux/BSD
-diverge (e.g.
-`ENOSYS=78`) — **but this was never actually completed on the musl side, and is currently broken
-for at least `ENOSYS`/`EPROTONOSUPPORT`/`ENOTSOCK`/`EDESTADDRREQ`/`EADDRINUSE`/`EHOSTUNREACH`.**
+diverge — **but this was never actually completed on the musl side, and is currently broken for at
+least `EPROTONOSUPPORT`/`ENOTSOCK`/`EDESTADDRREQ`/`EADDRINUSE`/`EHOSTUNREACH` in `src/net/udp.rs`
+(`ENOSYS` itself was the same story until the Session/controlling-tty pass below fixed it — see
+that section's own "two more real bugs" entry for why and how).**
 Whatever this file returns via the carry-flag ABI becomes musl's raw `errno` value directly (see
 `third_party/musl/arch/x86_64/syscall_arch.h`'s `jnc`/`neg` conversion) — so it must match whatever
 number musl's *own* compiled-in `bits/errno.h` (`third_party/musl/arch/generic/bits/errno.h`, since
 no x86_64-specific override exists) actually defines that symbolic name as, not a real-BSD nod that
 only lives on the kernel side. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC`/`EPIPE`/`ESRCH`/`ENOTTY` happen
 to be identical between Linux/generic and FreeBSD numbering, so those are accidentally fine; `src/
-syscall.rs`'s own `ENOSYS=78` and `src/net/udp.rs`'s `ENOTSOCK=38`/`EDESTADDRREQ=39`/
-`EADDRINUSE=48`/`EHOSTUNREACH=65` are real FreeBSD values that musl's own header does **not** share
-(its real values are `38`/`88`/`89`/`98`/`113` respectively — note musl's real `ENOSYS` **is** this
-codebase's own wrong `ENOTSOCK` value, a doubly-confusing collision) — found while tracing an
-unrelated `wget` HTTPS failure, fixed only for the two new-that-session constants this pass
+net/udp.rs`'s `ENOTSOCK=38`/`EDESTADDRREQ=39`/`EADDRINUSE=48`/`EHOSTUNREACH=65` are real FreeBSD
+values that musl's own header does **not** share (its real values are `88`/`89`/`98`/`113`
+respectively — note musl's real `ENOSYS` **was** this codebase's own wrong `ENOTSOCK` value before
+the fix below, a doubly-confusing collision while both were live) — found while tracing an
+unrelated `wget` HTTPS failure, fixed only for the two new-that-session constants that pass
 actually introduced (`src/syscall.rs`'s `EPROTONOSUPPORT=93`/`EAGAIN=11`/`ENOTSOCK=88`, now correct
-and matching musl), not yet fixed for the pre-existing four in `udp.rs` or for `ENOSYS` itself
-(referenced far more broadly) — deliberately left as a flagged, known bug rather than a silent
-sweeping renumbering; discuss scope with the user before touching it further.
+and matching musl), not yet fixed for the pre-existing four still in `udp.rs` — deliberately left as
+a flagged, known bug rather than a silent sweeping renumbering; discuss scope with the user before
+touching it further. `ENOSYS` was fixed in a later pass (see below) once a live test showed the
+mismatch concretely breaking real functionality, not as part of this same sweep.
 
 The number→handler mapping is a runtime registry (`SYSCALL_TABLE`, a `Mutex<BTreeMap>`) populated
 by `oxidebsd_register_syscall` from each module's `module_init` — not a hardcoded `match`. An
@@ -354,12 +356,32 @@ green: the `wait4`/exit-status encoding bug and the `kill(pid, 0)` gap (see this
 Process/scheduler section) and the missing `vfork`/`utimensat` syscalls (see this file's own
 musl-port section). `build_busybox_applet` is also now
 staleness-checked (skips its own `allnoconfig`/`oldconfig`/`make` sequence if that applet's already-
-built binary is newer than both `third_party/busybox` and `build.rs` itself) and the whole roster
-builds in parallel across a worker pool sized to `available_parallelism()` — both load-bearing at
-this scale, not true at 24 applets. `modules/fat32`'s own embedded image dropped busybox applets
-entirely over this same change (its 8.3-short-name format can't hold names over 8 characters, and
-its fixed sector budget was sized for a much smaller roster) — harmless, since nothing loads that
-image at boot.
+built binary is newer than `third_party/busybox`, `build.rs` itself, **and** `musl_sysroot`'s own
+`lib/libc.a`) and the whole roster builds in parallel across a worker pool sized to
+`available_parallelism()` — both load-bearing at this scale, not true at 24 applets. `modules/
+fat32`'s own embedded image dropped busybox applets entirely over this same change (its 8.3-short-
+name format can't hold names over 8 characters, and its fixed sector budget was sized for a much
+smaller roster) — harmless, since nothing loads that image at boot.
+
+**Two real bugs found in this staleness check itself, both live, both now fixed:**
+1. An earlier version only compared `busybox_source_mtime`/`build_rs_mtime` — a real musl-side
+   syscall fix (the `getdents`/`getdents64` one documented in this file's own musl-port section)
+   silently left every already-built applet linked against a stale `libc.a`. Fixed by adding
+   `musl_sysroot`'s own `lib/libc.a` mtime into the same `freshness_floor` comparison.
+2. **Found much later, live, testing `su`**: even with that fix, deciding "stale, rebuild" and
+   re-running `make allnoconfig` + `make` against an applet's *same, already-populated* `O=`
+   out-of-tree directory doesn't guarantee every object file actually gets recompiled — BusyBox's
+   own incremental build tracks its own source files, but never musl's *installed* sysroot headers
+   (`target/musl-sysroot/include/...`) as a dependency. Confirmed live: after a real musl
+   syscall-number fix (the `setgroups`/`SYS_KILL` collision — see the Session/controlling-tty
+   section below), `su`'s own `libbb/change_identity.o` still had a five-day-old mtime predating
+   the fix entirely, one of ~172 (of 177) object files in that applet's build directory that never
+   got recompiled — the linked binary's own mtime looked "freshly rebuilt" by the outer check, but
+   silently still ran the old, broken code. **Only a full `rm -rf` of the stale `O=` directory
+   before re-running the build reliably fixes this** — trusting BusyBox's own incremental tracking
+   here has already been proven wrong twice. More expensive than a true incremental rebuild (every
+   affected applet rebuilds fully from scratch, ~38 minutes for the whole ~300-applet roster the one
+   time this triggered), but only runs when something genuinely changed, not on every `cargo build`.
 
 - `hush` (pid 1) uses real `execvp()`/`$PATH` search — `process::spawn` passes a fixed `envp` of
   `PATH=/bin`, so musl's `__execvpe` always searches oxfs's `/bin` directory as an absolute path
@@ -957,13 +979,165 @@ prove the enforcement isn't just plumbing.
   `0o600` file owned by a different uid — the one check in the whole test that exercises
   `check_access` actually *denying* something, not just the always-true root-bypass path every
   earlier step ran through. The parent's `wait4()` confirms the child's real exit code.
-- **Not covered by this pass**: real login/session authentication (`su`/`login`/`sulogin`/`getty`),
+- **Not covered by this pass**: real login/session authentication (`su`/`login`/`sulogin`/`getty`
+  — **done in a later pass, see "Session, controlling-tty, and login authentication" below**),
   mutating `/etc/passwd`/`/etc/group` (`adduser`/`passwd`/`chpasswd`/... — an applet-level gap now,
   not a kernel one, since both files are already real, writable oxfs files), `lchown`, `fchmod`/
   `fchown` (fd-based variants — no target applet in the current roster calls them; `chmod.c`/
   `chown.c` in BusyBox both call the path-based syscalls directly), and setuid/setgid/sticky mode
   bits (`oxfs_chmod` masks its input to `0o777`, silently dropping anything above that — nothing in
   this port's roster sets or checks them).
+
+## Session, controlling-tty, and login authentication (`src/process.rs`, `src/stdin.rs`, `src/interrupts.rs`, `modules/posix_compat/`, `modules/oxfs/`)
+
+Closes the `su`/`login`/`sulogin`/`getty` row the Permission model pass above left open. Split into
+two genuinely separate pieces: `su`/`login` needed only a real second user + real password
+verification (no kernel session concept at all); `sulogin`/`getty` additionally needed a real
+session/controlling-tty/foreground-process-group model this kernel had never had any concept of.
+
+- **A real second user.** `/etc/passwd` now has `user:x:1000:1000:User:/home/user:/bin/sh`
+  alongside `root`, with a real `/home/user` directory (owned `1000:1000`, mode `0700`) — a
+  root-only `/etc/passwd` could never exercise real `su`/`login` authentication at all, since both
+  always skip the password check entirely when the caller is already root (see BusyBox's own
+  `loginutils/su.c`: `ask_and_check_password` is only called `if (cur_uid != 0)`, and
+  `loginutils/login.c`'s own `setsid()`/`ioctl(TIOCSCTTY)` calls are — independently —  already
+  commented out in BusyBox's own upstream source, so `login` never needed the session work below at
+  all). **A real `/etc/shadow`** (mode `0600`, root-owned — locked down immediately after seeding,
+  since `seed_file` always creates at the default `FIXED_PERM=0o755`) holds real SHA-512 (`$6$`)
+  `crypt(3)` hashes for both accounts (password equals the username — fine for a kernel with no
+  external network exposure and no real multi-user threat model), generated with `openssl passwd
+  -6` and verified against musl's own `crypt_sha512.c` — no code changes were needed there at all:
+  `third_party/musl/src/crypt/*.c` is plain portable C with no SIMD/vector ops (unlike `sha2`/
+  `chacha20` in `src/random.rs`, which needed real `force-soft`-style fixes for this target), so
+  `crypt()`/`getspnam()` already worked the moment real accounts existed to exercise them —
+  musl's own `getpwnam`/`getspnam`/`fopen`/`fgets` do all the real work, same "port libc's real
+  code" philosophy as everywhere else in this port.
+
+- **A real session model.** `Process` gains an `sid: Pid` field, the exact same shape as the
+  already-existing `pgid: Pid` (an ordinary `Pid`, not a distinct namespace): a freshly `spawn`ed
+  process becomes its own session leader (`sid == pid`, same as `pgid`); a forked child inherits
+  the parent's live `sid` unchanged (real `fork()` semantics); `execve` leaves it untouched (same
+  as `cwd`/`pgid`). Paired with two new globals in `src/stdin.rs` — `CONTROLLING_SESSION:
+  Option<Pid>` and `FOREGROUND_PGID: Option<Pid>` — **deliberately single globals, not per-session
+  tables**, the same simplification already accepted for `TERMIOS`: this kernel has exactly one
+  real console, so "which session owns the controlling tty" and "which pgroup is in its
+  foreground" only ever need one slot each, not a real multi-tty table.
+  - **`SYS_SETSID`** is real x86_64 Linux's own `__NR_setsid` value (`112`, confirmed directly
+    against `third_party/musl/arch/x86_64/bits/syscall.h.in`, not assumed from a generic/other-arch
+    table — the exact class of mismatch this file's syscall-ABI section warns about elsewhere).
+    `third_party/musl/src/unistd/setsid.c` is a bare no-argument `syscall(SYS_setsid)` — registering
+    a handler at `112` was the complete fix, no musl-side patch needed at all, unlike almost
+    everything else in this ABI. `process::do_setsid` enforces the real POSIX rule (`EPERM` if the
+    caller is already a process-group leader) and, on success, makes the caller leader of a fresh
+    session *and* a fresh process group at once (`sid = pgid = caller_pid`) — deliberately doesn't
+    touch `CONTROLLING_SESSION` at all: since that global is keyed by session id, landing on a
+    brand-new `sid` automatically means "not the current owner" with no explicit release step, and
+    the *old* session (and any other processes still in it) keeps whatever tty claim it already
+    had, matching real `setsid()`'s effect on the caller only.
+  - **`SYS_GETSID = 177`** (an *invented* number — unlike `SETSID`, real x86_64 Linux's own
+    `__NR_getsid` is `124`, which already means `SYS_IOCTL` in this ABI, so it needed the usual
+    musl-side remap). Exists specifically for `getty`'s own real, documented fallback path
+    (`third_party/busybox/loginutils/getty.c`): when `setsid()` fails — the common case for `getty`
+    launched as a job-control shell's own foreground child, since `hush`'s `HUSH_JOB` support
+    already puts a new foreground child in its own fresh pgroup *before* that child gets to call
+    `setsid()` itself (real, documented BusyBox behavior, not a bug — see that file's own comment
+    on why `getty 115200 /dev/tty2` typed directly at an interactive job-control shell is *expected*
+    to fail this way on real Linux too, and needs either a non-interactive invocation or the
+    `true | getty ...` trick to actually reach a session leader) — real `getty` calls `getsid(0)` to
+    double check whether it's already the leader it needs before giving up loudly.
+  - **`SYS_IOCTL` gains `TIOCSCTTY`/`TIOCNOTTY`/`TIOCGPGRP`/`TIOCSPGRP`** (`0x540E`/`0x5422`/
+    `0x540F`/`0x5410`), gated the same way `TCGETS`/`TIOCGWINSZ` already are (only the real console
+    fd ever answers). `TIOCSCTTY` requires the caller be a session leader (`sid == caller_pid`)
+    unless `force` (the raw `argp` value itself, matching real `ioctl(fd, TIOCSCTTY, arg)`'s
+    by-value argument convention for this one request) is set — this kernel has no permission model
+    gating `force` itself (real Linux requires `CAP_SYS_ADMIN`), so any caller may force-steal the
+    tty, the same "collapses to always-allowed on a kernel with no capability model" reasoning
+    `do_setpgid`'s own doc comment already uses. `TIOCGPGRP`/`TIOCSPGRP` are gated on the caller's
+    *session* currently owning the controlling tty (`ENOTTY` otherwise, matching real Linux);
+    `TIOCGPGRP` falls back to reporting the session id itself when nothing has explicitly called
+    `TIOCSPGRP` yet — the real Unix convention that a session's initial foreground group is its own
+    leader's group, and (verified by tracing through `hush.c`'s own job-control startup sequence)
+    exactly what lets a real `getty`→`login`→`hush` chain reach a working prompt on the first try
+    with no spurious `SIGTTIN` retry loop, since `pgid`/`sid` stay equal end-to-end through that
+    whole `execve` chain until `hush` itself first calls `setpgid`+`tcsetpgrp`.
+  - **Real Ctrl+C → `SIGINT` to the foreground process group.** `interrupts::
+    keyboard_interrupt_handler` now intercepts ASCII ETX (`0x03`) *before* pushing it to `stdin`'s
+    ring buffer, but only when the console's own `ISIG` termios bit is set **and** a real
+    `FOREGROUND_PGID` has actually been claimed — otherwise (today's common case: nothing besides a
+    future `sulogin`/`getty` chain ever calls `TIOCSCTTY`/`TIOCSPGRP`) it falls through unchanged to
+    the original behavior, the raw byte pushed to `stdin` for userland to handle itself exactly as
+    before this pass (`stsh`'s own `read_line`, BusyBox `hush`'s line editor). When it does fire,
+    `process::signal_foreground_group(pgid, SIGINT)` reuses the exact same Discard/Terminate/
+    SetPending per-target logic `do_kill`'s own cross-process branch already established, just
+    applied to every live process sharing that `pgid` instead of one.
+  - **Not covered**: real `SIGTSTP`/`SIGTTIN`/`SIGTTOU`-driven job control (`^Z`, background/
+    foreground job switching) — those signals' default disposition is still `Ignore` (see
+    `default_disposition`'s own doc comment), a real, documented simplification predating this
+    pass; only the `SIGINT` (`^C`) path was wired to the new foreground-group concept.
+  - **Verified via `tests/session_syscall_smoke.rs` + `userland/session-syscall-smoke/`** — a real
+    spawned ELF driven through genuine `SYSCALL`/`SYSRETQ` (same reasoning every other real-`SYSCALL`
+    smoke test in this codebase documents), running as a *forked child* of pid 1 rather than pid 1
+    itself (`process::spawn` already makes pid 1 its own process-group leader, so `setsid()` on pid
+    1 directly would always `EPERM` before reaching anything interesting — a forked child inherits
+    its parent's `pgid` unchanged, exactly the "not yet its own leader" shape `setsid()` requires,
+    and the same shape a real job-control-shell-spawned child like `getty` is in): `TIOCSCTTY`
+    correctly `EPERM`s before `setsid()` and succeeds after, `setsid()` itself succeeds once and
+    then `EPERM`s on a second call, `getsid(0)` tracks the change, `TIOCGPGRP` is `ENOTTY` before
+    `TIOCSCTTY` and reports the right value after (both the `sid` fallback and after an explicit
+    `TIOCSPGRP`), and `TIOCNOTTY` releases the claim cleanly. **Not covered by this test**: real
+    Ctrl+C→`SIGINT` delivery itself, since that's driven by a real PS/2 keyboard IRQ, not a
+    syscall, and this kernel has no way to script keystrokes into a test session (same "hand off
+    anything needing live interactive input" precedent the disk-persistence section already
+    documents) — only manually verifiable at a real QEMU prompt.
+
+**Two more real bugs found live testing `su` interactively at the `hush` prompt (not caught by any
+automated test, since neither is syscall-shaped in a way the smoke test above exercises), both now
+fixed:**
+
+1. **A real, dangerous syscall-number collision, independent of and predating the session work
+   above.** `su`'s own `initgroups()` → `setgroups()` call (`libbb/change_identity.c`, issued
+   unconditionally right before privilege drop) failed with a bizarre `Protocol not supported`.
+   Tracing it found `third_party/musl/arch/x86_64/bits/syscall.h.in` had left the real setgroups
+   syscall number at its *inert real Linux value* — which this fork had **independently and
+   separately** chosen as OxideBSD's own invented `SYS_KILL` number, in an unrelated, much earlier
+   pass, with no reason at the time to cross-check it against every other still-inert real Linux
+   number in the file. The result: a real `setgroups()` call didn't cleanly `ENOSYS` — it silently
+   invoked the real `kill(2)` handler instead, reinterpreting `(count, gid_list_ptr)` as
+   `(pid, sig)` (lucky here, since a raw pointer value almost never survives `do_kill`'s own
+   `0..=31` signal-range check, but a real latent landmine, not just a bad error message — the same
+   bug *class* this file's own musl-port section already documents at length for `getdents`/
+   `getdents64`/`vfork`, just never actually instantiated for a real-Linux-numbered, not
+   OxideBSD-invented, syscall before). Fixed by giving `setgroups` its own invented number instead
+   (`178`, continuing past `SYS_GETSID = 177`) and adding a real, minimal `SYS_SETGROUPS` handler
+   (`process::do_setgroups`, `modules/posix_compat`) — root-only, a genuine no-op (this kernel still
+   has no supplementary-group concept to actually store a list in, same reasoning `do_getgroups`
+   already documents), `EPERM` for anyone else (real `setgroups(2)`'s own unconditional
+   `CAP_SYS_ADMIN`-equivalent requirement — unlike `setuid`/`setgid`, there's no "become what you
+   already are" no-op allowance for a non-root caller, since a group *list* isn't a single value to
+   trivially compare for equality). **Any future syscall number chosen for this ABI needs to be
+   checked against every real-Linux-inert value still sitting in `bits/syscall.h.in`, not just
+   against this ABI's own already-invented numbers** — this collision existed for an unknown number
+   of prior passes without ever being exercised, since nothing before `su`/`login` called
+   `setgroups()` at all.
+2. **The already-documented `ENOSYS` mismatch (see this file's syscall-ABI section), now fixed —
+   found concretely blocking real functionality, not just a review nitpick.** Real BusyBox
+   `change_identity()` has an upstream fallback: if `initgroups()` fails with real `ENOSYS` *and*
+   the target uid already equals the caller's own uid, it's treated as a harmless no-op (real
+   Linux's own convention for a kernel built without multiuser support) — exactly `su`'s root→root
+   case. That fallback never fired because this kernel's `ENOSYS` constant (`78`, FreeBSD's value,
+   picked for authenticity like most of this file's other errno choices) didn't match musl's own
+   compiled-in value (`38`) — so the raw errno musl's syscall wrapper actually produced never
+   equaled the `ENOSYS` symbol musl's own C code compares it against, and `su` died outright instead
+   of degrading gracefully. Fixed by correcting `ENOSYS` to musl's real value (`38`) — deliberately
+   *not* bundled with a wider sweep of this file's other still-flagged, still-wrong errno constants
+   (`udp.rs`'s four, `net/tcp.rs`'s several — see this file's syscall-ABI/real-networking sections),
+   which remain a known, deliberately deferred gap: this fix was scoped to the one constant a live
+   test just demonstrated was load-bearing, not a preemptive audit of everything adjacent.
+
+Both found by testing `su` interactively at a real `hush` prompt after the session/`su`/`login`
+work above landed — a concrete reminder that a clean `cargo test` run (which exercises no BusyBox
+applet against real, interactively-typed input at all) doesn't substitute for actually running the
+thing.
 
 ## Signal handling module (`modules/signal/`, `src/process.rs`, `src/syscall.rs`)
 
@@ -1425,7 +1599,8 @@ at once, so the rows aren't a clean partition.
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | each needs a real device/driver this kernel doesn't model — not one gap, several unrelated small ones (see `docs/BUSYBOX_APPLETS.md`) |
 | Real block device driver + oxfs persistence | done | subset of 17 (`NEEDS_BLOCKDEV`, down from 20) | see this file's own "Real disk persistence" section for the full design — `src/ata.rs` (ATA PIO), real superblock/inode-table/bitmap format, mount-or-format boot logic, write-through persistence. oxfs's own disk is still a fixed, hardcoded backing store, not a mountable one — see the mount-table row below for what that did and didn't unblock |
 | Mount table (`mount --bind`/`mount -t tmpfs`) | done | `mount`/`umount`/`mountpoint` in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_BLOCKDEV` row | see this file's own "Mount table" section for the full design — `SYS_MOUNT_BIND`/`SYS_MOUNT_TMPFS`/`SYS_UMOUNT2` in `modules/oxfs`, a second in-memory-only tmpfs inode/block pool, `resolve_path_impl`'s redirect hook, `/proc/mounts`. Deliberately scoped, not a general pluggable-filesystem-type VFS (there's exactly one real block device/filesystem, nothing else to plug in) — doesn't unblock `pivot_root`/`switch_root` (need a real block-device-agnostic mount table) or anything needing a real partition table/multiple on-disk formats (`blkid`/`fdisk`/`fsck`/`mkswap`/...) |
-| uid/passwd-db model (process-attribute half + `/etc/passwd`+`/etc/group` lookups) | done | most of 16 (`NEEDS_UID`) | see this file's own "Permission model" section below for the full design. `whoami`/`groups`/`logname` should now work end-to-end (musl's `getpwuid`/`getgrgid` parse the new `/etc/passwd`/`/etc/group` in pure userspace, no new syscall needed for that half); `su`/`login`/`sulogin`/`getty` still need a real login/session-authentication flow, and `adduser`/`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` need real *mutation* of those two files (an applet-level gap now, not a kernel one — both files are already real, writable oxfs files) |
+| uid/passwd-db model (process-attribute half + `/etc/passwd`+`/etc/group` lookups) | done | most of 16 (`NEEDS_UID`) | see this file's own "Permission model" section below for the full design. `whoami`/`groups`/`logname` should now work end-to-end (musl's `getpwuid`/`getgrgid` parse the new `/etc/passwd`/`/etc/group` in pure userspace, no new syscall needed for that half); `adduser`/`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` still need real *mutation* of those two files (an applet-level gap now, not a kernel one — both files are already real, writable oxfs files) |
+| real login/session-authentication flow (`su`/`login`/`sulogin`/`getty`) | done | 4 (subset of `NEEDS_UID`) | see this file's own "Session, controlling-tty, and login authentication" section — a real second user + `/etc/shadow` (`su`/`login`), plus a real session/controlling-tty/foreground-pgroup model and real Ctrl+C→`SIGINT` delivery (`sulogin`/`getty`). Confirmed live via `tests/session_syscall_smoke.rs` for the syscall-reachable surface; `su`/`login` interactive password-prompt behavior and `sulogin`/`getty`'s own tty takeover are manual-QEMU-only (same precedent as everywhere else needing live keyboard input) |
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` — see this file's own "Real-time clock" section |
 | `nanosleep` | done | 9 (`NEEDS_CLOCK`), several also needed the clock read above | `SYS_NANOSLEEP=139` — see this file's own "Real-time clock" section. `date`/`hwclock`/`rtcwake`/`adjtimex`/`crond`/`crontab` needed the clock read more than a real sleep; not re-probed against the current roster to confirm which now fully work end to end |
 | Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | `runsv`/`svlogd`/`bootchartd`/... — this kernel has no init framework to plug into at all |

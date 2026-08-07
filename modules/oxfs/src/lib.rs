@@ -3721,6 +3721,11 @@ fn format_fresh_filesystem() -> bool {
     );
     ok &= seed_file(
         bin,
+        b"cryptpw",
+        include_bytes!(env!("OXFS_CRYPTPW_ELF_PATH")),
+    );
+    ok &= seed_file(
+        bin,
         b"cttyhack",
         include_bytes!(env!("OXFS_CTTYHACK_ELF_PATH")),
     );
@@ -4340,11 +4345,57 @@ fn format_fresh_filesystem() -> bool {
     // (third_party/musl/src/passwd/*.c) parse these directly via plain fopen/fgets, no syscall of
     // their own beyond the open/read/readv this filesystem already supports -- same "port libc's
     // real code, don't reimplement its logic kernel-side" philosophy CLAUDE.md's musl-port section
-    // already documents for DNS resolution. A single root entry is the complete, honest picture:
-    // no login mechanism exists, so root is the only uid/gid that has ever existed on this system
-    // (see Process::uid's own doc comment in src/process.rs).
-    ok &= seed_file(etc, b"passwd", b"root:x:0:0:root:/:/bin/sh\n");
-    ok &= seed_file(etc, b"group", b"root:x:0:\n");
+    // already documents for DNS resolution. Two real accounts now, not just root -- a second,
+    // non-root `user` (uid/gid 1000) exists specifically so `su`/`login` have something real to
+    // exercise: root calling either always skips the password check entirely (see busybox's own
+    // su.c), so a root-only passwd file could never demonstrate real authentication at all.
+    ok &= seed_file(
+        etc,
+        b"passwd",
+        b"root:x:0:0:root:/:/bin/sh\nuser:x:1000:1000:User:/home/user:/bin/sh\n",
+    );
+    ok &= seed_file(etc, b"group", b"root:x:0:\nuser:x:1000:\n");
+
+    // /etc/shadow: real crypt(3) password hashes (SHA-512, `$6$`) -- musl's own getspnam
+    // (third_party/musl/src/passwd/getspnam*.c) parses this the same way it parses /etc/passwd.
+    // Both passwords equal the account's own username (`root`/`user`) -- fine for a kernel with no
+    // external network exposure and no real multi-user threat model, but real enough that `su`/
+    // `login`'s own crypt() comparison genuinely succeeds or fails on the actual input, not a
+    // hardcoded stub. Locked to 0600 immediately after seeding, since `seed_file` always creates at
+    // the default `FIXED_PERM=0o755` and a real shadow file must not be world-readable.
+    ok &= seed_file(
+        etc,
+        b"shadow",
+        b"root:$6$rootsalt1$LPAGSn9wp5B5UT8Za.dDLpjIX7Iesb2cmVG/FkZsCpAaVTYOv5MM2tNq6/FtrWiSFSRAXC/JM.vP6j727dx63.:19000:0:99999:7:::\nuser:$6$usersalt1$K3nFr1EkyUio7bqA5yHH406lM.gYiQIJraJUwV47yxP/3fF.Sa4wdmFXIsT//WSUp5YDYkRnpOAFIjJqbtQXA.:19000:0:99999:7:::\n",
+    );
+    if let Some(shadow_inode) = dir_lookup(etc, b"shadow") {
+        let mut inode = read_inode(shadow_inode);
+        inode.mode = 0o600;
+        write_inode(shadow_inode, inode);
+    } else {
+        ok = false;
+    }
+
+    // /home/user -- real, owned by uid/gid 1000 -- so `su -`/`login`'s own real chdir-to-home
+    // lands somewhere that's actually theirs (permission-checked, not just root's own `/`).
+    let home = alloc_inode().expect("oxfs: failed to allocate /home inode");
+    write_inode(home, Inode::new(InodeKind::Dir));
+    dir_insert(home, b".", home).expect("oxfs: failed to seed /home's . entry");
+    dir_insert(home, b"..", root).expect("oxfs: failed to seed /home's .. entry");
+    dir_insert(root, b"home", home).expect("oxfs: failed to insert /home into root");
+
+    let user_home = alloc_inode().expect("oxfs: failed to allocate /home/user inode");
+    write_inode(user_home, Inode::new(InodeKind::Dir));
+    dir_insert(user_home, b".", user_home).expect("oxfs: failed to seed /home/user's . entry");
+    dir_insert(user_home, b"..", home).expect("oxfs: failed to seed /home/user's .. entry");
+    dir_insert(home, b"user", user_home).expect("oxfs: failed to insert /home/user into /home");
+    {
+        let mut inode = read_inode(user_home);
+        inode.mode = 0o700;
+        inode.uid = 1000;
+        inode.gid = 1000;
+        write_inode(user_home, inode);
+    }
 
     if !ok {
         log("[oxfs] self-check FAILED: seeding embedded files failed\n");

@@ -21,6 +21,16 @@
 //! Real logic (`process::do_setpgid`/`do_getpgid`, a new `Process::pgid` field) is kernel-resident,
 //! same reasoning as everything else this module only ever calls through to.
 //!
+//! `SYS_SETSID = 112` is the one exception to "continue the invented sequence": it's real x86_64
+//! Linux's own `__NR_setsid` value (confirmed against `third_party/musl/arch/x86_64/bits/
+//! syscall.h.in` directly), reused verbatim because `third_party/musl/src/unistd/setsid.c` is a
+//! bare no-argument `syscall(SYS_setsid)` — registering a handler at `112` is the complete fix,
+//! no musl patch needed at all. Backs `process::do_setsid`/a new `Process::sid` field — see
+//! CLAUDE.md's session/controlling-tty notes for why this exists (unblocking `sulogin`/`getty`).
+//! `SYS_GETSID = 177` is its counterpart, but *does* need an invented number (real `__NR_getsid`
+//! is `124`, already claimed by `SYS_IOCTL` here) — needed by `getty`'s own real fallback path
+//! when `setsid()` fails, see `process::do_getsid`'s own doc comment.
+//!
 //! `SYS_IOCTL = 124` (see CLAUDE.md's "BusyBox gap analysis" — the "termios/ioctl + pty" gap)
 //! continues the sequence right past `getpgid` (`122`/`123` reserved for a future clock/
 //! `nanosleep` pass). `(fd, request, argp)` matches real `ioctl(2)`'s own argument positions, and
@@ -76,6 +86,16 @@
 //! may become any uid/gid, anything else may only "become" what it already is) and why
 //! `getgroups` reporting a single-element list (the caller's own `gid`) is the complete, correct
 //! answer on a kernel with no supplementary-group concept.
+//!
+//! `SYS_SETGROUPS = 178` is `getgroups`'s write-side counterpart, but — unlike every other syscall
+//! in this paragraph — needed an *invented* number: real Linux's own `__NR_setgroups` (`116`) was
+//! already independently claimed by this ABI's own `SYS_KILL` (see `modules/signal/`), a real
+//! collision found live tracing why `su`'s own `initgroups()` call was dying instead of degrading
+//! gracefully (see `src/syscall.rs`'s `ENOSYS` doc comment for the other half of that story). Real
+//! logic (`process::do_setgroups`) is a permission-checked no-op — root-only (matching real
+//! `setgroups(2)`'s unconditional `CAP_SYS_ADMIN` requirement, unlike `setuid`/`setgid`'s narrower
+//! "become yourself" allowance for non-root), doesn't touch the actual list at all since there's
+//! still no supplementary-group concept to store it in.
 #![no_std]
 
 unsafe extern "C" {
@@ -88,6 +108,8 @@ unsafe extern "C" {
     fn oxidebsd_sys_dup2(oldfd: u64, newfd: u64) -> i64;
     fn oxidebsd_sys_setpgid(pid: u64, pgid: u64) -> i64;
     fn oxidebsd_sys_getpgid(pid: u64) -> i64;
+    fn oxidebsd_sys_setsid() -> i64;
+    fn oxidebsd_sys_getsid(pid: u64) -> i64;
     fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64;
     fn oxidebsd_sys_dup(oldfd: u64) -> i64;
     fn oxidebsd_sys_uname(uts_ptr: u64) -> i64;
@@ -101,6 +123,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_setuid(uid: u64) -> i64;
     fn oxidebsd_sys_setgid(gid: u64) -> i64;
     fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64;
+    fn oxidebsd_sys_setgroups(count: u64, list_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -116,6 +139,10 @@ const SYS_PIPE: u64 = 105;
 const SYS_DUP2: u64 = 106;
 const SYS_SETPGID: u64 = 120;
 const SYS_GETPGID: u64 = 121;
+/// Real x86_64 Linux's own `__NR_setsid` (`112`) -- see `sys_setsid`'s own doc comment in
+/// `src/syscall.rs` for why this is the one syscall in this whole module that needed neither an
+/// invented number nor a musl-side call-site patch.
+const SYS_SETSID: u64 = 112;
 const SYS_IOCTL: u64 = 124;
 const SYS_DUP: u64 = 125;
 const SYS_UNAME: u64 = 137;
@@ -129,6 +156,15 @@ const SYS_GETEGID: u64 = 161;
 const SYS_SETUID: u64 = 162;
 const SYS_SETGID: u64 = 163;
 const SYS_GETGROUPS: u64 = 164;
+/// Invented -- real `__NR_setgroups` (`116`) was already independently claimed by this ABI's own
+/// `SYS_KILL`, a real collision found live (see `third_party/musl/arch/x86_64/bits/syscall.h.in`'s
+/// own comment on that line for the full story). Continues the invented sequence right past
+/// `SYS_GETSID = 177`.
+const SYS_SETGROUPS: u64 = 178;
+/// Invented -- real x86_64 Linux's own `__NR_getsid` (`124`) already means `SYS_IOCTL` here, see
+/// `sys_getsid`'s own doc comment in `src/syscall.rs`. Continues the invented sequence right past
+/// `modules/oxfs`'s own `SYS_UMOUNT2 = 176`.
+const SYS_GETSID: u64 = 177;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -144,6 +180,14 @@ extern "C" fn handle_setpgid(pid: u64, pgid: u64, _arg2: u64, _arg3: u64) -> i64
 
 extern "C" fn handle_getpgid(pid: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_getpgid(pid) }
+}
+
+extern "C" fn handle_setsid(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_setsid() }
+}
+
+extern "C" fn handle_getsid(pid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getsid(pid) }
 }
 
 extern "C" fn handle_ioctl(fd: u64, request: u64, argp: u64, _arg3: u64) -> i64 {
@@ -198,6 +242,10 @@ extern "C" fn handle_getgroups(size: u64, list_ptr: u64, _a2: u64, _a3: u64) -> 
     unsafe { oxidebsd_sys_getgroups(size, list_ptr) }
 }
 
+extern "C" fn handle_setgroups(count: u64, list_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_setgroups(count, list_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -205,6 +253,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_DUP2, handle_dup2);
         oxidebsd_register_syscall(SYS_SETPGID, handle_setpgid);
         oxidebsd_register_syscall(SYS_GETPGID, handle_getpgid);
+        oxidebsd_register_syscall(SYS_SETSID, handle_setsid);
+        oxidebsd_register_syscall(SYS_GETSID, handle_getsid);
         oxidebsd_register_syscall(SYS_IOCTL, handle_ioctl);
         oxidebsd_register_syscall(SYS_DUP, handle_dup);
         oxidebsd_register_syscall(SYS_UNAME, handle_uname);
@@ -218,9 +268,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SETUID, handle_setuid);
         oxidebsd_register_syscall(SYS_SETGID, handle_setgid);
         oxidebsd_register_syscall(SYS_GETGROUPS, handle_getgroups);
+        oxidebsd_register_syscall(SYS_SETGROUPS, handle_setgroups);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS)\n",
     );
     0
 }

@@ -111,19 +111,23 @@ vs. what a documented, deliberate gap still blocks.
   `smemcap`, `taskset`, `watch`
 
 
-### NEEDS_UID (16)
+### NEEDS_UID (16, 4 now done -- `getty`/`login`/`su`/`sulogin`)
 
 Builds, but needs a real uid/passwd-db model -- see CLAUDE.md's "uid/passwd-db model" gap, **done**
-this pass for the process-attribute half (`getuid`/`geteuid`/`getgid`/`getegid`/`setuid`/`setgid`/
+for the process-attribute half (`getuid`/`geteuid`/`getgid`/`getegid`/`setuid`/`setgid`/
 `getgroups`, real `/etc/passwd`+`/etc/group`) -- `whoami`/`groups`/`logname` should now work
-end-to-end (not yet re-probed against the live roster to confirm), but `su`/`login`/`sulogin`/
-`getty` need a real login/session-authentication flow this pass doesn't add, and `adduser`/
-`chpasswd`/`passwd`/`mkpasswd`/`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` need
-real *mutation* of `/etc/passwd`/`/etc/group` (parsing them for lookups is a solved, musl-userspace
-problem now; rewriting them isn't a kernel gap at all, just unimplemented applet-level work against
-files that already exist and are already writable via ordinary `open`/`write`).
+end-to-end (not yet re-probed against the live roster to confirm). **`su`/`login`/`sulogin`/
+`getty` are also done now** -- see CLAUDE.md's "Session, controlling-tty, and login
+authentication" section: a real second user + `/etc/shadow` (crypt-hash password auth) for
+`su`/`login`, plus a real session/controlling-tty/foreground-process-group model and real
+Ctrl+C-to-`SIGINT` delivery for `sulogin`/`getty`. `adduser`/`chpasswd`/`passwd`/`mkpasswd`/
+`addgroup`/`delgroup`/`remove_shell`/`envuidgid`/`setuidgid` still need real *mutation* of
+`/etc/passwd`/`/etc/group` (parsing them for lookups is a solved, musl-userspace problem now;
+rewriting them isn't a kernel gap at all, just unimplemented applet-level work against files that
+already exist and are already writable via ordinary `open`/`write`).
 
-- no uid/passwd-db model (CLAUDE.md's "uid/passwd-db model" gap): `addgroup`, `adduser`, `chpasswd`, `delgroup`, `envuidgid`, `getty`, `groups`, `login`, `logname`, `mkpasswd`, `passwd`, `remove_shell`, `setuidgid`, `su`, `sulogin`, `whoami`
+- no uid/passwd-db model (CLAUDE.md's "uid/passwd-db model" gap): `addgroup`, `adduser`, `chpasswd`, `delgroup`, `envuidgid`, `groups`, `logname`, `mkpasswd`, `passwd`, `remove_shell`, `setuidgid`, `whoami`
+- real login/session authentication -- **done**, see CLAUDE.md's "Session, controlling-tty, and login authentication" section: `getty`, `login`, `su`, `sulogin`
 
 
 ### NEEDS_SYSCALL (33, down from 36 -- chmod/chown/chgrp moved to done this pass)

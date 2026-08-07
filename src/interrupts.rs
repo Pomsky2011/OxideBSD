@@ -291,6 +291,31 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                     // line-editing shell) does its own echoing; echoing here on top of that would
                     // double every keystroke. Defaults to on, matching this kernel's original,
                     // always-echo behavior before real termios existed.
+                    // Real tty-driver INTR behavior: once a real session has actually claimed the
+                    // controlling terminal and set a foreground process group (`TIOCSCTTY`/
+                    // `TIOCSPGRP` -- see CLAUDE.md's session/controlling-tty notes), Ctrl+C (ASCII
+                    // ETX, `0x03`) is intercepted here and turned into a real `SIGINT` delivered to
+                    // that whole group, exactly like a real terminal driver consuming INTR before
+                    // it ever reaches a reading process's buffer -- it is deliberately *not* also
+                    // pushed to stdin in this case. Gated on the console's own `ISIG` bit (real
+                    // convention: a program that's cleared it, same as `ECHO` above, wants raw
+                    // bytes instead, e.g. a line editor that means to handle Ctrl+C itself). Until
+                    // some session actually does this (the common case today -- nothing calls
+                    // `setsid`/`TIOCSCTTY` yet outside `sulogin`/`getty`), `foreground_pgid()` stays
+                    // `None` and this falls through to the original behavior below: the raw byte is
+                    // pushed to stdin and a userland reader (`stsh`'s own `read_line`, BusyBox
+                    // `hush`'s line editor) handles it itself, unchanged from before this existed.
+                    if byte == 0x03
+                        && crate::stdin::get_termios().c_lflag & crate::stdin::ISIG != 0
+                        && let Some(pgid) = crate::stdin::foreground_pgid()
+                    {
+                        serial_print!("^C\n");
+                        crate::process::signal_foreground_group(pgid, crate::process::SIGINT);
+                        unsafe {
+                            pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+                        }
+                        return;
+                    }
                     if crate::stdin::echo_enabled()
                         && (byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte))
                     {

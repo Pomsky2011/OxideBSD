@@ -34,6 +34,7 @@ fn main() {
         "OXFS_PERSISTENCE_SYSCALL_SMOKE_ELF_PATH",
     );
     build_userland_crate("mount-syscall-smoke", "MOUNT_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("session-syscall-smoke", "SESSION_SYSCALL_SMOKE_ELF_PATH");
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -194,6 +195,7 @@ fn main() {
         ("CRC32", "crc32", 0x6340000),
         ("CROND", "crond", 0x6380000),
         ("CRONTAB", "crontab", 0x63c0000),
+        ("CRYPTPW", "cryptpw", 0xa240000),
         ("CTTYHACK", "cttyhack", 0x6400000),
         ("DATE", "date", 0x6440000),
         ("DC", "dc", 0x6480000),
@@ -748,6 +750,23 @@ fn build_busybox_applet(
         }
     }
 
+    // A real, previously-undiscovered bug found live: this staleness check correctly notices
+    // when `musl_sysroot`'s own `libc.a` (or busybox's own source, or this file) is newer than
+    // `out_dir`'s existing `busybox` binary, but re-running `make allnoconfig` + `make` against
+    // that *same, already-populated* `O=` directory doesn't actually guarantee every object file
+    // gets recompiled -- BusyBox's own incremental build tracks its own source files, but not
+    // musl's *installed* sysroot headers (`target/musl-sysroot/include/...`, copied out of
+    // `third_party/musl` by `build_musl_sysroot`'s own `make install`) as a dependency at all.
+    // Confirmed live: after a real musl syscall-number fix, `libbb/change_identity.o` inside an
+    // already-built applet's own `O=` directory still had a five-day-old mtime predating the fix
+    // entirely -- only a handful of this applet's ~177 object files were newer than the changed
+    // header, the rest silently relinked from stale, pre-fix objects into a "freshly rebuilt"
+    // (by mtime) binary that still ran the old code. A full `rm -rf` of the stale `O=` directory
+    // whenever this function's own freshness check decides a rebuild is warranted is the only
+    // reliable fix -- trusting BusyBox's own incremental tracking here has already been proven
+    // wrong. More expensive than a true incremental rebuild would be, but correctness over speed:
+    // this only runs when something genuinely changed, not on every `cargo build`.
+    let _ = std::fs::remove_dir_all(&out_dir);
     std::fs::create_dir_all(&out_dir)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
 

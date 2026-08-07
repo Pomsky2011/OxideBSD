@@ -109,11 +109,14 @@ pub(crate) struct RawTermios {
 /// otherwise consulted: this kernel's own ring buffer has never done real canonical-mode
 /// line-holdback (backspace/erase has always been a userland concern — see `userland/stsh/`'s own
 /// `read_line`), so there's no existing "canonical" behavior for turning `ICANON` off to actually
-/// change; it's already effectively raw-mode-shaped regardless of this bit. `ECHO` is the one bit
-/// with a real, live effect — see `echo_enabled` below.
+/// change; it's already effectively raw-mode-shaped regardless of this bit. `ECHO`/`ISIG` are the
+/// two bits with a real, live effect — see `echo_enabled` below and `ISIG`'s own doc comment.
 pub(crate) const ICANON: u32 = 0o000002;
 pub(crate) const ECHO: u32 = 0o000010;
-const ISIG: u32 = 0o000001;
+/// No longer purely inert once `interrupts::keyboard_interrupt_handler`'s own Ctrl+C-to-`SIGINT`
+/// interception exists (see that function's own doc comment) — real convention: a program that's
+/// cleared this bit wants raw Ctrl+C bytes instead of a real signal.
+pub(crate) const ISIG: u32 = 0o000001;
 
 /// A plausible "cooked mode" default (`ISIG | ICANON | ECHO`, real Unix convention for a freshly
 /// opened terminal) — matters only in that it must be *something* self-consistent: nothing in this
@@ -153,6 +156,44 @@ pub(crate) fn get_termios() -> RawTermios {
 
 pub(crate) fn set_termios(new: RawTermios) {
     *TERMIOS.lock() = new;
+}
+
+/// The session (`process::Process::sid`) that currently owns this kernel's one real controlling
+/// terminal — `None` until some session leader claims it via `TIOCSCTTY`. A single global, not a
+/// per-tty table, for the same reason `TERMIOS` above is one: there is exactly one real console, no
+/// pty concept, no multiple simultaneous sessions each with their own tty. Set/cleared by
+/// `syscall::sys_ioctl`'s `TIOCSCTTY`/`TIOCNOTTY` handling.
+static CONTROLLING_SESSION: Mutex<Option<u64>> = Mutex::new(None);
+
+/// The process group currently in the foreground of the controlling terminal — `TIOCGPGRP`/
+/// `TIOCSPGRP`'s own backing store, and what `keyboard_interrupt_handler`'s own Ctrl+C handling
+/// signals instead of whatever single hardcoded target it used before this existed.
+static FOREGROUND_PGID: Mutex<Option<u64>> = Mutex::new(None);
+
+pub(crate) fn controlling_session() -> Option<u64> {
+    *CONTROLLING_SESSION.lock()
+}
+
+pub(crate) fn set_controlling_session(sid: u64) {
+    *CONTROLLING_SESSION.lock() = Some(sid);
+}
+
+/// Only clears the claim if `sid` is the one that currently holds it — a stale caller (one whose
+/// own session already lost the tty to someone else) can't accidentally revoke a different,
+/// current owner's claim.
+pub(crate) fn clear_controlling_session_if(sid: u64) {
+    let mut guard = CONTROLLING_SESSION.lock();
+    if *guard == Some(sid) {
+        *guard = None;
+    }
+}
+
+pub(crate) fn foreground_pgid() -> Option<u64> {
+    *FOREGROUND_PGID.lock()
+}
+
+pub(crate) fn set_foreground_pgid(pgid: u64) {
+    *FOREGROUND_PGID.lock() = Some(pgid);
 }
 
 /// Called from `keyboard_interrupt_handler` for each decoded ASCII character. Also wakes any

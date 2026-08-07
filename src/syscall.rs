@@ -33,8 +33,19 @@
 //! deliberate nod to authenticity — not a claim of binary compatibility with real BSD userland
 //! (newer syscalls this ABI invents for itself, e.g. `mmap`/`brk`/TLS-base-set, don't extend that
 //! convention — see `modules/native_abi/`). errno values are *mostly* shared across Linux and the
-//! BSDs (`EBADF`, `EINVAL` are identical), but not universally — `ENOSYS` is 38 on Linux, 78 on
-//! FreeBSD; this module uses the FreeBSD value.
+//! BSDs (`EBADF`, `EINVAL` are identical), but not universally — `ENOSYS` is `38` on Linux, `78` on
+//! FreeBSD. **`ENOSYS` itself uses the Linux/musl value (`38`), not the FreeBSD one** — the one
+//! deliberate exception to this file's own "FreeBSD authenticity" framing, fixed after it was found
+//! live blocking real functionality: whatever this file returns via the carry-flag ABI becomes
+//! musl's raw `errno` directly (see `EPROTONOSUPPORT`'s own doc comment below for the full
+//! mechanism), so a FreeBSD-authentic-but-musl-wrong value here isn't just cosmetic — BusyBox's own
+//! `libbb/change_identity.c` has a real upstream fallback (`errno == ENOSYS && target_uid ==
+//! getuid()` → treat a failed `initgroups()` as a harmless no-op, the correct behavior on a kernel
+//! with no supplementary-group concept, real Linux's own convention for `CONFIG_MULTIUSER=n`) that
+//! silently never fired while this returned FreeBSD's `78` instead of musl's real `38`, making `su`
+//! die outright instead of degrading gracefully. Was previously deliberately left unfixed pending a
+//! wider scope discussion (this constant is referenced far more broadly than the group below) —
+//! fixed once a live test demonstrated a concrete functional blocker, not as a preemptive sweep.
 //!
 //! **The number → handler mapping (`dispatch`'s table) is populated by a dynamically loaded
 //! kernel module, not hardcoded here.** `modules/native_abi/` registers `SYS_EXIT`/`SYS_READ`/
@@ -57,11 +68,11 @@ use crate::gdt;
 use crate::serial_println;
 
 /// Standard, POSIX-heritage errno values. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC`/`EPIPE` happen to be
-/// identical on Linux and the BSDs; `ENOSYS` is not (see module doc comment) — this is FreeBSD's
-/// real value.
+/// identical on Linux and the BSDs; `ENOSYS` is not (see module doc comment) — unlike this group's
+/// other members, it uses musl's real Linux value (`38`), not FreeBSD's (`78`).
 pub(crate) const EBADF: u64 = 9;
 pub(crate) const EINVAL: u64 = 22;
-pub(crate) const ENOSYS: u64 = 78;
+pub(crate) const ENOSYS: u64 = 38;
 pub(crate) const ECHILD: u64 = 10;
 pub(crate) const ENOEXEC: u64 = 8;
 pub(crate) const ENOMEM: u64 = 12;
@@ -791,6 +802,26 @@ pub(crate) fn sys_getpgid(pid: u64) -> Result<u64, u64> {
     crate::process::do_getpgid(crate::scheduler::current_pid(), pid as i64)
 }
 
+/// `SYS_SETSID` — real x86_64 Linux's own `__NR_setsid` value (`112`, confirmed against
+/// `third_party/musl/arch/x86_64/bits/syscall.h.in` directly, not assumed from a generic/other-arch
+/// table — the exact class of mismatch CLAUDE.md's syscall-ABI section warns about elsewhere).
+/// `third_party/musl/src/unistd/setsid.c` is a bare `syscall(SYS_setsid)` with no arguments and no
+/// call-site patch needed at all — registering a handler at `112` is the complete fix, unlike
+/// `open`/`execve`/`chown`/... which also needed musl-side argument-shape patches. Delegates to
+/// `process::do_setsid` — see that function's own doc comment.
+pub(crate) fn sys_setsid() -> Result<u64, u64> {
+    crate::process::do_setsid(crate::scheduler::current_pid())
+}
+
+/// `SYS_GETSID` (`177` — an invented number, unlike `SYS_SETSID`: real x86_64 Linux's own
+/// `__NR_getsid` is `124`, which already means `SYS_IOCTL` in this ABI, so it needed the usual
+/// remap-in-musl treatment `open`/`chown`/... get, not a free ride). Matches real `getsid(2)`'s
+/// exact `(pid)` wire format. Delegates to `process::do_getsid` — see that function's own doc
+/// comment for why this exists (`getty`'s own real fallback path).
+pub(crate) fn sys_getsid(pid: u64) -> Result<u64, u64> {
+    crate::process::do_getsid(crate::scheduler::current_pid(), pid as i64)
+}
+
 /// `SYS_GETUID`/`SYS_GETEUID`/`SYS_GETGID`/`SYS_GETEGID` (`158`-`161`, registered by
 /// `modules/posix_compat`, continuing on from `SYS_SETITIMER`/`SYS_GETITIMER = 156`/`157`) — all
 /// four are real zero-argument `getuid(2)`-family calls, so only the number needed remapping on
@@ -831,6 +862,16 @@ pub(crate) fn sys_getgroups(size: u64, list_ptr: u64) -> Result<u64, u64> {
     crate::process::do_getgroups(crate::scheduler::current_pid(), size as i64, list_ptr)
 }
 
+/// `SYS_SETGROUPS` (`178` — an *invented* number, not real Linux's own `__NR_setgroups` (`116`):
+/// that value was already independently claimed by this ABI's own `SYS_KILL`, a real collision
+/// found live — see `third_party/musl/arch/x86_64/bits/syscall.h.in`'s own comment on this line
+/// for the full story). Real `(size, gid_list_ptr)` wire format, no argument-convention patch
+/// needed. See `process::do_setgroups`'s own doc comment for why this is a real, permission-
+/// checked no-op rather than either an unconditional success or a plain `ENOSYS`.
+pub(crate) fn sys_setgroups(count: u64, list_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_setgroups(crate::scheduler::current_pid(), count, list_ptr)
+}
+
 /// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
 /// this ABI's `SYS_IOCTL` reuses these verbatim as its own `request` argument values (they're
 /// already architecture-generic constants, not syscall numbers, so there's nothing to remap the
@@ -841,6 +882,15 @@ const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
+/// Session/controlling-tty requests (see CLAUDE.md's session/controlling-tty notes, and
+/// `process::Process::sid`/`stdin::CONTROLLING_SESSION`/`stdin::FOREGROUND_PGID`) — added
+/// specifically to get `sulogin`/`getty` (both call `setsid()` then one of these) past their own
+/// startup sequence, since this kernel had no session/foreground-process-group concept at all
+/// before.
+const TIOCSCTTY: u64 = 0x540E;
+const TIOCGPGRP: u64 = 0x540F;
+const TIOCSPGRP: u64 = 0x5410;
+const TIOCNOTTY: u64 = 0x5422;
 
 /// A fixed, plausible `struct winsize` (`third_party/musl`'s `include/alltypes.h.in`: four `u16`s,
 /// `ws_row`/`ws_col`/`ws_xpixel`/`ws_ypixel`, no padding) -- this kernel has no real display-size
@@ -865,9 +915,10 @@ const FIXED_WINSIZE: RawWinsize = RawWinsize {
 
 /// `SYS_IOCTL` (`124`) — real request codes (see above), but **not** real `ioctl(2)`'s full
 /// surface: only the handful of tty-specific requests this kernel's own console can plausibly
-/// answer (`TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`) are handled; anything else is `ENOTTY`,
-/// logged the same way an unregistered syscall number already is, so a future need is discoverable
-/// the same "boot it and read the log" way every other gap in this codebase was found.
+/// answer (`TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`/`TIOCSCTTY`/`TIOCNOTTY`/`TIOCGPGRP`/
+/// `TIOCSPGRP`) are handled; anything else is `ENOTTY`, logged the same way an unregistered
+/// syscall number already is, so a future need is discoverable the same "boot it and read the log"
+/// way every other gap in this codebase was found.
 ///
 /// **Only ever succeeds against the console** (`crate::fd::real_fd_of(fd)` resolving to stdin's or
 /// stdout's own `real_fd`, `0`/`1` -- see `src/fd.rs`'s module doc comment for why checking `fd`
@@ -911,6 +962,70 @@ pub(crate) fn sys_ioctl(fd: u64, request: u64, argp: u64) -> Result<u64, u64> {
             Ok(0)
         }
         TIOCSWINSZ => Ok(0), // accepted, silently discarded -- nothing reads window size back out
+        TIOCSCTTY => {
+            let caller_pid = crate::scheduler::current_pid();
+            let table = crate::process::table().lock();
+            let Some(proc) = table.get(&caller_pid) else {
+                return Err(ENOTTY);
+            };
+            // Real Linux requires the caller be a session leader unless `force` (the raw `argp`
+            // value here, not a pointer -- real `ioctl(fd, TIOCSCTTY, arg)` passes `arg` by value
+            // for this request) is set; this kernel has no permission model gating `force` itself
+            // (only root has ever existed as a concept predating this pass), so any caller may
+            // force-steal the controlling tty, matching real Linux's own "force requires
+            // CAP_SYS_ADMIN" collapsing to "always allowed" on a kernel with no capability model.
+            if proc.sid != caller_pid && argp == 0 {
+                return Err(EPERM);
+            }
+            let sid = proc.sid;
+            drop(table);
+            crate::stdin::set_controlling_session(sid);
+            Ok(0)
+        }
+        TIOCNOTTY => {
+            let caller_pid = crate::scheduler::current_pid();
+            let sid = crate::process::table()
+                .lock()
+                .get(&caller_pid)
+                .map(|p| p.sid)
+                .ok_or(ENOTTY)?;
+            crate::stdin::clear_controlling_session_if(sid);
+            Ok(0)
+        }
+        TIOCGPGRP => {
+            let caller_pid = crate::scheduler::current_pid();
+            let sid = crate::process::table()
+                .lock()
+                .get(&caller_pid)
+                .map(|p| p.sid)
+                .ok_or(ENOTTY)?;
+            if crate::stdin::controlling_session() != Some(sid) {
+                return Err(ENOTTY);
+            }
+            let pgid = crate::stdin::foreground_pgid().unwrap_or(sid) as i32;
+            // SAFETY: same known pointer-validation gap every other user-memory write in this file
+            // already has.
+            unsafe { *(argp as *mut i32) = pgid };
+            Ok(0)
+        }
+        TIOCSPGRP => {
+            let caller_pid = crate::scheduler::current_pid();
+            let sid = crate::process::table()
+                .lock()
+                .get(&caller_pid)
+                .map(|p| p.sid)
+                .ok_or(ENOTTY)?;
+            if crate::stdin::controlling_session() != Some(sid) {
+                return Err(ENOTTY);
+            }
+            // SAFETY: same known pointer-validation gap as above, for a read this time.
+            let pgid = unsafe { *(argp as *const i32) };
+            if pgid <= 0 {
+                return Err(EINVAL);
+            }
+            crate::stdin::set_foreground_pgid(pgid as u64);
+            Ok(0)
+        }
         _ => {
             serial_println!("[boot] unrecognized ioctl request 0x{:x}", request);
             Err(ENOTTY)
@@ -1147,6 +1262,14 @@ pub(crate) extern "C" fn oxidebsd_sys_getpgid(pid: u64) -> i64 {
     result_to_ffi(sys_getpgid(pid))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_setsid() -> i64 {
+    result_to_ffi(sys_setsid())
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getsid(pid: u64) -> i64 {
+    result_to_ffi(sys_getsid(pid))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_getuid() -> i64 {
     sys_getuid() as i64
 }
@@ -1173,6 +1296,10 @@ pub(crate) extern "C" fn oxidebsd_sys_setgid(gid: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64 {
     result_to_ffi(sys_getgroups(size, list_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_setgroups(count: u64, list_ptr: u64) -> i64 {
+    result_to_ffi(sys_setgroups(count, list_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {
