@@ -124,6 +124,16 @@ unsafe extern "C" {
     fn oxidebsd_sys_setgid(gid: u64) -> i64;
     fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64;
     fn oxidebsd_sys_setgroups(count: u64, list_ptr: u64) -> i64;
+    fn oxidebsd_sys_prlimit64(pid: u64, resource: u64, new_ptr: u64, old_ptr: u64) -> i64;
+    fn oxidebsd_sys_setpriority(which: u64, who: u64, prio: u64) -> i64;
+    fn oxidebsd_sys_getpriority(which: u64, who: u64) -> i64;
+    fn oxidebsd_sys_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64) -> i64;
+    fn oxidebsd_sys_sched_getscheduler(pid: u64) -> i64;
+    fn oxidebsd_sys_sched_getparam(pid: u64, param_ptr: u64) -> i64;
+    fn oxidebsd_sys_sched_get_priority_max(policy: u64) -> i64;
+    fn oxidebsd_sys_sched_get_priority_min(policy: u64) -> i64;
+    fn oxidebsd_sys_reboot(cmd: u64) -> i64;
+    fn oxidebsd_sys_umask(new_mask: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -165,6 +175,32 @@ const SYS_SETGROUPS: u64 = 178;
 /// `sys_getsid`'s own doc comment in `src/syscall.rs`. Continues the invented sequence right past
 /// `modules/oxfs`'s own `SYS_UMOUNT2 = 176`.
 const SYS_GETSID: u64 = 177;
+
+/// `SYS_PRLIMIT64 = 478` through `SYS_REBOOT = 486` are this ABI's process-attribute half of the
+/// NEEDS_SYSCALL gap-table pass (`modules/oxfs`'s own `SYS_FSYNC = 471` through `SYS_FSTATFS =
+/// 477` are the filesystem-owned half). None of these six continue this module's own existing
+/// 105-178 invented sequence -- a first attempt at that collided with a *second* set of real,
+/// still-inert Linux syscalls sharing those same low numbers (see `third_party/musl/arch/
+/// x86_64/bits/syscall.h.in`'s own comment on `__NR_flock`, right near `__NR_fsync`, for the full
+/// story on why 471-486 is used instead).
+const SYS_PRLIMIT64: u64 = 478;
+const SYS_SETPRIORITY: u64 = 479;
+const SYS_GETPRIORITY: u64 = 480;
+const SYS_SCHED_SETSCHEDULER: u64 = 481;
+const SYS_SCHED_GETSCHEDULER: u64 = 482;
+const SYS_SCHED_GETPARAM: u64 = 483;
+const SYS_SCHED_GET_PRIORITY_MAX: u64 = 484;
+const SYS_SCHED_GET_PRIORITY_MIN: u64 = 485;
+const SYS_REBOOT: u64 = 486;
+/// Continues the same 471-486 batch one past `SYS_REBOOT = 486` -- see this module's own
+/// `SYS_PRLIMIT64` doc comment for why that batch landed there instead of continuing this
+/// module's earlier 105-178 invented sequence. Found live testing `chmod +x` on a real script:
+/// BusyBox's `libbb/parse_mode.c` calls `umask(0)`/`umask(old)` unconditionally to compute
+/// symbolic mode changes, and with this unmapped it silently read back a garbage `ENOSYS`-derived
+/// value instead of a real mask (real POSIX `umask()` can't fail, so musl's own wrapper never
+/// checks for an error at all). See `src/process.rs`'s `do_umask`/`Process::umask` for the real
+/// per-process, stored-not-enforced semantics this backs.
+const SYS_UMASK: u64 = 487;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -246,6 +282,50 @@ extern "C" fn handle_setgroups(count: u64, list_ptr: u64, _a2: u64, _a3: u64) ->
     unsafe { oxidebsd_sys_setgroups(count, list_ptr) }
 }
 
+extern "C" fn handle_prlimit64(pid: u64, resource: u64, new_ptr: u64, old_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_prlimit64(pid, resource, new_ptr, old_ptr) }
+}
+
+extern "C" fn handle_setpriority(which: u64, who: u64, prio: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_setpriority(which, who, prio) }
+}
+
+extern "C" fn handle_getpriority(which: u64, who: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getpriority(which, who) }
+}
+
+extern "C" fn handle_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_setscheduler(pid, policy, param_ptr) }
+}
+
+extern "C" fn handle_sched_getscheduler(pid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_getscheduler(pid) }
+}
+
+extern "C" fn handle_sched_getparam(pid: u64, param_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_getparam(pid, param_ptr) }
+}
+
+extern "C" fn handle_sched_get_priority_max(policy: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_get_priority_max(policy) }
+}
+
+extern "C" fn handle_sched_get_priority_min(policy: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_get_priority_min(policy) }
+}
+
+/// Real `reboot(int type)`'s musl-side call site (`third_party/musl/src/linux/reboot.c`) passes
+/// the two real magic numbers as the syscall's first two arguments and `type` as the third --
+/// this handler picks `cmd` out of the third register (`argp`-equivalent position) rather than the
+/// first, matching that real wire shape instead of assuming a single-argument one.
+extern "C" fn handle_reboot(_magic1: u64, _magic2: u64, cmd: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_reboot(cmd) }
+}
+
+extern "C" fn handle_umask(new_mask: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_umask(new_mask) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -269,9 +349,19 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SETGID, handle_setgid);
         oxidebsd_register_syscall(SYS_GETGROUPS, handle_getgroups);
         oxidebsd_register_syscall(SYS_SETGROUPS, handle_setgroups);
+        oxidebsd_register_syscall(SYS_PRLIMIT64, handle_prlimit64);
+        oxidebsd_register_syscall(SYS_SETPRIORITY, handle_setpriority);
+        oxidebsd_register_syscall(SYS_GETPRIORITY, handle_getpriority);
+        oxidebsd_register_syscall(SYS_SCHED_SETSCHEDULER, handle_sched_setscheduler);
+        oxidebsd_register_syscall(SYS_SCHED_GETSCHEDULER, handle_sched_getscheduler);
+        oxidebsd_register_syscall(SYS_SCHED_GETPARAM, handle_sched_getparam);
+        oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MAX, handle_sched_get_priority_max);
+        oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MIN, handle_sched_get_priority_min);
+        oxidebsd_register_syscall(SYS_REBOOT, handle_reboot);
+        oxidebsd_register_syscall(SYS_UMASK, handle_umask);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK)\n",
     );
     0
 }

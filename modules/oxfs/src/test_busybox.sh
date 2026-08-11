@@ -4,41 +4,92 @@
 # Usage, at the hush prompt:
 #   sh /test_busybox.sh
 #
-# Written for this kernel's actual hush build, not a generic POSIX shell: `sh`'s own .config
-# (target/busybox-sh/.config after a real build.rs run) has only CONFIG_HUSH/HUSH_INTERACTIVE/
-# HUSH_JOB set -- HUSH_IF/HUSH_LOOPS/HUSH_CASE/HUSH_FUNCTIONS/HUSH_TICK are all off. So: no
-# if/for/while/case, no shell functions, no $(...)/`...` command substitution, no shell-builtin
-# test/echo/printf/kill (real standalone applet binaries are used for all of those instead, via
-# PATH). What's used here: plain command execution, pipes, redirection, `&&`/`||`/`;`, `$?`/`$$`,
-# and variable assignment -- all unconditional core hush grammar.
+# A real POSIX-shell test harness now, not a flat sequence of hand-unrolled PASS/FAIL lines.
+# `sh`'s own .config (target/busybox-sh/.config after a real build.rs run) used to have only
+# CONFIG_HUSH/HUSH_INTERACTIVE/HUSH_JOB set -- HUSH_IF/HUSH_LOOPS/HUSH_CASE/HUSH_FUNCTIONS/
+# HUSH_TICK/HUSH_TEST/... were all off (an `allnoconfig` artifact: it writes an explicit
+# "not set" line for every symbol in the whole Kconfig tree up front, so the later `make
+# oldconfig` pass -- which only fills in symbols with *no* prior answer -- never got a chance to
+# apply hush's real `default y` for any of them). Fixed in `build.rs`'s
+# `configure_busybox_single_applet` (see its own doc comment) by flipping those lines directly,
+# the same way it already did for `HUSH_INTERACTIVE`/`HUSH_JOB`. This script both exercises real
+# applets *and* doubles as the regression check for that fix: the "control flow smoke test"
+# section below asserts `if`/`for`/`while`/`until`/`case`/functions/`local`/arithmetic/command
+# substitution/brace expansion/`$RANDOM` all actually work, not just that they compiled in.
 #
-# Every check redirects a real applet's output to a fresh file and compares it (via `cmp` or the
-# command's own exit status) against a hand-written expected result, printing PASS/FAIL straight
-# to the console and recording a `ok_<name>`/`bad_<name>` marker file (via `echo 1 > ...`, not
-# `touch` -- see below) for the final tally. **Every file this script writes to is a brand-new
-# name, written exactly once**: oxfs's own `open()` has a documented simplification (see
-# `oxfs_open`'s doc comment in modules/oxfs/src/lib.rs) where re-opening an *existing* file for
-# writing silently downgrades to a read-only fd instead of erroring or truncating -- an earlier
-# version of this script accumulated PASS/FAIL lines into one shared results.txt via repeated
-# `tee -a`, which hit exactly that gap on every line after the first.
+# `check`/`check_status`/`report` (below) accumulate into real `PASS`/`FAIL` shell variables via
+# real `$((...))` arithmetic -- no longer marker files (`ok_<name>`/`bad_<name>`) tallied with
+# `ls | wc -l` at the end, since that workaround existed only because hush had no working
+# arithmetic or persistent variables across... itself (it always ran in one process; the marker
+# files were purely a stand-in for a counter that didn't work yet). Most checks now capture a
+# real applet's output directly via `$(...)` and compare it to an inline expected string, instead
+# of writing both sides out to scratch files and running `cmp` -- real command substitution
+# strips all trailing newlines on both the actual and hand-written-expected side uniformly, so a
+# plain string comparison is exact without needing a byte-for-byte file compare.
 #
-# That earlier version also hit a real, separate, now-fixed kernel bug: `oxidebsd_sys_exit`
-# (src/syscall.rs) used to store a userland `exit(code)` value as the wait4() status *unshifted*,
-# instead of real `wait(2)`'s actual encoding (`WEXITSTATUS` in bits 8-15, low 7 bits zero for a
-# normal exit). Any applet exiting normally with a nonzero code -- extremely common, e.g. any
-# command reporting its own ordinary error -- had that raw low byte misread by hush's real
-# `WIFSIGNALED`/`WTERMSIG` macros as "terminated by signal N" (`exit(1)` decoded as `SIGHUP`,
-# hence a spurious "Hangup" after nearly any failing command, and real signal-death handling then
-# corrupting later commands in the same session). Fixed at the source; this script no longer needs
-# to work around it, just noted here since it's why the marker-file approach below still avoids
-# `touch` specifically for an unrelated reason (next paragraph), not because of the old cascade.
+# Two real, separate kernel bugs this script (or an earlier version of it) found live, both now
+# fixed, still worth remembering here since nothing in `cargo test`/`clippy` would have caught
+# either:
 #
-# Markers use `echo 1 > file`, not `touch file`: this kernel doesn't implement `utimensat`
-# (BusyBox's `touch` tries it first and, since it gets `ENOSYS` rather than the `ENOENT` it knows
-# how to recover from by falling back to creating the file, `touch` always fails here -- a real,
-# separate, unfixed gap this script's own "touch creates a file" check is expected to legitimately
-# FAIL until `utimensat` exists). Everything else in this script (`echo`/`printf`/redirection) has
-# no such dependency.
+# 1. `oxidebsd_sys_exit` used to store a userland `exit(code)` value as the `wait4()` status
+#    *unshifted*, instead of real `wait(2)`'s actual encoding (`WEXITSTATUS` in bits 8-15, low 7
+#    bits zero for a normal exit). Any applet exiting normally with a nonzero code -- extremely
+#    common -- had that raw low byte misread by hush's real `WIFSIGNALED`/`WTERMSIG` macros as
+#    "terminated by signal N" (`exit(1)` decoded as `SIGHUP`), printing a spurious "Hangup" after
+#    nearly any failing command and corrupting later commands in the same session. Fixed at the
+#    source (see CLAUDE.md's Process/scheduler section) -- this script no longer needs to work
+#    around it at all.
+# 2. `oxfs_open` used to always return a read-only fd for a path that already existed, regardless
+#    of `O_WRONLY`/`O_RDWR`/`O_APPEND`/`O_TRUNC` -- a file could only ever be written once, for
+#    its entire lifetime. An earlier version of *this exact script* found it live (accumulating
+#    PASS/FAIL lines into one shared results file via repeated `tee -a` started failing on the
+#    second line). Fixed in `oxfs_open`/`oxfs_close` (see CLAUDE.md's Permission model section) --
+#    the "overwrite an existing file" / "append to an existing file" checks below are the real
+#    regression coverage for that fix, something the old file-per-check design could never have
+#    exercised even by accident.
+#
+# `touch` on a path that already exists now succeeds for real too (`utimensat`'s own real
+# existence-check semantics -- see CLAUDE.md's musl-port section: no per-inode timestamp fields
+# exist to actually update, but a real `ENOENT`-vs-success distinction is enough to satisfy
+# `touch.c`'s own fallback logic either way).
+
+PASS=0
+FAIL=0
+
+# report NAME STATUS -- STATUS is a real 0/nonzero shell exit-status value (typically `$?` from
+# the line just above, or 0/1 computed inline). Tallies into PASS/FAIL and prints straight away.
+report() {
+    name=$1
+    status=$2
+    if [ "$status" -eq 0 ]; then
+        echo "PASS: $name"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $name"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# check NAME ACTUAL EXPECTED -- compares two strings directly (captured via $(...) at the call
+# site), no scratch files or `cmp` needed.
+check() {
+    name=$1
+    actual=$2
+    expected=$3
+    if [ "$actual" = "$expected" ]; then
+        report "$name" 0
+    else
+        report "$name" 1
+        echo "  actual:   $actual"
+        echo "  expected: $expected"
+    fi
+}
+
+# check_status NAME STATUS -- thin alias of report(), used at call sites that are asserting a
+# real command's own exit status rather than comparing two strings.
+check_status() {
+    report "$1" "$2"
+}
 
 rm -rf /test_busybox_scratch
 mkdir /test_busybox_scratch
@@ -46,208 +97,181 @@ cd /test_busybox_scratch
 
 echo "=== OxideBSD BusyBox applet self-test ==="
 
+echo "--- control flow smoke test (what build.rs's HUSH config fix actually turned on) ---"
+
+# if / elif / else
+if [ 1 -eq 2 ]; then
+    ctrl_if="wrong branch"
+elif [ 2 -eq 2 ]; then
+    ctrl_if="elif branch"
+else
+    ctrl_if="wrong branch"
+fi
+check "if/elif/else" "$ctrl_if" "elif branch"
+
+# for loop
+ctrl_for=""
+for word in one two three; do
+    ctrl_for="$ctrl_for$word,"
+done
+check "for loop" "$ctrl_for" "one,two,three,"
+
+# while loop
+ctrl_while=0
+i=0
+while [ "$i" -lt 5 ]; do
+    ctrl_while=$((ctrl_while + i))
+    i=$((i + 1))
+done
+check "while loop" "$ctrl_while" "10"
+
+# until loop
+ctrl_until=0
+until [ "$ctrl_until" -ge 3 ]; do
+    ctrl_until=$((ctrl_until + 1))
+done
+check "until loop" "$ctrl_until" "3"
+
+# case / esac, driven by a for loop over several inputs
+ctrl_case=""
+for word in apple banana cherry; do
+    case "$word" in
+        apple) ctrl_case="${ctrl_case}A" ;;
+        banana) ctrl_case="${ctrl_case}B" ;;
+        *) ctrl_case="${ctrl_case}?" ;;
+    esac
+done
+check "case/esac" "$ctrl_case" "AB?"
+
+# functions, local variables, arithmetic, and a real return value read back via $(...)
+add_one() {
+    local n=$1
+    echo $((n + 1))
+}
+check "function + local + arithmetic" "$(add_one 41)" "42"
+
+# command substitution -- both real forms
+check 'command substitution $(...)' "$(echo nested)" "nested"
+check 'command substitution `...`' "`echo nested`" "nested"
+
+# arithmetic expansion on its own
+check 'arithmetic $((...))' "$((6 * 7))" "42"
+
+# brace expansion (a bash-compat extension, CONFIG_HUSH_BRACE_EXPANSION)
+check "brace expansion" "$(echo {a,b,c})" "a b c"
+
+# $RANDOM -- value is nondeterministic, so only assert it's a real nonempty decimal number
+r1=$RANDOM
+case "$r1" in
+    ''|*[!0-9]*) check_status '$RANDOM produces a decimal number' 1 ;;
+    *) check_status '$RANDOM produces a decimal number' 0 ;;
+esac
+
+echo "--- individual applets ---"
+
 # --- echo / printf ---
-echo "hello world" > act_echo.txt
-printf 'hello world\n' > exp_echo.txt
-cmp -s act_echo.txt exp_echo.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: echo" || echo "FAIL: echo"
-test "$STATUS" -eq 0 && echo 1 > ok_echo || echo 1 > bad_echo
+check "echo" "$(echo hello world)" "hello world"
+check "printf formatting" "$(printf '%s-%d' foo 7)" "foo-7"
 
-printf '%s-%d\n' foo 7 > act_printf.txt
-printf 'foo-7\n' > exp_printf.txt
-cmp -s act_printf.txt exp_printf.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: printf formatting" || echo "FAIL: printf formatting"
-test "$STATUS" -eq 0 && echo 1 > ok_printf || echo 1 > bad_printf
-
-# --- touch / test -f ---
+# --- touch / test -f, including touch on an already-existing path ---
 touch a.txt
-test -f a.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: touch creates a file" || echo "FAIL: touch creates a file"
-test "$STATUS" -eq 0 && echo 1 > ok_touch || echo 1 > bad_touch
+check_status "touch creates a file" $?
+[ -f a.txt ]
+check_status "the touched file really exists" $?
+touch a.txt
+check_status "touch on an already-existing path (utimensat)" $?
+
+# --- overwrite / append an existing file (the real regression check for the oxfs write-existing-
+#     file fix noted above -- impossible to have exercised under the old one-write-per-file design) ---
+echo "first" > overwrite.txt
+echo "second" > overwrite.txt
+check "overwrite an existing file" "$(cat overwrite.txt)" "second"
+
+echo "first" > append.txt
+echo "second" >> append.txt
+check "append to an existing file" "$(cat append.txt)" "$(printf 'first\nsecond')"
 
 # --- write/read via redirection + cat ---
 echo "line one" > multi.txt
 echo "line two" >> multi.txt
-cat multi.txt > act_cat.txt
-printf 'line one\nline two\n' > exp_cat.txt
-cmp -s act_cat.txt exp_cat.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: cat reads back written content" || echo "FAIL: cat reads back written content"
-test "$STATUS" -eq 0 && echo 1 > ok_cat || echo 1 > bad_cat
+check "cat reads back written content" "$(cat multi.txt)" "$(printf 'line one\nline two')"
 
-# --- wc ---
-wc -l < multi.txt > act_wc.txt
-grep -q '^ *2 *$' act_wc.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: wc -l counts lines" || echo "FAIL: wc -l counts lines"
-test "$STATUS" -eq 0 && echo 1 > ok_wc || echo 1 > bad_wc
+# --- wc (word-split to strip any column-padding whitespace real wc adds) ---
+set -- $(wc -l < multi.txt)
+check "wc -l counts lines" "$1" "2"
 
 # --- head / tail ---
-head -n 1 multi.txt > act_head.txt
-printf 'line one\n' > exp_head.txt
-cmp -s act_head.txt exp_head.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: head -n 1" || echo "FAIL: head -n 1"
-test "$STATUS" -eq 0 && echo 1 > ok_head || echo 1 > bad_head
-
-tail -n 1 multi.txt > act_tail.txt
-printf 'line two\n' > exp_tail.txt
-cmp -s act_tail.txt exp_tail.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: tail -n 1" || echo "FAIL: tail -n 1"
-test "$STATUS" -eq 0 && echo 1 > ok_tail || echo 1 > bad_tail
+check "head -n 1" "$(head -n 1 multi.txt)" "line one"
+check "tail -n 1" "$(tail -n 1 multi.txt)" "line two"
 
 # --- cp / mv / rm ---
 cp multi.txt copy.txt
-test -f copy.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: cp created the destination" || echo "FAIL: cp created the destination"
-test "$STATUS" -eq 0 && echo 1 > ok_cp || echo 1 > bad_cp
+[ -f copy.txt ]
+check_status "cp created the destination" $?
 
 mv copy.txt moved.txt
-test -f moved.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: mv created the new name" || echo "FAIL: mv created the new name"
-test "$STATUS" -eq 0 && echo 1 > ok_mv_new || echo 1 > bad_mv_new
-
-test -f copy.txt
-STATUS=$?
-test "$STATUS" -ne 0 && echo "PASS: mv removed the old name" || echo "FAIL: mv left the old name behind"
-test "$STATUS" -ne 0 && echo 1 > ok_mv_old || echo 1 > bad_mv_old
+[ -f moved.txt ]
+check_status "mv created the new name" $?
+[ ! -f copy.txt ]
+check_status "mv removed the old name" $?
 
 rm moved.txt
-test -f moved.txt
-STATUS=$?
-test "$STATUS" -ne 0 && echo "PASS: rm removed the file" || echo "FAIL: rm did not remove the file"
-test "$STATUS" -ne 0 && echo 1 > ok_rm || echo 1 > bad_rm
+[ ! -f moved.txt ]
+check_status "rm removed the file" $?
 
 # --- mkdir -p / rmdir (nested) ---
 mkdir -p nest/deep
-test -d nest/deep
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: mkdir -p created nested dirs" || echo "FAIL: mkdir -p created nested dirs"
-test "$STATUS" -eq 0 && echo 1 > ok_mkdirp || echo 1 > bad_mkdirp
+[ -d nest/deep ]
+check_status "mkdir -p created nested dirs" $?
 
 rmdir nest/deep
 rmdir nest
-test -d nest
-STATUS=$?
-test "$STATUS" -ne 0 && echo "PASS: rmdir removed nested dirs" || echo "FAIL: rmdir left a directory behind"
-test "$STATUS" -ne 0 && echo 1 > ok_rmdir || echo 1 > bad_rmdir
+[ ! -d nest ]
+check_status "rmdir removed nested dirs" $?
 
 # --- cut / sort / uniq ---
 printf 'b:2\na:1\na:1\nc:3\n' > kv.txt
 
-cut -d: -f1 kv.txt > act_cut.txt
-printf 'b\na\na\nc\n' > exp_cut.txt
-cmp -s act_cut.txt exp_cut.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: cut -d: -f1" || echo "FAIL: cut -d: -f1"
-test "$STATUS" -eq 0 && echo 1 > ok_cut || echo 1 > bad_cut
-
-sort kv.txt > act_sort.txt
-printf 'a:1\na:1\nb:2\nc:3\n' > exp_sort.txt
-cmp -s act_sort.txt exp_sort.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: sort" || echo "FAIL: sort"
-test "$STATUS" -eq 0 && echo 1 > ok_sort || echo 1 > bad_sort
-
-sort -u kv.txt > act_sortu.txt
-printf 'a:1\nb:2\nc:3\n' > exp_sortu.txt
-cmp -s act_sortu.txt exp_sortu.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: sort -u" || echo "FAIL: sort -u"
-test "$STATUS" -eq 0 && echo 1 > ok_sortu || echo 1 > bad_sortu
-
-sort kv.txt | uniq > act_uniq.txt
-cmp -s act_uniq.txt exp_sortu.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: sort | uniq" || echo "FAIL: sort | uniq"
-test "$STATUS" -eq 0 && echo 1 > ok_uniq || echo 1 > bad_uniq
+check "cut -d: -f1" "$(cut -d: -f1 kv.txt)" "$(printf 'b\na\na\nc')"
+check "sort" "$(sort kv.txt)" "$(printf 'a:1\na:1\nb:2\nc:3')"
+check "sort -u" "$(sort -u kv.txt)" "$(printf 'a:1\nb:2\nc:3')"
+check "sort | uniq" "$(sort kv.txt | uniq)" "$(sort -u kv.txt)"
 
 # --- grep ---
-grep 'a:1' kv.txt > act_grep.txt
-printf 'a:1\na:1\n' > exp_grep.txt
-cmp -s act_grep.txt exp_grep.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: grep matches" || echo "FAIL: grep matches"
-test "$STATUS" -eq 0 && echo 1 > ok_grep || echo 1 > bad_grep
-
-grep -q zzz kv.txt
-STATUS=$?
-test "$STATUS" -ne 0 && echo "PASS: grep -q reports no match" || echo "FAIL: grep -q should not have matched"
-test "$STATUS" -ne 0 && echo 1 > ok_grepq || echo 1 > bad_grepq
+check "grep matches" "$(grep 'a:1' kv.txt)" "$(printf 'a:1\na:1')"
+if grep -q zzz kv.txt; then
+    check_status "grep -q reports no match" 1
+else
+    check_status "grep -q reports no match" 0
+fi
 
 # --- sed ---
-echo abc > act_sed_in.txt
-sed 's/b/X/' act_sed_in.txt > act_sed.txt
-printf 'aXc\n' > exp_sed.txt
-cmp -s act_sed.txt exp_sed.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: sed substitution" || echo "FAIL: sed substitution"
-test "$STATUS" -eq 0 && echo 1 > ok_sed || echo 1 > bad_sed
+echo abc > sed_in.txt
+check "sed substitution" "$(sed 's/b/X/' sed_in.txt)" "aXc"
 
 # --- tr ---
-tr a-z A-Z < act_sed_in.txt > act_tr.txt
-printf 'ABC\n' > exp_tr.txt
-cmp -s act_tr.txt exp_tr.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: tr uppercases" || echo "FAIL: tr uppercases"
-test "$STATUS" -eq 0 && echo 1 > ok_tr || echo 1 > bad_tr
+check "tr uppercases" "$(tr a-z A-Z < sed_in.txt)" "ABC"
 
 # --- basename / dirname ---
-basename /a/b/c.txt > act_basename.txt
-printf 'c.txt\n' > exp_basename.txt
-cmp -s act_basename.txt exp_basename.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: basename" || echo "FAIL: basename"
-test "$STATUS" -eq 0 && echo 1 > ok_basename || echo 1 > bad_basename
-
-dirname /a/b/c.txt > act_dirname.txt
-printf '/a/b\n' > exp_dirname.txt
-cmp -s act_dirname.txt exp_dirname.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: dirname" || echo "FAIL: dirname"
-test "$STATUS" -eq 0 && echo 1 > ok_dirname || echo 1 > bad_dirname
+check "basename" "$(basename /a/b/c.txt)" "c.txt"
+check "dirname" "$(dirname /a/b/c.txt)" "/a/b"
 
 # --- seq ---
-seq 1 3 > act_seq.txt
-printf '1\n2\n3\n' > exp_seq.txt
-cmp -s act_seq.txt exp_seq.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: seq" || echo "FAIL: seq"
-test "$STATUS" -eq 0 && echo 1 > ok_seq || echo 1 > bad_seq
+check "seq" "$(seq 1 3)" "$(printf '1\n2\n3')"
 
 # --- xargs ---
-printf 'one\ntwo\n' | xargs -n 1 > act_xargs.txt
-printf 'one\ntwo\n' > exp_xargs.txt
-cmp -s act_xargs.txt exp_xargs.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: xargs -n 1 (default echo)" || echo "FAIL: xargs -n 1 (default echo)"
-test "$STATUS" -eq 0 && echo 1 > ok_xargs || echo 1 > bad_xargs
+check "xargs -n 1 (default echo)" "$(printf 'one\ntwo\n' | xargs -n 1)" "$(printf 'one\ntwo')"
 
 # --- chmod ---
 chmod 600 a.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: chmod succeeds" || echo "FAIL: chmod succeeds"
-test "$STATUS" -eq 0 && echo 1 > ok_chmod || echo 1 > bad_chmod
+check_status "chmod succeeds" $?
 
 # --- whoami (real uid/passwd-db path, see CLAUDE.md's Permission model section) ---
-whoami > act_whoami.txt
-printf 'root\n' > exp_whoami.txt
-cmp -s act_whoami.txt exp_whoami.txt
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: whoami reports root" || echo "FAIL: whoami reports root"
-test "$STATUS" -eq 0 && echo 1 > ok_whoami || echo 1 > bad_whoami
+check "whoami reports root" "$(whoami)" "root"
 
 # --- kill -0 on our own pid (real POSIX existence-check convention) ---
 kill -0 $$
-STATUS=$?
-test "$STATUS" -eq 0 && echo "PASS: kill -0 finds a live process" || echo "FAIL: kill -0 finds a live process"
-test "$STATUS" -eq 0 && echo 1 > ok_kill || echo 1 > bad_kill
+check_status "kill -0 finds a live process" $?
 
 # --- informational only (output shape not asserted -- shown so you can eyeball it) ---
 echo "--- find . -name a.txt (informational) ---"
@@ -265,9 +289,11 @@ printf 'a\nc\n' > d2.txt
 diff d1.txt d2.txt
 
 echo "=== summary ==="
-echo "pass count:"
-ls ok_* 2>/dev/null | wc -l
-echo "fail count:"
-ls bad_* 2>/dev/null | wc -l
-
-echo "scratch files left at /test_busybox_scratch (act_*.txt/exp_*.txt/ok_*/bad_*) for inspection"
+echo "pass: $PASS  fail: $FAIL  total: $((PASS + FAIL))"
+if [ "$FAIL" -eq 0 ]; then
+    echo "ALL PASS"
+    exit 0
+else
+    echo "$FAIL CHECK(S) FAILED"
+    exit 1
+fi

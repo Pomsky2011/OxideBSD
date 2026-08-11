@@ -130,11 +130,11 @@ already exist and are already writable via ordinary `open`/`write`).
 - real login/session authentication -- **done**, see CLAUDE.md's "Session, controlling-tty, and login authentication" section: `getty`, `login`, `su`, `sulogin`
 
 
-### NEEDS_SYSCALL (33, down from 36 -- chmod/chown/chgrp moved to done this pass)
+### NEEDS_SYSCALL (22, down from 33 -- fsync/flock/fallocate/truncate/chrt/halt/nice/poweroff/sync/softlimit/df moved to done this pass)
 
-Builds, but its core function needs a specific syscall OxideBSD hasn't registered (chmod, link, flock, mknod, setrlimit, statfs, sched priority, reboot, ...).
+Builds, but its core function needs a specific syscall OxideBSD hasn't registered (link, mknod, SysV IPC, chroot, namespaces, ext2 ioctls/xattr, ...).
 
-- `chmod`/`chown`/`chgrp` -- **done** this pass: `SYS_CHMOD=165`/`SYS_CHOWN=166` (`modules/oxfs`),
+- `chmod`/`chown`/`chgrp` -- **done**: `SYS_CHMOD=165`/`SYS_CHOWN=166` (`modules/oxfs`),
   real per-inode `mode`/`uid`/`gid` plus `oxfs_open` permission enforcement. BusyBox's own
   `coreutils/chown.c` implements `chgrp` as the same `chown()` call restricted to the group field,
   so all three are unblocked by the same two syscalls. `chattr`/`fatattr`/`lsattr`/`setfattr` are
@@ -145,29 +145,43 @@ Builds, but its core function needs a specific syscall OxideBSD hasn't registere
   (tty-only) or syscall table implement at all -- a real, distinct gap, corrected here rather than
   left mis-attributed: `chattr`, `fatattr`, `lsattr`, `setfattr`
 
-- no SYS_FLOCK: `flock`
-
-- no SYS_FSYNC (fine as a no-op only if it tolerates ENOSYS; not verified): `fsync`
-
-- no SYS_FTRUNCATE/SYS_FALLOCATE: `fallocate`, `truncate`
+- `flock`/`fsync`/`fallocate`/`truncate` -- **done** this pass: `SYS_FLOCK=475`/`SYS_FSYNC=471`/
+  `SYS_FALLOCATE=474`/`SYS_FTRUNCATE=473` (`modules/oxfs`) -- see CLAUDE.md's own "Filesystem/
+  process misc syscalls" section for the full design (real per-inode advisory locks, a real
+  force-commit for `fsync`, real block-level resize for `ftruncate`/`fallocate`, and why a
+  conflicting `flock` request fails `EAGAIN` immediately rather than genuinely blocking)
 
 - no SYS_MKNOD / device-node model: `makedevs`, `mknod`
 
 - no SysV IPC syscalls: `ipcrm`, `ipcs`
 
 - no chroot(2)/namespace syscalls: `chroot`, `linux32`, `linux64`, `nsenter`, `setarch`, `setpriv`, `unshare`
+  -- namespaces in particular don't fit this kernel's single-address-space model at all; faking
+  them would be theater, not a real syscall, so this row is likely to stay open longer than the
+  others here even if `chroot` itself (just a per-process root-inode concept) gets picked up later
 
 - no getrusage/real wait4 rusage reporting: `time`
 
-- no sched_setscheduler/setpriority/reboot/sync/inotify syscalls: `chrt`, `halt`, `inotifyd`, `mesg`, `nice`, `poweroff`, `sync`
+- `chrt`/`halt`/`nice`/`poweroff`/`sync` -- **done** this pass: `SYS_SCHED_SETSCHEDULER=481`/
+  `SYS_SCHED_GETSCHEDULER=482`/`SYS_SCHED_GETPARAM=483`/`SYS_SCHED_GET_PRIORITY_MAX=484`/
+  `SYS_SCHED_GET_PRIORITY_MIN=485`/`SYS_SETPRIORITY=479`/`SYS_GETPRIORITY=480` (`chrt`/`nice`,
+  stored, no real scheduling effect), `SYS_REBOOT=486` (`halt`/`poweroff` -- a real QEMU ACPI
+  shutdown / plain halt, `src/reboot.rs`), `SYS_SYNC=472` (`modules/oxfs`, all in
+  `modules/posix_compat` unless noted) -- see CLAUDE.md's own "Filesystem/process misc syscalls"
+  section. `inotifyd`/`mesg` remain blocked (inotify/hardware, a distinct gap): `inotifyd`, `mesg`
 
-- no setrlimit: `softlimit`
+- `softlimit` -- **done** this pass: `SYS_PRLIMIT64=478` (`modules/posix_compat`) backs real
+  `setrlimit(2)`/`getrlimit(2)` (musl's own wrapper for both tries `prlimit64` first
+  unconditionally) -- stored per-process, not actually enforced, an honest documented gap, but
+  enough for `chpst.c`'s own `setrlimit()` call itself to succeed rather than `ENOSYS`
 
-- no statfs/fstatfs (df's own core syscall): `df`
+- no statfs/fstatfs (df's own core syscall) -- **done** this pass: `SYS_STATFS=476`/
+  `SYS_FSTATFS=477` (`modules/oxfs`), a real `struct statfs` built from this filesystem's own live
+  usage counts: `df`
 
 - oxfs has no FIFO/special-file inode kind: `mkfifo`
 
-- oxfs has no hard links / no SYS_LINK -- **`ln -s`/`readlink` moved to done this pass** (real
+- oxfs has no hard links / no SYS_LINK -- **`ln -s`/`readlink` are done** (real
   `InodeKind::Symlink`, `SYS_SYMLINK`/`SYS_READLINK`, `stat`/`lstat` divergence, confirmed live via
   `modules/oxfs`'s own boot self-check -- symlinks and hard links are different mechanisms, and
   only the former exists now): `link`

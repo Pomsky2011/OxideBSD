@@ -109,6 +109,13 @@ pub(crate) const ENOTSOCK: u64 = 88;
 /// other than its own -- identical value on Linux/BSD/musl, no divergence to worry about, unlike
 /// most of this group's other members.
 pub(crate) const EPERM: u64 = 1;
+/// Returned by `process::do_execve` when a `#!`-line interpreter chain (a script whose own
+/// interpreter is itself another `#!`-line script) nests deeper than `do_execve`'s own
+/// `MAX_SHEBANG_DEPTH` -- matches real Linux's own `ELOOP` for excessive `binfmt_script`
+/// recursion. `40`, musl's real compiled value (identical to `modules/oxfs`'s own local copy of
+/// this constant for symlink-depth overflow, same reasoning as `EPROTONOSUPPORT`/`EAGAIN` above:
+/// must match musl's macro, not a real-BSD nod).
+pub(crate) const ELOOP: u64 = 40;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -872,6 +879,87 @@ pub(crate) fn sys_setgroups(count: u64, list_ptr: u64) -> Result<u64, u64> {
     crate::process::do_setgroups(crate::scheduler::current_pid(), count, list_ptr)
 }
 
+/// `SYS_PRLIMIT64` (`478`) — real `prlimit64(2)`'s exact `(pid, resource, new_limit, old_limit)`
+/// wire format. See `process::do_prlimit64`'s own doc comment for the real logic and why nothing
+/// it stores is actually enforced.
+pub(crate) fn sys_prlimit64(
+    pid: u64,
+    resource: u64,
+    new_ptr: u64,
+    old_ptr: u64,
+) -> Result<u64, u64> {
+    crate::process::do_prlimit64(
+        crate::scheduler::current_pid(),
+        pid as i64,
+        resource,
+        new_ptr,
+        old_ptr,
+    )
+}
+
+/// `SYS_SETPRIORITY` (`479`) — real `setpriority(2)`'s exact `(which, who, prio)` wire format.
+pub(crate) fn sys_setpriority(which: u64, who: u64, prio: u64) -> Result<u64, u64> {
+    crate::process::do_setpriority(
+        crate::scheduler::current_pid(),
+        which,
+        who as i64,
+        prio as i32,
+    )
+}
+
+/// `SYS_GETPRIORITY` (`480`) — real `getpriority(2)`'s exact `(which, who)` wire format. See
+/// `process::do_getpriority`'s own doc comment for the real `20 - nice` return-value convention.
+pub(crate) fn sys_getpriority(which: u64, who: u64) -> Result<u64, u64> {
+    crate::process::do_getpriority(crate::scheduler::current_pid(), which, who as i64)
+}
+
+/// `SYS_UMASK` (`487`) — real `umask(2)`'s exact single-`mask`-argument wire format. See
+/// `process::do_umask`'s own doc comment for the real always-succeeds/returns-previous-mask
+/// semantics this backs.
+pub(crate) fn sys_umask(new_mask: u64) -> Result<u64, u64> {
+    crate::process::do_umask(crate::scheduler::current_pid(), new_mask as u32)
+}
+
+/// `SYS_SCHED_SETSCHEDULER` (`481`) — real `sched_setscheduler(2)`'s exact
+/// `(pid, policy, param_ptr)` wire format.
+pub(crate) fn sys_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sched_setscheduler(
+        crate::scheduler::current_pid(),
+        pid as i64,
+        policy as i32,
+        param_ptr,
+    )
+}
+
+/// `SYS_SCHED_GETSCHEDULER` (`482`) — real `sched_getscheduler(2)`'s exact `(pid)` wire format.
+pub(crate) fn sys_sched_getscheduler(pid: u64) -> Result<u64, u64> {
+    crate::process::do_sched_getscheduler(crate::scheduler::current_pid(), pid as i64)
+}
+
+/// `SYS_SCHED_GETPARAM` (`483`) — real `sched_getparam(2)`'s exact `(pid, param_ptr)` wire format.
+pub(crate) fn sys_sched_getparam(pid: u64, param_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sched_getparam(crate::scheduler::current_pid(), pid as i64, param_ptr)
+}
+
+/// `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN` (`484`/`485`) — real
+/// `sched_get_priority_max/min(2)`'s exact single-`policy`-argument wire format. Pure functions of
+/// `policy` alone — no current-process state involved.
+pub(crate) fn sys_sched_get_priority_max(policy: u64) -> Result<u64, u64> {
+    crate::process::do_sched_get_priority_max(policy as i32)
+}
+
+pub(crate) fn sys_sched_get_priority_min(policy: u64) -> Result<u64, u64> {
+    crate::process::do_sched_get_priority_min(policy as i32)
+}
+
+/// `SYS_REBOOT` (`486`) — real `reboot(2)`'s exact single-`cmd`-argument wire format (musl's own
+/// `reboot.c` passes the two real magic numbers as the first two syscall args and `cmd` as the
+/// third — this ABI's 4-register width holds all three whole, no call-site patch needed). See
+/// `process::do_reboot`'s own doc comment: every success path diverges.
+pub(crate) fn sys_reboot(cmd: u64) -> Result<u64, u64> {
+    crate::process::do_reboot(cmd)
+}
+
 /// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
 /// this ABI's `SYS_IOCTL` reuses these verbatim as its own `request` argument values (they're
 /// already architecture-generic constants, not syscall numbers, so there's nothing to remap the
@@ -1300,6 +1388,55 @@ pub(crate) extern "C" fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64
 
 pub(crate) extern "C" fn oxidebsd_sys_setgroups(count: u64, list_ptr: u64) -> i64 {
     result_to_ffi(sys_setgroups(count, list_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_prlimit64(
+    pid: u64,
+    resource: u64,
+    new_ptr: u64,
+    old_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_prlimit64(pid, resource, new_ptr, old_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_setpriority(which: u64, who: u64, prio: u64) -> i64 {
+    result_to_ffi(sys_setpriority(which, who, prio))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getpriority(which: u64, who: u64) -> i64 {
+    result_to_ffi(sys_getpriority(which, who))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_umask(new_mask: u64) -> i64 {
+    result_to_ffi(sys_umask(new_mask))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_setscheduler(
+    pid: u64,
+    policy: u64,
+    param_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_sched_setscheduler(pid, policy, param_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_getscheduler(pid: u64) -> i64 {
+    result_to_ffi(sys_sched_getscheduler(pid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_getparam(pid: u64, param_ptr: u64) -> i64 {
+    result_to_ffi(sys_sched_getparam(pid, param_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_get_priority_max(policy: u64) -> i64 {
+    result_to_ffi(sys_sched_get_priority_max(policy))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_get_priority_min(policy: u64) -> i64 {
+    result_to_ffi(sys_sched_get_priority_min(policy))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_reboot(cmd: u64) -> i64 {
+    result_to_ffi(sys_reboot(cmd))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {

@@ -152,6 +152,37 @@ const SYS_MOUNT_TMPFS: u64 = 175;
 /// unlike `mount` above.
 const SYS_UMOUNT2: u64 = 176;
 
+/// `SYS_FSYNC=471` through `SYS_FSTATFS=477` (continuing with `SYS_PRLIMIT64=478` through
+/// `SYS_REBOOT=486` in `modules/posix_compat`) are the NEEDS_SYSCALL gap-table pass's own
+/// filesystem-owned half. All seven landed at 471-486, not a continuation of this ABI's existing
+/// 105-178 invented sequence -- a first attempt at continuing that sequence collided with a
+/// *second* set of real, still-inert Linux syscalls sharing those same low numbers further down
+/// `third_party/musl/arch/x86_64/bits/syscall.h.in` (e.g. real `__NR_gettid=186`, which has a live
+/// caller inside musl itself, `src/thread/synccall.c`) -- see that file's own comment on
+/// `__NR_flock` (right near `__NR_fsync`) for the full story on why 471-486 is provably
+/// collision-free instead. `SYS_FSYNC`/`SYS_SYNC` force-commit a still-open fd's pending write
+/// buffer to its real inode (oxfs's write model otherwise only commits at `close()`, see
+/// `OpenFile::Write`'s own doc comment) -- `oxfs_fsync` for one fd, `oxfs_sync` for every
+/// currently-open write fd at once. `SYS_FTRUNCATE`/`SYS_FALLOCATE` resize a file's real content
+/// directly at the block level (`resize_inode_data`, not `write_inode_data` -- materializing a
+/// whole file's content into one stack buffer first would risk overflowing this kernel's 128 KiB
+/// kernel-stack floor for anything near this filesystem's ~4 MiB per-file cap).
+/// `SYS_FLOCK` is a real per-inode `LOCK_SH`/`LOCK_EX`/`LOCK_UN` advisory-lock table
+/// (`FLOCKS`) -- but a request that would conflict fails `EAGAIN` immediately even without
+/// `LOCK_NB`, rather than genuinely blocking: this module has no scheduler-yield primitive
+/// reachable from a syscall handler, and a real spin-wait here would permanently deadlock this
+/// single-core, non-preemptive kernel against a lock holder that could never run to release it.
+/// `SYS_STATFS`/`SYS_FSTATFS` report a real `struct statfs` built from this filesystem's own live
+/// block/inode-usage counts (separately for the real vs. tmpfs pool, `write_statfs`), backing
+/// `df`'s real `statvfs(3)` call.
+const SYS_FSYNC: u64 = 471;
+const SYS_SYNC: u64 = 472;
+const SYS_FTRUNCATE: u64 = 473;
+const SYS_FALLOCATE: u64 = 474;
+const SYS_FLOCK: u64 = 475;
+const SYS_STATFS: u64 = 476;
+const SYS_FSTATFS: u64 = 477;
+
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
 /// `open()` passes real POSIX flag values).
@@ -215,6 +246,17 @@ const EROFS: i64 = 30;
 /// read/write permission.
 const EPERM: i64 = 1;
 const EACCES: i64 = 13;
+/// musl's real *compiled* value (`third_party/musl/arch/generic/bits/errno.h:11`) -- `EWOULDBLOCK`
+/// is a bare alias of this same value in musl (`#define EWOULDBLOCK EAGAIN`), not a distinct
+/// number, so this one constant covers both real POSIX names. Returned by `oxfs_flock` for any
+/// conflicting request, `LOCK_NB` or not -- see `SYS_FLOCK`'s own doc comment for why a genuinely
+/// blocking wait isn't attempted.
+const EAGAIN: i64 = 11;
+/// Real value, no Linux/BSD divergence. Returned by `oxfs_flock` only if `FLOCKS`'s own fixed
+/// table is completely full of *non-conflicting* locks on other inodes -- `MAX_FLOCKS` is sized
+/// generously past any real concurrent use this port's roster exercises, so this is a defensive
+/// bound, not an expected outcome.
+const ENOLCK: i64 = 37;
 
 const BLOCK_SIZE: usize = 4096;
 /// 32 MiB pool (raised from 4 MiB once the BusyBox roster grew from 24 applets to ~300 -- see
@@ -426,6 +468,41 @@ static mut BLOCKS: [[u8; BLOCK_SIZE]; TOTAL_BLOCKS] = [[0; BLOCK_SIZE]; TOTAL_BL
 static mut BLOCK_USED: [bool; TOTAL_BLOCKS] = [false; TOTAL_BLOCKS];
 static mut INODES: [Inode; TOTAL_INODES] = [Inode::FREE; TOTAL_INODES];
 static mut OPEN_FILES: [Option<(u64, OpenFile)>; MAX_OPEN_FILES] = [None; MAX_OPEN_FILES];
+
+const LOCK_SH: u64 = 1;
+const LOCK_EX: u64 = 2;
+const LOCK_NB: u64 = 4;
+const LOCK_UN: u64 = 8;
+/// Sized past any real concurrent `flock()` use this port's roster exercises (a handful of
+/// scripts serializing themselves through one lock file at a time) -- see `ENOLCK`'s own doc
+/// comment for what happens if it's ever actually exhausted.
+const MAX_FLOCKS: usize = 16;
+/// `(inode, holder_real_fd, exclusive)` -- one real-`flock()`-table entry per currently-held lock.
+/// Keyed by `real_fd` (an open file description, matching real `flock()`'s own "released when any
+/// fd referring to this open file description closes" semantics), not by inode alone, since a
+/// shared (`LOCK_SH`) lock can have multiple simultaneous holders. `static mut`, not `static` --
+/// same requirement as `OPEN_FILES` above (see that field's own doc comment): every write is
+/// observable only through `oxfs_flock`'s own syscall-reachable return value, so the optimizer
+/// can't treat a write here as dead.
+static mut FLOCKS: [Option<(u32, u64, bool)>; MAX_FLOCKS] = [None; MAX_FLOCKS];
+
+fn flocks() -> &'static mut [Option<(u32, u64, bool)>; MAX_FLOCKS] {
+    // SAFETY: same reasoning as `find_open_file`'s own access to `OPEN_FILES` -- single-core,
+    // no concurrent access (a syscall handler runs to completion before another can start).
+    unsafe { &mut *core::ptr::addr_of_mut!(FLOCKS) }
+}
+
+/// Releases every lock `real_fd` itself holds -- called from `oxfs_close` (real `flock()`
+/// semantics: closing *any* fd referencing the locked open file description releases its locks,
+/// and this filesystem has no `dup()`-shared open-file-description concept beyond the fd itself,
+/// so "this one real_fd" is the complete, correct scope).
+fn release_flocks_for(real_fd: u64) {
+    for slot in flocks().iter_mut() {
+        if matches!(slot, Some((_, fd, _)) if *fd == real_fd) {
+            *slot = None;
+        }
+    }
+}
 
 fn read_block(n: u32) -> [u8; BLOCK_SIZE] {
     // SAFETY: see BLOCKS's own doc comment -- single-core, syscall-serialized access only. Copies
@@ -645,6 +722,41 @@ fn write_inode_data(inode_num: u32, content: &[u8]) -> bool {
     }
     let mut inode = read_inode(inode_num);
     inode.size = content.len() as u32;
+    write_inode(inode_num, inode);
+    true
+}
+
+/// `SYS_FTRUNCATE`/`SYS_FALLOCATE`'s real logic -- resizes `inode_num`'s content to exactly
+/// `new_size` bytes without ever materializing the file's complete old-or-new content in one
+/// buffer the way `write_inode_data` does: growing zero-fills only the newly-added region,
+/// block by block, via the same `inode_ensure_block_at`/`write_block` primitives
+/// `write_inode_data` itself uses internally; shrinking touches no block content at all (bytes
+/// past the new `size` simply become unreachable -- `read_inode_at` already never reads past
+/// `inode.size`, and a later grow back past the old size would zero-fill over them again, matching
+/// real POSIX "grow into a hole reads as zero" semantics either way). Load-bearing for staying
+/// off the stack: this filesystem's per-file cap is ~4 MiB (see `Inode`'s own doc comment), far
+/// past what this kernel's 128 KiB kernel-stack floor could ever hold as one local buffer.
+fn resize_inode_data(inode_num: u32, new_size: usize) -> bool {
+    let old_size = read_inode(inode_num).size as usize;
+    if new_size > old_size {
+        let mut pos = old_size;
+        while pos < new_size {
+            let block_index = pos / BLOCK_SIZE;
+            let in_block_off = pos % BLOCK_SIZE;
+            let Some(blk) = inode_ensure_block_at(inode_num, block_index) else {
+                return false;
+            };
+            let mut block = read_block(blk);
+            let chunk = (new_size - pos).min(BLOCK_SIZE - in_block_off);
+            for b in &mut block[in_block_off..in_block_off + chunk] {
+                *b = 0;
+            }
+            write_block(blk, &block);
+            pos += chunk;
+        }
+    }
+    let mut inode = read_inode(inode_num);
+    inode.size = new_size as u32;
     write_inode(inode_num, inode);
     true
 }
@@ -2312,20 +2424,17 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
     }
 }
 
-/// Registered as `fd`'s close callback via `oxidebsd_register_fd_ops`. For a file opened for
-/// writing, this is the only point its accumulated buffer is actually committed to a real inode
-/// (same all-at-once-on-close model `modules/fat32` already uses).
-extern "C" fn oxfs_close(fd: u64) -> i64 {
-    let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
-    let Some(slot) = slots
-        .iter_mut()
-        .find(|s| matches!(s, Some((slot_fd, _)) if *slot_fd == fd))
-    else {
-        return -EBADF;
-    };
-    let (_, file) = slot.take().expect("just matched Some above");
-
-    if let OpenFile::Write {
+/// Shared by `oxfs_close` (which then discards the slot entirely) and `oxfs_fsync`/`oxfs_sync`
+/// (which force this same commit early, without closing the fd -- see `SYS_FSYNC`'s own doc
+/// comment for why this filesystem's normal commit-only-at-close write model otherwise makes
+/// `fsync()` a lie). A no-op (`0`) for any non-`Write` variant -- nothing to flush for a read or
+/// directory-listing fd. For a brand-new file (`existing_inode` still `None`), allocates the real
+/// inode and inserts its directory entry *now*, then records that new inode back into
+/// `existing_inode` -- idempotent: a second `commit_write_buffer` call on the same still-open fd
+/// (a `write()` then another `fsync()`, or `fsync()` then `close()`) takes the `Some(inode_num)`
+/// branch instead of re-allocating and double-inserting.
+fn commit_write_buffer(file: &mut OpenFile) -> i64 {
+    let OpenFile::Write {
         parent_inode,
         name,
         name_len,
@@ -2334,38 +2443,60 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
         owner_uid,
         existing_inode,
     } = file
-    {
-        // Overwriting/appending to a file that already exists: write the new content into its own
-        // existing inode -- same inode number, same directory entry, same owner/mode -- rather
-        // than allocating a second inode and re-inserting the name (which would either collide
-        // with or orphan the original entry; see OpenFile::Write's own doc comment).
-        if let Some(inode_num) = existing_inode {
-            return if write_inode_data(inode_num, &buffer[..len]) {
-                0
-            } else {
-                -EIO
-            };
-        }
-        // A new file created inside a tmpfs-mounted directory must itself come from the tmpfs
-        // pool -- see `alloc_inode_in` below for why this is the one call site of the three
-        // "create a new named entry" ones (mkdir/open-O_CREAT/symlink) that had a live bug here
-        // (found via `tests/mount_syscall_smoke.rs`): the other two check `parent`/`cwd` directly,
-        // but this one only learns `parent_inode` this late, at close-time commit.
-        let Some(new_inode) = alloc_inode_in(parent_inode) else {
-            return -ENOSPC;
-        };
-        let mut inode = Inode::new(InodeKind::File);
-        inode.uid = owner_uid;
-        write_inode(new_inode, inode);
-        if !write_inode_data(new_inode, &buffer[..len]) {
-            return -EIO;
-        }
-        return match dir_insert(parent_inode, &name[..name_len as usize], new_inode) {
-            Ok(()) => 0,
-            Err(e) => errno_for(e),
+    else {
+        return 0;
+    };
+    // Overwriting/appending to a file that already exists: write the new content into its own
+    // existing inode -- same inode number, same directory entry, same owner/mode -- rather
+    // than allocating a second inode and re-inserting the name (which would either collide
+    // with or orphan the original entry; see OpenFile::Write's own doc comment).
+    if let Some(inode_num) = *existing_inode {
+        return if write_inode_data(inode_num, &buffer[..*len]) {
+            0
+        } else {
+            -EIO
         };
     }
-    0
+    // A new file created inside a tmpfs-mounted directory must itself come from the tmpfs
+    // pool -- see `alloc_inode_in` below for why this is the one call site of the three
+    // "create a new named entry" ones (mkdir/open-O_CREAT/symlink) that had a live bug here
+    // (found via `tests/mount_syscall_smoke.rs`): the other two check `parent`/`cwd` directly,
+    // but this one only learns `parent_inode` this late, at commit time.
+    let Some(new_inode) = alloc_inode_in(*parent_inode) else {
+        return -ENOSPC;
+    };
+    let mut inode = Inode::new(InodeKind::File);
+    inode.uid = *owner_uid;
+    write_inode(new_inode, inode);
+    if !write_inode_data(new_inode, &buffer[..*len]) {
+        return -EIO;
+    }
+    match dir_insert(*parent_inode, &name[..*name_len as usize], new_inode) {
+        Ok(()) => {
+            *existing_inode = Some(new_inode);
+            0
+        }
+        Err(e) => errno_for(e),
+    }
+}
+
+/// Registered as `fd`'s close callback via `oxidebsd_register_fd_ops`. For a file opened for
+/// writing, this is (ordinarily) the point its accumulated buffer is actually committed to a real
+/// inode, via `commit_write_buffer` above -- unless `SYS_FSYNC`/`SYS_SYNC` already did so earlier
+/// on this same still-open fd, in which case this is a cheap idempotent no-op re-commit of
+/// unchanged content. Also releases any `flock()` locks `fd` still holds -- real `flock()`
+/// semantics: closing the locked fd releases its locks.
+extern "C" fn oxfs_close(fd: u64) -> i64 {
+    release_flocks_for(fd);
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
+    let Some(slot) = slots
+        .iter_mut()
+        .find(|s| matches!(s, Some((slot_fd, _)) if *slot_fd == fd))
+    else {
+        return -EBADF;
+    };
+    let (_, mut file) = slot.take().expect("just matched Some above");
+    commit_write_buffer(&mut file)
 }
 
 /// Registered for `SYS_CLOSE`. Delegates to the kernel's own `oxidebsd_close_fd`, which removes
@@ -2374,6 +2505,247 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
 extern "C" fn sys_close(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
     unsafe { oxidebsd_close_fd(fd) as i64 }
+}
+
+/// Registered for `SYS_FSYNC`. See `SYS_FSYNC`'s own doc comment (up near its number's
+/// definition) for why this filesystem's normal commit-only-at-close write model otherwise makes
+/// `fsync()` a lie for anything opened for writing. A no-op success for a read/directory fd --
+/// real Unix `fsync()` on a read-only fd is also a harmless no-op.
+extern "C" fn oxfs_fsync(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    match find_open_file(real_fd as u64) {
+        Some(file) => commit_write_buffer(file),
+        None => -EBADF,
+    }
+}
+
+/// Registered for `SYS_SYNC`. Real `sync(2)` takes no arguments and (per POSIX) has no failure
+/// return at all -- best-effort force-commits every currently-open write fd's pending buffer, the
+/// whole-filesystem counterpart of `oxfs_fsync`'s single-fd version, and always reports success.
+extern "C" fn oxfs_sync(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
+    for (_, file) in slots.iter_mut().flatten() {
+        commit_write_buffer(file);
+    }
+    0
+}
+
+/// `SYS_FTRUNCATE`/`SYS_FALLOCATE`'s shared fd-to-inode resolution: `inode_of_open_file` alone
+/// (see its own doc comment) reports `None` for *every* `OpenFile::Write` fd, even one that
+/// already refers to a real, pre-existing inode (`O_WRONLY` on an existing path, not a fresh
+/// `O_CREAT`) -- exactly BusyBox `truncate`'s own common case (`open()` an existing file, then
+/// `ftruncate()` it). This falls through to that case specifically before giving up.
+fn inode_for_resize(real_fd: u64) -> Option<u32> {
+    if let Some(inode_num) = inode_of_open_file(real_fd) {
+        return Some(inode_num);
+    }
+    match find_open_file(real_fd)? {
+        OpenFile::Write {
+            existing_inode: Some(inode_num),
+            ..
+        } => Some(*inode_num),
+        _ => None,
+    }
+}
+
+/// Registered for `SYS_FTRUNCATE`. Resizes the fd's real inode directly (`resize_inode_data`) --
+/// if this fd is also still mid-write (an existing file opened `O_WRONLY`, not yet `close()`d),
+/// a later `write()`/`close()` on it will still overwrite this content again as usual, matching
+/// real Unix's own "whichever happens last wins" ordering between `ftruncate()` and `write()`.
+extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let Some(inode_num) = inode_for_resize(real_fd as u64) else {
+        return -EBADF;
+    };
+    if read_inode(inode_num).kind == InodeKind::Dir {
+        return -EISDIR;
+    }
+    if resize_inode_data(inode_num, len as usize) {
+        0
+    } else {
+        -ENOSPC
+    }
+}
+
+/// Registered for `SYS_FALLOCATE`. `mode` is ignored -- always behaves like the default (no
+/// `FALLOC_FL_KEEP_SIZE`/`FALLOC_FL_PUNCH_HOLE`/... flag support, a known simplification no
+/// applet in this port's roster needs past). Zero-extends the file to `offset + len` if it's
+/// currently shorter; otherwise a real no-op (real `fallocate()` never shrinks a file).
+extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 {
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let Some(inode_num) = inode_for_resize(real_fd as u64) else {
+        return -EBADF;
+    };
+    let inode = read_inode(inode_num);
+    if inode.kind == InodeKind::Dir {
+        return -EISDIR;
+    }
+    let target = offset.saturating_add(len) as usize;
+    if inode.size as usize >= target {
+        return 0;
+    }
+    if resize_inode_data(inode_num, target) {
+        0
+    } else {
+        -ENOSPC
+    }
+}
+
+/// Registered for `SYS_FLOCK`. See `SYS_FLOCK`'s own doc comment (up near its number's
+/// definition) for the real `LOCK_SH`/`LOCK_EX`/`LOCK_UN` semantics this implements, and why a
+/// request that would conflict fails `EAGAIN` immediately rather than genuinely blocking even
+/// without `LOCK_NB`.
+extern "C" fn oxfs_flock(fd: u64, op: u64, _a2: u64, _a3: u64) -> i64 {
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let real_fd = real_fd as u64;
+    let Some(inode_num) = inode_of_open_file(real_fd) else {
+        return -EBADF;
+    };
+
+    if op & LOCK_UN != 0 {
+        release_flocks_for(real_fd);
+        return 0;
+    }
+    let exclusive = op & LOCK_EX != 0;
+    if !exclusive && op & LOCK_SH == 0 {
+        return -EINVAL;
+    }
+    let table = flocks();
+    let conflict = table.iter().any(|s| {
+        matches!(s, Some((i, holder_fd, ex))
+            if *i == inode_num && *holder_fd != real_fd && (exclusive || *ex))
+    });
+    if conflict {
+        return -EAGAIN;
+    }
+    if let Some(slot) = table
+        .iter_mut()
+        .find(|s| matches!(s, Some((i, holder_fd, _)) if *i == inode_num && *holder_fd == real_fd))
+    {
+        *slot = Some((inode_num, real_fd, exclusive));
+        return 0;
+    }
+    match table.iter_mut().find(|s| s.is_none()) {
+        Some(slot) => {
+            *slot = Some((inode_num, real_fd, exclusive));
+            0
+        }
+        None => -ENOLCK,
+    }
+}
+
+/// musl's real generic `struct statfs` (`arch/generic/bits/statfs.h` in `third_party/musl` -- this
+/// target has no x86_64-specific override, and no separate `statfs64` syscall exists on a 64-bit
+/// arch, so this is the one and only shape `src/stat/statvfs.c`'s `__statfs`/`__fstatfs` ever
+/// build). All eight `unsigned long`/`fsblkcnt_t`/`fsfilcnt_t` fields are 8 bytes wide on this
+/// target, `fsid_t` is a 2-element `int` array -- `f_spare` pads the real kernel-reserved tail.
+#[repr(C)]
+struct MuslStatfs {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<MuslStatfs>() == 120);
+
+/// An arbitrary but recognizable magic (`"OXFS"` as big-endian ASCII bytes) -- no applet in this
+/// port's roster branches on `f_type`'s specific value, so any fixed constant would do.
+const OXFS_STATFS_MAGIC: u64 = 0x4f584653;
+
+/// Builds a real `struct statfs` from this filesystem's own live usage counts and writes it into
+/// the caller's buffer -- shared by `oxfs_statfs` (path-based) and `oxfs_fstatfs` (fd-based).
+/// `is_tmpfs` picks which of the two block/inode pools to report on (see `TMPFS_NUM_BLOCKS`'s own
+/// doc comment) -- free counts are computed by scanning that pool's own slice of `BLOCK_USED`/
+/// `INODES` fresh on every call (no cached running total exists to go stale). `f_bavail` is set
+/// equal to `f_bfree` -- this filesystem has no reserved-for-root-only block reservation to make
+/// the two diverge, unlike a real ext-family filesystem's own `statfs()`.
+fn write_statfs(is_tmpfs: bool, buf_ptr: u64) -> i64 {
+    let (blocks_lo, blocks_hi, inodes_lo, inodes_hi) = if is_tmpfs {
+        (NUM_BLOCKS, TOTAL_BLOCKS, MAX_INODES, TOTAL_INODES)
+    } else {
+        (0, NUM_BLOCKS, 0, MAX_INODES)
+    };
+    let used = unsafe { &*core::ptr::addr_of!(BLOCK_USED) };
+    let free_blocks = (blocks_lo..blocks_hi).filter(|&i| !used[i]).count() as u64;
+    let inodes = unsafe { &*core::ptr::addr_of!(INODES) };
+    let free_inodes = (inodes_lo..inodes_hi)
+        .filter(|&i| inodes[i].kind == InodeKind::Free)
+        .count() as u64;
+    let statfs = MuslStatfs {
+        f_type: OXFS_STATFS_MAGIC,
+        f_bsize: BLOCK_SIZE as u64,
+        f_blocks: (blocks_hi - blocks_lo) as u64,
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: (inodes_hi - inodes_lo) as u64,
+        f_ffree: free_inodes,
+        f_fsid: [0, 0],
+        f_namelen: NAME_MAX as u64,
+        f_frsize: BLOCK_SIZE as u64,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    // SAFETY: same trust boundary as `write_stat` -- caller-owned pointer, sized by the caller's
+    // own `sizeof(struct statfs)` (120 bytes, matching `MuslStatfs` exactly, checked above).
+    unsafe { (buf_ptr as *mut MuslStatfs).write_unaligned(statfs) };
+    0
+}
+
+/// Registered for `SYS_STATFS`. No `/proc` interception (unlike `oxfs_stat`) -- `/proc` isn't a
+/// real, statfs-able mount in this design, and no target applet's own `df`/`statvfs()` call ever
+/// targets it. A synthetic-`/proc` cwd falls back to resolving from the real root for an absolute
+/// path, same as `oxfs_stat`'s own handling of that case.
+extern "C" fn oxfs_statfs(path_ptr: u64, path_len: u64, buf_ptr: u64, _r10: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(_) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return -ENOENT;
+            }
+        }
+    };
+    match resolve_path(cwd, path) {
+        Ok(inode_num) => write_statfs(inode_num >= MAX_INODES as u32, buf_ptr),
+        Err(e) => errno_for(e),
+    }
+}
+
+/// Registered for `SYS_FSTATFS`. `oxfs_statfs`'s fd-based counterpart -- same fd-to-inode
+/// resolution `oxfs_fstat` already uses.
+extern "C" fn oxfs_fstatfs(fd: u64, buf_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    match inode_of_open_file(real_fd as u64) {
+        Some(inode_num) => write_statfs(inode_num >= MAX_INODES as u32, buf_ptr),
+        None => -EBADF,
+    }
 }
 
 /// Registered for `SYS_CHDIR`. An absolute `/proc/...` target is intercepted first (via
@@ -5052,6 +5424,13 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MOUNT_BIND, oxfs_mount_bind);
         oxidebsd_register_syscall(SYS_MOUNT_TMPFS, oxfs_mount_tmpfs);
         oxidebsd_register_syscall(SYS_UMOUNT2, oxfs_umount2);
+        oxidebsd_register_syscall(SYS_FSYNC, oxfs_fsync);
+        oxidebsd_register_syscall(SYS_SYNC, oxfs_sync);
+        oxidebsd_register_syscall(SYS_FTRUNCATE, oxfs_ftruncate);
+        oxidebsd_register_syscall(SYS_FALLOCATE, oxfs_fallocate);
+        oxidebsd_register_syscall(SYS_FLOCK, oxfs_flock);
+        oxidebsd_register_syscall(SYS_STATFS, oxfs_statfs);
+        oxidebsd_register_syscall(SYS_FSTATFS, oxfs_fstatfs);
     }
 
     if ok { 0 } else { -1 }

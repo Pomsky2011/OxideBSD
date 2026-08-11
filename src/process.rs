@@ -21,7 +21,7 @@ use crate::address_space::AddressSpace;
 use crate::elf::{self, Elf};
 use crate::memory::{self, with_frame_allocator};
 use crate::scheduler;
-use crate::syscall::{self, ECHILD, EINVAL, ENOEXEC, ENOMEM, EPERM, ESRCH, SyscallFrame};
+use crate::syscall::{self, ECHILD, EINVAL, ELOOP, ENOEXEC, ENOMEM, EPERM, ESRCH, SyscallFrame};
 
 pub type Pid = u64;
 
@@ -400,6 +400,38 @@ pub struct Process {
     /// (real `fork()` semantics, same as `cwd`/`pgid`/`brk`).
     pub uid: u32,
     pub gid: u32,
+    /// `SYS_PRLIMIT64`'s backing store -- one `(rlim_cur, rlim_max)` pair per real `RLIMIT_*`
+    /// resource (`RLIM_NLIMITS = 16` on real Linux), `u64::MAX` (`RLIM_INFINITY`) in every slot by
+    /// default. Copied by `fork` (real POSIX rlimit/fork semantics, same as `uid`/`gid`/`pgid`);
+    /// preserved by `execve` (untouched, same as `cwd`/`pgid`). **Stored, never enforced** — an
+    /// honest, documented gap, the same tier as several other accepted-but-unenforced fields
+    /// already in this codebase (e.g. `O_NONBLOCK` on a TCP socket, see `src/net/tcp.rs`).
+    pub rlimits: [(u64, u64); 16],
+    /// `SYS_SETPRIORITY`/`SYS_GETPRIORITY`'s backing store — real `nice` range is `-20..=19`, `0`
+    /// by default. Stored and echoed back honestly; this kernel's cooperative round-robin
+    /// scheduler has no priority concept at all, so it has no real scheduling effect. Copied by
+    /// `fork`; preserved by `execve` (same reasoning as `rlimits` above).
+    pub nice: i32,
+    /// `SYS_SCHED_SETSCHEDULER`/`SYS_SCHED_GETSCHEDULER`'s backing store — real Linux
+    /// `SCHED_RR = 2` by default (matching BusyBox `chrt`'s own default when no `-r`/`-f`/`-o`/
+    /// `-b`/`-i` flag is given). No real RT scheduling class exists here — stored and echoed back
+    /// honestly, same tier as `nice` above. Copied by `fork`; preserved by `execve`.
+    pub sched_policy: i32,
+    /// `SYS_SCHED_SETSCHEDULER`/`SYS_SCHED_GETPARAM`'s backing store — the `sched_priority` field
+    /// of a real `struct sched_param`, `0` by default. Same "stored, not enforced" tier as
+    /// `sched_policy` above. Copied by `fork`; preserved by `execve`.
+    pub sched_priority: i32,
+    /// `SYS_UMASK`'s backing store — real POSIX `umask()` always succeeds and returns the
+    /// *previous* mask, so this has to be real per-process state, not a pure function. `0o022`
+    /// (the standard real Unix default) rather than `0`, since a plausible ambient value matters
+    /// here in a way it doesn't for `nice`/`sched_policy`: BusyBox's `libbb/parse_mode.c` reads it
+    /// back via `umask(0)`/`umask(old)` to compute symbolic mode changes (`chmod +x`, ...) — found
+    /// live testing `chmod +x` on a real script, before this field existed, computing garbage from
+    /// the `ENOSYS` this ABI used to return for the then-unmapped `umask(2)` syscall (see
+    /// `third_party/musl/arch/x86_64/bits/syscall.h.in`'s own `__NR_umask` comment). Same
+    /// "stored, not enforced" tier as `rlimits`/`nice`/`sched_policy` otherwise — oxfs doesn't
+    /// consult this anywhere it creates a new inode. Copied by `fork`; preserved by `execve`.
+    pub umask: u32,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -509,6 +541,11 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         // root, same reasoning as Process::uid's own doc comment.
         uid: 0,
         gid: 0,
+        rlimits: [(u64::MAX, u64::MAX); 16],
+        nice: 0,
+        sched_policy: SCHED_RR_DEFAULT,
+        sched_priority: 0,
+        umask: 0o022,
     };
 
     {
@@ -600,6 +637,11 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_cmdline,
         parent_uid,
         parent_gid,
+        parent_rlimits,
+        parent_nice,
+        parent_sched_policy,
+        parent_sched_priority,
+        parent_umask,
     ) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
@@ -634,6 +676,13 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             // Process::uid's own doc comment.
             parent.uid,
             parent.gid,
+            // Real POSIX rlimit/nice/scheduling-attribute/fork semantics: all four are copied,
+            // same as uid/gid/pgid -- see Process::rlimits's own doc comment.
+            parent.rlimits,
+            parent.nice,
+            parent.sched_policy,
+            parent.sched_priority,
+            parent.umask,
         )
     };
 
@@ -673,6 +722,11 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         real_timer_interval_ticks: 0,
         uid: parent_uid,
         gid: parent_gid,
+        rlimits: parent_rlimits,
+        nice: parent_nice,
+        sched_policy: parent_sched_policy,
+        sched_priority: parent_sched_priority,
+        umask: parent_umask,
     };
 
     {
@@ -769,6 +823,84 @@ fn build_cmdline(argv: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Reads a whole file's contents via the real `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE` syscall path,
+/// given a raw `(ptr, len)` pointing at a NUL-free path string. `ptr` may point into the
+/// *caller's* own user address space (a top-level `execve` target) or into this kernel's own heap
+/// (a `#!`-line interpreter path parsed out of a script's own content, see `do_execve`'s
+/// shebang-following loop below) -- both are valid dereference targets regardless of which
+/// process's `CR3` happens to be active: kernel-heap virtual addresses are mapped identically in
+/// every address space's page table (see CLAUDE.md's own address-space section on why
+/// `AddressSpace::fork`/`new_excluding_user` still shallow-copy the kernel's own high entries).
+fn read_file_via_syscall(path_ptr: u64, path_len: u64) -> Result<Vec<u8>, u64> {
+    let fd = syscall::dispatch(SYS_OPEN, path_ptr, path_len, 0, 0)?;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        match syscall::dispatch(
+            SYS_READ,
+            fd,
+            chunk.as_mut_ptr() as u64,
+            chunk.len() as u64,
+            0,
+        ) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n as usize]),
+            Err(errno) => {
+                let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0, 0);
+                return Err(errno);
+            }
+        }
+    }
+    let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0, 0);
+    Ok(bytes)
+}
+
+/// Leading/trailing ASCII-whitespace trim -- `core::slice` has no built-in for `&[u8]` the way
+/// `str::trim` does.
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// Parses a `#!interpreter [optional-single-arg]` first line out of `bytes` (already confirmed to
+/// start with `#!`) -- real Linux `binfmt_script` semantics: the interpreter path runs up to the
+/// first whitespace, then *at most one* further whitespace-trimmed argument runs to the end of
+/// the line (never further word-split, unlike a normal shell command line). An empty interpreter
+/// (a bare `#!` with nothing else on the line) is reported as `None` -- `do_execve`'s own caller
+/// turns that into `ENOEXEC`, matching real Linux's own refusal to exec a scriptless shebang.
+fn parse_shebang_line(bytes: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let line_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line = trim_ascii_whitespace(&bytes[2..line_end]);
+    let interpreter_end = line
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let interpreter = &line[..interpreter_end];
+    if interpreter.is_empty() {
+        return None;
+    }
+    let rest = trim_ascii_whitespace(&line[interpreter_end..]);
+    let optional_arg = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_vec())
+    };
+    Some((interpreter.to_vec(), optional_arg))
+}
+
+/// Real Linux caps `#!`-chain recursion (a script whose own interpreter is itself another `#!`
+/// script) rather than following it forever -- this kernel has no equivalent existing constant to
+/// reuse (`modules/oxfs`'s own `MAX_SYMLINK_DEPTH` lives in a separate, unlinkable module), so a
+/// small, independently-chosen bound of the same shape.
+const MAX_SHEBANG_DEPTH: u32 = 4;
+
 pub fn do_execve(
     caller_pid: Pid,
     path_ptr: u64,
@@ -785,27 +917,38 @@ pub fn do_execve(
     let raw_argv = read_ptr_len_array(argv_ptr);
     let envp = read_ptr_len_array(envp_ptr);
 
-    let fd = syscall::dispatch(SYS_OPEN, path_ptr, path_len, 0, 0)?;
-
-    let mut elf_bytes: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        match syscall::dispatch(
-            SYS_READ,
-            fd,
-            chunk.as_mut_ptr() as u64,
-            chunk.len() as u64,
-            0,
-        ) {
-            Ok(0) => break,
-            Ok(n) => elf_bytes.extend_from_slice(&chunk[..n as usize]),
-            Err(errno) => {
-                let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0, 0);
-                return Err(errno);
-            }
+    // Real Unix `execve()` on a `#!`-prefixed file re-execs the named interpreter instead of
+    // trying to load the script itself as an ELF (this kernel's own `elf::load` has no shebang
+    // awareness at all -- a script handed to it directly fails `Elf::parse` with `ENOEXEC`, "Exec
+    // format error", the same error a real kernel gives for any genuinely non-ELF file). Found
+    // live: hush has no userspace `ENOEXEC`-fallback-to-script-interpretation logic of its own
+    // (real Linux shells generally don't need one, since the kernel already handles `#!`) -- a
+    // real script's own `+x` bit alone was never going to be enough to run it directly without
+    // this. `effective_path` starts as the caller's own target and is replaced by each
+    // interpreter in turn; `shebang_argv_prefix`, once any `#!` is followed, becomes the real
+    // `[interpreter, optional-arg?, script-path]` prefix `argv` is built from below instead of the
+    // caller's original `argv[0]`.
+    let mut effective_path: Vec<u8> = path_bytes.clone();
+    let mut shebang_argv_prefix: Option<Vec<Vec<u8>>> = None;
+    let mut shebang_depth: u32 = 0;
+    let elf_bytes: Vec<u8> = loop {
+        let bytes = read_file_via_syscall(effective_path.as_ptr() as u64, effective_path.len() as u64)?;
+        if bytes.len() < 2 || &bytes[0..2] != b"#!" {
+            break bytes;
         }
-    }
-    let _ = syscall::dispatch(SYS_CLOSE, fd, 0, 0, 0);
+        shebang_depth += 1;
+        if shebang_depth > MAX_SHEBANG_DEPTH {
+            return Err(ELOOP);
+        }
+        let (interpreter, optional_arg) = parse_shebang_line(&bytes).ok_or(ENOEXEC)?;
+        let mut prefix = alloc::vec![interpreter.clone()];
+        if let Some(arg) = optional_arg {
+            prefix.push(arg);
+        }
+        prefix.push(effective_path);
+        shebang_argv_prefix = Some(prefix);
+        effective_path = interpreter;
+    };
 
     let elf = Elf::parse(&elf_bytes).map_err(|_| ENOEXEC)?;
 
@@ -829,11 +972,24 @@ pub fn do_execve(
     // present-but-immediately-terminated array) falls back to a synthesized single-element
     // argv = [path_bytes], the same fallback every pre-existing caller already relies on. envp is
     // real too -- whatever the caller's own envp_ptr described, or empty if it passed 0.
-    let argv: Vec<&[u8]> = if raw_argv.is_empty() {
-        core::iter::once(path_bytes.as_slice()).collect()
+    //
+    // When a `#!` shebang was followed above (`shebang_argv_prefix` is `Some`), real
+    // `binfmt_script` semantics replace the whole thing instead: `[interpreter, optional-arg?,
+    // script-path]` followed by the caller's own *original* `argv[1..]` -- `argv[0]` is always
+    // discarded, matching real Linux (the script's own path, not the caller's `argv[0]`, is what
+    // ends up in the new argv, since they need not be equal -- see `RawArgvEntry`'s own doc
+    // comment referenced above).
+    let argv_owned: Vec<Vec<u8>> = if let Some(mut prefix) = shebang_argv_prefix {
+        if !raw_argv.is_empty() {
+            prefix.extend(raw_argv[1..].iter().cloned());
+        }
+        prefix
+    } else if raw_argv.is_empty() {
+        alloc::vec![path_bytes.clone()]
     } else {
-        raw_argv.iter().map(Vec::as_slice).collect()
+        raw_argv.clone()
     };
+    let argv: Vec<&[u8]> = argv_owned.iter().map(Vec::as_slice).collect();
     let envp_refs: Vec<&[u8]> = envp.iter().map(Vec::as_slice).collect();
     let initial_rsp = crate::user_stack::build(
         &elf,
@@ -864,7 +1020,12 @@ pub fn do_execve(
         me.user_stack_top = initial_rsp;
         me.entry_point = entry;
         me.brk = VirtAddr::new(elf.highest_loaded_address());
-        me.comm = basename(&path_bytes).to_vec();
+        // effective_path is whichever path actually got loaded as the real ELF above -- the
+        // caller's own original path_bytes when there was no `#!` to follow, or the final
+        // interpreter in a shebang chain otherwise. Matches real Linux: `/proc/[pid]/comm` names
+        // the actual binary execve() loaded (the interpreter), not the script argument handed to
+        // it, since only the interpreter is ever really "exec'd" at the kernel level.
+        me.comm = basename(&effective_path).to_vec();
         me.cmdline = build_cmdline(&argv);
         // The old program's TLS base doesn't mean anything to the new one -- reset the stored value
         // (restored on every future context switch, see Process::fs_base's own doc comment) *and*
@@ -1496,6 +1657,231 @@ pub fn do_setgroups(caller_pid: Pid, _count: u64, _list_ptr: u64) -> Result<u64,
         return Err(EPERM);
     }
     Ok(0)
+}
+
+/// Resolves a real POSIX "`0` means the caller itself, otherwise a specific target pid" argument
+/// (the shared convention `setpriority`'s `who`, `sched_setscheduler`/`sched_getscheduler`/
+/// `sched_getparam`'s `pid`, and `prlimit64`'s `pid` all use) -- `ESRCH` for a nonzero target that
+/// doesn't exist. No further permission check beyond existence: this kernel has no capability
+/// model and (today) exactly one uid that's ever run anything other than as itself, the same
+/// "collapses to always-allowed" reasoning `do_setpgid`'s own doc comment already uses.
+fn resolve_target_pid(caller_pid: Pid, target: i64) -> Result<Pid, u64> {
+    if target == 0 {
+        return Ok(caller_pid);
+    }
+    let pid = target as Pid;
+    if PROCESS_TABLE.lock().contains_key(&pid) {
+        Ok(pid)
+    } else {
+        Err(ESRCH)
+    }
+}
+
+/// Real `struct rlimit` on x86_64 -- two plain `u64`s (`rlim_cur`, `rlim_max`), `RLIM_INFINITY`
+/// wire-compatible with `u64::MAX` (musl's own `getrlimit.c`/`setrlimit.c` already special-case
+/// that exact value, see `SYSCALL_RLIM_INFINITY`'s own `FIX()` macro in those files).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawRlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+/// Real Linux's own `RLIM_NLIMITS` -- the number of `Process::rlimits` slots that exist.
+const RLIM_NLIMITS: u64 = 16;
+
+/// `SYS_PRLIMIT64`'s real logic -- real `prlimit64(pid, resource, new_limit, old_limit)`: writes
+/// the resource's *old* value to `old_ptr` first (if non-null), matching real Linux's own
+/// "read-then-write, atomically" contract, then applies `new_ptr`'s value (if non-null). Either
+/// pointer may be null independently (a bare read, a bare write, or both). See
+/// `Process::rlimits`'s own doc comment for why nothing here is actually enforced.
+pub fn do_prlimit64(
+    caller_pid: Pid,
+    pid: i64,
+    resource: u64,
+    new_ptr: u64,
+    old_ptr: u64,
+) -> Result<u64, u64> {
+    if resource >= RLIM_NLIMITS {
+        return Err(EINVAL);
+    }
+    let target = resolve_target_pid(caller_pid, pid)?;
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&target)
+        .expect("prlimit64: target process missing from table");
+    if old_ptr != 0 {
+        let (cur, max) = proc.rlimits[resource as usize];
+        // SAFETY: same known pointer-validation gap every other user-memory write in this
+        // codebase already has.
+        unsafe {
+            (old_ptr as *mut RawRlimit).write(RawRlimit {
+                rlim_cur: cur,
+                rlim_max: max,
+            })
+        };
+    }
+    if new_ptr != 0 {
+        // SAFETY: same known pointer-validation gap every other user-memory read in this
+        // codebase already has.
+        let new = unsafe { *(new_ptr as *const RawRlimit) };
+        proc.rlimits[resource as usize] = (new.rlim_cur, new.rlim_max);
+    }
+    Ok(0)
+}
+
+/// `SYS_SETPRIORITY`'s real logic -- only `PRIO_PROCESS` (`0`) is supported (`PRIO_PGRP`/
+/// `PRIO_USER` are `EINVAL`; no target applet in this port's roster uses either). See
+/// `Process::nice`'s own doc comment for why storing it has no real scheduling effect.
+pub fn do_setpriority(caller_pid: Pid, which: u64, who: i64, prio: i32) -> Result<u64, u64> {
+    if which != PRIO_PROCESS {
+        return Err(EINVAL);
+    }
+    let target = resolve_target_pid(caller_pid, who)?;
+    let mut table = PROCESS_TABLE.lock();
+    table
+        .get_mut(&target)
+        .expect("setpriority: target process missing from table")
+        .nice = prio.clamp(-20, 19);
+    Ok(0)
+}
+
+/// `SYS_GETPRIORITY`'s real logic -- real Linux's own `getpriority(2)` returns `20 - nice`
+/// (never negative, since the real syscall ABI can't otherwise distinguish "nice value `-1`" from
+/// "error"); musl's own `getpriority()` wrapper un-shifts this client-side (`third_party/musl/
+/// src/misc/getpriority.c`), so the raw value returned here must already be shifted the same way.
+pub fn do_getpriority(caller_pid: Pid, which: u64, who: i64) -> Result<u64, u64> {
+    if which != PRIO_PROCESS {
+        return Err(EINVAL);
+    }
+    let target = resolve_target_pid(caller_pid, who)?;
+    let table = PROCESS_TABLE.lock();
+    let nice = table
+        .get(&target)
+        .expect("getpriority: target process missing from table")
+        .nice;
+    Ok((20 - nice) as u64)
+}
+
+/// `SYS_UMASK`'s real logic -- real POSIX `umask(2)` always succeeds and returns the *previous*
+/// mask. Masked to `0o777` (the only bits a real file-permission mask can meaningfully hold),
+/// matching real Linux/musl's own `umask()` wrapper's implicit contract. See `Process::umask`'s
+/// own doc comment for why this needed to be real per-process state rather than a stub, and why
+/// it's stored/returned honestly without actually being consulted anywhere oxfs creates a file.
+pub fn do_umask(caller_pid: Pid, new_mask: u32) -> Result<u64, u64> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&caller_pid)
+        .expect("umask: current process missing from table");
+    let old_mask = proc.umask;
+    proc.umask = new_mask & 0o777;
+    Ok(old_mask as u64)
+}
+
+const PRIO_PROCESS: u64 = 0;
+
+/// Real Linux's own `SCHED_RR` value -- `Process::sched_policy`'s default, matching BusyBox
+/// `chrt`'s own default policy when none of `-r`/`-f`/`-o`/`-b`/`-i` is given.
+const SCHED_RR_DEFAULT: i32 = 2;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+
+/// Real `struct sched_param` on x86_64 -- a single `int sched_priority` field (real Linux's own
+/// layout has no other members on this arch).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawSchedParam {
+    sched_priority: i32,
+}
+
+/// `SYS_SCHED_SETSCHEDULER`'s real logic -- stores `policy`/`param.sched_priority` verbatim, no
+/// validation beyond what `param_ptr` itself provides (real Linux would range-check `sched_priority`
+/// against `policy`'s own `sched_get_priority_min/max`, but nothing in this port's roster depends
+/// on that rejection path firing). See `Process::sched_policy`'s own doc comment for why storing
+/// this has no real RT-scheduling effect on this kernel's cooperative round-robin scheduler.
+pub fn do_sched_setscheduler(
+    caller_pid: Pid,
+    pid: i64,
+    policy: i32,
+    param_ptr: u64,
+) -> Result<u64, u64> {
+    let target = resolve_target_pid(caller_pid, pid)?;
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let param = unsafe { *(param_ptr as *const RawSchedParam) };
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&target)
+        .expect("sched_setscheduler: target process missing from table");
+    proc.sched_policy = policy;
+    proc.sched_priority = param.sched_priority;
+    Ok(0)
+}
+
+/// `SYS_SCHED_GETSCHEDULER`'s real logic -- echoes back the stored `Process::sched_policy`.
+pub fn do_sched_getscheduler(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
+    let target = resolve_target_pid(caller_pid, pid)?;
+    let table = PROCESS_TABLE.lock();
+    Ok(table
+        .get(&target)
+        .expect("sched_getscheduler: target process missing from table")
+        .sched_policy as u64)
+}
+
+/// `SYS_SCHED_GETPARAM`'s real logic -- writes the stored `Process::sched_priority` back into the
+/// caller's `struct sched_param`.
+pub fn do_sched_getparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u64, u64> {
+    let target = resolve_target_pid(caller_pid, pid)?;
+    let table = PROCESS_TABLE.lock();
+    let sched_priority = table
+        .get(&target)
+        .expect("sched_getparam: target process missing from table")
+        .sched_priority;
+    // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
+    // already has.
+    unsafe { (param_ptr as *mut RawSchedParam).write(RawSchedParam { sched_priority }) };
+    Ok(0)
+}
+
+/// `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN`'s real logic -- fixed,
+/// real-Linux-matching ranges per policy (`SCHED_FIFO`/`SCHED_RR` -> `1..=99`, everything else
+/// (`SCHED_OTHER`/`SCHED_BATCH`/`SCHED_IDLE`/...) -> `0..=0`), not backed by any real scheduling
+/// class this kernel implements -- pure functions, no `Process` state involved at all.
+pub fn do_sched_get_priority_max(policy: i32) -> Result<u64, u64> {
+    Ok(if policy == SCHED_FIFO || policy == SCHED_RR {
+        99
+    } else {
+        0
+    })
+}
+
+pub fn do_sched_get_priority_min(policy: i32) -> Result<u64, u64> {
+    Ok(if policy == SCHED_FIFO || policy == SCHED_RR {
+        1
+    } else {
+        0
+    })
+}
+
+/// Real Linux `reboot(2)` magic values (`third_party/musl/include/sys/reboot.h`) -- `reboot.c`'s
+/// own musl wrapper passes these straight through as the real 3rd syscall argument, no call-site
+/// patch needed (see this ABI's own remap comment in `bits/syscall.h.in`).
+const RB_AUTOBOOT: u64 = 0x01234567;
+const RB_HALT_SYSTEM: u64 = 0xcdef0123;
+const RB_POWER_OFF: u64 = 0x4321fedc;
+
+/// `SYS_REBOOT`'s real logic -- matches real Linux's own magic `cmd` values against this kernel's
+/// three real actions (`src/reboot.rs`). No permission check: this kernel has no capability model
+/// to gate real Linux's own `CAP_SYS_BOOT` requirement against, the same "collapses to
+/// always-allowed" reasoning `do_setpgid`/`TIOCSCTTY`'s own `force` flag already use. Every
+/// success arm diverges (`-> !`) -- the `Result` return type exists only for the `EINVAL` case.
+pub fn do_reboot(cmd: u64) -> Result<u64, u64> {
+    match cmd {
+        RB_AUTOBOOT => crate::reboot::reboot(),
+        RB_HALT_SYSTEM => crate::reboot::halt(),
+        RB_POWER_OFF => crate::reboot::poweroff(),
+        _ => Err(EINVAL),
+    }
 }
 
 /// musl's own `struct timespec` on x86_64 -- see `src/syscall.rs`'s `RawTimespec` (duplicated

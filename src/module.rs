@@ -791,6 +791,32 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_setgroups" => {
             Some(crate::syscall::oxidebsd_sys_setgroups as *const () as u64)
         }
+        "oxidebsd_sys_prlimit64" => {
+            Some(crate::syscall::oxidebsd_sys_prlimit64 as *const () as u64)
+        }
+        "oxidebsd_sys_setpriority" => {
+            Some(crate::syscall::oxidebsd_sys_setpriority as *const () as u64)
+        }
+        "oxidebsd_sys_getpriority" => {
+            Some(crate::syscall::oxidebsd_sys_getpriority as *const () as u64)
+        }
+        "oxidebsd_sys_umask" => Some(crate::syscall::oxidebsd_sys_umask as *const () as u64),
+        "oxidebsd_sys_sched_setscheduler" => {
+            Some(crate::syscall::oxidebsd_sys_sched_setscheduler as *const () as u64)
+        }
+        "oxidebsd_sys_sched_getscheduler" => {
+            Some(crate::syscall::oxidebsd_sys_sched_getscheduler as *const () as u64)
+        }
+        "oxidebsd_sys_sched_getparam" => {
+            Some(crate::syscall::oxidebsd_sys_sched_getparam as *const () as u64)
+        }
+        "oxidebsd_sys_sched_get_priority_max" => {
+            Some(crate::syscall::oxidebsd_sys_sched_get_priority_max as *const () as u64)
+        }
+        "oxidebsd_sys_sched_get_priority_min" => {
+            Some(crate::syscall::oxidebsd_sys_sched_get_priority_min as *const () as u64)
+        }
+        "oxidebsd_sys_reboot" => Some(crate::syscall::oxidebsd_sys_reboot as *const () as u64),
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {

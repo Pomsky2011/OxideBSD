@@ -347,14 +347,23 @@ every built applet tagged with what it's still missing (`NEEDS_NETWORK`/`NEEDS_P
 `WORKS` if it needs nothing this kernel doesn't already have), plus every candidate that didn't
 build at all and why (almost entirely missing Linux uapi headers musl doesn't vendor — framebuffer/
 VT/MTD/I2C/netlink ioctl tools with no portable equivalent). `modules/oxfs/src/test_busybox.sh`
-(seeded into oxfs at `/test_busybox.sh`, run by hand via `sh /test_busybox.sh` at the hush prompt —
-see its own header comment for why it's a flat sequence of real applet invocations, not an
-if/for-based test harness: this kernel's actual `sh` build has no shell control flow at all, see
-this file's own musl-port section) exercises ~20 real applets against hand-written expected output
-and found three real, now-fixed bugs this way, none visible from `cargo test`/`clippy` staying
-green: the `wait4`/exit-status encoding bug and the `kill(pid, 0)` gap (see this file's own
-Process/scheduler section) and the missing `vfork`/`utimensat` syscalls (see this file's own
-musl-port section). `build_busybox_applet` is also now
+(seeded into oxfs at `/test_busybox.sh`, run by hand via `sh /test_busybox.sh` at the hush prompt)
+exercises ~40 real applet/control-flow checks against hand-written expected output and found three
+real, now-fixed bugs this way, none visible from `cargo test`/`clippy` staying green: the
+`wait4`/exit-status encoding bug and the `kill(pid, 0)` gap (see this file's own Process/scheduler
+section) and the missing `vfork`/`utimensat` syscalls (see this file's own musl-port section). It
+was originally written as a flat sequence of real applet invocations, not an if/for-based test
+harness, because this kernel's actual `sh` build had no shell control flow at all -- `make
+allnoconfig` writes an explicit "not set" line for every symbol in the whole BusyBox Kconfig tree
+up front, so the later `make oldconfig` pass (which only fills in symbols with *no* prior answer)
+never got a chance to apply hush's real `default y` for `HUSH_IF`/`HUSH_LOOPS`/`HUSH_CASE`/
+`HUSH_FUNCTIONS`/`HUSH_TICK`/`HUSH_TEST`/... -- they'd stayed off ever since `HUSH_INTERACTIVE`/
+`HUSH_JOB` were first turned on. Fixed in `build.rs`'s `configure_busybox_single_applet` (flips
+those lines directly, the same way it already did for `HUSH_INTERACTIVE`/`HUSH_JOB` -- see its own
+doc comment), and the script itself rewritten to match: real `if`/`for`/`while`/`until`/`case`,
+functions with `local` variables, `$((...))` arithmetic, both forms of command substitution, and a
+real `PASS`/`FAIL` tally via shell arithmetic instead of `ok_<name>`/`bad_<name>` marker files
+counted with `ls | wc -l`. `build_busybox_applet` is also now
 staleness-checked (skips its own `allnoconfig`/`oldconfig`/`make` sequence if that applet's already-
 built binary is newer than `third_party/busybox`, `build.rs` itself, **and** `musl_sysroot`'s own
 `lib/libc.a`) and the whole roster builds in parallel across a worker pool sized to
@@ -481,6 +490,33 @@ copy), no SMP, no frame deallocation anywhere.
   the caller untouched, matching real `execve(2)` semantics. `argv_ptr` now supplies the complete
   `argv[]` including a real caller-chosen `argv[0]` (length-prefixed `RawArgvEntry{ptr,len}`
   array, zero-entry-terminated — not real `execve`'s NUL-terminated `char**`).
+- **Real `#!interpreter [arg]` shebang support**, added after live testing found `sh /test_busybox.sh`
+  worked but the far more natural `./test_busybox.sh`/`/test_busybox.sh` (a `+x` script invoked
+  directly, the normal way anyone actually runs a script) failed `ENOEXEC` ("Exec format error") —
+  this kernel's `elf::load` has no shebang awareness at all, and BusyBox `hush` has no userspace
+  `ENOEXEC`-fallback-to-script-interpretation logic of its own either (real Unix shells generally
+  don't need one, since a real kernel's own `binfmt_script` already handles `#!`; confirmed by
+  grepping `third_party/busybox/shell/hush.c` for `ENOEXEC` — no hits at all). Before
+  `Elf::parse` is even attempted, `do_execve` peeks at the target's first two bytes; if `#!`, it
+  parses the rest of the line as `interpreter` + an optional single trailing argument (real
+  `binfmt_script` semantics: everything after the interpreter path, once leading whitespace is
+  trimmed, becomes *one* argument, never further word-split), then re-targets the open/read loop
+  at the interpreter instead — looping (capped at `MAX_SHEBANG_DEPTH = 4`, past which it's a real
+  `ELOOP`) to follow a chain of interpreter scripts, matching real Linux's own bounded recursion.
+  `argv` is rebuilt as `[interpreter, optional-arg?, script-path] + original-argv[1..]` (the
+  caller's own `argv[0]` is always discarded, matching real Linux — the two need not be equal in
+  the first place, see `RawArgvEntry`'s own doc comment two paragraphs up), and `Process::comm`
+  (`/proc/[pid]/comm`) is taken from the *actual* interpreter's own basename rather than the
+  script's, matching real Linux: only the interpreter is ever really `exec`'d at the kernel level,
+  the script path is just data handed to it as an argument. The one already-open-user-address-space
+  subtlety this relies on: an interpreter path parsed out of file content lives only in a kernel
+  heap `Vec<u8>`, not the caller's own user-space buffer the way the *original* exec target does —
+  passing a raw pointer to that kernel allocation into the same open/read syscall path still works
+  correctly regardless of which process's `CR3` is currently active, since kernel-heap virtual
+  addresses are mapped identically in every address space's page table (see this file's own
+  `AddressSpace::new`/`fork` notes above). Confirmed live: `./test_busybox.sh`/`/test_busybox.sh`
+  (both `#!/bin/sh` — the interpreter resolves to the already-seeded `/bin/sh`) now run directly
+  and report all-pass, the same self-test `sh /test_busybox.sh` already did.
 - Per-process state carried across `fork` (copied) / `execve` (mostly preserved, some reset)
   alongside the obvious (pid, address space): `cwd` (preserved by execve), `brk` (copied by fork,
   not reset by execve), `fs_base` (copied by fork, reset to 0 by execve — new TLS layout), `pgid`
@@ -1567,6 +1603,149 @@ now passes; the full existing suite re-verified green afterward (this bug was la
 `resolve_with_retry`/`connect` too, just never triggered there since every prior test's ARP/
 handshake happened to succeed before hitting its own deadline).
 
+## Filesystem/process misc syscalls: fsync, ftruncate, fallocate, flock, statfs, prlimit64, nice, chrt, reboot (`modules/oxfs`, `modules/posix_compat`, `src/reboot.rs`)
+
+Closes most of the BusyBox gap table's `NEEDS_SYSCALL` row in one pass: `fsync`/`sync`/`truncate`/
+`fallocate`/`flock` (`df`'s own `statvfs()`)/`nice`/`chrt`/`halt`/`poweroff`/`reboot`. Deliberately
+scoped to syscalls needing no new on-disk format or data model beyond a couple of small fixed-size
+tables — `link`/`mknod`/SysV IPC/`chroot`/namespaces/`inotify`/ext2 `ioctl`s/`xattr` remain a
+distinct, unstarted gap (namespaces in particular don't fit this kernel's single-address-space
+model at all; faking them would be theater, not a real syscall).
+
+- **All sixteen new syscall numbers landed at `471`-`486`, not a continuation of this ABI's
+  existing `100`-`178` invented sequence.** A first attempt continuing that sequence (`179`-`194`)
+  silently collided with a *second* set of real, still-inert Linux syscalls sharing those same low
+  numbers further down `third_party/musl/arch/x86_64/bits/syscall.h.in` (real `__NR_quotactl=179`,
+  `__NR_gettid=186`, `__NR_setxattr=188`, ...) — and `__NR_gettid` in particular has a real caller
+  inside musl itself (`src/thread/synccall.c`), a live landmine, not a hypothetical one, caught
+  only by grepping musl's own source tree before trusting the number, the same collision class
+  this file's own `SYS_SETGROUPS`/musl-port notes already document at length. Since this vendored
+  musl fork is frozen at tag `v1.2.6` and won't be re-pinned casually, `471`+ (right past this
+  file's own real, highest-numbered entry, `__NR_listns=470`) is *permanently* collision-free, not
+  just collision-free today — `modules/oxfs`'s own `SYS_FSYNC=471` through `SYS_FSTATFS=477`, then
+  `modules/posix_compat`'s `SYS_PRLIMIT64=478` through `SYS_REBOOT=486`. **Any future syscall
+  number chosen for this ABI needs the same check** (grep every real, still-inert value in
+  `bits/syscall.h.in` for a live musl caller before reusing it, not just check against this ABI's
+  own already-invented numbers) — this file's own prose comments explaining these 16 numbers
+  deliberately never write the literal `__NR_` prefix (using bare names instead), matching this
+  file's own documented sed-based `__NR_`-to-`SYS_` generator gotcha (see its comment on
+  `SYS_MOUNT_BIND`/`SYS_UMOUNT2`): that generator matches any *line* containing `__NR_`, including
+  inside a comment, and duplicates it verbatim outside any comment block in the generated header —
+  broke the build this way while this pass landed, found immediately via `cargo build`, not live.
+- **`SYS_FSYNC`/`SYS_SYNC`** (`modules/oxfs`) are real, not stubs: this filesystem's write model
+  normally only commits a file's accumulated write buffer to its real inode at `close()` (see
+  `OpenFile::Write`'s own doc comment), so a naive always-succeed `fsync()` would be a lie for
+  anything still open. `commit_write_buffer` (refactored out of `oxfs_close`'s own body, which now
+  just calls it) is the shared real logic — `oxfs_fsync` calls it for one still-open fd,
+  `oxfs_sync` sweeps every currently-open write fd. Idempotent: a fresh file's first commit
+  allocates the real inode and inserts its directory entry, then records that inode back into the
+  open file's own `existing_inode` field so a later `fsync`/`close` on the same fd re-commits in
+  place instead of double-inserting.
+- **`SYS_FTRUNCATE`/`SYS_FALLOCATE`** (`modules/oxfs`) resize a file directly at the block level
+  (`resize_inode_data`), not by materializing the whole old-or-new content into one buffer the way
+  this filesystem's only other write primitive (`write_inode_data`) does — this filesystem's
+  per-file cap is ~4 MiB, far past what this kernel's 128 KiB kernel-stack floor could hold as a
+  local buffer inside a module's own syscall handler. Growing zero-fills only the newly-added
+  region; shrinking touches no block content at all (bytes past the new `size` are simply
+  unreachable, matching `read_inode_at`'s own size-bounded reads). Both also resolve a fd that's
+  still `OpenFile::Write`-in-progress but already refers to a real, pre-existing inode (`O_WRONLY`
+  on an existing path, BusyBox `truncate`'s own common case) — `inode_of_open_file` alone reports
+  `None` for *every* `Write` variant, even that one, so `inode_for_resize` falls through to check
+  `existing_inode` directly first. `fallocate`'s `mode` argument is ignored (always the default
+  zero-extend-if-shorter behavior, never shrinks) — no `FALLOC_FL_KEEP_SIZE`/`FALLOC_FL_PUNCH_HOLE`
+  support, a known simplification no applet in this port's roster needs past.
+- **`SYS_FLOCK`** (`modules/oxfs`) is a real per-inode `LOCK_SH`/`LOCK_EX`/`LOCK_UN` advisory-lock
+  table (`FLOCKS`, a fixed 16-entry `[Option<(inode, holder_real_fd, exclusive)>; 16]`), released
+  on `close()` (real `flock()` semantics). **A conflicting request fails `EAGAIN` immediately even
+  without `LOCK_NB`**, rather than genuinely blocking — this module has no scheduler-yield
+  primitive reachable from a syscall handler (only kernel-resident code like `src/pipe.rs` can call
+  `scheduler::schedule()`), and a real spin-wait here would permanently deadlock this single-core,
+  non-preemptive kernel against a lock holder that could never run to release it. A documented,
+  deliberate simplification, not an oversight.
+- **`SYS_STATFS`/`SYS_FSTATFS`** (`modules/oxfs`) report a real musl-layout `struct statfs`
+  (`MuslStatfs`, 120 bytes, `#[repr(C)]` + `write_unaligned`, same idiom `MuslStat` already uses)
+  built from this filesystem's own live block/inode-usage counts, scanned fresh on every call
+  (separately for the real vs. tmpfs pool, by the same `inode_num >= MAX_INODES` split `st_dev`
+  already uses) — no cached running total to go stale. Backs `df`'s real `statvfs(3)` call
+  (`third_party/musl/src/stat/statvfs.c`'s `__statfs`/`__fstatfs` needed no call-site patch at all,
+  just the number remap — no separate `statfs64` syscall exists on a 64-bit arch).
+- **`SYS_PRLIMIT64`** (`modules/posix_compat`) backs both real `getrlimit(2)`/`setrlimit(2)` —
+  musl's own wrapper for both tries `prlimit64` first unconditionally, and only falls back to the
+  legacy `getrlimit`/`setrlimit` syscalls if that returns `ENOSYS`, which it no longer does (see
+  `third_party/musl/src/misc/getrlimit.c`/`setrlimit.c`). `Process::rlimits: [(u64, u64); 16]`
+  (`RLIM_INFINITY = u64::MAX` default) is real per-process state, copied by `fork`/preserved by
+  `execve` (same tier as `uid`/`gid`/`pgid`) — but **stored, never enforced**, an honest, documented
+  gap the same tier as several other accepted-but-unenforced fields already in this codebase (e.g.
+  `O_NONBLOCK` on a TCP socket). Real Linux's own `__NR_getrlimit=97`/`__NR_setrlimit=160` stay at
+  their original inert values in `bits/syscall.h.in` — `__NR_setrlimit`'s real value would collide
+  with this ABI's own `SYS_GETGID=160` if that fallback path were ever actually reached, a real
+  landmine avoided (not triggered) by `prlimit64` succeeding first.
+- **`SYS_SETPRIORITY`/`SYS_GETPRIORITY`** (`modules/posix_compat`, `nice`) store a real
+  `Process::nice: i32` (default `0`), copied by `fork`/preserved by `execve`. `getpriority`'s real
+  return-value convention is `20 - nice` (never negative, since the raw syscall ABI can't otherwise
+  distinguish a real negative nice value from an error) — musl's own `getpriority()` wrapper
+  un-shifts this client-side, so the raw kernel-side value must already be shifted the same way.
+  No real scheduling effect at all — this kernel's cooperative round-robin scheduler has no
+  priority concept to hook it into.
+- **`SYS_SCHED_SETSCHEDULER`/`SYS_SCHED_GETSCHEDULER`/`SYS_SCHED_GETPARAM`/
+  `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN`** (`modules/posix_compat`, `chrt`) —
+  BusyBox `chrt.c` calls all three of the first group directly via a raw `syscall()`, bypassing
+  musl's own library wrappers entirely (`sched_setscheduler()`/`sched_getscheduler()`/
+  `sched_getparam()` are all three permanently stubbed to return `ENOSYS` in this musl fork, per
+  upstream's own real-Linux-noncompliance stance — see `third_party/musl/src/sched/
+  sched_{setscheduler,getscheduler,getparam}.c`), so only the number needed remapping, no
+  call-site patch. `Process::sched_policy`/`sched_priority: i32` (defaults `SCHED_RR`/`0`) are
+  stored and echoed back honestly — same "no real effect" tier as `nice` above.
+  `sched_get_priority_max`/`_min` are pure functions of `policy` alone (no `Process` state): a
+  fixed, real-Linux-matching range (`SCHED_FIFO`/`SCHED_RR` → `1..=99`, everything else → `0..=0`),
+  not backed by any real scheduling class this kernel implements.
+- **`SYS_REBOOT`** (`modules/posix_compat`, plus `src/reboot.rs`'s new `poweroff`/`halt`) matches
+  real Linux's own magic `RB_AUTOBOOT`/`RB_HALT_SYSTEM`/`RB_POWER_OFF` values (`reboot.c`'s musl
+  wrapper passes these through unmodified — no call-site patch needed, this ABI's 4-register width
+  already holds all three real arguments whole). `RB_AUTOBOOT` reuses the existing 8042-pulse
+  reset (previously only called from fatal exception handlers); `RB_HALT_SYSTEM` is a plain
+  permanent `hlt_loop()`; `RB_POWER_OFF` writes QEMU's own ACPI PM shutdown port (`0x604`, value
+  `0x2000` — the standard "system_powerdown" trick for QEMU's default `i440fx`/PIIX4 machine, the
+  same machine this file's own "Real disk persistence" section already assumes fixed ATA ports
+  for), falling back to a plain halt if nothing acts on it. No permission check — this kernel has
+  no capability model to gate real Linux's own `CAP_SYS_BOOT` requirement against, the same
+  "collapses to always-allowed" reasoning `do_setpgid`/`TIOCSCTTY`'s own `force` flag already use.
+  **Not covered by automated testing** (`tests/needs_syscall_smoke.rs` covers every other syscall
+  in this section): every success path halts, resets, or powers off the whole VM, which
+  `isa-debug-exit` can't distinguish from a hang — manual-QEMU-only, same "hand off anything that
+  can't be scripted this way" precedent this file already follows for real interactive-keyboard
+  cases.
+- **`SYS_UMASK = 487`** (`modules/posix_compat`) — added in a later pass, not part of the original
+  471-486 batch (continues one past `SYS_REBOOT=486` rather than reusing a gap inside it, same
+  collision-avoidance discipline as the rest of this batch). Found live, not by design: testing the
+  real-control-flow `hush` fix (see this file's BusyBox section) by running `chmod +x` on a real
+  script hit `[boot] unrecognized syscall number 95` — BusyBox's `libbb/parse_mode.c` calls
+  `umask(0)`/`umask(old_mask)` unconditionally whenever it parses a symbolic mode change (`+x`,
+  `-w`, `u+rwx`, ...), to compute the result relative to the ambient umask, and real POSIX
+  `umask()` can't fail, so musl's own wrapper (`third_party/musl/src/stat/umask.c`) returns
+  whatever the raw syscall gives back with no error check at all — meaning every symbolic chmod
+  across the *entire* BusyBox roster (not just `chmod` itself; `mkdir`/`install`/`cp` share the
+  same `parse_mode.c`) was silently computing its result against a garbage `ENOSYS`-derived value.
+  `Process::umask: u32` (default `0o022`, the standard real Unix default) is real per-process
+  state — real `umask()` semantics require it, since the syscall always succeeds and returns the
+  *previous* mask — copied by `fork`/preserved by `execve`, same tier as `rlimits`/`nice`/
+  `sched_policy` otherwise: stored and returned honestly, never actually consulted anywhere oxfs
+  creates a new inode. Confirmed live: `chmod +x`/full applet self-test (see this file's BusyBox
+  section) reported all-pass after this landed.
+- Verified via `tests/needs_syscall_smoke.rs` + `userland/needs-syscall-smoke/` (a real spawned
+  pid 1 driving all of it — except `reboot`/`umask`, see above — through genuine `SYSCALL`/
+  `SYSRETQ`, the same reasoning every other real-`SYSCALL` smoke test in this codebase already
+  documents): a still-open fd's `fsync`'d content visible to a concurrent independent reader before
+  the writer closes, `sync`, real `flock` exclusion between two independent opens plus
+  release-on-close, a real `ftruncate` shrink and `fallocate` zero-extend round-tripped through a
+  fresh reopen, `statfs`/`fstatfs` agreeing on the same live filesystem, a `prlimit64`
+  read-old/write-new/read-back round trip against its `RLIM_INFINITY` default,
+  `setpriority`/`getpriority`'s real `20 - nice` convention, and a
+  `sched_setscheduler`/`sched_getscheduler`/`sched_getparam`/`sched_get_priority_max`/`_min` round
+  trip. `umask` itself isn't in that automated test (added in a later pass, see its own bullet
+  above) — confirmed live instead, the same "hand off anything only proven by real interactive
+  BusyBox usage" precedent as `reboot`.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
@@ -1591,7 +1770,8 @@ at once, so the rows aren't a clean partition.
 | `socketpair(AF_UNIX, SOCK_STREAM, ...)` + `fcntl`/`shutdown`/`set_tid_address`/`readv` + `/dev/{u}random`/`null`/`zero` + a real `tcp_read` EOF-vs-empty fix | **done, confirmed live** — `wget` HTTPS completed a real end-to-end download | `wget` HTTPS specifically (plain HTTP already worked) | see "Real networking" section's own known-gaps entry — `SYS_SOCKETPAIR=149`/`SYS_SET_TID_ADDRESS=150`/`SYS_FCNTL=151`/`SYS_SHUTDOWN=152`/`SYS_READV=153` in `posix_compat`/`native_abi`, built on `src/pipe.rs`'s existing blocking-buffer machinery; a synthetic `/dev` in `modules/oxfs` backed by a real SHA-256/ChaCha20 generator (`src/random.rs`); and a real bug in `src/net/tcp.rs`'s own `tcp_read` (returned false EOF instead of blocking) — five real bugs, each surfaced only once the previous fix got live-retested |
 | `alarm`/`setitimer` | done | `ping`'s own real receive-loop timeout (chief motivator); any other program relying on a real `SIGALRM` to bound an otherwise-indefinite wait | `SYS_SETITIMER=156`/`SYS_GETITIMER=157` in `modules/clock` — see "Real networking" section's own known-gaps entry for the full design (why only `ITIMER_REAL`, why expiry only sets `pending_signals` rather than immediately terminating a blocked target, fork/execve semantics) and `tests/itimer_syscall_smoke.rs`'s own real-`SYSCALL` coverage |
 | `chmod`/`chown`/`chgrp` | done | — | `SYS_CHMOD=165`/`SYS_CHOWN=166` in `modules/oxfs` — see this file's own "Filesystem: oxfs" section. BusyBox's own `chown.c` implements `chgrp` as the same `chown()` call restricted to the group field, so one pair of syscalls unblocks all three; `chattr`/`fatattr`/`lsattr`/`setfattr` are a distinct, still-unstarted gap (real ext2 `ioctl`s / `setxattr`, not chmod/chown, despite `docs/BUSYBOX_APPLETS.md`'s original probe bucketing them together — corrected there this pass) |
-| A specific missing syscall per applet (`link`/`mknod`/`flock`/`fsync`/`ftruncate`/`fallocate`/SysV IPC/`setrlimit`/`statfs`/sched-priority/`reboot`/`sync`/`inotify`/`chroot`/namespaces/ext2 `ioctl`s/`xattr`) | not started | 33 (`NEEDS_SYSCALL`, down from 36) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
+| `fsync`/`sync`/`ftruncate`/`fallocate`/`flock`/`statfs`/`setrlimit`/sched-priority/`reboot` | done | subset of 33 (down to 22, `NEEDS_SYSCALL`) | see this file's own "Filesystem/process misc syscalls" section — `SYS_FSYNC=471` through `SYS_REBOOT=486` in `modules/oxfs`/`modules/posix_compat`. Unblocks `fsync`/`flock`/`fallocate`/`truncate`/`chrt`/`halt`/`nice`/`poweroff`/`sync`/`softlimit`/`df` |
+| A specific missing syscall per remaining applet (`link`/`mknod`/SysV IPC/`chroot`/namespaces/`getrusage`/`inotify`/ext2 `ioctl`s/`xattr`) | not started | 22 (`NEEDS_SYSCALL`) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
 | `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
 | `/proc` filesystem — system-wide files (`/proc/meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | three new system-wide (not per-pid) kernel accessors (`oxidebsd_proc_meminfo`/`_uptime`/`_stat_global` in `src/process.rs`), routed as siblings of the numeric pid entries at `/proc`'s own top level. `MemFree`/`MemAvailable` are set equal to `MemTotal` (no free-memory/dealloc tracking exists anywhere in this kernel); `/proc/stat`'s `cpu` line is all-zero except `idle` (`ticks()` itself — no per-tick user/system accounting exists), so any CPU%-computing tool (`top`) reads permanently ~0% used, an honest placeholder, not a bug. `chdir(2)` into `/proc` needed a real sentinel encoding for `Process::cwd` (still a fully kernel-opaque `u64`, zero kernel-side changes) — the top bit tags it as a synthetic `/proc` location (`CWD_PROC_TAG`) rather than a real inode number, reusing `ProcDirKind` itself as the "which synthetic directory" representation; every path-taking oxfs syscall handler (`open`/`chdir`/`getcwd`/`stat`/`lstat`/`readlink`, plus a hard `-EROFS` reject for `mkdir`/`unlink`/`rmdir`/`rename` attempted relative to a synthetic cwd) got a matching branch. **Load-bearing fix along the way**: `current_cwd()`/`set_current_cwd()` used to truncate the kernel's own `u64` cwd value to `u32` immediately — harmless while `cwd` only ever held a small real inode index, but would have silently discarded this new tag; both were replaced by a `Cwd` enum-returning pair. Confirmed via `modules/oxfs`'s own boot self-check (system files, chdir in/out of `/proc`, the `EROFS` guard) and `tests/proc_smoke.rs`/`userland/proc-smoke` (a real spawned pid 1 driving all of it through genuine `SYSCALL`/`SYSRETQ`, since the boot self-check itself runs as pid 0 before any real process exists and can't exercise `/proc/<pid>/...` navigation). BusyBox's own `procps/top.c` source confirms `top` is the concrete applet this combination targets (`chdir("/proc")` once at startup, then relative `open("stat")`/`open("meminfo")`) — not yet confirmed live end to end. `free`/`uptime` turn out to call the Linux-only `sysinfo(2)` for their *primary* numbers (confirmed via BusyBox's own `procps/{free,uptime}.c` source) — these two new files don't unblock them; `sysinfo(2)` itself remains a distinct, unimplemented gap |
 | `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | done (enumeration only) | subset of the above | `src/fd.rs`'s new `oxidebsd_fd_at(pid, index)` (mirrors `oxidebsd_proc_pid_at`'s own "loop until -1" shape, a bounded range scan over the `(pid, fd)`-keyed fd table) backs a new `ProcDirKind::FdList`. Real directory listing, real fd numbers — but each entry is a plain placeholder (`DT_REG`, no real content), **not** a real symlink to its target, since real Linux's own `/proc/<pid>/fd/N` entries are symlinks and this kernel had zero symlink support at all until this same pass added one (see the `SYS_SYMLINK`/`SYS_READLINK` row below). Making these entries real target-bearing symlinks needs a separate, cross-module "describe this fd" mechanism (oxfs doesn't know what a pipe/socket fd actually is; only `src/pipe.rs`/`src/net/*` do) — a known, deliberate limitation, not solved by guessing. Unlocks the enumeration half of `lsof`/`fuser`, not the full readlink-target behavior |

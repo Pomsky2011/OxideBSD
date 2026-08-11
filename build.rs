@@ -35,6 +35,7 @@ fn main() {
     );
     build_userland_crate("mount-syscall-smoke", "MOUNT_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("session-syscall-smoke", "SESSION_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("needs-syscall-smoke", "NEEDS_SYSCALL_SMOKE_ELF_PATH");
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -841,7 +842,18 @@ fn build_busybox_applet(
 /// Left off deliberately: `CONFIG_HUSH_SAVEHISTORY`/`CONFIG_FEATURE_EDITING_SAVEHISTORY` (no
 /// `HISTFILE` persistence -- in-session history only, one less thing to get right this pass) and
 /// `CONFIG_FEATURE_EDITING_WINCH` (nothing in this kernel ever sends `SIGWINCH`, so tracking it
-/// would be pure unused surface). Every other applet stays exactly as narrow as it already was.
+/// would be pure unused surface).
+///
+/// Also for `HUSH` specifically: a second block of flips (below, in the function body -- see its
+/// own comment) turns on real script control flow (`if`/`for`/`while`/`until`/`case`, functions,
+/// command substitution, `$((...))` arithmetic, and most of hush's other real builtins). Without
+/// these, hush could only run a flat sequence of individual commands -- no control flow at all --
+/// since `make allnoconfig` writes an explicit "not set" line for every symbol in the whole
+/// Kconfig tree up front (confirmed empirically), so `resolve_busybox_new_config_options`'s later
+/// `make oldconfig` pass never gets a chance to apply their real `default y` the way it does for a
+/// symbol with no prior answer at all.
+///
+/// Every other applet stays exactly as narrow as it already was.
 fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
     let config_path = out_dir.join(".config");
     let mut config = std::fs::read_to_string(&config_path)
@@ -907,6 +919,178 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
             (
                 "# CONFIG_FEATURE_EDITING_FANCY_PROMPT is not set".to_string(),
                 "CONFIG_FEATURE_EDITING_FANCY_PROMPT=y".to_string(),
+            ),
+        ]);
+        // `allnoconfig` writes an explicit "# CONFIG_X is not set" line for every symbol in the
+        // whole Kconfig tree, including ones invisible at the time (e.g. everything under
+        // `if SHELL_HUSH` while `CONFIG_HUSH` was still off) -- confirmed by grepping an already-
+        // built non-shell applet's own `.config` for `CONFIG_FEATURE_SH_MATH` and finding the same
+        // "not set" line there too. That's why `resolve_busybox_new_config_options`'s `make
+        // oldconfig` pass doesn't help here: oldconfig only prompts for symbols with *no* line at
+        // all in `.config`, and every one of these already has an explicit "not set" answer from
+        // the initial allnoconfig run -- it never re-evaluates an already-answered symbol against
+        // its Kconfig `default`, even after growing newly visible via `CONFIG_HUSH`'s own `select
+        // SHELL_HUSH`. Left unflipped, hush had **no real control flow at all**: no `if`/`for`/
+        // `while`/`case`, no functions, no command substitution, no `$((...))` arithmetic -- only
+        // a flat sequence of individual command lines, which is why `modules/oxfs/src/
+        // test_busybox.sh` (see CLAUDE.md's BusyBox section) had to be written as one instead of
+        // using any real script control flow. Flipped directly here, the same
+        // known-shape-text-replacement way as everything else in this function, rather than
+        // relying on oldconfig's default-acceptance (which doesn't apply to these at all).
+        //
+        // Left off deliberately, matching real upstream `default n`/already-documented reasons:
+        // `CONFIG_HUSH_BASH_SOURCE_CURDIR` (explicitly non-standard per its own Kconfig help),
+        // `CONFIG_HUSH_MEMLEAK` (debugging only), `CONFIG_HUSH_SAVEHISTORY` (already left off above
+        // -- no `HISTFILE` persistence), `CONFIG_FEATURE_SH_STANDALONE` (re-execs `/proc/self/exe`,
+        // which doesn't exist on this kernel), `CONFIG_FEATURE_SH_NOFORK` (calls `<applet>_main`
+        // directly instead of fork/exec -- meaningless in a single-applet-per-binary build, and a
+        // real behavior change if it silently did anything), `CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS`
+        // (embeds scripts from a build-time `embed/` directory this codebase doesn't populate --
+        // no benefit here).
+        flips.extend([
+            (
+                "# CONFIG_HUSH_BASH_COMPAT is not set".to_string(),
+                "CONFIG_HUSH_BASH_COMPAT=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_BRACE_EXPANSION is not set".to_string(),
+                "CONFIG_HUSH_BRACE_EXPANSION=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_LINENO_VAR is not set".to_string(),
+                "CONFIG_HUSH_LINENO_VAR=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_TICK is not set".to_string(),
+                "CONFIG_HUSH_TICK=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_IF is not set".to_string(),
+                "CONFIG_HUSH_IF=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_LOOPS is not set".to_string(),
+                "CONFIG_HUSH_LOOPS=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_CASE is not set".to_string(),
+                "CONFIG_HUSH_CASE=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_FUNCTIONS is not set".to_string(),
+                "CONFIG_HUSH_FUNCTIONS=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_LOCAL is not set".to_string(),
+                "CONFIG_HUSH_LOCAL=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_RANDOM_SUPPORT is not set".to_string(),
+                "CONFIG_HUSH_RANDOM_SUPPORT=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_MODE_X is not set".to_string(),
+                "CONFIG_HUSH_MODE_X=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_ECHO is not set".to_string(),
+                "CONFIG_HUSH_ECHO=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_PRINTF is not set".to_string(),
+                "CONFIG_HUSH_PRINTF=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_TEST is not set".to_string(),
+                "CONFIG_HUSH_TEST=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_HELP is not set".to_string(),
+                "CONFIG_HUSH_HELP=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_EXPORT is not set".to_string(),
+                "CONFIG_HUSH_EXPORT=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_EXPORT_N is not set".to_string(),
+                "CONFIG_HUSH_EXPORT_N=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_READONLY is not set".to_string(),
+                "CONFIG_HUSH_READONLY=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_KILL is not set".to_string(),
+                "CONFIG_HUSH_KILL=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_WAIT is not set".to_string(),
+                "CONFIG_HUSH_WAIT=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_COMMAND is not set".to_string(),
+                "CONFIG_HUSH_COMMAND=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_TRAP is not set".to_string(),
+                "CONFIG_HUSH_TRAP=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_TYPE is not set".to_string(),
+                "CONFIG_HUSH_TYPE=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_TIMES is not set".to_string(),
+                "CONFIG_HUSH_TIMES=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_READ is not set".to_string(),
+                "CONFIG_HUSH_READ=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_SET is not set".to_string(),
+                "CONFIG_HUSH_SET=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_UNSET is not set".to_string(),
+                "CONFIG_HUSH_UNSET=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_ULIMIT is not set".to_string(),
+                "CONFIG_HUSH_ULIMIT=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_UMASK is not set".to_string(),
+                "CONFIG_HUSH_UMASK=y".to_string(),
+            ),
+            (
+                "# CONFIG_HUSH_GETOPTS is not set".to_string(),
+                "CONFIG_HUSH_GETOPTS=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_SH_MATH is not set".to_string(),
+                "CONFIG_FEATURE_SH_MATH=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_SH_MATH_64 is not set".to_string(),
+                "CONFIG_FEATURE_SH_MATH_64=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_SH_MATH_BASE is not set".to_string(),
+                "CONFIG_FEATURE_SH_MATH_BASE=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_SH_EXTRA_QUIET is not set".to_string(),
+                "CONFIG_FEATURE_SH_EXTRA_QUIET=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_SH_READ_FRAC is not set".to_string(),
+                "CONFIG_FEATURE_SH_READ_FRAC=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_SH_HISTFILESIZE is not set".to_string(),
+                "CONFIG_FEATURE_SH_HISTFILESIZE=y".to_string(),
             ),
         ]);
     }
