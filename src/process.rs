@@ -328,6 +328,14 @@ pub struct Process {
     /// this untouched (real `execve()` preserves the caller's cwd, unlike `fs_base`, which an
     /// exec'd program's own TLS layout makes meaningless to keep).
     pub cwd: u64,
+    /// This process's own root directory (`SYS_CHROOT`) -- same "opaque inode number `modules/oxfs`
+    /// assigns meaning to, kernel just persists/restores it" shape as `cwd` immediately above,
+    /// right down to `0` doubling as both oxfs's real root inode number *and* "never chrooted".
+    /// Copied by `fork` (real `chroot(2)` semantics: a forked child stays confined to whatever root
+    /// its parent already had); left untouched by `execve` (real `chroot(2)` persists across
+    /// `exec` too -- unlike `fs_base`, there's no reason a new program's own layout would make this
+    /// meaningless to keep).
+    pub root_inode: u64,
     /// Bitmask, bit `N-1` = signal `N` is pending delivery. Set by `do_kill`; drained by
     /// `take_deliverable_signal` (called once, at the tail of every completed syscall — see
     /// `src/syscall.rs`'s `deliver_pending_signal`).
@@ -525,6 +533,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         brk: VirtAddr::new(elf.highest_loaded_address()),
         fs_base: 0,
         cwd: 0,
+        root_inode: 0,
         pending_signals: 0,
         blocked_signals: 0,
         sigactions: [SigAction::DEFAULT; 32],
@@ -627,6 +636,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_brk,
         parent_fs_base,
         parent_cwd,
+        parent_root_inode,
         parent_pgid,
         parent_sid,
         parent_blocked_signals,
@@ -657,6 +667,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             parent.brk,
             parent.fs_base,
             parent.cwd,
+            parent.root_inode,
             parent.pgid,
             parent.sid,
             // Real fork() semantics: signal disposition and the blocked-signal mask are
@@ -706,6 +717,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         brk: parent_brk,
         fs_base: parent_fs_base,
         cwd: parent_cwd,
+        root_inode: parent_root_inode,
         pending_signals: 0,
         blocked_signals: parent_blocked_signals,
         sigactions: parent_sigactions,
@@ -876,7 +888,10 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 /// (a bare `#!` with nothing else on the line) is reported as `None` -- `do_execve`'s own caller
 /// turns that into `ENOEXEC`, matching real Linux's own refusal to exec a scriptless shebang.
 fn parse_shebang_line(bytes: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-    let line_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line_end = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len());
     let line = trim_ascii_whitespace(&bytes[2..line_end]);
     let interpreter_end = line
         .iter()
@@ -932,7 +947,8 @@ pub fn do_execve(
     let mut shebang_argv_prefix: Option<Vec<Vec<u8>>> = None;
     let mut shebang_depth: u32 = 0;
     let elf_bytes: Vec<u8> = loop {
-        let bytes = read_file_via_syscall(effective_path.as_ptr() as u64, effective_path.len() as u64)?;
+        let bytes =
+            read_file_via_syscall(effective_path.as_ptr() as u64, effective_path.len() as u64)?;
         if bytes.len() < 2 || &bytes[0..2] != b"#!" {
             break bytes;
         }
@@ -1061,7 +1077,12 @@ pub fn do_execve(
 /// only returns once something (`do_exit`, on a matching child) wakes it back to `Ready` and the
 /// scheduler picks it again — at which point the loop re-checks from the top, since `do_exit` only
 /// wakes the parent, it doesn't hand the child's info across directly.
-pub fn do_wait4(caller_pid: Pid, target_pid: i64, status_ptr: u64) -> Result<u64, u64> {
+pub fn do_wait4(
+    caller_pid: Pid,
+    target_pid: i64,
+    status_ptr: u64,
+    rusage_ptr: u64,
+) -> Result<u64, u64> {
     let matches = |pid: Pid| target_pid == -1 || target_pid as u64 == pid;
 
     loop {
@@ -1122,6 +1143,10 @@ pub fn do_wait4(caller_pid: Pid, target_pid: i64, status_ptr: u64) -> Result<u64
                 // invalid one page-faults, handled safely elsewhere (log + reboot).
                 unsafe { (status_ptr as *mut i32).write(code) };
             }
+            // No per-process CPU-time/memory-usage accounting exists anywhere in this kernel --
+            // see `RawRusage`'s own doc comment (`src/syscall.rs`) for why an honest all-zero
+            // placeholder is written here rather than an invented number.
+            crate::syscall::write_zeroed_rusage(rusage_ptr);
             return Ok(child_pid);
         }
 
@@ -2108,6 +2133,33 @@ pub(crate) extern "C" fn oxidebsd_set_cwd(inode: u64) {
     }
     if let Some(p) = table().lock().get_mut(&pid) {
         p.cwd = inode;
+    }
+}
+
+/// `BOOT_CWD`'s own counterpart for `Process::root_inode` -- same "no real process exists yet
+/// during `modules/oxfs`'s own boot self-check" reasoning, and the same `0`-doubles-as-"real root"
+/// default.
+static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Exposed to modules (see `src/module.rs`'s `resolve_external_symbol`) for `SYS_CHROOT` --
+/// byte-for-byte mirrors `oxidebsd_get_cwd`/`oxidebsd_set_cwd` immediately above, right down to the
+/// `pid == 0` boot-time fallback.
+pub(crate) extern "C" fn oxidebsd_get_root() -> u64 {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        return BOOT_ROOT.load(Ordering::Relaxed);
+    }
+    table().lock().get(&pid).map(|p| p.root_inode).unwrap_or(0)
+}
+
+pub(crate) extern "C" fn oxidebsd_set_root(inode: u64) {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        BOOT_ROOT.store(inode, Ordering::Relaxed);
+        return;
+    }
+    if let Some(p) = table().lock().get_mut(&pid) {
+        p.root_inode = inode;
     }
 }
 

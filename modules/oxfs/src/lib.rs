@@ -75,6 +75,8 @@ unsafe extern "C" {
     fn oxidebsd_close_fd(fd: u64) -> i32;
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
+    fn oxidebsd_get_root() -> u64;
+    fn oxidebsd_set_root(inode: u64);
     fn oxidebsd_real_fd_of(fd: u64) -> i64;
     fn oxidebsd_proc_exists(pid: u64) -> i32;
     fn oxidebsd_proc_pid_at(index: u64) -> i64;
@@ -104,6 +106,18 @@ unsafe extern "C" {
 
 const SYS_OPEN: u64 = 5;
 const SYS_CLOSE: u64 = 6;
+/// Real x86_64 Linux's own `__NR_lseek` value -- confirmed against
+/// `third_party/musl/arch/x86_64/bits/syscall.h.in` still at its inert value (no prior pass ever
+/// needed it), and musl's own `lseek()` (`src/unistd/lseek.c`) already issues a plain
+/// `syscall(SYS_lseek, fd, offset, whence)` with no `SYS__llseek` fallback on this arch -- no
+/// musl-side patch needed at all, unlike almost every other syscall this ABI has added. Found live
+/// via TinyCC (see CLAUDE.md's TinyCC section): its own object-file loader needs a real file size
+/// upfront (`fseek(f, 0, SEEK_END)`/`ftell`) to read `crt1.o`/`libc.a` whole into memory before
+/// parsing their real ELF/ar headers -- without this registered, that `fseek` silently failed
+/// (`[boot] unrecognized syscall number 8`), and tcc's own file-loading code doesn't check the
+/// return value, so it went on to read a garbage/zero-length buffer and reported `invalid object
+/// file` for every crt/lib file it opened, not just "not found".
+const SYS_LSEEK: u64 = 8;
 const SYS_CHDIR: u64 = 12;
 const SYS_MKDIR: u64 = 136;
 const SYS_GETCWD: u64 = 108;
@@ -183,6 +197,19 @@ const SYS_FLOCK: u64 = 475;
 const SYS_STATFS: u64 = 476;
 const SYS_FSTATFS: u64 = 477;
 
+/// Continues past `SYS_UMASK = 487` (the highest number assigned anywhere in this ABI before this
+/// pass -- see `modules/posix_compat`), not the `471`-`477` batch above -- confirmed via the same
+/// "grep every still-inert real Linux `__NR_*` value in `bits/syscall.h.in`" audit those numbers
+/// needed: none of real Linux's own `link`/`mknod`/`mknodat`/`chroot`/`getrusage` values (86/133/
+/// 259/161/98) land anywhere near 488-491. `SYS_LINK`/`SYS_MKNOD` implement real hard links and
+/// device-node creation (see `oxfs_link`/`oxfs_mknod`'s own doc comments -- neither existed before
+/// this pass, since `Inode` had no link count and this filesystem had no device-node concept
+/// distinct from `dev_open`'s own magic-path interception). `SYS_CHROOT` gives each process a real,
+/// per-process root inode (`Process::root_inode` in `src/process.rs`).
+const SYS_LINK: u64 = 488;
+const SYS_MKNOD: u64 = 489;
+const SYS_CHROOT: u64 = 490;
+
 /// Same real POSIX value FAT32's own `O_CREAT` already uses (`0o100`, not an arbitrary bit) --
 /// see `modules/fat32`'s own doc comment for why matching the real bit matters (musl's real
 /// `open()` passes real POSIX flag values).
@@ -205,6 +232,13 @@ const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 /// Real POSIX value, no Linux/BSD divergence -- backs `InodeKind::Symlink`.
 const S_IFLNK: u32 = 0o120000;
+/// Real POSIX values, no Linux/BSD divergence -- back `InodeKind::Device`'s two flavors (see
+/// `oxfs_mknod`'s own doc comment).
+const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
+/// Real POSIX mask isolating the type bits above out of a raw `mode_t` -- used by `oxfs_mknod` to
+/// read the caller's requested node type back out of its own `mode` argument.
+const S_IFMT: u32 = 0o170000;
 const FIXED_PERM: u32 = 0o755;
 
 /// Real `d_type` values (`include/dirent.h` on the `oxidebsd` musl branch) for `SYS_GETDENTS`'s
@@ -213,6 +247,10 @@ const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 /// Real value, no Linux/BSD divergence -- reported for an `InodeKind::Symlink` entry.
 const DT_LNK: u8 = 10;
+/// Real values, no Linux/BSD divergence -- reported for an `InodeKind::Device` entry (see
+/// `oxfs_mknod`'s own doc comment).
+const DT_CHR: u8 = 2;
+const DT_BLK: u8 = 6;
 
 const EBADF: i64 = 9;
 const ENOENT: i64 = 2;
@@ -224,6 +262,10 @@ const ENOSPC: i64 = 28;
 const EIO: i64 = 5;
 const EINVAL: i64 = 22;
 const ERANGE: i64 = 34;
+/// musl's real compiled value (`third_party/musl/arch/generic/bits/errno.h`, `29` -- same on
+/// FreeBSD, no divergence to worry about here). Returned by `oxfs_lseek` for a fd this filesystem
+/// has no real position to seek within (an in-progress `Write`, or a synthetic `/dev/*` node).
+const ESPIPE: i64 = 29;
 /// FreeBSD's value (`66`), not Linux's (`39`) -- matching this codebase's established convention
 /// of using FreeBSD errno values where they diverge (see `src/syscall.rs`'s own `ENOSYS`).
 const ENOTEMPTY: i64 = 66;
@@ -257,6 +299,22 @@ const EAGAIN: i64 = 11;
 /// generously past any real concurrent use this port's roster exercises, so this is a defensive
 /// bound, not an expected outcome.
 const ENOLCK: i64 = 37;
+/// Real value, no Linux/BSD divergence. Returned by `oxfs_link` when a `File`/`Device` inode's
+/// `nlink` is already at `u16::MAX` -- effectively unreachable in practice, a defensive bound like
+/// `ENOLCK` above, not an expected outcome.
+const EMLINK: i64 = 31;
+/// musl's real *compiled* value (`third_party/musl/arch/generic/bits/errno.h:19`). Returned by
+/// `oxfs_link` when `existing` and the new parent directory fall in different inode pools (the
+/// real, disk-persisted pool vs. a tmpfs mount's own in-memory-only pool) -- real POSIX "different
+/// filesystem" behavior, and load-bearing here specifically to stop a tmpfs-pool inode from
+/// gaining a real, disk-persisted name that points at content never actually written through (see
+/// `alloc_inode_in`'s own doc comment for the same real/tmpfs-pool concern elsewhere).
+const EXDEV: i64 = 18;
+/// musl's real *compiled* value (`third_party/musl/arch/generic/bits/errno.h:6`). Returned by
+/// `oxfs_open` when a real `InodeKind::Device` entry's major:minor doesn't match one of the four
+/// synthetic devices this kernel can actually service -- see `known_device`'s own doc comment for
+/// the deliberately small, honestly documented scope boundary this represents.
+const ENXIO: i64 = 6;
 
 const BLOCK_SIZE: usize = 4096;
 /// 32 MiB pool (raised from 4 MiB once the BusyBox roster grew from 24 applets to ~300 -- see
@@ -269,7 +327,12 @@ const BLOCK_SIZE: usize = 4096;
 const NUM_BLOCKS: usize = 8192;
 /// Raised from 64 alongside `NUM_BLOCKS` above, same reason -- ~300 applets plus root/`hello.txt`/
 /// `big.txt`/the self-check's own `/gdtest` fixtures need comfortably more than 64 inode slots.
-const MAX_INODES: usize = 512;
+/// Raised again, 512 -> 1024, once TinyCC (`third_party/tinycc`, see CLAUDE.md's TinyCC section)
+/// needed musl's entire real header tree seeded under `/usr/include` at runtime -- measured
+/// exactly against the real built `target/musl-sysroot`, not estimated: 217 header files (plus
+/// ~7 subdirectories) + ~9 `/usr/lib` crt/lib files + tcc's own `libtcc1.a` + 5 bundled headers +
+/// the `tcc` binary itself is ~250 new inodes, overflowing the ~180 that were free at 512.
+const MAX_INODES: usize = 1024;
 const DIRECT_BLOCKS: usize = 12;
 const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
 /// Sentinel for "no block"/"no indirect block" -- block numbers are plain indices into `BLOCKS`
@@ -302,8 +365,9 @@ const TMPFS_MAX_INODES: usize = 128;
 // INODE_TABLE_START + INODE_TABLE_BLOCKS)` is the packed inode table, `BITMAP_BLOCK` is the
 // block-used bitmap, and real data starts at `DATA_BLOCK_OFFSET` -- this module's own in-memory
 // block number `i` maps to physical disk block `DATA_BLOCK_OFFSET + i`. Sizing: 512 inodes at a
-// fixed 128-byte stride (real content is 67 bytes -- 1 tag + 4 size + 48 direct + 4 indirect + 2
-// mode + 4 uid + 4 gid -- rounded up to a power-of-two stride that divides BLOCK_SIZE evenly,
+// fixed 128-byte stride (real content is 74 bytes -- 1 tag + 4 size + 48 direct + 4 indirect + 2
+// mode + 4 uid + 4 gid + 2 nlink + 4 rdev + 1 device_char -- rounded up to a power-of-two stride
+// that divides BLOCK_SIZE evenly,
 // leaving headroom for future fields) is exactly 16 4096-byte blocks; `NUM_BLOCKS` (8192) bits is
 // exactly 1. Total metadata region: 18 blocks.
 
@@ -408,6 +472,12 @@ enum InodeKind {
     /// storage mechanism needed. See `resolve_path_impl`'s own doc comment for how this is
     /// followed during path resolution.
     Symlink,
+    /// A real, listable device node (`SYS_MKNOD`) -- unlike `/dev/{random,urandom,null,zero}`'s
+    /// existing magic-path interception in `dev_open` (not backed by any inode at all), this is a
+    /// genuine directory entry reporting `S_IFCHR`/`S_IFBLK` and a real `st_rdev` via `stat`. See
+    /// `oxfs_mknod`'s own doc comment for the (deliberately small) set of major:minor pairs that
+    /// actually work when opened.
+    Device,
 }
 
 #[derive(Clone, Copy)]
@@ -430,6 +500,21 @@ struct Inode {
     /// decision.
     uid: u32,
     gid: u32,
+    /// Real hard-link count -- meaningful only for `File`/`Device` (see `SYS_LINK`'s own doc
+    /// comment); `Dir`/`Symlink` keep reporting their existing hardcoded `write_stat` values
+    /// unchanged (real subdirectory-count-based `Dir` nlink stays a documented, separate gap).
+    /// `Inode::new` seeds this to `1` (the one directory entry about to be inserted for it);
+    /// `write_stat` floors a decoded `0` (an on-disk inode written before this field existed, whose
+    /// zero-padded stride tail decodes as `0`) back up to `1` rather than reporting a bogus
+    /// zero-link count.
+    nlink: u16,
+    /// Packed major/minor for an `InodeKind::Device` entry (`0` for everything else) -- decoded
+    /// from the caller's raw `dev` argument using the same formula musl's own
+    /// `makedev()`/`major()`/`minor()` macros use. See `oxfs_mknod`'s own doc comment.
+    rdev: u32,
+    /// `true` for a character device, `false` for a block device -- only meaningful for
+    /// `InodeKind::Device`.
+    device_char: bool,
 }
 
 impl Inode {
@@ -441,6 +526,9 @@ impl Inode {
         mode: FIXED_PERM as u16,
         uid: 0,
         gid: 0,
+        nlink: 0,
+        rdev: 0,
+        device_char: false,
     };
 
     fn new(kind: InodeKind) -> Inode {
@@ -452,6 +540,9 @@ impl Inode {
             mode: FIXED_PERM as u16,
             uid: 0,
             gid: 0,
+            nlink: 1,
+            rdev: 0,
+            device_char: false,
         }
     }
 }
@@ -817,14 +908,26 @@ const _: () = assert!(core::mem::size_of::<MuslStat>() == 144);
 /// comment).
 fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     let inode = read_inode(inode_num);
+    // `File`/`Device` report a real, tracked link count (floored at `1` -- see `Inode::nlink`'s
+    // own doc comment for why a decoded `0` means "written before this field existed", not "no
+    // links at all"). `Dir`/`Symlink` keep their existing hardcoded values.
     let (type_bits, nlink) = match inode.kind {
         InodeKind::Dir => (S_IFDIR, 2u64),
         InodeKind::Symlink => (S_IFLNK, 1u64),
-        _ => (S_IFREG, 1u64),
+        InodeKind::Device => (
+            if inode.device_char { S_IFCHR } else { S_IFBLK },
+            inode.nlink.max(1) as u64,
+        ),
+        _ => (S_IFREG, inode.nlink.max(1) as u64),
     };
     let mode = type_bits | inode.mode as u32;
     let size = inode.size as i64;
     let dev = if inode_num >= MAX_INODES as u32 { 2 } else { 1 };
+    let rdev = if inode.kind == InodeKind::Device {
+        inode.rdev as u64
+    } else {
+        0
+    };
     let stat = MuslStat {
         st_dev: dev,
         st_ino: inode_num as u64,
@@ -833,7 +936,7 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
         st_uid: inode.uid,
         st_gid: inode.gid,
         __pad0: 0,
-        st_rdev: 0,
+        st_rdev: rdev,
         st_size: size,
         st_blksize: BLOCK_SIZE as i64,
         st_blocks: (size + 511) / 512,
@@ -1209,17 +1312,35 @@ fn active_mount_for(inode: u32) -> Option<MountEntry> {
         .copied()
 }
 
-/// Resolves `path` to a single inode number, starting from `cwd_inode` (or root, if `path` starts
-/// with `/`) and walking every `/`-separated component (`.`/`..`/empty components handled along
-/// the way) -- real multi-component resolution, replacing `modules/fat32`'s single-component-only
-/// `to_short_name`. Every *intermediate* component is transparently followed if it's itself a
-/// symlink (real Unix behavior -- an intermediate component must resolve to a directory one way
-/// or another). The *final* component is followed too when `follow_last` is set; when it isn't,
-/// a symlink final component is returned as-is (its own inode, not its target's) -- the one
-/// difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't). Recursion
-/// depth is bounded by `MAX_SYMLINK_DEPTH` -- see `resolve_path`/`resolve_path_nofollow_last` for
-/// the two callable wrappers over this.
+/// `Process::root_inode` (`src/process.rs`), decoded the same "opaque `u64`, oxfs-owned meaning"
+/// way `current_cwd()` already decodes `Process::cwd` -- `0` doubles as both oxfs's real root inode
+/// number and "never chrooted", so no separate sentinel handling is needed here.
+fn effective_root_inode() -> u32 {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    unsafe { oxidebsd_get_root() as u32 }
+}
+
+/// Resolves `path` to a single inode number, starting from `cwd_inode` (or `root_inode`, if `path`
+/// starts with `/`) and walking every `/`-separated component (`.`/`..`/empty components handled
+/// along the way) -- real multi-component resolution, replacing `modules/fat32`'s
+/// single-component-only `to_short_name`. Every *intermediate* component is transparently followed
+/// if it's itself a symlink (real Unix behavior -- an intermediate component must resolve to a
+/// directory one way or another). The *final* component is followed too when `follow_last` is set;
+/// when it isn't, a symlink final component is returned as-is (its own inode, not its target's) --
+/// the one difference between `stat(2)`/`open(2)` (follow) and `lstat(2)`/`readlink(2)` (don't).
+/// Recursion depth is bounded by `MAX_SYMLINK_DEPTH` -- see `resolve_path`/
+/// `resolve_path_nofollow_last` for the two callable wrappers over this (both fetch
+/// `effective_root_inode()` themselves; every other call site in this file only ever goes through
+/// one of those two, or `resolve_parent`, which itself calls `resolve_path`).
+///
+/// `root_inode` is also the real `SYS_CHROOT` containment mechanism: when a `..` component would
+/// otherwise walk out of it (`current == root_inode`), it's treated as staying put instead of
+/// following that directory's own genuine, real `..` record -- without this, `cd ..` from a
+/// chrooted process's own root would walk straight back into the real tree via that directory's
+/// real parent. Fully backward compatible for the un-chrooted case: the real root (`ROOT_INODE =
+/// 0`) already self-references `..` (see the module doc comment), so this check is a no-op there.
 fn resolve_path_impl(
+    root_inode: u32,
     cwd_inode: u32,
     path: &[u8],
     follow_last: bool,
@@ -1229,7 +1350,7 @@ fn resolve_path_impl(
         return Err(OxfsError::TooManyLinks);
     }
     let mut current = if path.first() == Some(&b'/') {
-        ROOT_INODE
+        root_inode
     } else {
         cwd_inode
     };
@@ -1240,6 +1361,9 @@ fn resolve_path_impl(
     while let Some(component) = iter.next() {
         let is_last = iter.peek().is_none();
         if component == b"." {
+            continue;
+        }
+        if component == b".." && current == root_inode {
             continue;
         }
         let next = dir_lookup(current, component).ok_or(OxfsError::NotFound)?;
@@ -1253,11 +1377,11 @@ fn resolve_path_impl(
             let mut target = [0u8; MAX_CWD_PATH];
             let n = read_inode_at(next, 0, &mut target);
             let start = if target.first() == Some(&b'/') {
-                ROOT_INODE
+                root_inode
             } else {
                 current
             };
-            current = resolve_path_impl(start, &target[..n], true, depth + 1)?;
+            current = resolve_path_impl(root_inode, start, &target[..n], true, depth + 1)?;
             if !is_last && read_inode(current).kind != InodeKind::Dir {
                 return Err(OxfsError::NotADirectory);
             }
@@ -1275,13 +1399,13 @@ fn resolve_path_impl(
 /// `resolve_parent` (real Unix: an intermediate path component is always followed regardless of
 /// caller).
 fn resolve_path(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsError> {
-    resolve_path_impl(cwd_inode, path, true, 0)
+    resolve_path_impl(effective_root_inode(), cwd_inode, path, true, 0)
 }
 
 /// Never follows a symlink final component (still follows every intermediate one) -- used by
 /// `lstat(2)`/`readlink(2)`, the two real Unix calls that must see the link itself.
 fn resolve_path_nofollow_last(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsError> {
-    resolve_path_impl(cwd_inode, path, false, 0)
+    resolve_path_impl(effective_root_inode(), cwd_inode, path, false, 0)
 }
 
 /// Resolves `path` to its *parent* directory's inode number plus the final path component's raw
@@ -1603,18 +1727,24 @@ fn find_name_of_inode_in_dir(parent: u32, target: u32) -> Option<([u8; NAME_MAX]
     None
 }
 
-/// Reconstructs an absolute path for `inode_num` by walking `..` links up to root and, at each
-/// level, recovering that level's own name from its parent's listing -- there's no stored path
-/// anywhere, only inode numbers, so every call re-derives it from scratch (same approach
-/// `modules/fat32`'s own `build_cwd_path` already used for cluster numbers). Root itself is `"/"`.
+/// Reconstructs an absolute path for `inode_num` by walking `..` links up to the caller's own
+/// effective root (`effective_root_inode()` -- real root unless chrooted, see `SYS_CHROOT`'s own
+/// doc comment) and, at each level, recovering that level's own name from its parent's listing --
+/// there's no stored path anywhere, only inode numbers, so every call re-derives it from scratch
+/// (same approach `modules/fat32`'s own `build_cwd_path` already used for cluster numbers). The
+/// effective root itself is always `"/"`, matching real `getcwd(2)` inside a chroot (a contained
+/// process has no way to name anything above its own root, so nothing above it should ever appear
+/// in the reconstructed path either -- otherwise `pwd` would visibly contradict
+/// `resolve_path_impl`'s own `cd ..` containment).
 fn build_cwd_path(inode_num: u32, out: &mut [u8; MAX_CWD_PATH]) -> usize {
+    let root_inode = effective_root_inode();
     let mut chain = [0u32; MAX_CWD_DEPTH];
     let mut depth = 0;
     let mut cur = inode_num;
-    while cur != ROOT_INODE && depth < MAX_CWD_DEPTH {
+    while cur != root_inode && depth < MAX_CWD_DEPTH {
         chain[depth] = cur;
         depth += 1;
-        cur = dir_lookup(cur, b"..").unwrap_or(ROOT_INODE);
+        cur = dir_lookup(cur, b"..").unwrap_or(root_inode);
     }
 
     if depth == 0 {
@@ -1628,7 +1758,7 @@ fn build_cwd_path(inode_num: u32, out: &mut [u8; MAX_CWD_PATH]) -> usize {
         let parent = if i + 1 < depth {
             chain[i + 1]
         } else {
-            ROOT_INODE
+            root_inode
         };
         let Some((name, name_len)) = find_name_of_inode_in_dir(parent, child) else {
             break;
@@ -2184,6 +2314,37 @@ fn dev_open(suffix: &[u8]) -> i64 {
     }
 }
 
+/// Splits a raw `dev_t` register value into `(major, minor)` the same way musl's own
+/// `major()`/`minor()` macros do (`third_party/musl/include/sys/sysmacros.h`) for any major <
+/// 4096 / minor < 256 -- musl's full macro folds in extra bits past that range, but every value
+/// this filesystem's own device support actually needs to round-trip (the four devices below, and
+/// anything BusyBox's own `makedevs` default table passes) stays well inside it, so this reduced
+/// form is bit-for-bit identical to the real one there. `Inode::rdev` stores the caller's raw
+/// `dev` argument verbatim (truncated to `u32`, already exactly this packed shape for a realistic
+/// value) -- so encoding back out for `write_stat`'s own `st_rdev` needs no separate step, only
+/// this same split for the `oxfs_open` dispatch below.
+fn dev_major_minor(dev: u32) -> (u32, u32) {
+    ((dev >> 8) & 0xfff, dev & 0xff)
+}
+
+/// The only major:minor pairs an `InodeKind::Device` node's `open()` can actually service -- real
+/// Linux's own standard values for `/dev/null`(1,3)/`zero`(1,5)/`random`(1,8)/`urandom`(1,9), so a
+/// real `mknod /dev/null c 1 3` genuinely works. No general device-driver framework exists (mirrors
+/// `dev_open`'s own scope, just reached via a real inode instead of magic-path interception) --
+/// anything else is a real, listable, stat-able device node whose `open()` honestly fails `-ENXIO`,
+/// matching real Linux's own behavior for a device number with no bound driver.
+fn known_device(rdev: u32, device_char: bool) -> Option<OpenFile> {
+    if !device_char {
+        return None;
+    }
+    match dev_major_minor(rdev) {
+        (1, 3) => Some(OpenFile::DevNull),
+        (1, 5) => Some(OpenFile::DevZero),
+        (1, 8) | (1, 9) => Some(OpenFile::DevRandom),
+        _ => None,
+    }
+}
+
 /// Registered for `SYS_OPEN`. `/proc/...` (absolute only -- a *relative* path reached while cwd is
 /// already inside `/proc` is `proc_relative_open`'s job, below) is intercepted before any of the
 /// real, cwd-relative special-casing below, since it isn't backed by a real inode at all -- see
@@ -2276,6 +2437,10 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
             match inode.kind {
                 InodeKind::Dir if want_write => -EISDIR,
                 InodeKind::Dir => open_dir_listing(resolved),
+                InodeKind::Device => match known_device(inode.rdev, inode.device_char) {
+                    Some(open_file) => register_open_file(open_file),
+                    None => -ENXIO,
+                },
                 _ if want_write => {
                     let mut name = [0u8; NAME_MAX];
                     name[..leaf.len()].copy_from_slice(leaf);
@@ -2792,6 +2957,42 @@ extern "C" fn oxfs_chdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
     }
 }
 
+/// Registered for `SYS_CHROOT`. `path` is resolved exactly like any other path -- against the
+/// caller's current cwd *and* its own already-live root (`effective_root_inode()`, consulted
+/// automatically inside `resolve_path`), so a nested chroot resolves relative to whatever root is
+/// already active, matching real `chroot(2)`. Root-only (`-EPERM` otherwise, real `chroot(2)`'s own
+/// `CAP_SYS_CHROOT` requirement -- same genuine-root-only tier as `oxfs_chown`, not the older
+/// "no capability model, so always allow" precedent predating the permission-model pass).
+/// Deliberately does **not** also `chdir` to the new root -- real `chroot(2)` doesn't either;
+/// BusyBox's own `chroot` applet calls `chdir("/")` itself right afterward, the normal real-world
+/// pattern. See `resolve_path_impl`'s own doc comment for the actual `cd ..` containment mechanism
+/// this enables.
+extern "C" fn oxfs_chroot(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let caller_uid = unsafe { oxidebsd_current_uid() };
+    if caller_uid != 0 {
+        return -EPERM;
+    }
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        // cwd inside /proc, and a *relative* (non-`/`-leading) target: no real caller in this
+        // port's roster does this (BusyBox's own `chroot` applet always operates on a real
+        // filesystem path), same "honest ENOENT, not a dedicated proc-relative-resolution helper"
+        // reasoning `oxfs_utimensat` above already established for the identical edge case.
+        Cwd::Proc(_) if path.first() != Some(&b'/') => return -ENOENT,
+        Cwd::Proc(_) => ROOT_INODE,
+    };
+    match resolve_path(cwd, path) {
+        Ok(inode_num) if read_inode(inode_num).kind == InodeKind::Dir => {
+            unsafe { oxidebsd_set_root(inode_num as u64) };
+            0
+        }
+        Ok(_) => -ENOTDIR,
+        Err(e) => errno_for(e),
+    }
+}
+
 /// Registered for `SYS_GETCWD`. Same wire format as `modules/fat32`'s own `sys_getcwd` (a
 /// NUL-terminated string written into `buf`, byte count including the NUL on success, `-ERANGE`
 /// if `buf_len` is too small).
@@ -2847,8 +3048,11 @@ extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 }
 
 /// Registered for `SYS_UNLINK`. Refuses to unlink a directory (`EISDIR` -- use `SYS_RMDIR`
-/// instead, matching real Unix convention). The removed record's inode/blocks are not freed (see
-/// the module doc comment).
+/// instead, matching real Unix convention). The removed record's inode/blocks are still never
+/// freed (see the module doc comment) -- what's real now is `nlink` itself: a `File`/`Device`
+/// inode's own link count is decremented before the record is cleared, so a still-linked file's
+/// other name(s) keep reporting the right count via `write_stat` (see `SYS_LINK`'s own doc
+/// comment). Reaching `0` isn't a dealloc trigger, just "the last name is gone."
 extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -2864,10 +3068,136 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
     let Some(target) = dir_lookup(parent, leaf) else {
         return -ENOENT;
     };
-    if read_inode(target).kind == InodeKind::Dir {
+    let mut target_inode = read_inode(target);
+    if target_inode.kind == InodeKind::Dir {
         return -EISDIR;
     }
+    if matches!(target_inode.kind, InodeKind::File | InodeKind::Device) {
+        target_inode.nlink = target_inode.nlink.saturating_sub(1);
+        write_inode(target, target_inode);
+    }
     match dir_remove(parent, leaf) {
+        Ok(()) => 0,
+        Err(e) => errno_for(e),
+    }
+}
+
+/// Registered for `SYS_LINK`. `(existing_ptr, existing_len, new_ptr, new_len)` -- same 4-register
+/// two-path shape `SYS_RENAME`/`SYS_SYMLINK` already use (see
+/// `third_party/musl/src/unistd/link.c`'s own patch for why `existing`/`new` need explicit lengths
+/// where real `link(2)` doesn't). `existing` is resolved via the normal, symlink-following
+/// `resolve_path` -- same as `stat`/`open` already do -- so linking a symlink *path* links its
+/// real target, not the symlink entry itself (this filesystem doesn't support hard-linking a
+/// symlink directly, a documented simplification; POSIX itself leaves this implementation-defined).
+/// Only `File`/`Device` inodes can be linked (`EPERM` for a directory, real Unix's own
+/// hard-link-to-a-directory prohibition). Rejects linking across the real/tmpfs inode-pool
+/// boundary with `EXDEV` -- see that constant's own doc comment for why (a tmpfs-pool inode must
+/// never gain a real, disk-persisted name).
+extern "C" fn oxfs_link(existing_ptr: u64, existing_len: u64, new_ptr: u64, new_len: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let existing_path =
+        unsafe { core::slice::from_raw_parts(existing_ptr as *const u8, existing_len as usize) };
+    let new_path = unsafe { core::slice::from_raw_parts(new_ptr as *const u8, new_len as usize) };
+    let existing_cwd = match real_cwd_for_mutation(existing_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_cwd = match real_cwd_for_mutation(new_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let existing_inode = match resolve_path(existing_cwd, existing_path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let mut inode = read_inode(existing_inode);
+    if !matches!(inode.kind, InodeKind::File | InodeKind::Device) {
+        return -EPERM;
+    }
+
+    let (new_parent, new_leaf) = match resolve_parent(new_cwd, new_path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    if dir_lookup(new_parent, new_leaf).is_some() {
+        return -EEXIST;
+    }
+    let existing_pool_tmpfs = existing_inode >= MAX_INODES as u32;
+    let new_pool_tmpfs = new_parent >= MAX_INODES as u32;
+    if existing_pool_tmpfs != new_pool_tmpfs {
+        return -EXDEV;
+    }
+    let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
+    if !check_access(&read_inode(new_parent), uid, gid, true) {
+        return -EACCES;
+    }
+    if inode.nlink == u16::MAX {
+        return -EMLINK;
+    }
+    match dir_insert(new_parent, new_leaf, existing_inode) {
+        Ok(()) => {
+            inode.nlink += 1;
+            write_inode(existing_inode, inode);
+            0
+        }
+        Err(e) => errno_for(e),
+    }
+}
+
+/// Registered for `SYS_MKNOD`. `(path_ptr, path_len, mode, dev)` -- real `mknod(2)`'s own
+/// `(path, mode, dev)` shape plus the length-prefixed path convention every other path-taking
+/// syscall here uses (see `third_party/musl/src/stat/mknod.c`'s own patch). Creates a real,
+/// listable inode reporting `S_IFCHR`/`S_IFBLK` and a real `st_rdev` via `stat`/`getdents` --
+/// unlike `/dev/{random,urandom,null,zero}`'s existing magic-path interception in `dev_open` (not
+/// backed by any inode at all). See `known_device`'s own doc comment for the deliberately small
+/// set of major:minor pairs `open()` actually services. Also supports `S_IFREG` (an immediately
+/// committed empty regular file, unlike `O_CREAT`'s deferred-to-`close()` commit -- matches
+/// `oxfs_symlink`'s eager-allocate shape instead). `S_IFIFO`/`S_IFSOCK`/anything else in `mode`'s
+/// type bits is `-EINVAL` -- real named-pipe persistence is a distinct, unstarted gap. Creating a
+/// device node is root-only (`-EPERM` otherwise, real `mknod(2)`'s own `CAP_MKNOD` requirement,
+/// same genuine-root-only tier as `oxfs_chown`); `S_IFREG` only needs ordinary write permission on
+/// the parent, same as any other create.
+extern "C" fn oxfs_mknod(path_ptr: u64, path_len: u64, mode: u64, dev: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let cwd = match real_cwd_for_mutation(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent, leaf) = match resolve_parent(cwd, path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    if dir_lookup(parent, leaf).is_some() {
+        return -EEXIST;
+    }
+    let (kind, device_char) = match (mode as u32) & S_IFMT {
+        S_IFREG => (InodeKind::File, false),
+        S_IFCHR => (InodeKind::Device, true),
+        S_IFBLK => (InodeKind::Device, false),
+        _ => return -EINVAL,
+    };
+    let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
+    if kind == InodeKind::Device && uid != 0 {
+        return -EPERM;
+    }
+    if !check_access(&read_inode(parent), uid, gid, true) {
+        return -EACCES;
+    }
+    let Some(new_inode) = alloc_inode_in(parent) else {
+        return -ENOSPC;
+    };
+    let mut inode = Inode::new(kind);
+    inode.mode = (mode & 0o777) as u16;
+    inode.uid = uid as u32;
+    inode.gid = gid as u32;
+    if kind == InodeKind::Device {
+        inode.rdev = dev as u32;
+        inode.device_char = device_char;
+    }
+    write_inode(new_inode, inode);
+    match dir_insert(parent, leaf, new_inode) {
         Ok(()) => 0,
         Err(e) => errno_for(e),
     }
@@ -3063,7 +3393,12 @@ extern "C" fn oxfs_readlink(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_cap:
 /// lengths where real `symlink(2)` doesn't. `target` is stored verbatim, unvalidated and
 /// unresolved (matching real `symlink(2)`: a dangling or even syntactically-nonsensical target is
 /// perfectly legal to create, only resolving it later can fail).
-extern "C" fn oxfs_symlink(target_ptr: u64, target_len: u64, linkpath_ptr: u64, linkpath_len: u64) -> i64 {
+extern "C" fn oxfs_symlink(
+    target_ptr: u64,
+    target_len: u64,
+    linkpath_ptr: u64,
+    linkpath_len: u64,
+) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let target =
         unsafe { core::slice::from_raw_parts(target_ptr as *const u8, target_len as usize) };
@@ -3313,8 +3648,7 @@ extern "C" fn oxfs_mount_tmpfs(target_ptr: u64, target_len: u64, _a2: u64, _a3: 
         return -ENOSPC;
     };
     write_inode(new_root, Inode::new(InodeKind::Dir));
-    if dir_insert(new_root, b".", new_root).is_err()
-        || dir_insert(new_root, b"..", parent).is_err()
+    if dir_insert(new_root, b".", new_root).is_err() || dir_insert(new_root, b"..", parent).is_err()
     {
         return -EIO;
     }
@@ -3384,6 +3718,50 @@ extern "C" fn oxfs_fstat(fd: u64, buf_ptr: u64, _a2: u64, _a3: u64) -> i64 {
         Some(inode_num) => write_stat(inode_num, buf_ptr),
         None => -EBADF,
     }
+}
+
+/// Registered for `SYS_LSEEK` -- see that constant's own doc comment for why this exists at all
+/// (found live via TinyCC needing a real file size upfront to load `crt1.o`/`libc.a` whole).
+/// `offset`/`whence` arrive as real `u64` register values -- `offset` is reinterpreted as `i64`
+/// (real `lseek(2)`'s own signed-offset convention; musl's `off_t` is 64-bit on this arch, so no
+/// truncation). Real `SEEK_SET=0`/`SEEK_CUR=1`/`SEEK_END=2` -- no divergence to remap. Only the
+/// `{FileRead,DirListing,ProcRead,ProcDir}` variants have a real `position`/size to seek within;
+/// `Write` (an in-progress accumulate-then-commit buffer, not a real random-access file -- see
+/// `OpenFile::Write`'s own doc comment) and the synthetic `/dev/*` variants report `ESPIPE`, the
+/// real POSIX answer for "this fd has no seekable position", rather than silently accepting a seek
+/// that would never actually change what a later `read`/`write` sees.
+extern "C" fn oxfs_lseek(fd: u64, offset: u64, whence: u64, _a3: u64) -> i64 {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let Some(open_file) = find_open_file(real_fd as u64) else {
+        return -EBADF;
+    };
+    let offset = offset as i64;
+    let (position, size): (&mut usize, i64) = match open_file {
+        OpenFile::FileRead { inode, position } => {
+            (position, read_inode(*inode).size as i64)
+        }
+        OpenFile::DirListing { content: _, len, position, .. } => (position, *len as i64),
+        OpenFile::ProcRead { len, position, .. } => (position, *len as i64),
+        OpenFile::ProcDir { len, position, .. } => (position, *len as i64),
+        OpenFile::Write { .. } | OpenFile::DevRandom | OpenFile::DevNull | OpenFile::DevZero => {
+            return -ESPIPE;
+        }
+    };
+    let new_pos = match whence {
+        0 => offset,                     // SEEK_SET
+        1 => *position as i64 + offset,  // SEEK_CUR
+        2 => size + offset,              // SEEK_END
+        _ => return -EINVAL,
+    };
+    if new_pos < 0 {
+        return -EINVAL;
+    }
+    *position = new_pos as usize;
+    new_pos
 }
 
 /// Writes `value`'s decimal digits (no leading zeros; `0` prints as `"0"`) into `buf`, returning
@@ -3512,9 +3890,12 @@ extern "C" fn oxfs_getdents(fd: u64, buf_ptr: u64, buf_len: u64, _a3: u64) -> i6
                 if written + reclen > out.len() {
                     break;
                 }
-                let dtype = match read_inode(child_inode).kind {
+                let child = read_inode(child_inode);
+                let dtype = match child.kind {
                     InodeKind::Dir => DT_DIR,
                     InodeKind::Symlink => DT_LNK,
+                    InodeKind::Device if child.device_char => DT_CHR,
+                    InodeKind::Device => DT_BLK,
                     _ => DT_REG,
                 };
                 write_dirent_record(
@@ -3612,6 +3993,7 @@ fn pack_inode(inode: &Inode, out: &mut [u8]) {
         InodeKind::File => 1,
         InodeKind::Dir => 2,
         InodeKind::Symlink => 3,
+        InodeKind::Device => 4,
     };
     out[1..5].copy_from_slice(&inode.size.to_le_bytes());
     for (i, d) in inode.direct.iter().enumerate() {
@@ -3626,7 +4008,13 @@ fn pack_inode(inode: &Inode, out: &mut [u8]) {
     out[uid_off..uid_off + 4].copy_from_slice(&inode.uid.to_le_bytes());
     let gid_off = uid_off + 4;
     out[gid_off..gid_off + 4].copy_from_slice(&inode.gid.to_le_bytes());
-    for b in &mut out[gid_off + 4..] {
+    let nlink_off = gid_off + 4;
+    out[nlink_off..nlink_off + 2].copy_from_slice(&inode.nlink.to_le_bytes());
+    let rdev_off = nlink_off + 2;
+    out[rdev_off..rdev_off + 4].copy_from_slice(&inode.rdev.to_le_bytes());
+    let device_char_off = rdev_off + 4;
+    out[device_char_off] = inode.device_char as u8;
+    for b in &mut out[device_char_off + 1..] {
         *b = 0;
     }
 }
@@ -3637,6 +4025,7 @@ fn unpack_inode(data: &[u8]) -> Inode {
         1 => InodeKind::File,
         2 => InodeKind::Dir,
         3 => InodeKind::Symlink,
+        4 => InodeKind::Device,
         _ => InodeKind::Free,
     };
     let size = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
@@ -3668,6 +4057,17 @@ fn unpack_inode(data: &[u8]) -> Inode {
         data[gid_off + 2],
         data[gid_off + 3],
     ]);
+    let nlink_off = gid_off + 4;
+    let nlink = u16::from_le_bytes([data[nlink_off], data[nlink_off + 1]]);
+    let rdev_off = nlink_off + 2;
+    let rdev = u32::from_le_bytes([
+        data[rdev_off],
+        data[rdev_off + 1],
+        data[rdev_off + 2],
+        data[rdev_off + 3],
+    ]);
+    let device_char_off = rdev_off + 4;
+    let device_char = data[device_char_off] != 0;
     Inode {
         kind,
         size,
@@ -3676,6 +4076,9 @@ fn unpack_inode(data: &[u8]) -> Inode {
         mode,
         uid,
         gid,
+        nlink,
+        rdev,
+        device_char,
     }
 }
 
@@ -3755,21 +4158,76 @@ fn write_superblock() {
     }
 }
 
+/// Resets the *real* (non-tmpfs) block-used bitmap and inode table back to a pristine, all-free
+/// state -- `0..NUM_BLOCKS`/`0..MAX_INODES` by the named constants, never touching the separate
+/// tmpfs pool above them (which `mount_from_disk` never populates in the first place, and which
+/// `module_init` never touches at this stage either). Must run before `format_fresh_filesystem` on
+/// *any* path that might have already partially populated this state -- concretely, a failed
+/// `mount_from_disk` call.
+///
+/// **Found live, the hard way**: `mount_from_disk`'s own bitmap-load and inode-table-load loops
+/// (both, below) run to completion *before* its own subsequent per-block data-read loop, which is
+/// where a real failure (`oxidebsd_block_read` returning nonzero partway through) actually gets
+/// detected and turned into a `return false`. A stale disk image predating a real layout change --
+/// concretely, the very case this fix was found from: `MAX_INODES` doubling (512 -> 1024, see
+/// CLAUDE.md's TinyCC section) shifts `INODE_TABLE_BLOCKS`/`DATA_BLOCK_OFFSET` forward, so an
+/// already-existing disk image written under the old, smaller layout has real, physically
+/// different bytes at every "data block" location the new layout expects -- mounted cleanly enough
+/// to load a bitmap marking most of the *old* install's blocks used (a fully-packed ~300-applet
+/// roster, close to the old pool's own capacity), then failed partway through the actual data read.
+/// Without this reset, `format_fresh_filesystem`'s own fresh allocations (`alloc_block`/
+/// `alloc_inode`, both plain linear scans for the first *unmarked* slot) inherited that stale
+/// "mostly full" bitmap from a filesystem that no longer exists in memory at all -- confirmed live:
+/// a fresh format, on a completely empty in-memory pool, panicked `DiskFull` seeding `/etc`'s own
+/// `.` entry (one of the very first real block allocations *after* `/bin`'s ~300+ applets), not
+/// because the real content genuinely didn't fit, but because most of the pool was falsely marked
+/// used before formatting had allocated anything of its own.
+fn reset_real_pool_for_fresh_format() {
+    for i in 0..NUM_BLOCKS as u32 {
+        set_block_used(i, false);
+    }
+    for i in 0..MAX_INODES as u32 {
+        write_inode(i, Inode::FREE);
+    }
+}
+
 /// Attempts to mount an already-formatted disk: reads the superblock, and if its magic matches,
 /// loads the bitmap and inode table wholesale, then eager-loads only the data blocks the bitmap
 /// marks used (not an unconditional full sweep of `NUM_BLOCKS` -- see this file's own
 /// `PERSISTENCE_READY` doc comment and CLAUDE.md's own notes on this class of PIO-under-emulation
 /// cost). Returns `false` on a missing/mismatched superblock (an unformatted disk -- the expected,
 /// common first-boot case) or on any real read failure partway through, in which case the caller
-/// falls back to `format_fresh_filesystem` -- a partially-readable disk gets cleanly reformatted
-/// rather than the kernel trying to recover a partial mount, a deliberate simplification for this
-/// phase (see the implementation plan's own "known limitations" list).
+/// falls back to `format_fresh_filesystem` (after first calling
+/// `reset_real_pool_for_fresh_format` -- see its own doc comment for why that's required, not
+/// optional) -- a partially-readable disk gets cleanly reformatted rather than the kernel trying to
+/// recover a partial mount, a deliberate simplification for this phase (see the implementation
+/// plan's own "known limitations" list).
 fn mount_from_disk() -> bool {
     let mut sb = [0u8; BLOCK_SIZE];
     if unsafe { oxidebsd_block_read(0, sb.as_mut_ptr() as u64) } != 0 {
         return false;
     }
     if sb[0..4] != SUPERBLOCK_MAGIC {
+        return false;
+    }
+
+    // Layout check, not just a magic check -- a disk formatted under a previous `NUM_BLOCKS`/
+    // `MAX_INODES`/`SUPERBLOCK_VERSION` has the right magic but real, physically different bytes
+    // at every block-offset this build's own `INODE_TABLE_START`/`BITMAP_BLOCK`/
+    // `DATA_BLOCK_OFFSET` expect (all derived from these same constants -- see this file's own
+    // "Real disk persistence" section). Before this check, a stale disk merely *usually* failed
+    // loudly partway through the loops below (see `reset_real_pool_for_fresh_format`'s own doc
+    // comment for the real, live case this was found from) -- that was incidental, not a real
+    // safety guarantee, since a layout change can just as easily leave every read in-bounds and
+    // silently misinterpret stale bytes as this build's own inode table/bitmap/data.
+    let stored_version = u32::from_le_bytes(sb[4..8].try_into().unwrap());
+    let stored_num_blocks = u32::from_le_bytes(sb[8..12].try_into().unwrap());
+    let stored_max_inodes = u32::from_le_bytes(sb[12..16].try_into().unwrap());
+    if stored_version != SUPERBLOCK_VERSION
+        || stored_num_blocks as usize != NUM_BLOCKS
+        || stored_max_inodes as usize != MAX_INODES
+    {
+        log("[oxfs] mount: on-disk layout doesn't match this build -- falling back to format\n");
         return false;
     }
 
@@ -3911,6 +4369,57 @@ fn seed_symlink(parent: u32, name: &[u8], target: &[u8]) -> bool {
     write_inode_data(inode, target) && dir_insert(parent, name, inode).is_ok()
 }
 
+/// Idempotent directory creation -- looks up an existing child named `name` under `parent` first,
+/// only allocating and wiring a fresh `.`/`..`-seeded directory inode when one doesn't already
+/// exist. Factors out the same 5-statement pattern every other directory in this file hand-inlines
+/// once each (`/bin`, `/etc`, `/home`, `/home/user`, root itself) -- `seed_tree` below is the first
+/// caller that needs to create directories in a loop, re-entering the same parent many times (once
+/// per sibling file under it), where hand-inlining stops being reasonable.
+fn ensure_dir(parent: u32, name: &[u8]) -> u32 {
+    if let Some(existing) = dir_lookup(parent, name) {
+        return existing;
+    }
+    let inode = alloc_inode().expect("oxfs: failed to allocate a directory inode");
+    write_inode(inode, Inode::new(InodeKind::Dir));
+    dir_insert(inode, b".", inode).expect("oxfs: failed to seed a directory's . entry");
+    dir_insert(inode, b"..", parent).expect("oxfs: failed to seed a directory's .. entry");
+    dir_insert(parent, name, inode)
+        .expect("oxfs: failed to insert a new directory into its parent");
+    inode
+}
+
+/// Seeds a whole manifest of `(relative_path, content)` pairs (each `relative_path` real,
+/// `/`-separated, e.g. `"bits/alltypes.h"`) under `root`, creating any missing intermediate
+/// directories via `ensure_dir` along the way. Used for TinyCC's own on-target runtime tree
+/// (`/usr/include`, `/usr/lib`, `/usr/lib/tcc` -- see `format_fresh_filesystem`'s own call sites
+/// and CLAUDE.md's TinyCC section) -- the first content this filesystem seeds shaped like a real
+/// nested directory tree (musl's own `include/bits`, `include/sys`, ...) rather than a small fixed
+/// set of top-level files.
+fn seed_tree(root: u32, files: &[(&str, &[u8])]) -> bool {
+    let mut ok = true;
+    for (rel_path, content) in files {
+        let (dir_path, file_name) = match rel_path.rsplit_once('/') {
+            Some((dir, name)) => (dir, name),
+            None => ("", *rel_path),
+        };
+        let mut dir = root;
+        if !dir_path.is_empty() {
+            for component in dir_path.split('/') {
+                dir = ensure_dir(dir, component.as_bytes());
+            }
+        }
+        ok &= seed_file(dir, file_name.as_bytes(), content);
+    }
+    ok
+}
+
+/// `MUSL_INCLUDE_FILES`/`MUSL_LIB_FILES`/`TCC_RUNTIME_FILES` -- generated by build.rs's
+/// `write_tcc_runtime_manifest` (see its own doc comment for why this is a generated `include!`
+/// rather than the `env!()`-per-file pattern every other embedded ELF in this file uses). Declared
+/// at module scope since it defines real top-level `pub static` items, consumed by
+/// `format_fresh_filesystem`'s own `/usr` seeding below.
+include!(env!("TCC_RUNTIME_MANIFEST_PATH"));
+
 /// Populates a completely fresh (never-before-formatted) in-memory filesystem: root/`bin`/`etc`,
 /// every seed file/BusyBox applet, and the self-check. Runs unconditionally when no data disk is
 /// attached; runs once, the first time a real disk is attached with no valid superblock on it yet
@@ -3949,11 +4458,7 @@ fn format_fresh_filesystem() -> bool {
     // against the real generated target/busybox-sh/.config, not assumed from BusyBox's own
     // Kconfig defaults), so it's a flat sequence of real applet invocations using only
     // redirection/pipes/`&&`/`||`, not an if/for-based test harness.
-    ok &= seed_file(
-        root,
-        b"test_busybox.sh",
-        include_bytes!("test_busybox.sh"),
-    );
+    ok &= seed_file(root, b"test_busybox.sh", include_bytes!("test_busybox.sh"));
 
     // All executables live under /bin, not root -- matches `src/process.rs`'s pid-1 `PATH=/bin`
     // envp, so a bare command name (`ls`, not `/ls`) resolves via musl's real `execvp` search.
@@ -3974,8 +4479,19 @@ fn format_fresh_filesystem() -> bool {
     // BusyBox gap analysis), but that one reads Linux's own `/proc/modules` format expecting real
     // Linux kernel modules, not this kernel's own module system, so the name is intentionally
     // pointed at the OxideBSD-native tool instead of BusyBox's applet of the same name.
-    ok &= seed_file(bin, b"lsoxmod", include_bytes!(env!("OXFS_LSOXMOD_ELF_PATH")));
+    ok &= seed_file(
+        bin,
+        b"lsoxmod",
+        include_bytes!(env!("OXFS_LSOXMOD_ELF_PATH")),
+    );
     ok &= seed_symlink(bin, b"lsmod", b"lsoxmod");
+    // tcc: OxideBSD's first on-target C compiler -- real upstream TinyCC (`third_party/tinycc`,
+    // see CLAUDE.md's TinyCC section and `build_tinycc`'s own doc comment in build.rs), cross-built
+    // against this same musl sysroot with `--config-musl`. Milestone A only: the binary launches
+    // and its own `-v`/`--help` work (no filesystem access needed for those). It can't yet actually
+    // compile/link a real C file -- that needs musl's header tree, crt objects, `libc.a`, and tcc's
+    // own `libtcc1.a` seeded under `/usr`, wired in separately once that milestone lands.
+    ok &= seed_file(bin, b"tcc", include_bytes!(env!("OXFS_TCC_ELF_PATH")));
     ok &= seed_file(bin, b"true", include_bytes!(env!("OXFS_TRUE_ELF_PATH")));
     ok &= seed_file(bin, b"echo", include_bytes!(env!("OXFS_ECHO_ELF_PATH")));
     ok &= seed_file(bin, b"cat", include_bytes!(env!("OXFS_CAT_ELF_PATH")));
@@ -4769,6 +5285,28 @@ fn format_fresh_filesystem() -> bool {
         write_inode(user_home, inode);
     }
 
+    // TinyCC's own on-target runtime tree -- see CLAUDE.md's TinyCC section. `/usr/include`,
+    // `/usr/lib`, `/usr/lib/tcc` exactly match tcc's own compiled-in defaults (`CONFIG_TCCDIR`/
+    // `CONFIG_TCC_CRTPREFIX`/`CONFIG_TCC_SYSINCLUDEPATHS`, baked in via build.rs's
+    // `--prefix=/usr` configure flag), so no extra `-B`/`-I`/`-L` flags are needed to invoke `tcc`
+    // on target.
+    let usr = ensure_dir(root, b"usr");
+    let usr_include = ensure_dir(usr, b"include");
+    ok &= seed_tree(usr_include, MUSL_INCLUDE_FILES);
+    let usr_lib = ensure_dir(usr, b"lib");
+    ok &= seed_tree(usr_lib, MUSL_LIB_FILES);
+    let usr_lib_tcc = ensure_dir(usr_lib, b"tcc");
+    ok &= seed_tree(usr_lib_tcc, TCC_RUNTIME_FILES);
+
+    // A real fixture for exercising the compiler end to end (`tcc -static -o hello.elf hello.c`,
+    // by hand at the hush prompt or via `tests/tcc_syscall_smoke.rs`) -- a real `printf`, not a
+    // bare `return`, so it exercises musl's stdio/writev path, not just process exit.
+    ok &= seed_file(
+        root,
+        b"hello.c",
+        b"#include <stdio.h>\nint main(void) {\n    printf(\"hello from tcc\\n\");\n    return 0;\n}\n",
+    );
+
     if !ok {
         log("[oxfs] self-check FAILED: seeding embedded files failed\n");
     }
@@ -5066,12 +5604,19 @@ fn format_fresh_filesystem() -> bool {
                 oxfs_close(fd as u64);
                 if fd < 0 || n != 2 || &buf[..2] != b"BB" {
                     ok = false;
-                    log("[oxfs] self-check FAILED: O_WRONLY overwrite did not truncate correctly\n");
+                    log(
+                        "[oxfs] self-check FAILED: O_WRONLY overwrite did not truncate correctly\n",
+                    );
                 }
             }
 
             // O_APPEND: new writes land after the real existing content, not replacing it.
-            let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, O_WRONLY | O_APPEND, 0);
+            let fd = oxfs_open(
+                path.as_ptr() as u64,
+                path.len() as u64,
+                O_WRONLY | O_APPEND,
+                0,
+            );
             if fd < 0 {
                 ok = false;
                 log("[oxfs] self-check FAILED: O_APPEND reopen of an existing file failed\n");
@@ -5310,6 +5855,186 @@ fn format_fresh_filesystem() -> bool {
         log("[oxfs] self-check FAILED: hello.txt not found for symlink check\n");
     }
 
+    // --- Real hard links, device nodes, and per-process chroot containment, through the real
+    // registered handlers (Part D2). ---
+    if let Some(hello) = dir_lookup(ROOT_INODE, b"hello.txt") {
+        let hello_size = read_inode(hello).size;
+        let hello_name = b"hello.txt";
+        let link_name = b"hello_hardlink";
+        if oxfs_link(
+            hello_name.as_ptr() as u64,
+            hello_name.len() as u64,
+            link_name.as_ptr() as u64,
+            link_name.len() as u64,
+        ) != 0
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: link hello_hardlink failed\n");
+        } else {
+            let mut stat_buf = [0u8; 144];
+            if oxfs_stat(
+                link_name.as_ptr() as u64,
+                link_name.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+                0,
+            ) != 0
+            {
+                ok = false;
+                log("[oxfs] self-check FAILED: stat hello_hardlink failed\n");
+            } else {
+                let st = unsafe { (stat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+                if st.st_ino != hello as u64 || st.st_nlink != 2 || st.st_size != hello_size as i64
+                {
+                    ok = false;
+                    log(
+                        "[oxfs] self-check FAILED: hello_hardlink didn't report the real shared inode/nlink\n",
+                    );
+                }
+            }
+            if oxfs_unlink(link_name.as_ptr() as u64, link_name.len() as u64, 0, 0) != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: unlink hello_hardlink failed\n");
+            }
+            if read_inode(hello).nlink != 1 {
+                ok = false;
+                log("[oxfs] self-check FAILED: hello.txt nlink didn't drop back to 1\n");
+            }
+            if dir_lookup(ROOT_INODE, b"hello.txt").is_none() {
+                ok = false;
+                log(
+                    "[oxfs] self-check FAILED: hello.txt disappeared after unlinking its hard link\n",
+                );
+            }
+        }
+    } else {
+        ok = false;
+        log("[oxfs] self-check FAILED: hello.txt not found for link check\n");
+    }
+
+    {
+        let reg_path = b"mknodtest.reg";
+        if oxfs_mknod(
+            reg_path.as_ptr() as u64,
+            reg_path.len() as u64,
+            (S_IFREG | 0o644) as u64,
+            0,
+        ) != 0
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: mknod mknodtest.reg (S_IFREG) failed\n");
+        } else if oxfs_unlink(reg_path.as_ptr() as u64, reg_path.len() as u64, 0, 0) != 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: unlink mknodtest.reg failed\n");
+        }
+
+        // Real Linux's own standard major:minor for /dev/null (1,3) -- see known_device's own doc
+        // comment. Exercises the real create -> stat -> open -> write/read -> unlink round trip
+        // through a genuine inode, distinct from dev_open's own magic-path /dev/null.
+        let dev_path = b"mknodtest.null";
+        let null_dev: u64 = (1 << 8) | 3;
+        if oxfs_mknod(
+            dev_path.as_ptr() as u64,
+            dev_path.len() as u64,
+            (S_IFCHR | 0o600) as u64,
+            null_dev,
+        ) != 0
+        {
+            ok = false;
+            log("[oxfs] self-check FAILED: mknod mknodtest.null (S_IFCHR 1,3) failed\n");
+        } else {
+            let mut stat_buf = [0u8; 144];
+            if oxfs_stat(
+                dev_path.as_ptr() as u64,
+                dev_path.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+                0,
+            ) != 0
+            {
+                ok = false;
+                log("[oxfs] self-check FAILED: stat mknodtest.null failed\n");
+            } else {
+                let st = unsafe { (stat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+                if st.st_mode & S_IFMT != S_IFCHR || st.st_rdev != null_dev {
+                    ok = false;
+                    log(
+                        "[oxfs] self-check FAILED: mknodtest.null didn't report S_IFCHR/real rdev\n",
+                    );
+                }
+            }
+            let fd = oxfs_open(dev_path.as_ptr() as u64, dev_path.len() as u64, 0o1, 0);
+            if fd < 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: open mknodtest.null failed\n");
+            } else {
+                let payload = b"x";
+                let wrote = oxfs_write(fd as u64, payload.as_ptr() as u64, 1);
+                let mut rbuf = [1u8; 8];
+                let read = oxfs_read(fd as u64, rbuf.as_mut_ptr() as u64, rbuf.len() as u64);
+                oxfs_close(fd as u64);
+                if wrote < 0 || read != 0 {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: mknodtest.null didn't behave like /dev/null\n");
+                }
+            }
+            if oxfs_unlink(dev_path.as_ptr() as u64, dev_path.len() as u64, 0, 0) != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: unlink mknodtest.null failed\n");
+            }
+        }
+    }
+
+    // Real per-process chroot containment. Runs at pid 0 (module_init's own self-check), where
+    // oxidebsd_current_uid always reports root -- see oxfs_chroot's own doc comment. Explicitly
+    // resets BOOT_ROOT back to the real root (0) afterward regardless of outcome, via
+    // oxidebsd_set_root directly rather than a path-based chroot back (once chrooted, an absolute
+    // "/" no longer names the real root at all -- see resolve_path_impl's own containment logic),
+    // so every check after this one in this same self-check still resolves against the real tree.
+    {
+        let dir_name = b"chroottest";
+        if oxfs_mkdir(dir_name.as_ptr() as u64, dir_name.len() as u64, 0, 0) != 0 {
+            ok = false;
+            log("[oxfs] self-check FAILED: mkdir chroottest failed\n");
+        } else {
+            let chroot_inode = dir_lookup(ROOT_INODE, b"chroottest");
+            let path = b"/chroottest";
+            if oxfs_chroot(path.as_ptr() as u64, path.len() as u64, 0, 0) != 0 {
+                ok = false;
+                log("[oxfs] self-check FAILED: chroot /chroottest failed\n");
+            } else {
+                // Real chroot(2) doesn't move cwd -- BusyBox's own chroot applet chdir("/")s
+                // right afterward, the normal real-world pattern this mirrors.
+                let root_path = b"/";
+                if oxfs_chdir(root_path.as_ptr() as u64, root_path.len() as u64, 0, 0) != 0 {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: chdir / after chroot failed\n");
+                }
+                let mut cwd_buf = [0u8; 16];
+                let n = oxfs_getcwd(cwd_buf.as_mut_ptr() as u64, cwd_buf.len() as u64, 0, 0);
+                if n != 2 || &cwd_buf[..1] != b"/" {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: getcwd inside chroot should report /\n");
+                }
+                let dotdot = b"..";
+                if oxfs_chdir(dotdot.as_ptr() as u64, dotdot.len() as u64, 0, 0) != 0 {
+                    ok = false;
+                    log(
+                        "[oxfs] self-check FAILED: chdir .. inside chroot should still succeed (contained, not escape)\n",
+                    );
+                }
+                let after_dotdot = match current_cwd() {
+                    Cwd::Real(inode) => Some(inode),
+                    Cwd::Proc(_) => None,
+                };
+                if after_dotdot != chroot_inode {
+                    ok = false;
+                    log("[oxfs] self-check FAILED: chdir .. escaped the chroot\n");
+                }
+            }
+            unsafe { oxidebsd_set_root(0) };
+            set_current_cwd_real(ROOT_INODE);
+        }
+    }
+
     // --- Real chmod/chown, through the real registered handlers (Part E). This runs at pid 0
     // (module_init's own self-check, before any real process exists), where oxidebsd_current_uid
     // always reports root -- see oxfs_chmod/oxfs_chown's own doc comments for the real permission
@@ -5383,6 +6108,12 @@ pub extern "C" fn module_init() -> i32 {
     let ok = if has_disk && mount_from_disk() {
         true
     } else {
+        // A failed mount attempt can have already partially populated the real block-used
+        // bitmap/inode table from the stale disk it just gave up on -- see
+        // `reset_real_pool_for_fresh_format`'s own doc comment for the real, live bug this
+        // guards against. Harmless (a no-op over already-pristine state) on the "no disk
+        // attached at all" path, so this runs unconditionally rather than only when `has_disk`.
+        reset_real_pool_for_fresh_format();
         let ok = format_fresh_filesystem();
         if has_disk {
             flush_all_to_disk();
@@ -5407,9 +6138,12 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_OPEN, oxfs_open);
         oxidebsd_register_syscall(SYS_CLOSE, sys_close);
         oxidebsd_register_syscall(SYS_CHDIR, oxfs_chdir);
+        oxidebsd_register_syscall(SYS_CHROOT, oxfs_chroot);
         oxidebsd_register_syscall(SYS_MKDIR, oxfs_mkdir);
         oxidebsd_register_syscall(SYS_GETCWD, oxfs_getcwd);
         oxidebsd_register_syscall(SYS_UNLINK, oxfs_unlink);
+        oxidebsd_register_syscall(SYS_LINK, oxfs_link);
+        oxidebsd_register_syscall(SYS_MKNOD, oxfs_mknod);
         oxidebsd_register_syscall(SYS_RMDIR, oxfs_rmdir);
         oxidebsd_register_syscall(SYS_RENAME, oxfs_rename);
         oxidebsd_register_syscall(SYS_READLINK, oxfs_readlink);
@@ -5417,6 +6151,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_STAT, oxfs_stat);
         oxidebsd_register_syscall(SYS_LSTAT, oxfs_lstat);
         oxidebsd_register_syscall(SYS_FSTAT, oxfs_fstat);
+        oxidebsd_register_syscall(SYS_LSEEK, oxfs_lseek);
         oxidebsd_register_syscall(SYS_GETDENTS, oxfs_getdents);
         oxidebsd_register_syscall(SYS_CHMOD, oxfs_chmod);
         oxidebsd_register_syscall(SYS_CHOWN, oxfs_chown);

@@ -205,6 +205,10 @@ name = "needs-syscall-smoke"
 version = "0.1.0"
 
 [[package]]
+name = "needs-syscall2-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "net"
 version = "0.1.0"
 
@@ -301,6 +305,10 @@ dependencies = [
 
 [[package]]
 name = "stsh"
+version = "0.1.0"
+
+[[package]]
+name = "tcc-syscall-smoke"
 version = "0.1.0"
 
 [[package]]

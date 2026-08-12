@@ -1169,6 +1169,61 @@ pub(crate) fn sys_uname(uts_ptr: u64) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// musl's own `struct timeval` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
+/// timeval` template): a `time_t`/`suseconds_t` pair, both 8 bytes on this arch.
+#[repr(C)]
+#[derive(Default)]
+struct RawTimeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+/// musl's own `struct rusage` on x86_64 (`third_party/musl/include/sys/resource.h`): two
+/// `timeval`s, then 14 `long` fields, then a 16-`long` reserved tail -- 272 bytes total. Backs both
+/// `SYS_GETRUSAGE` and `SYS_WAIT4`'s own optional 4th `rusage_ptr` argument (see
+/// `write_zeroed_rusage`, below). This kernel tracks no per-process CPU time/memory-usage
+/// accounting at all (`/proc/stat`'s own `cpu` line is already an honest all-zero placeholder for
+/// the identical reason) -- every field here is a real, correctly-shaped, honestly-zeroed
+/// placeholder rather than an invented number, same tier as `/proc/meminfo`'s `MemFree ==
+/// MemTotal`.
+#[repr(C)]
+#[derive(Default)]
+struct RawRusage {
+    ru_utime: RawTimeval,
+    ru_stime: RawTimeval,
+    fields: [i64; 14],
+    reserved: [i64; 16],
+}
+
+const _: () = assert!(core::mem::size_of::<RawRusage>() == 272);
+
+/// Writes an all-zero `RawRusage` to `ptr` if it's non-null -- shared by `sys_getrusage` and
+/// `do_wait4`'s own optional `rusage_ptr` argument (`src/process.rs`), the same "one real helper,
+/// two call sites" shape `write_stat`-style functions elsewhere in this codebase already use.
+pub(crate) fn write_zeroed_rusage(ptr: u64) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: same known pointer-validation gap every other user-memory write in this file already
+    // has -- an arbitrary caller-supplied pointer isn't checked against the caller's actual
+    // mappings first. `write_unaligned` since a real `struct rusage*` has no alignment guarantee
+    // this kernel can rely on (unlike `RawUtsname` above, which is only ever reached from
+    // `sys_uname`'s own single, always-aligned-in-practice call site).
+    unsafe { (ptr as *mut RawRusage).write_unaligned(RawRusage::default()) };
+}
+
+/// `SYS_GETRUSAGE` (registered by `modules/posix_compat`, continuing on from `SYS_UMASK = 487`) --
+/// real `getrusage(2)`'s exact `(who, rusage_ptr)` wire format (musl's own `getrusage()`,
+/// `third_party/musl/src/misc/getrusage.c`, already issues a plain 2-argument raw syscall with a
+/// bare pointer, no length-prefixing involved, so no call-site patch was needed beyond the usual
+/// number remap). `who` (`RUSAGE_SELF`/`RUSAGE_CHILDREN`) makes no difference to the answer -- see
+/// `RawRusage`'s own doc comment for why.
+pub(crate) fn sys_getrusage(who: u64, rusage_ptr: u64) -> Result<u64, u64> {
+    let _ = who;
+    write_zeroed_rusage(rusage_ptr);
+    Ok(0)
+}
+
 /// musl's own `struct timespec` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
 /// timespec` template, `time_t`/`long` both 8 bytes on this arch): two `i64`s, no padding.
 #[repr(C)]
@@ -1488,13 +1543,23 @@ pub(crate) extern "C" fn oxidebsd_sys_fork() -> i64 {
     result_to_ffi(crate::process::do_fork_from_current())
 }
 
-pub(crate) extern "C" fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: u64) -> i64 {
+pub(crate) extern "C" fn oxidebsd_sys_wait4(
+    pid: u64,
+    status_ptr: u64,
+    options: u64,
+    rusage_ptr: u64,
+) -> i64 {
     let _ = options; // no WNOHANG/etc support this pass -- always blocks until a match exists
     result_to_ffi(crate::process::do_wait4(
         crate::scheduler::current_pid(),
         pid as i64,
         status_ptr,
+        rusage_ptr,
     ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64 {
+    result_to_ffi(sys_getrusage(who, rusage_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_execve(

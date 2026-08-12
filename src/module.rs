@@ -718,6 +718,8 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_close_fd" => Some(crate::fd::oxidebsd_close_fd as *const () as u64),
         "oxidebsd_get_cwd" => Some(crate::process::oxidebsd_get_cwd as *const () as u64),
         "oxidebsd_set_cwd" => Some(crate::process::oxidebsd_set_cwd as *const () as u64),
+        "oxidebsd_get_root" => Some(crate::process::oxidebsd_get_root as *const () as u64),
+        "oxidebsd_set_root" => Some(crate::process::oxidebsd_set_root as *const () as u64),
         "oxidebsd_sys_kill" => Some(crate::syscall::oxidebsd_sys_kill as *const () as u64),
         "oxidebsd_sys_sigaction" => {
             Some(crate::syscall::oxidebsd_sys_sigaction as *const () as u64)
@@ -817,6 +819,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::syscall::oxidebsd_sys_sched_get_priority_min as *const () as u64)
         }
         "oxidebsd_sys_reboot" => Some(crate::syscall::oxidebsd_sys_reboot as *const () as u64),
+        "oxidebsd_sys_getrusage" => {
+            Some(crate::syscall::oxidebsd_sys_getrusage as *const () as u64)
+        }
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {

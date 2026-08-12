@@ -49,7 +49,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_fork() -> i64;
-    fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: u64) -> i64;
+    fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64) -> i64;
     fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64;
     fn oxidebsd_sys_getpid() -> i64;
     fn oxidebsd_sys_getppid() -> i64;
@@ -94,8 +94,8 @@ extern "C" fn handle_fork(_arg0: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64
     unsafe { oxidebsd_sys_fork() }
 }
 
-extern "C" fn handle_wait4(pid: u64, status_ptr: u64, options: u64, _arg3: u64) -> i64 {
-    unsafe { oxidebsd_sys_wait4(pid, status_ptr, options) }
+extern "C" fn handle_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_wait4(pid, status_ptr, options, rusage_ptr) }
 }
 
 /// The one handler that actually reads its 4th argument (`envp_ptr`, via `R10`) -- see

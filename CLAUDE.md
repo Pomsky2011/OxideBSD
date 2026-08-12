@@ -33,6 +33,11 @@ Current state:
   Ethernet/ARP/IPv4/ICMP, UDP/TCP/raw-ICMP sockets, `poll(2)`, and real hostname resolution over
   musl's own DNS stub resolver (no DNS protocol code of its own) — see this file's own "Real
   networking" section.
+- A real, on-target C compiler (`third_party/tinycc`, vendored TinyCC) — `tcc` runs as an ordinary
+  seeded `/bin` binary and can genuinely compile+link a real C file against a real, seeded
+  `/usr/include`/`/usr/lib` musl tree, producing a real runnable ELF — see this file's own "TinyCC"
+  section. GCC/Clang remain unstarted (real subprocess pipelines, likely real dynamic linking and
+  threads — a much bigger lift than this kernel currently supports).
 
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
 no preemption, no copy-on-write fork, no frame deallocation anywhere,
@@ -1746,6 +1751,380 @@ model at all; faking them would be theater, not a real syscall).
   above) — confirmed live instead, the same "hand off anything only proven by real interactive
   BusyBox usage" precedent as `reboot`.
 
+## Real hard links, device nodes, per-process chroot, and getrusage/wait4 rusage (`modules/oxfs`, `modules/posix_compat`, `src/process.rs`, `src/syscall.rs`)
+
+Closes most of the rest of the BusyBox gap table's `NEEDS_SYSCALL` row: `link`/`ln` (hard links),
+`mknod`/`makedevs`, `chroot`, and `time`'s own `getrusage`/`wait4`-rusage dependency. SysV IPC and
+real namespaces (`chroot`'s own cousins `unshare`/`nsenter`/`setarch`/`setpriv`) stay out of scope
+— namespaces in particular don't fit this kernel's single-address-space model at all.
+
+- **`SYS_LINK=488`/`SYS_MKNOD=489`/`SYS_CHROOT=490`** (`modules/oxfs`) and **`SYS_GETRUSAGE=491`**
+  (`modules/posix_compat`) land at `488`+, not a continuation of any of this ABI's earlier invented
+  sequences (`100`-`178`, `471`-`487`) — same "grep every still-inert real Linux `__NR_*` value in
+  `bits/syscall.h.in` before trusting a number" discipline the `471`-`487` batch already
+  established (confirmed real `link`/`mknod`/`mknodat`/`chroot`/`getrusage` sit at `86`/`133`/
+  `259`/`161`/`98`, nowhere near `488`+).
+- **Real hard links**: `Inode` gains `nlink: u16` (previously nonexistent — `write_stat`'s own
+  `st_nlink` used to be a hardcoded `2`/`1` by kind, not backed by anything real), packed into 2 of
+  `INODE_STRIDE`'s 61 previously-unused trailing bytes (see that constant's own doc comment on why
+  this headroom exists). `oxfs_link` resolves `existing` via the normal, symlink-following
+  `resolve_path` (this filesystem doesn't support hard-linking a symlink *entry* itself, only what
+  it points to — a documented simplification, POSIX itself leaves this implementation-defined),
+  rejects `InodeKind::Dir` (`EPERM`, real Unix's own prohibition), rejects linking across the real/
+  tmpfs inode-pool boundary (`EXDEV` — a tmpfs-pool inode must never gain a real, disk-persisted
+  name pointing at content that's never actually written through, the same concern
+  `alloc_inode_in`'s own doc comment already flags elsewhere), then `dir_insert`s the new name
+  against the *existing* inode and bumps `nlink`. `oxfs_unlink` now decrements `nlink` for `File`/
+  `Device` before clearing the directory record — the record-clear itself, and every other inode/
+  block, is still never actually freed (this module's long-standing "no deallocation anywhere"
+  stance), `nlink` reaching `0` just means the last name is gone. A pre-existing on-disk inode
+  (mounted from a disk written before this field existed) decodes `nlink = 0` from its zero-padded
+  stride tail — `write_stat` floors this back up to `1` for `File`/`Device` rather than reporting a
+  bogus zero-link count.
+- **Real device nodes**: new `InodeKind::Device`, plus `Inode::rdev: u32`/`device_char: bool`
+  (5 more bytes of the same stride headroom). Unlike `/dev/{random,urandom,null,zero}`'s existing
+  `dev_open` magic-path interception (never backed by any inode at all), `mknod` creates a real,
+  listable inode reporting `S_IFCHR`/`S_IFBLK` and a real `st_rdev` via `stat`/`getdents` — but
+  there's still no general device-driver framework: `oxfs_open`'s new `InodeKind::Device` dispatch
+  arm (`known_device`, checked before the ordinary read/write-buffer arms) only actually services
+  major:minor pairs matching the same four already-real devices (`(1,3)`→null/`(1,5)`→zero/
+  `(1,8)`|`(1,9)`→random, real Linux's own standard values), reusing the existing
+  `OpenFile::DevNull`/`DevZero`/`DevRandom` variants — so a real `mknod /dev/null c 1 3` genuinely
+  works, but any other major:minor is a real, stat-able node that honestly fails `-ENXIO` on open
+  (matching real Linux's own behavior for a device number with no bound driver), not a silent
+  pretense of support. `mknod` also supports `S_IFREG` (an immediately committed empty file,
+  `oxfs_symlink`'s eager-allocate shape, not `O_CREAT`'s deferred-to-`close()` one); `S_IFIFO`/
+  `S_IFSOCK` are `EINVAL` — real named-pipe persistence remains a distinct, unstarted gap. Creating
+  a device node is root-only (`EPERM` otherwise, real `mknod(2)`'s own `CAP_MKNOD` requirement,
+  same genuine-root-only tier the permission-model pass already established for `oxfs_chown`);
+  `S_IFREG` only needs ordinary parent write access. The incoming wire `dev` register is stored
+  into `Inode::rdev` verbatim (truncated to `u32`) rather than re-encoded — for any major < 4096 /
+  minor < 256 (every value this port's own device support or BusyBox's `makedevs` default table
+  ever needs), that raw value already equals what musl's own `makedev()`/`major()`/`minor()` macros
+  produce/expect, so no separate encode/decode step is needed (see `dev_major_minor`'s own doc
+  comment for the exact reasoning).
+- **Real per-process `chroot`**: `Process::root_inode: u64` mirrors `Process::cwd`'s existing
+  "opaque `u64`, oxfs-owned meaning, kernel just persists/copies it" design exactly, right down to
+  `0` doubling as both oxfs's real root inode number *and* "never chrooted" — no extra sentinel
+  needed. Copied by `fork`, left untouched by `execve` (real `chroot(2)` persists across `exec`).
+  `oxidebsd_get_root`/`oxidebsd_set_root` (`src/process.rs`) byte-for-byte mirror
+  `oxidebsd_get_cwd`/`oxidebsd_set_cwd`, including a `BOOT_ROOT` fallback for
+  `scheduler::current_pid() == 0` (`modules/oxfs`'s own boot self-check, same shape `BOOT_CWD`
+  already established). `resolve_path_impl` (`modules/oxfs`) gains a `root_inode: u32` parameter —
+  used both for the absolute-path/absolute-symlink-target start (previously hardcoded
+  `ROOT_INODE`) and, more importantly, as the actual containment mechanism: a `..` component is
+  treated as staying put, not following that directory's real stored `..` record, whenever
+  `current == root_inode`. Fully backward compatible for the un-chrooted case (the real root
+  already self-references `..`, so the check is a no-op there); `resolve_path`/
+  `resolve_path_nofollow_last` are the only two places that fetch `effective_root_inode()`
+  (a thin wrapper over `oxidebsd_get_root`) — no other call site in the file changes, since every
+  external caller only ever goes through those two wrappers (or `resolve_parent`, which itself
+  calls `resolve_path`). `build_cwd_path` (backing `getcwd`) got the same swap, so `pwd` inside a
+  chroot reports paths relative to the chroot's own root, not the real one — otherwise it would
+  visibly contradict the `cd ..` containment above. `oxfs_chroot` is root-only (`EPERM` otherwise,
+  real `chroot(2)`'s own `CAP_SYS_CHROOT` requirement, same tier as `oxfs_chown`/device-node
+  creation above — not the older "no capability model, so always allow" precedent from before the
+  permission-model pass existed) and deliberately does **not** also `chdir` to the new root — real
+  `chroot(2)` doesn't either; BusyBox's own `chroot` applet calls `chdir("/")` itself right
+  afterward, the normal real-world pattern. **Known, accepted gap** (same tier as the mount table's
+  own documented bind-mount `cd ..` limitation): a chrooted-into directory being later removed/
+  renamed out from under the process, or interaction with an already-active tmpfs/bind mount inside
+  the new root, isn't specially handled — no target applet in this port's roster exercises either.
+- **`SYS_GETRUSAGE` + real `wait4` rusage**: this kernel tracks no per-process CPU-time/memory-
+  usage accounting at all (same honest-placeholder tier as `/proc/stat`'s own all-zero `cpu` line),
+  so both report a real, correctly-shaped, all-zero `struct rusage` (`RawRusage`, `src/syscall.rs`,
+  272 bytes, written via `write_unaligned` like `MuslStat`/`MuslStatfs` — an arbitrary user pointer
+  has no alignment guarantee) rather than inventing numbers. `do_wait4` (`src/process.rs`) gained a
+  4th `rusage_ptr` parameter, threaded through `oxidebsd_sys_wait4`/`modules/native_abi`'s
+  `handle_wait4` (which already had an ignored `_arg3` slot — R10 was already a live, precedented
+  argument position from `execve`'s own `envp_ptr`). No musl call-site patch was needed for either
+  syscall — `getrusage.c` already issues a plain 2-argument raw syscall, and `wait4.c` already
+  issues a real 4-argument raw syscall with a bare `dest` pointer, both already shaped to match
+  this ABI's native `(RDI,RSI,RDX,R10)` convention.
+- **A real, live regression found immediately by the full test suite, not by review**: making
+  `SYS_WAIT4`'s 4th argument (`R10`) suddenly meaningful broke `tests/fork_wait.rs` with a page
+  fault at a suspiciously round address (`0x6474e551` — `PT_GNU_STACK`'s own program-header type
+  constant, i.e. genuinely uninitialized register content, not a deliberately bad pointer).
+  `SYSCALL` doesn't clear `R10`, and several existing hand-written userland smoke-test crates
+  (`fork-exec-smoke`, `itimer-syscall-smoke`, `session-syscall-smoke`) have their own local 3-argument
+  `syscall()` asm helper that never touched `R10` at all — harmless while `wait4` only ever read
+  3 registers, a real crash the instant a 4th became live. (`uid-syscall-smoke`/`stsh` were already
+  safe: their own `syscall()` delegates to a `syscall4(..., 0)` that explicitly zeroes it.) Fixed by
+  adding an explicit `in("r10") 0u64` to the three affected helpers — safe for every other
+  3-argument syscall too, since a real kernel-side handler for one just carries an unused `_arg3`
+  parameter regardless of what userland happens to leave in that register. **Any future syscall
+  that upgrades from 3 to 4 real arguments needs the same audit**: grep every existing userland
+  crate's own hand-rolled `syscall()`/`syscall3` helper for whether it actually zeroes `r10`, not
+  just check the kernel-side signature change compiles.
+- Verified via `modules/oxfs`'s own boot self-check (new checks alongside the existing chmod/chown
+  ones: a `link`/`stat`/`nlink`/`unlink` round trip, a `mknod`-as-`/dev/null`-equivalent create/
+  stat/open/write/read/unlink round trip plus a plain `S_IFREG` node, and a `chroot`-into-a-
+  subdirectory/`chdir("/")`/`getcwd`/contained-`cd ..` round trip that resets `BOOT_ROOT` back to
+  real root afterward regardless of outcome) and `tests/needs_syscall2_smoke.rs` +
+  `userland/needs-syscall2-smoke/` (a real spawned pid 1 through genuine `SYSCALL`/`SYSRETQ`, same
+  reasoning every other real-`SYSCALL` smoke test in this codebase documents — `chroot`'s own
+  containment behavior in particular depends on real per-process state resolved fresh via
+  `scheduler::current_pid()`, exactly the class of thing a plain-Rust-function test can't exercise):
+  the same link/mknod scenarios, a `getrusage`/`wait4`-with-rusage round trip against a real
+  forked+exited child, a forked child that `setuid(1)`s and confirms `chroot` then fails real
+  `EPERM`, and — deliberately last, since a process has no path-based way back to its real root
+  once chrooted — the parent's own chroot-into-a-subdirectory containment check.
+
+## TinyCC: a real, on-target C compiler (`third_party/tinycc`, `modules/oxfs`, `build.rs`)
+
+OxideBSD's first C compiler that runs *on* the target itself, not just at build time (`musl-gcc`
+already cross-builds every embedded binary in `build.rs`, but that never touches OxideBSD's own
+running kernel). GCC/Clang are explicitly wanted eventually but are a much bigger lift — real
+multi-process pipelines (`cc1`/`as`/`ld`), usually real dynamic linking, and often threads, none of
+which this kernel has (`elf.rs` has zero `PT_INTERP` support at all, `clone`/`futex`/`mprotect` are
+unregistered). TinyCC is a single monolithic static binary (its own assembler and linker, no
+subprocess pipeline), single-threaded, and has real, maintained upstream musl support
+(`--config-musl`) — the natural first target.
+
+- **Vendored as a real submodule**, `third_party/tinycc`, mirroring `github.com/mirror/tinycc`
+  (itself a mirror of the canonical `repo.or.cz/tinycc.git`) into a personal fork
+  (`Pomsky2011/tinycc-oxidebsd`) on its own `oxidebsd` branch, pinned to tag `release_0_9_27` — the
+  same pin/patch procedure `third_party/musl`/`third_party/busybox` already use, even though (aside
+  from the one real patch below) nothing else has needed changing yet.
+- **`build_tinycc()`** (`build.rs`) cross-builds `tcc` against the existing musl sysroot
+  (`build_musl_sysroot()`'s own output) via `musl-gcc`, the same "shell out to the real toolchain,
+  no cargo" idiom `build_musl_smoke`/`build_busybox_applet` already use — a plain `./configure` +
+  `make`, no per-applet Kconfig flip/oldconfig dance (`--config-musl` is real, maintained upstream
+  support, confirmed by the fact that Alpine Linux — a musl distro — ships tcc in production the
+  same way). `--prefix=/usr` becomes tcc's own compiled-in runtime defaults (`CONFIG_TCCDIR`,
+  `CONFIG_TCC_CRTPREFIX`, `CONFIG_TCC_SYSINCLUDEPATHS`) — where *it* looks for headers/crt/its own
+  runtime library once running on target, not anything touching the host's real `/usr`. **Explicit
+  `--crtprefix=/usr/lib --libpaths=/usr/lib --sysincludepaths=/usr/include` are required, not
+  redundant with `--prefix`** — found live: tcc's own `configure` (only when not cross-compiling)
+  probes the *build host's* own `/usr/lib64/crti.o` to decide whether to bake in a `lib64` library
+  directory name, a real host-distro quirk with zero relationship to the musl sysroot's own flat
+  `/usr/lib` layout — without these three flags, the built `tcc` reported `file 'crt1.o' not found`
+  the moment it actually ran on target.
+- **`libtcc1.a` (tcc's own runtime helper library) deliberately bypasses tcc's normal self-hosting
+  recipe.** tcc's own `Makefile` builds it as `libtcc1.a : tcc$(EXESUF) FORCE`, running the
+  just-built `tcc` binary *on the host* to compile `lib/*.c`. Confirmed live this cannot work here:
+  the just-built `tcc` is linked against this project's own *patched* musl (carry-flag errno
+  conversion, remapped `__NR_*` values), so every syscall it issues is misinterpreted by the real
+  host kernel's real Linux ABI — running it directly on the host doesn't crash, it silently does
+  nothing (`./tcc --version` exits `0` with no output at all). Fixed via tcc's own documented
+  escape hatch for exactly this shape of problem (normally meant for cross-architecture builds):
+  `<target>-libtcc1-usegcc=yes`, swapping in the real, host-executable `musl-gcc` instead of
+  self-hosting. Safe here because `libtcc1.a`'s own sources are pure freestanding numeric helper
+  routines (softfloat/int64 conversions) with no syscalls at all.
+- **Built in-place inside the submodule** (matching `build_musl_sysroot`'s own precedent, not
+  `build_busybox_applet`'s out-of-tree `O=` build — tcc's Makefile has no equivalent mechanism), so
+  staleness tracking can't just be `latest_mtime(&tinycc_dir)` the way `build_busybox_applet` uses
+  for BusyBox's own source tree — that would walk right back over the build's own prior output
+  sitting in the same directory. `tinycc_source_mtime`/`is_tinycc_build_output`/
+  `clean_tinycc_build_outputs` in `build.rs` share one exclusion list (deliberately, so a name added
+  to one can't silently drift from the other) and **each real source file walked also gets its own
+  `cargo:rerun-if-changed`** — found live, the hard way: an earlier version only computed the
+  staleness *value* without ever registering the watch itself, so a real source edit
+  (`x86_64-link.c`'s patches below) was completely invisible to cargo's own decision of whether to
+  re-run `build.rs` at all — `cargo build` reported `Finished ... in 0.09s` and silently kept using
+  the stale, pre-patch `tcc` binary. Same class of bug as `build_busybox_applet`'s own
+  freshness-floor lesson, just one level up the stack (cargo never re-invoking `build.rs` at all,
+  rather than this function's own logic making the wrong call once invoked).
+
+**Two real, deep bugs found getting a genuine on-target `tcc -static -o hello.elf hello.c &&
+./hello.elf` to actually work — both root-caused by tracing raw ELF/GOT/PLT bytes read back off the
+freshly compiled output via a real `SYS_LSEEK`-driven debug dump in the test's own userland crate,
+not guessed:**
+
+1. **This dev machine's own host `gcc` defaults to PIE** (confirmed directly: `echo | gcc -E -dM -`
+   defines `__PIC__`/`__PIE__` with *no* flags at all — a real, common modern-distro default, not
+   anything this project's own toolchain chose). musl's own `configure` (`trycppif __PIC__ ...`)
+   auto-detects that and lets PIE-style GOT-indirect codegen (`R_X86_64_REX_GOTPCRELX`) leak into
+   every musl object it builds, including plain `crt1.o` — confirmed directly via `readelf -r`,
+   showing real GOT-relative relocations for `main`/`_init`/`_fini` inside `_start_c`. Every *other*
+   consumer of this sysroot links via `musl-gcc` → real GNU ld, which silently performs the
+   standard GOTPCRELX link-time relaxation (rewriting the GOT-indirect load into a direct `lea`
+   once the final static address is known) — completely hiding this. TinyCC's own linker doesn't
+   implement that relaxation: the very first attempt at running a `tcc`-produced binary faulted
+   with an instruction-fetch page fault at a garbage, uninitialized-looking address, reached via a
+   GOT slot that was reserved but never actually written. **Fixed by forcing genuinely old-style,
+   non-GOT-indirect codegen for the whole musl build** (`build_musl_sysroot`'s `./configure` gains
+   `CFLAGS=-fno-pie -fno-PIC`) — confirmed directly: recompiling `crt1.c` this way produces only
+   plain `R_X86_64_32`/`PC32`/`PLT32` relocations, no GOTPCRELX at all. Required a full
+   `make distclean` + fresh `target/musl-sysroot` (a `CFLAGS`-level change doesn't invalidate
+   already-built objects any more reliably than the BusyBox incremental-build lesson already
+   documented elsewhere in this file) and, transitively, every BusyBox applet relinking against the
+   rebuilt `libc.a`.
+2. **TinyCC generates real PLT/GOT indirection for calls to any default-visibility external
+   function, even under a fully `-static` link with no shared libraries at all.** Once bug 1 was
+   fixed, a *second*, structurally different crash appeared (a real `#GP`, not a page fault) — real
+   PLT stubs (traced via a manual disassembly of the exact bytes at the faulting address: a genuine
+   `push`/`jmp`-through-GOT trampoline, textbook PLT0/PLTn shape) were being generated for printf's
+   own internal calls into other musl object files (malloc, memcpy, ...), and `relocate_plt`'s own
+   GOT/PLT address-delta computation produced a jump landing back inside the PLT/text region
+   instead of the real `.got` section in the data segment. PLT/lazy-binding has no meaning at all
+   without a dynamic loader to ever populate a GOT slot the first time a function is actually
+   called — this target has none, by design (`elf.rs` has zero `PT_INTERP`/relocation-processing
+   support). TinyCC's own `tccelf.c` (`build_got_entries`) already has a carve-out that skips PLT
+   generation entirely for hidden-visibility or `STB_LOCAL` symbols, rewriting the call to a direct
+   `R_X86_64_PC32` reference instead — **patched to extend that same carve-out to fire whenever
+   `s1->static_link` is true**, regardless of visibility/binding, matching exactly what a real
+   linker (GNU ld) already does automatically for every other static binary in this whole project.
+   A narrow, semantically-correct fix reusing an already-proven code path, not a new mechanism.
+   Confirmed fixed: the same `hello.elf` build now contains zero PLT entries, runs cleanly, and
+   prints its real `printf` output.
+- **`SYS_LSEEK = 8`** (`modules/oxfs`) — real x86_64 Linux's own `__NR_lseek` value (confirmed
+  still inert in `bits/syscall.h.in`, no prior pass ever needed it; musl's own `lseek()` already
+  issues a plain `syscall(SYS_lseek, fd, offset, whence)` on this arch, no musl-side patch needed
+  at all). Found live via tcc itself: its own object-file loader needs a real file size upfront
+  (`fseek`/`ftell`) to read `crt1.o`/`libc.a` whole into memory before parsing their real
+  ELF/`ar` headers — without this registered, every crt/lib file it opened reported `invalid
+  object file` (a silently-ignored failed `fseek`, not a clean "not found"). Real
+  `SEEK_SET=0`/`SEEK_CUR=1`/`SEEK_END=2`, no divergence to remap. Only the
+  `{FileRead,DirListing,ProcRead,ProcDir}` `OpenFile` variants have a real position to seek within
+  — `Write` (an accumulate-then-commit buffer, not a random-access file) and the synthetic
+  `/dev/*` variants report `ESPIPE`, the real POSIX answer, rather than silently accepting a seek
+  that would never change what a later `read`/`write` sees.
+- **A real, generated on-target runtime tree** — `/usr/include` (musl's entire real header tree
+  embedded whole, 217 files — even a trivial `printf` pulls in a nontrivial closure of internal
+  `bits/*.h`/`features.h` headers, and the full tree is already sitting there post-`make install`
+  at zero extra build cost), `/usr/lib` (`crt1.o`/`crti.o`/`crtn.o` + `libc.a` + 8 small musl stub
+  archives, for real `-lm`/`-lpthread`/etc link-line compatibility even though musl merges
+  everything into `libc.a` itself — `rcrt1.o`/`Scrt1.o`, the PIE-only crt variants, and
+  `musl-gcc.specs`, a host build-tool artifact, are deliberately skipped), `/usr/lib/tcc` (tcc's
+  own `libtcc1.a` + its 5 bundled compiler-magic headers — `stdarg.h`/`stddef.h`/`float.h`/... —
+  distinct from musl's real userspace headers, needed because tcc's preprocessor wants its own
+  compatible versions of a handful of compiler-intrinsic headers). Generated by `build.rs`'s
+  `write_tcc_runtime_manifest` into a single `target/generated/tcc_runtime_manifest.rs` (a real
+  generated Rust source, `pub static X: &[(&str, &[u8])]`, `include!`'d once into `modules/oxfs`)
+  — deliberately a *generated file with literal absolute `include_bytes!` paths*, not the
+  `env!()`-indirected `cargo:rustc-env`-per-file pattern every other embedded ELF in this build
+  script uses: this is ~235 individual files, not a handful of named applets each already needing
+  a unique identifier for other reasons (a Kconfig symbol, a load address) — inventing and
+  sanitizing ~235 one-off env var names for data with no other reason to need a name would be pure
+  ceremony, and the generated file is itself a build artifact (never checked in, already
+  host-specific), so embedding this host's own absolute paths directly is no less portable than
+  the indirection used elsewhere.
+- **`modules/oxfs` gains real directory-tree seeding infrastructure**, previously nonexistent —
+  every directory in `format_fresh_filesystem` before this was a hand-inlined 5-statement block
+  (`alloc_inode`/`write_inode`/two `dir_insert`s for `.`/`..`/one more into the parent), repeated
+  once per top-level directory (`/bin`, `/etc`, `/home`, `/home/user`, root itself). `ensure_dir(
+  parent, name) -> u32` factors that pattern out, made idempotent (looks up an existing child
+  first) since a manifest-driven tree walk re-enters the same parent directory many times (once per
+  sibling file under it) — the first caller that actually needs that, unlike every prior
+  one-shot directory creation. `seed_tree(root, files)` splits each `/`-separated relative path,
+  walks/creates intermediate directories via `ensure_dir`, and `seed_file`s the leaf — the first
+  content this filesystem seeds shaped like a real nested tree (musl's own `include/bits`,
+  `include/sys`, ...) rather than a small fixed set of top-level files.
+- **`MAX_INODES` raised 512 → 1024** — measured exactly against the real built
+  `target/musl-sysroot`, not estimated: 217 headers (plus ~10 subdirectories) + 12 lib/crt files +
+  tcc's own 5 bundled headers + `libtcc1.a` + the `tcc` binary itself is ~250 new inodes,
+  overflowing the ~180 that were free at 512 (same 64→512 precedent this constant already went
+  through once for the BusyBox roster).
+- **A seeded `/hello.c` fixture** (a real `printf("hello from tcc\n"); return 0;`, not a bare
+  `return` — exercises the stdio/writev path, not just process exit) for both the automated test
+  below and manual interactive use at the hush prompt.
+- Verified via `tests/tcc_syscall_smoke.rs` + `userland/tcc-syscall-smoke/` (a real spawned pid 1
+  through genuine `SYSCALL`/`SYSRETQ`, same reasoning every other real-`SYSCALL` smoke test in this
+  codebase documents — this is the first time this kernel has ever run a real compiler+linker doing
+  hundreds of small file opens during a single syscall-driven process, exactly the class of thing
+  worth exercising through the genuine ring-3 path): `fork`+`execve` `/bin/tcc -static -o
+  /hello.elf /hello.c`, `wait4` for a clean exit; `fork`+`execve` the freshly produced `/hello.elf`
+  itself, `wait4` and check its exit status — proving the *output* of a real on-target compile+link
+  is itself a real, runnable ELF, not just that `tcc` exits `0`; then the same round trip again via
+  a bare `tcc -o /hello2.elf /hello.c` (no explicit `-static`) — see `libtcc.c`'s own
+  `static_link = 1` default, below, for why this needed its own coverage. Full existing test suite
+  re-verified green after the musl `-fno-pie` rebuild and the tcc PLT patch, confirming neither
+  regressed anything already working.
+- **Not covered by this pass**: `-run` (tcc's in-memory JIT execution mode — not needed for the
+  "compile a real ELF, exec it" story this closes; this kernel's total lack of `NO_EXECUTE`
+  enforcement means it would likely already work if ever wanted, but that's untested), and
+  self-hosting (tcc compiling its own source, entirely on-target) — a natural next step once this
+  is solid, not attempted here. GCC/Clang remain a distinct, much larger, unstarted effort (real
+  subprocess pipelines, likely real dynamic linking and threads).
+
+**A real, three-layered disk-persistence bug found testing this against a real, already-formatted
+disk** (`target/oxfs_disk.img`, not the always-freshly-zeroed test disk every automated test above
+uses) — `MAX_INODES`'s own 512→1024 bump (above) changed the real on-disk inode-table size, and an
+already-formatted disk from before that change broke in three separate, independently-real ways
+before booting cleanly again:
+
+1. **`reset_real_pool_for_fresh_format()`** (`modules/oxfs/src/lib.rs`) — `mount_from_disk`'s own
+   bitmap-load and inode-table-load loops run to completion *before* its later per-block data-read
+   loop, which is where a real failure actually gets detected and turned into a `return false`. A
+   stale disk's bitmap (marking most of the *old* install's blocks used, a fully-packed ~300-applet
+   roster) was already loaded into the live in-memory pool by the time that failure was caught, and
+   nothing reset it before falling back to `format_fresh_filesystem` — so a fresh format inherited a
+   "mostly full" bitmap from a filesystem that no longer existed, and `alloc_block`/`alloc_inode`'s
+   own plain linear scans for the first *unmarked* slot panicked `DiskFull` seeding `/etc`, not
+   because the real content didn't fit, but because most of the pool was falsely marked used before
+   formatting had allocated anything of its own. Fixed: resets the real (non-tmpfs) bitmap and
+   inode table back to all-free immediately before `format_fresh_filesystem` runs on any path that
+   might have already partially populated this state.
+2. **`OXFS_METADATA_BLOCKS` in `build.rs`** — a second, independently hand-duplicated copy of the
+   on-disk metadata-block-count math (see this file's own "Real disk persistence" section for why a
+   `build.rs` can't just import oxfs's own constants), left at a stale hardcoded `18` (correct only
+   for the old `MAX_INODES = 512`) when `MAX_INODES` was bumped — silently sizing every *newly
+   created* `oxfs_disk.img` 64 KiB too small for the real layout the kernel-side code actually uses.
+   Fixed: computed from the same real constants (`OXFS_MAX_INODES`/`OXFS_INODE_STRIDE`/
+   `OXFS_BLOCK_SIZE`) instead of a magic number, with a `cargo:rerun-if-changed` on every real
+   TinyCC source file walked (a genuinely separate bug from the constant itself, found the same way
+   this section's own build-script staleness note describes below: an earlier version computed the
+   staleness *value* without ever registering the watch, so cargo never even knew to re-run
+   `build.rs` after a real source edit).
+3. **`mount_from_disk`'s own superblock check was magic-only, not layout-aware** — even after fixes
+   1-2, a disk formatted under the *old* layout still has the right magic bytes, just real,
+   physically different content at every block offset this build's own `INODE_TABLE_START`/
+   `BITMAP_BLOCK`/`DATA_BLOCK_OFFSET` expect (all derived from `NUM_BLOCKS`/`MAX_INODES`). Before
+   this fix, a stale disk merely *usually* failed loudly partway through mounting (an incidental,
+   not guaranteed, out-of-bounds read) — a layout change could just as easily leave every read
+   in-bounds and silently misinterpret stale bytes as this build's own inode table/bitmap/data.
+   Fixed: `mount_from_disk` now reads back the superblock's own stored `SUPERBLOCK_VERSION`/
+   `NUM_BLOCKS`/`MAX_INODES` (fields the on-disk format already carried, just never checked) right
+   after the magic check, and falls back to the same clean reformat path on any mismatch — a real
+   layout/version check, not an incidental crash. Confirmed live against the actual disk that first
+   surfaced this whole bug: boots straight to `[oxfs] mount: on-disk layout doesn't match this
+   build -- falling back to format`, reformats cleanly, no panic.
+4. **`write_data_disk_images()` in `build.rs` only ever created the persistent dev disk if missing,
+   never grew an existing-but-undersized one** — bug 2's own fix means a *freshly created* disk is
+   now sized correctly, but a disk file that already existed (written under the old, smaller
+   layout) stayed physically too small regardless, so `mount_from_disk`'s own per-block data read
+   (or, before fix 3, its bitmap/inode-table read) would eventually run off the end of a real file
+   too short to hold the new layout at all — a real, physical I/O failure, not something fix 3
+   alone can paper over. Fixed: an existing dev disk smaller than the current
+   `OXFS_DISK_IMAGE_BYTES` gets grown in place (zeros appended, real existing bytes untouched) so
+   fix 3's own superblock check gets to run against a real, complete disk and decide mount-vs-format
+   on its own terms, rather than failing on a truncated file before that check ever has the chance.
+   Confirmed live: a real, previously-formatted `oxfs_disk.img` grew from 33628160 to 33693696
+   bytes (exactly the 64 KiB shortfall bug 2 describes) on the next build.
+
+**A second, unrelated crash found testing further, live, at a real hush prompt** (not a
+disk-persistence issue at all): a bare `tcc hello.c` (no `-static`) compiled a real `a.out`, which
+then page-faulted immediately on `./a.out` — `INSTRUCTION_FETCH` at `VirtAddr(0x0)`. Real upstream
+tcc defaults to dynamic linking unless `-static`/`-shared` is given; `elf.rs` has zero
+`PT_INTERP`/dynamic-relocation support at all, so a dynamically linked output's PLT/GOT slots stay
+at their zero-initialized default forever (no loader ever runs to populate them) — the first
+indirect call through one jumps straight to address `0`. Fixed at the root, not by teaching users to
+always remember `-static`: `third_party/tinycc/libtcc.c`'s `tcc_new()` now defaults
+`s->static_link = 1` unconditionally (alongside its existing `alacarte_link`/`nocommon`/... default
+flags), so every on-target `tcc` invocation links statically regardless of flags — the explicit
+`-static` option (`TCC_OPTION_static` in the same file) is now always a no-op rather than required.
+Covered by `tcc_syscall_smoke`'s own third check, above.
+
+**A live operational gotcha found rolling this fix out, worth remembering for any future change to
+seeded content**: a disk that's already been formatted has its seeded files (every BusyBox applet,
+`tcc` itself, `/hello.c`, ...) captured once, at format time, and never re-synced on a later boot
+that merely *mounts* — `module_init`'s mount-or-format decision (see "Real disk persistence") only
+reformats on a magic/layout mismatch (bug 3, above), not on "the kernel binary's own embedded seed
+content changed." Concretely: after fixing the `tcc` default-static bug above, `cargo run` against
+an already-formatted real disk still ran the *old*, unfixed `/bin/tcc` — the fix was real and live
+in the freshly-built kernel image, but the disk's own persisted copy of `/bin/tcc` predated it and
+mounting never re-seeds. **Any future fix to seeded content (a BusyBox applet, `tcc`, a fixture
+file) needs the target disk actually reformatted to take effect** — delete `target/oxfs_disk.img`
+(destructive to anything created directly at the hush prompt — self-check artifacts like
+`gdtest`/`chroottest`/`hello.c` are auto-recreated regardless, real user-created files are not) and
+let the next `cargo run` recreate-and-format it fresh. Also found live in the same pass: touching
+`build.rs` itself (to force a rerun after such a disk deletion, since deleting a file `build.rs`
+merely checks for isn't itself a tracked rerun trigger) invalidates its mtime relative to every
+already-built BusyBox applet, triggering the full ~300-applet `allnoconfig`+`oldconfig`+`make`
+rebuild this file's own BusyBox section already documents (~25-40 minutes) — expected, not a new
+bug, but worth expecting before doing this casually.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
@@ -1771,7 +2150,8 @@ at once, so the rows aren't a clean partition.
 | `alarm`/`setitimer` | done | `ping`'s own real receive-loop timeout (chief motivator); any other program relying on a real `SIGALRM` to bound an otherwise-indefinite wait | `SYS_SETITIMER=156`/`SYS_GETITIMER=157` in `modules/clock` — see "Real networking" section's own known-gaps entry for the full design (why only `ITIMER_REAL`, why expiry only sets `pending_signals` rather than immediately terminating a blocked target, fork/execve semantics) and `tests/itimer_syscall_smoke.rs`'s own real-`SYSCALL` coverage |
 | `chmod`/`chown`/`chgrp` | done | — | `SYS_CHMOD=165`/`SYS_CHOWN=166` in `modules/oxfs` — see this file's own "Filesystem: oxfs" section. BusyBox's own `chown.c` implements `chgrp` as the same `chown()` call restricted to the group field, so one pair of syscalls unblocks all three; `chattr`/`fatattr`/`lsattr`/`setfattr` are a distinct, still-unstarted gap (real ext2 `ioctl`s / `setxattr`, not chmod/chown, despite `docs/BUSYBOX_APPLETS.md`'s original probe bucketing them together — corrected there this pass) |
 | `fsync`/`sync`/`ftruncate`/`fallocate`/`flock`/`statfs`/`setrlimit`/sched-priority/`reboot` | done | subset of 33 (down to 22, `NEEDS_SYSCALL`) | see this file's own "Filesystem/process misc syscalls" section — `SYS_FSYNC=471` through `SYS_REBOOT=486` in `modules/oxfs`/`modules/posix_compat`. Unblocks `fsync`/`flock`/`fallocate`/`truncate`/`chrt`/`halt`/`nice`/`poweroff`/`sync`/`softlimit`/`df` |
-| A specific missing syscall per remaining applet (`link`/`mknod`/SysV IPC/`chroot`/namespaces/`getrusage`/`inotify`/ext2 `ioctl`s/`xattr`) | not started | 22 (`NEEDS_SYSCALL`) | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones |
+| `link`/`ln`, `mknod`/`makedevs`, `chroot`, `getrusage`/`time` | done | `link`/`mknod`/`chroot`/`time` (subset of the 22 `NEEDS_SYSCALL` applets) | see this file's own "Real hard links, device nodes, per-process chroot, and getrusage/wait4 rusage" section — `SYS_LINK=488`/`SYS_MKNOD=489`/`SYS_CHROOT=490` (`modules/oxfs`), `SYS_GETRUSAGE=491` (`modules/posix_compat`). `mknod` only actually opens the same four synthetic devices `dev_open` already serviced (real Linux major:minor values) — a real, listable, stat-able node with any other major:minor honestly fails `ENXIO` on open, no general device-driver framework |
+| SysV IPC, `chroot`'s own cousins (namespaces: `unshare`/`nsenter`/`setarch`/`setpriv`), `inotify`, ext2 `ioctl`s/`xattr` (`chattr`/`fatattr`/`lsattr`/`setfattr`) | not started | remainder of the 22 `NEEDS_SYSCALL` applets | see `docs/BUSYBOX_APPLETS.md`'s own breakdown for which applet needs which — no single fix, a checklist of small ones. Namespaces in particular don't fit this kernel's single-address-space model at all; faking them would be theater, not a real syscall |
 | `/proc` filesystem — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`/`lstat(2)`) | done | — | special-cased path prefix inside `modules/oxfs` (no VFS layer exists to plug a separate procfs module into, and oxfs already owns `SYS_OPEN`/`SYS_GETDENTS`/`SYS_STAT`; see `oxfs`'s own `proc_open`/`proc_kind`), synthesizing content from new kernel-exported accessors (`src/process.rs`'s `oxidebsd_proc_exists`/`_pid_at`/`_stat_line`/`_cmdline`/`_status`) — no real inode/blocks (`write_proc_stat` fakes `st_mode` only; every other field, including `st_size`, is a fixed placeholder). Includes a minimal `/proc/<pid>/task/<tid>/` redirect (`tid == pid` only, this kernel has no real threading) since `pstree` unconditionally `opendir()`s it *and* `stat()`s it for uid/gid, silently skipping a pid entirely if either fails, rather than falling back to the plain per-pid files — confirmed live: without `stat()` support, `pstree` produced zero output, not a degraded one. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
 | `/proc` filesystem — system-wide files (`/proc/meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | three new system-wide (not per-pid) kernel accessors (`oxidebsd_proc_meminfo`/`_uptime`/`_stat_global` in `src/process.rs`), routed as siblings of the numeric pid entries at `/proc`'s own top level. `MemFree`/`MemAvailable` are set equal to `MemTotal` (no free-memory/dealloc tracking exists anywhere in this kernel); `/proc/stat`'s `cpu` line is all-zero except `idle` (`ticks()` itself — no per-tick user/system accounting exists), so any CPU%-computing tool (`top`) reads permanently ~0% used, an honest placeholder, not a bug. `chdir(2)` into `/proc` needed a real sentinel encoding for `Process::cwd` (still a fully kernel-opaque `u64`, zero kernel-side changes) — the top bit tags it as a synthetic `/proc` location (`CWD_PROC_TAG`) rather than a real inode number, reusing `ProcDirKind` itself as the "which synthetic directory" representation; every path-taking oxfs syscall handler (`open`/`chdir`/`getcwd`/`stat`/`lstat`/`readlink`, plus a hard `-EROFS` reject for `mkdir`/`unlink`/`rmdir`/`rename` attempted relative to a synthetic cwd) got a matching branch. **Load-bearing fix along the way**: `current_cwd()`/`set_current_cwd()` used to truncate the kernel's own `u64` cwd value to `u32` immediately — harmless while `cwd` only ever held a small real inode index, but would have silently discarded this new tag; both were replaced by a `Cwd` enum-returning pair. Confirmed via `modules/oxfs`'s own boot self-check (system files, chdir in/out of `/proc`, the `EROFS` guard) and `tests/proc_smoke.rs`/`userland/proc-smoke` (a real spawned pid 1 driving all of it through genuine `SYSCALL`/`SYSRETQ`, since the boot self-check itself runs as pid 0 before any real process exists and can't exercise `/proc/<pid>/...` navigation). BusyBox's own `procps/top.c` source confirms `top` is the concrete applet this combination targets (`chdir("/proc")` once at startup, then relative `open("stat")`/`open("meminfo")`) — not yet confirmed live end to end. `free`/`uptime` turn out to call the Linux-only `sysinfo(2)` for their *primary* numbers (confirmed via BusyBox's own `procps/{free,uptime}.c` source) — these two new files don't unblock them; `sysinfo(2)` itself remains a distinct, unimplemented gap |
 | `/proc` filesystem — per-fd (`/proc/<pid>/fd/`) | done (enumeration only) | subset of the above | `src/fd.rs`'s new `oxidebsd_fd_at(pid, index)` (mirrors `oxidebsd_proc_pid_at`'s own "loop until -1" shape, a bounded range scan over the `(pid, fd)`-keyed fd table) backs a new `ProcDirKind::FdList`. Real directory listing, real fd numbers — but each entry is a plain placeholder (`DT_REG`, no real content), **not** a real symlink to its target, since real Linux's own `/proc/<pid>/fd/N` entries are symlinks and this kernel had zero symlink support at all until this same pass added one (see the `SYS_SYMLINK`/`SYS_READLINK` row below). Making these entries real target-bearing symlinks needs a separate, cross-module "describe this fd" mechanism (oxfs doesn't know what a pipe/socket fd actually is; only `src/pipe.rs`/`src/net/*` do) — a known, deliberate limitation, not solved by guessing. Unlocks the enumeration half of `lsof`/`fuser`, not the full readlink-target behavior |

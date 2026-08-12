@@ -134,6 +134,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_sched_get_priority_min(policy: u64) -> i64;
     fn oxidebsd_sys_reboot(cmd: u64) -> i64;
     fn oxidebsd_sys_umask(new_mask: u64) -> i64;
+    fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -201,6 +202,13 @@ const SYS_REBOOT: u64 = 486;
 /// checks for an error at all). See `src/process.rs`'s `do_umask`/`Process::umask` for the real
 /// per-process, stored-not-enforced semantics this backs.
 const SYS_UMASK: u64 = 487;
+/// Invented -- continues past `modules/oxfs`'s own `SYS_CHROOT = 490` (the highest number assigned
+/// anywhere in this ABI as of that pass), not this module's own `105`-`178`/`478`-`487` sequences.
+/// Same "grep every still-inert real Linux `__NR_*` value in `bits/syscall.h.in`" audit as always
+/// -- real `__NR_getrusage` is `98`, nowhere near `491`. Process-resource-adjacent, same module as
+/// `SYS_PRLIMIT64`/`SYS_SETPRIORITY` above, not `modules/oxfs` (no filesystem state involved). See
+/// `src/syscall.rs`'s own `sys_getrusage`/`RawRusage` for the real (honestly all-zero) logic.
+const SYS_GETRUSAGE: u64 = 491;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -326,6 +334,10 @@ extern "C" fn handle_umask(new_mask: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_umask(new_mask) }
 }
 
+extern "C" fn handle_getrusage(who: u64, rusage_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getrusage(who, rusage_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -359,9 +371,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MIN, handle_sched_get_priority_min);
         oxidebsd_register_syscall(SYS_REBOOT, handle_reboot);
         oxidebsd_register_syscall(SYS_UMASK, handle_umask);
+        oxidebsd_register_syscall(SYS_GETRUSAGE, handle_getrusage);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE)\n",
     );
     0
 }

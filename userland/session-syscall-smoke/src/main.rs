@@ -72,6 +72,12 @@ unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u
             in("rdi") arg0,
             in("rsi") arg1,
             in("rdx") arg2,
+            // Explicitly zeroed, not left as whatever garbage the compiler happened to leave in
+            // r10 -- SYSCALL doesn't clear it, and SYS_WAIT4's own optional rusage_ptr 4th
+            // argument now reads it for real. Every 3-argument syscall's own handler still just
+            // ignores this (an unused `_arg3` parameter), so zeroing it here is safe for all of
+            // them, not just wait4.
+            in("r10") 0u64,
             failed = out(reg_byte) failed,
             lateout("rcx") _,
             lateout("r11") _,
