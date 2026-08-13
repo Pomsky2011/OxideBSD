@@ -118,6 +118,13 @@ const SYS_CLOSE: u64 = 6;
 /// return value, so it went on to read a garbage/zero-length buffer and reported `invalid object
 /// file` for every crt/lib file it opened, not just "not found".
 const SYS_LSEEK: u64 = 8;
+/// Real x86_64 Linux's own `__NR_access` value -- like `SYS_LSEEK` above, still at its inert
+/// value in `third_party/musl/arch/x86_64/bits/syscall.h.in` (confirmed unclaimed by grepping
+/// every already-registered syscall number in this codebase), so no remap was needed, only the
+/// argument-convention patch every path-taking syscall needs (see `oxfs_access`'s own doc
+/// comment). Found live: `[boot] unrecognized syscall number 21` whenever real `access(2)` (PATH
+/// search via `execvp`, `test -e`/`-r`/`-w`/`-x`, ...) was reached.
+const SYS_ACCESS: u64 = 21;
 const SYS_CHDIR: u64 = 12;
 const SYS_MKDIR: u64 = 136;
 const SYS_GETCWD: u64 = 108;
@@ -954,17 +961,26 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
     0
 }
 
-/// Real POSIX permission check: `uid == 0` (root) bypasses read/write bits entirely, same as every
-/// real Unix -- this kernel's own single-user reality (root is the only uid that has ever existed
-/// so far, see `Process::uid`'s own doc comment in `src/process.rs`) means this always evaluates to
-/// `true` today, but the logic is real, not a stub -- it'll start mattering the moment `setuid`
+/// Real POSIX `F_OK`/`X_OK`/`W_OK`/`R_OK` `amode` bits — the exact values musl's own `<unistd.h>`
+/// (and every other libc) defines them as, so real `access(2)`'s own `amode` argument needs no
+/// translation at this kernel boundary; `check_access`'s own `want` parameter uses this same
+/// encoding directly.
+const X_OK: u8 = 1;
+const W_OK: u8 = 2;
+const R_OK: u8 = 4;
+
+/// Real POSIX permission check: `uid == 0` (root) bypasses every bit entirely, same as every real
+/// Unix — this kernel's own single-user reality (root is the only uid that has ever existed so
+/// far, see `Process::uid`'s own doc comment in `src/process.rs`) means this always evaluates to
+/// `true` today, but the logic is real, not a stub — it'll start mattering the moment `setuid`
 /// actually gets used to drop privilege. Otherwise picks the owner/group/other rwx triplet by
 /// comparing against the inode's own `uid`/`gid` (first match wins, real Unix semantics: being in
 /// the owning group doesn't fall through to "other" just because the group bits happen to deny
-/// it), then checks the one requested bit (`0o4` read, `0o2` write). No execute-bit check here —
-/// see `oxfs_open`'s own doc comment for why `do_execve`'s reuse of the ordinary read path means
-/// there's no separate execute-permission check to make yet.
-fn check_access(inode: &Inode, uid: u64, gid: u64, want_write: bool) -> bool {
+/// it), then requires every bit in `want` (`R_OK`/`W_OK`/`X_OK`, singly or combined — real
+/// `access(2)`'s own encoding, see the constants above) to be set. `oxfs_open`'s own existing
+/// callers only ever pass a single bit (`R_OK` or `W_OK`); `oxfs_access` below is the one caller
+/// that can pass a real combination.
+fn check_access(inode: &Inode, uid: u64, gid: u64, want: u8) -> bool {
     if uid == 0 {
         return true;
     }
@@ -976,8 +992,7 @@ fn check_access(inode: &Inode, uid: u64, gid: u64, want_write: bool) -> bool {
     } else {
         mode & 0o7
     };
-    let want = if want_write { 0o2 } else { 0o4 };
-    bits & want != 0
+    bits & want as u16 == want as u16
 }
 
 /// `write_stat`'s counterpart for a synthetic `/proc` entry -- no real inode to read, so every
@@ -1664,6 +1679,26 @@ fn proc_relative_stat(kind: ProcDirKind, path: &[u8], buf_ptr: u64) -> i64 {
     };
     match proc_kind(&suffix[..len]) {
         Some(is_dir) => write_proc_stat(is_dir, buf_ptr),
+        None => -ENOENT,
+    }
+}
+
+/// `oxfs_access`'s own cwd-relative delegate -- `/proc` has no real permission bits (see
+/// `oxfs_access`'s own doc comment), so this is existence-only, the same shape
+/// `proc_relative_readlink` below already uses for its own "exists or not" question.
+fn proc_relative_access(kind: ProcDirKind, path: &[u8]) -> i64 {
+    if path.is_empty() || path == b"." {
+        return 0;
+    }
+    if path == b".." {
+        return 0;
+    }
+    let mut suffix = [0u8; MAX_CWD_PATH];
+    let Some(len) = proc_join_suffix(kind, path, &mut suffix) else {
+        return -ENOENT;
+    };
+    match proc_kind(&suffix[..len]) {
+        Some(_) => 0,
         None => -ENOENT,
     }
 }
@@ -2431,7 +2466,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
             let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
             // Real O_RDONLY is 0 -- "anything but that" in the low two bits means O_WRONLY/O_RDWR.
             let want_write = flags & O_ACCMODE != 0;
-            if !check_access(&inode, uid, gid, want_write) {
+            if !check_access(&inode, uid, gid, if want_write { W_OK } else { R_OK }) {
                 return -EACCES;
             }
             match inode.kind {
@@ -2476,7 +2511,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
         None if create => {
             let parent_inode = read_inode(parent);
             let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
-            if !check_access(&parent_inode, uid, gid, true) {
+            if !check_access(&parent_inode, uid, gid, W_OK) {
                 return -EACCES;
             }
             let mut name = [0u8; NAME_MAX];
@@ -3129,7 +3164,7 @@ extern "C" fn oxfs_link(existing_ptr: u64, existing_len: u64, new_ptr: u64, new_
         return -EXDEV;
     }
     let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
-    if !check_access(&read_inode(new_parent), uid, gid, true) {
+    if !check_access(&read_inode(new_parent), uid, gid, W_OK) {
         return -EACCES;
     }
     if inode.nlink == u16::MAX {
@@ -3182,7 +3217,7 @@ extern "C" fn oxfs_mknod(path_ptr: u64, path_len: u64, mode: u64, dev: u64) -> i
     if kind == InodeKind::Device && uid != 0 {
         return -EPERM;
     }
-    if !check_access(&read_inode(parent), uid, gid, true) {
+    if !check_access(&read_inode(parent), uid, gid, W_OK) {
         return -EACCES;
     }
     let Some(new_inode) = alloc_inode_in(parent) else {
@@ -3280,6 +3315,57 @@ extern "C" fn oxfs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64
             let _ = dir_insert(old_parent, old_leaf, target);
             errno_for(e)
         }
+    }
+}
+
+/// Registered for `SYS_ACCESS`, kept at real Linux's own inert value (`21`) rather than one of
+/// this ABI's own invented numbers -- `third_party/musl/arch/x86_64/bits/syscall.h.in` never
+/// remapped `__NR_access`, and nothing else in this ABI claims `21` (confirmed by grep across
+/// every registered syscall number here), the same "leave it where musl already emits it" call
+/// already made for `SYS_WRITEV`/`SYS_PIPE` in that same header. `(path_ptr, path_len, amode)` --
+/// real `access(2)`'s own `(path, amode)` shape plus the length-prefixed path convention every
+/// other path-taking syscall here uses (see `third_party/musl/src/unistd/access.c`'s own patch).
+/// `amode == F_OK` (`0`) is existence-only; otherwise every requested `R_OK`/`W_OK`/`X_OK` bit
+/// (singly or combined) must be granted, checked against the caller's real uid/gid via
+/// `check_access` (this kernel has no separate effective uid to diverge from -- see `Process::
+/// uid`'s own doc comment in `src/process.rs`). `/proc` entries have no real permission bits (see
+/// `write_proc_stat`'s own fixed-placeholder stance) -- existence alone is treated as access,
+/// matching this codebase's "don't pretend to model what isn't there" approach elsewhere.
+extern "C" fn oxfs_access(path_ptr: u64, path_len: u64, amode: u64, _r10: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+
+    if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
+        return match proc_kind(&path[5..]) {
+            Some(_) => 0,
+            None => -ENOENT,
+        };
+    }
+
+    let cwd = match current_cwd() {
+        Cwd::Real(inode) => inode,
+        Cwd::Proc(kind) => {
+            if path.first() == Some(&b'/') {
+                ROOT_INODE
+            } else {
+                return proc_relative_access(kind, path);
+            }
+        }
+    };
+    let inode_num = match resolve_path(cwd, path) {
+        Ok(v) => v,
+        Err(e) => return errno_for(e),
+    };
+    let amode = amode as u8;
+    if amode == 0 {
+        return 0;
+    }
+    let inode = read_inode(inode_num);
+    let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
+    if check_access(&inode, uid, gid, amode) {
+        0
+    } else {
+        -EACCES
     }
 }
 
@@ -6136,6 +6222,7 @@ pub extern "C" fn module_init() -> i32 {
     // SAFETY: FFI calls to kernel-exported functions, matching their declared signatures exactly.
     unsafe {
         oxidebsd_register_syscall(SYS_OPEN, oxfs_open);
+        oxidebsd_register_syscall(SYS_ACCESS, oxfs_access);
         oxidebsd_register_syscall(SYS_CLOSE, sys_close);
         oxidebsd_register_syscall(SYS_CHDIR, oxfs_chdir);
         oxidebsd_register_syscall(SYS_CHROOT, oxfs_chroot);

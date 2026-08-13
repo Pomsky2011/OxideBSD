@@ -5,7 +5,7 @@ AI GENERATED CONTENT DISCLOSURE!
 AI assistance was used in the making of this project. If you do not like this, you can look at a different repository.
 
 Overview:
-The kernel is a highly modular monolithic kernel, to allow isolating attack surface even if it is wide, such that exploits can be isolated and fixed quickly.
+The kernel is a hybrid of monolithic and modular, to allow isolating attack surface even if it is wide, such that exploits can be isolated and fixed quickly.
 This technique also speeds up development as it allows critical system components to be developed seperately from the kernel.
 It also removes one of the key disadvantages of modularity, as it allows components to run at the same level as the kernel.
 

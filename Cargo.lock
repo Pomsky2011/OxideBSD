@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "access-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
