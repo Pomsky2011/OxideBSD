@@ -1736,24 +1736,35 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
         );
     }
 
-    let deps_dir = target_dir.join("x86_64-oxidebsd/release/deps");
-    let module_obj = find_emitted_object_file(&stdout, crate_name).unwrap_or_else(|| {
-        newest_matching(&deps_dir, &format!("{crate_name}-"), ".o").unwrap_or_else(|| {
-            panic!(
-                "{crate_name}: no object file found via cargo's own JSON build output, and none \
-                 matching the fallback `{crate_name}-*.o` pattern in {} either\n--- cargo stdout \
-                 ---\n{stdout}",
-                deps_dir.display()
-            )
-        })
-    });
-
     let sysroot = rustc_output(manifest_dir, &["--print", "sysroot"]);
     let host = host_triple(manifest_dir);
     let llvm_bin = Path::new(&sysroot)
         .join("lib/rustlib")
         .join(&host)
         .join("bin");
+
+    let deps_dir = target_dir.join("x86_64-oxidebsd/release/deps");
+    let module_obj = find_artifact_file(&stdout, crate_name, ".o")
+        .or_else(|| newest_matching(&deps_dir, &format!("{crate_name}-"), ".o"))
+        .unwrap_or_else(|| {
+            // Last resort -- confirmed live on rustc 1.99.0-nightly: cargo's own JSON build
+            // output can report a crate's `compiler-artifact` message with only its `.rlib`/
+            // `.rmeta` in `filenames`, no `.o` at all, even though `--emit=obj` was passed and the
+            // build genuinely succeeded -- `--emit=obj` silently dropped, not just renamed. Pull
+            // the real compiled object straight out of the `.rlib` cargo always produces instead
+            // of depending on that flag working at all (see `extract_object_from_rlib`'s own doc
+            // comment).
+            let rlib = find_artifact_file(&stdout, crate_name, ".rlib")
+                .or_else(|| newest_matching(&deps_dir, &format!("lib{crate_name}-"), ".rlib"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{crate_name}: no object file *or* rlib found anywhere -- cargo's own \
+                         JSON build output:\n{stdout}"
+                    )
+                });
+            let extract_dir = target_dir.join(format!("{crate_name}-rlib-extract"));
+            extract_object_from_rlib(&llvm_bin, &rlib, &extract_dir, crate_name)
+        });
 
     let merged_obj = target_dir.join(format!("{crate_name}-merged.o"));
     partial_link(crate_name, &llvm_bin, &deps_dir, &module_obj, &merged_obj);
@@ -1772,16 +1783,20 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
 
 /// Scans `cargo rustc --message-format=json-render-diagnostics`'s own stdout (plain ndjson, one
 /// JSON object per line, no pretty-printing) for the `compiler-artifact` message naming
-/// `crate_name`'s own build, and returns the `.o` path out of its real `filenames` array -- the
-/// artifact's actual, cargo-reported location, not a guessed `{crate}-<hash>.o` filename pattern
-/// (see `build_module_crate`'s own doc comment on why guessing broke on a newer nightly: that
-/// naming convention was never a stability guarantee to begin with).
+/// `crate_name`'s own build, and returns whichever path in its real `filenames` array ends in
+/// `suffix` (`".o"` or `".rlib"`) -- the artifact's actual, cargo-reported location, not a guessed
+/// `{crate}-<hash>.<ext>` filename pattern (see `build_module_crate`'s own doc comment on why
+/// guessing broke on a newer nightly: that naming convention was never a stability guarantee to
+/// begin with). Returns `None` both when the message itself is missing and when the message
+/// exists but no filename with that suffix is in it -- confirmed live (rustc 1.99.0-nightly) that
+/// the latter genuinely happens for `.o`: cargo's own `compiler-artifact` message for a `--lib`
+/// build can list only `.rlib`/`.rmeta`, silently dropping `--emit=obj` from the emitted set.
 ///
 /// Hand-rolled substring scanning, not a `serde_json` build-dependency: cargo's message-format
 /// output is simple single-line JSON with no nested arrays inside `filenames`, and this project's
 /// own paths never contain characters needing JSON escaping (no quotes/backslashes) -- a real
 /// parser would be more correct in the abstract but pure ceremony for this one shape of input.
-fn find_emitted_object_file(cargo_json_stdout: &str, crate_name: &str) -> Option<PathBuf> {
+fn find_artifact_file(cargo_json_stdout: &str, crate_name: &str, suffix: &str) -> Option<PathBuf> {
     let name_needle = format!("\"name\":\"{crate_name}\"");
     for line in cargo_json_stdout.lines() {
         if !line.contains("\"reason\":\"compiler-artifact\"") || !line.contains(&name_needle) {
@@ -1796,12 +1811,63 @@ fn find_emitted_object_file(cargo_json_stdout: &str, crate_name: &str) -> Option
         };
         for raw in line[list_start..list_start + list_len].split(',') {
             let path = raw.trim().trim_matches('"');
-            if path.ends_with(".o") {
+            if path.ends_with(suffix) {
                 return Some(PathBuf::from(path));
             }
         }
     }
     None
+}
+
+/// Last-resort fallback for getting a module's compiled object code when cargo's own `--emit=obj`
+/// passthrough produces nothing usable (see `find_artifact_file`'s own doc comment for when this
+/// happens). An `.rlib` is itself just an `ar` archive whose members are the crate's real compiled
+/// object code (one member per codegen unit) plus a `lib.rmeta` metadata member -- `llvm-ar x`
+/// extracts them directly, sidestepping `--emit` entirely rather than depending on cargo choosing
+/// to honor it. `-C codegen-units=1` (already passed at every module's own build_module_crate call
+/// site) should mean exactly one extracted member ends in `.o`; this panics loudly rather than
+/// guessing if that invariant doesn't hold, since silently picking one of several codegen units
+/// would link a module missing most of its own code.
+fn extract_object_from_rlib(
+    llvm_bin: &Path,
+    rlib: &Path,
+    extract_dir: &Path,
+    crate_name: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(extract_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", extract_dir.display()));
+
+    let llvm_ar = llvm_bin.join("llvm-ar");
+    let status = Command::new(&llvm_ar)
+        .arg("x")
+        .arg(rlib)
+        .current_dir(extract_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run llvm-ar on {}: {e}", rlib.display()));
+    if !status.success() {
+        panic!("llvm-ar failed to extract {}: {status}", rlib.display());
+    }
+
+    let objects: Vec<PathBuf> = std::fs::read_dir(extract_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", extract_dir.display()))
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "o"))
+        .collect();
+
+    match objects.as_slice() {
+        [only] => only.clone(),
+        [] => panic!(
+            "{crate_name}: extracted {} but it contains no .o member -- is it actually an rlib?",
+            rlib.display()
+        ),
+        many => panic!(
+            "{crate_name}: rlib {} contained {} object members ({many:?}), expected exactly one \
+             -- codegen-units=1 may not have taken effect for this build",
+            rlib.display(),
+            many.len()
+        ),
+    }
 }
 
 /// Merges `module_obj` with the exact `core`/`alloc`/`compiler_builtins` rlibs found in
