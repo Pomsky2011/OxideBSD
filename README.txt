@@ -22,4 +22,4 @@ Each major release will have extended support for a year after the release of it
 There is one exception: The LTS releases of vX.0 will have support for 3 years after the release of its successor.
 Each minor release will be supported for 2 months after the release of its successor, of course excluding LTS releases.
 The format is a typical semantic release, where the minor versions have minor feature additions between them, the major versions have major overhauls or feature additions between them, and the bugfix versions merely carry bugfixes between them.
-
+v0.x.y releases WILL BE UNSTABLE. Therefore they will not have extended support past a week.
