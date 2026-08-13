@@ -1701,6 +1701,14 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
             "--lib",
             "--target-dir",
             target_dir.to_str().unwrap(),
+            // Structured output, parsed below to find the real `--emit=obj` artifact path
+            // directly rather than guessing a filename convention (`{crate}-<hash>.o`) that isn't
+            // part of any stability guarantee -- found live on a newer nightly (rustc
+            // 1.99.0-nightly) where that guessed pattern no longer matched anything cargo actually
+            // wrote, even though the build itself succeeded. `-render-diagnostics` keeps warning/
+            // error text human-readable inside the JSON stream (in each message's own `rendered`
+            // field) rather than needing a second pass to reformat raw diagnostic spans.
+            "--message-format=json-render-diagnostics",
             "--",
             "--emit=obj",
             "-C",
@@ -1715,22 +1723,30 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let status = command
-        .status()
+    let output = command
+        .output()
         .unwrap_or_else(|e| panic!("failed to run cargo rustc for module {crate_name}: {e}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !status.success() {
-        panic!("building the {crate_name} module's object file failed: {status}");
+    if !output.status.success() {
+        panic!(
+            "building the {crate_name} module's object file failed: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let deps_dir = target_dir.join("x86_64-oxidebsd/release/deps");
-    let module_obj =
+    let module_obj = find_emitted_object_file(&stdout, crate_name).unwrap_or_else(|| {
         newest_matching(&deps_dir, &format!("{crate_name}-"), ".o").unwrap_or_else(|| {
             panic!(
-                "{crate_name}: no object file found in {}",
+                "{crate_name}: no object file found via cargo's own JSON build output, and none \
+                 matching the fallback `{crate_name}-*.o` pattern in {} either\n--- cargo stdout \
+                 ---\n{stdout}",
                 deps_dir.display()
             )
-        });
+        })
+    });
 
     let sysroot = rustc_output(manifest_dir, &["--print", "sysroot"]);
     let host = host_triple(manifest_dir);
@@ -1752,6 +1768,40 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
         "cargo:rustc-env={env_var}_MOD_PANIC_SYMBOL={}",
         panic_symbol.as_deref().unwrap_or("")
     );
+}
+
+/// Scans `cargo rustc --message-format=json-render-diagnostics`'s own stdout (plain ndjson, one
+/// JSON object per line, no pretty-printing) for the `compiler-artifact` message naming
+/// `crate_name`'s own build, and returns the `.o` path out of its real `filenames` array -- the
+/// artifact's actual, cargo-reported location, not a guessed `{crate}-<hash>.o` filename pattern
+/// (see `build_module_crate`'s own doc comment on why guessing broke on a newer nightly: that
+/// naming convention was never a stability guarantee to begin with).
+///
+/// Hand-rolled substring scanning, not a `serde_json` build-dependency: cargo's message-format
+/// output is simple single-line JSON with no nested arrays inside `filenames`, and this project's
+/// own paths never contain characters needing JSON escaping (no quotes/backslashes) -- a real
+/// parser would be more correct in the abstract but pure ceremony for this one shape of input.
+fn find_emitted_object_file(cargo_json_stdout: &str, crate_name: &str) -> Option<PathBuf> {
+    let name_needle = format!("\"name\":\"{crate_name}\"");
+    for line in cargo_json_stdout.lines() {
+        if !line.contains("\"reason\":\"compiler-artifact\"") || !line.contains(&name_needle) {
+            continue;
+        }
+        let Some(list_start) = line.find("\"filenames\":[") else {
+            continue;
+        };
+        let list_start = list_start + "\"filenames\":[".len();
+        let Some(list_len) = line[list_start..].find(']') else {
+            continue;
+        };
+        for raw in line[list_start..list_start + list_len].split(',') {
+            let path = raw.trim().trim_matches('"');
+            if path.ends_with(".o") {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    None
 }
 
 /// Merges `module_obj` with the exact `core`/`alloc`/`compiler_builtins` rlibs found in
