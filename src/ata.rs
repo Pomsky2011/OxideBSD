@@ -175,56 +175,99 @@ fn setup_lba28(io_base: u16, lba: u32, sector_count: u8) {
     }
 }
 
-/// Reads one 512-byte sector at `lba` (LBA28) from `channel`/`drive`.
-pub fn read_sector(
+/// Transfers `word_count` 16-bit words from `port` into `buf` (must hold `word_count * 2` bytes)
+/// via a single `rep insw`. **Why not `x86_64::instructions::port::Port`'s `read()` in a loop**:
+/// that's what this replaced -- under QEMU's TCG, each individually decoded/trapped `in`
+/// instruction ends the current translated block, while a single `rep insw` is one instruction
+/// whose whole repeat count is serviced in one trap, the standard OSDev-wiki-recommended technique
+/// for PIO sector transfers. `INSW` targets `ES:(E)DI`; safe only because this kernel runs with a
+/// flat segment model (`ES` base `0`), so the linear address is just `buf`. Guarded by an explicit
+/// `cld` rather than trusting the SysV ABI's "DF clear on entry" convention, since this is the one
+/// place a stray `std` elsewhere would silently corrupt every disk transfer.
+unsafe fn insw(port: u16, buf: *mut u8, word_count: usize) {
+    unsafe {
+        core::arch::asm!(
+            "cld",
+            "rep insw",
+            in("dx") port,
+            inout("rdi") buf => _,
+            inout("rcx") word_count => _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// `insw`'s write counterpart -- `OUTSW` reads from `DS:(E)SI`, same flat-segment reasoning.
+unsafe fn outsw(port: u16, buf: *const u8, word_count: usize) {
+    unsafe {
+        core::arch::asm!(
+            "cld",
+            "rep outsw",
+            in("dx") port,
+            inout("rsi") buf => _,
+            inout("rcx") word_count => _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Reads `sector_count` consecutive 512-byte sectors starting at `lba` (LBA28) from
+/// `channel`/`drive` into `buf` (must be exactly `sector_count as usize * 512` bytes) in a single
+/// command -- the drive command/LBA setup and busy-wait happen once, not once per sector (only the
+/// per-sector `DRQ` wait is inherent to the ATA protocol and can't be batched away). `sector_count`
+/// `0` addresses 256 sectors on real hardware (unused by this driver's own callers, which never
+/// batch past 8).
+pub fn read_sectors(
     channel: Channel,
     drive: Drive,
     lba: u32,
-    buf: &mut [u8; 512],
+    sector_count: u8,
+    buf: &mut [u8],
 ) -> Result<(), AtaError> {
+    debug_assert_eq!(buf.len(), sector_count as usize * 512);
     let p = ports(channel);
     select_drive_lba28(p.io_base, drive, lba);
     wait_while_busy(p.io_base)?;
-    setup_lba28(p.io_base, lba, 1);
+    setup_lba28(p.io_base, lba, sector_count);
     unsafe {
         Port::<u8>::new(p.io_base + REG_STATUS_COMMAND).write(CMD_READ_SECTORS);
     }
-    wait_for_data(p.io_base)?;
-
-    let mut data_port: Port<u16> = Port::new(p.io_base + REG_DATA);
-    for word_slot in buf.chunks_exact_mut(2) {
-        let word = unsafe { data_port.read() };
-        word_slot[0] = (word & 0xFF) as u8;
-        word_slot[1] = (word >> 8) as u8;
+    for sector in 0..sector_count as usize {
+        wait_for_data(p.io_base)?;
+        let sector_buf = &mut buf[sector * 512..(sector + 1) * 512];
+        unsafe {
+            insw(p.io_base + REG_DATA, sector_buf.as_mut_ptr(), 256);
+        }
     }
     Ok(())
 }
 
-/// Writes one 512-byte sector at `lba` (LBA28) to `channel`/`drive`, followed by a real `CACHE
-/// FLUSH` so the write is actually durable in the backing image before this returns -- otherwise
-/// QEMU's own write-back caching could reorder it past a later read of the same sector via a
-/// different code path (there isn't one today, but this is the difference between "looks
-/// persistent" and "is persistent").
-pub fn write_sector(
+/// Writes `sector_count` consecutive 512-byte sectors starting at `lba` (LBA28) to
+/// `channel`/`drive` from `buf`, followed by a single real `CACHE FLUSH` covering the whole batch
+/// (not one per sector) so every sector in it is durable in the backing image before this returns
+/// -- otherwise QEMU's own write-back caching could reorder a write past a later read of the same
+/// sector via a different code path. Same one-command/one-flush-for-the-whole-batch reasoning as
+/// `read_sectors`.
+pub fn write_sectors(
     channel: Channel,
     drive: Drive,
     lba: u32,
-    buf: &[u8; 512],
+    sector_count: u8,
+    buf: &[u8],
 ) -> Result<(), AtaError> {
+    debug_assert_eq!(buf.len(), sector_count as usize * 512);
     let p = ports(channel);
     select_drive_lba28(p.io_base, drive, lba);
     wait_while_busy(p.io_base)?;
-    setup_lba28(p.io_base, lba, 1);
+    setup_lba28(p.io_base, lba, sector_count);
     unsafe {
         Port::<u8>::new(p.io_base + REG_STATUS_COMMAND).write(CMD_WRITE_SECTORS);
     }
-    wait_for_data(p.io_base)?;
-
-    let mut data_port: Port<u16> = Port::new(p.io_base + REG_DATA);
-    for word_slot in buf.chunks_exact(2) {
-        let word = (word_slot[0] as u16) | ((word_slot[1] as u16) << 8);
+    for sector in 0..sector_count as usize {
+        wait_for_data(p.io_base)?;
+        let sector_buf = &buf[sector * 512..(sector + 1) * 512];
         unsafe {
-            data_port.write(word);
+            outsw(p.io_base + REG_DATA, sector_buf.as_ptr(), 256);
         }
     }
 
@@ -233,6 +276,28 @@ pub fn write_sector(
     }
     wait_while_busy(p.io_base)?;
     Ok(())
+}
+
+/// Reads one 512-byte sector at `lba` (LBA28) from `channel`/`drive`. A thin `read_sectors(...,
+/// 1, ...)` wrapper kept for callers that only ever want one sector at a time (`tests/ata_smoke.rs`).
+pub fn read_sector(
+    channel: Channel,
+    drive: Drive,
+    lba: u32,
+    buf: &mut [u8; 512],
+) -> Result<(), AtaError> {
+    read_sectors(channel, drive, lba, 1, buf)
+}
+
+/// Writes one 512-byte sector at `lba` (LBA28) to `channel`/`drive`. A thin `write_sectors(..., 1,
+/// ...)` wrapper kept for callers that only ever want one sector at a time.
+pub fn write_sector(
+    channel: Channel,
+    drive: Drive,
+    lba: u32,
+    buf: &[u8; 512],
+) -> Result<(), AtaError> {
+    write_sectors(channel, drive, lba, 1, buf)
 }
 
 /// Issues `IDENTIFY` against `channel`/`drive` and reports whether a real ATA drive answered.
@@ -318,62 +383,40 @@ pub extern "C" fn oxidebsd_block_device_present() -> i64 {
     }
 }
 
-/// Reads oxfs block `block_no` (4096 bytes) into `buf_ptr`, as 8 real 512-byte sector reads
-/// against the fixed data-disk channel/drive. `-1` on any failure (no device, timeout, device
-/// error) or if no data disk is attached at all; `0` on success. `buf_ptr` is a raw pointer into
-/// the calling module's own memory (a `static mut` block buffer, in oxfs's case) -- modules have
-/// no `alloc`, so this is the same `ptr`+implicit-fixed-length convention every other
-/// `oxidebsd_*` bulk-data function here already uses.
+/// Reads oxfs block `block_no` (4096 bytes) into `buf_ptr` as a single real 8-sector `READ
+/// SECTORS` command (see `read_sectors`'s own doc comment for why this beats 8 separate
+/// single-sector commands) against the fixed data-disk channel/drive. `-1` on any failure (no
+/// device, timeout, device error) or if no data disk is attached at all; `0` on success. `buf_ptr`
+/// is a raw pointer into the calling module's own memory (a `static mut` block buffer, in oxfs's
+/// case, always exactly `BLOCK_SIZE = 4096` bytes) -- modules have no `alloc`, so this is the same
+/// `ptr`+implicit-fixed-length convention every other `oxidebsd_*` bulk-data function here already
+/// uses.
 pub extern "C" fn oxidebsd_block_read(block_no: u64, buf_ptr: u64) -> i64 {
     if !DATA_DISK_PRESENT.load(Ordering::Relaxed) {
         return -1;
     }
-    let base_lba = block_no * 8;
-    let buf = buf_ptr as *mut u8;
-    for i in 0..8u64 {
-        let mut sector = [0u8; 512];
-        if read_sector(
-            DATA_DISK_CHANNEL,
-            DATA_DISK_DRIVE,
-            (base_lba + i) as u32,
-            &mut sector,
-        )
-        .is_err()
-        {
-            return -1;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(sector.as_ptr(), buf.add((i * 512) as usize), 512);
-        }
+    let base_lba = (block_no * 8) as u32;
+    // SAFETY: caller (oxfs) always passes a pointer to a live 4096-byte `static mut` block buffer.
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 4096) };
+    match read_sectors(DATA_DISK_CHANNEL, DATA_DISK_DRIVE, base_lba, 8, buf) {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
-    0
 }
 
-/// Writes oxfs block `block_no` (4096 bytes) from `buf_ptr` to disk, as 8 real 512-byte sector
-/// writes (each followed by a real `CACHE FLUSH` -- see `write_sector`'s own doc comment) against
-/// the fixed data-disk channel/drive. Same `-1`/`0` and `buf_ptr` conventions as
-/// `oxidebsd_block_read`.
+/// Writes oxfs block `block_no` (4096 bytes) from `buf_ptr` to disk as a single real 8-sector
+/// `WRITE SECTORS` command with one `CACHE FLUSH` covering the whole block (see `write_sectors`'s
+/// own doc comment) against the fixed data-disk channel/drive. Same `-1`/`0` and `buf_ptr`
+/// conventions as `oxidebsd_block_read`.
 pub extern "C" fn oxidebsd_block_write(block_no: u64, buf_ptr: u64) -> i64 {
     if !DATA_DISK_PRESENT.load(Ordering::Relaxed) {
         return -1;
     }
-    let base_lba = block_no * 8;
-    let buf = buf_ptr as *const u8;
-    for i in 0..8u64 {
-        let mut sector = [0u8; 512];
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.add((i * 512) as usize), sector.as_mut_ptr(), 512);
-        }
-        if write_sector(
-            DATA_DISK_CHANNEL,
-            DATA_DISK_DRIVE,
-            (base_lba + i) as u32,
-            &sector,
-        )
-        .is_err()
-        {
-            return -1;
-        }
+    let base_lba = (block_no * 8) as u32;
+    // SAFETY: caller (oxfs) always passes a pointer to a live 4096-byte block buffer.
+    let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, 4096) };
+    match write_sectors(DATA_DISK_CHANNEL, DATA_DISK_DRIVE, base_lba, 8, buf) {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
-    0
 }
