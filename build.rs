@@ -1767,7 +1767,14 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
         });
 
     let merged_obj = target_dir.join(format!("{crate_name}-merged.o"));
-    partial_link(crate_name, &llvm_bin, &deps_dir, &module_obj, &merged_obj);
+    partial_link(
+        crate_name,
+        &stdout,
+        &llvm_bin,
+        &deps_dir,
+        &module_obj,
+        &merged_obj,
+    );
 
     let panic_symbol = discover_panic_symbol(&llvm_bin, &merged_obj);
 
@@ -1891,6 +1898,7 @@ fn extract_object_from_rlib(
 /// reachable from it, which brought that same object down to ~60 sections.
 fn partial_link(
     crate_name: &str,
+    cargo_json_stdout: &str,
     llvm_bin: &Path,
     deps_dir: &Path,
     module_obj: &Path,
@@ -1904,13 +1912,22 @@ fn partial_link(
         lld.display()
     );
 
+    // Prefer cargo's own JSON build output over guessing `deps_dir`'s layout -- confirmed live
+    // (rustc 1.99.0-nightly) that `-Z build-std`'s sysroot crates (`core`/`alloc`/
+    // `compiler_builtins`) don't land in `deps/` at all on this toolchain, but under their own
+    // `build/<crate>/<hash>/out/` directory instead (same class of drift as
+    // `find_artifact_file`'s own doc comment documents for `--emit=obj`). Falls back to the old
+    // `deps_dir` glob for whatever toolchain still uses that layout.
     let find_rlib = |name: &str| {
-        newest_matching(deps_dir, &format!("lib{name}-"), ".rlib").unwrap_or_else(|| {
-            panic!(
-                "{crate_name}: no {name} rlib found in {} -- is `-Z build-std` producing one?",
-                deps_dir.display()
-            )
-        })
+        find_artifact_file(cargo_json_stdout, name, ".rlib")
+            .or_else(|| newest_matching(deps_dir, &format!("lib{name}-"), ".rlib"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{crate_name}: no {name} rlib found via cargo's own JSON build output, nor \
+                     in {} -- is `-Z build-std` producing one?",
+                    deps_dir.display()
+                )
+            })
     };
     let core_rlib = find_rlib("core");
     let alloc_rlib = find_rlib("alloc");
