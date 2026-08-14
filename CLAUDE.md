@@ -355,6 +355,15 @@ the tool that found the
   `BlockReason::WaitingForPipeData` + `scheduler::schedule()`), and a **per-process** `(Pid, fd)`
   fd table (`src/fd.rs`) — a flat table broke real pipelines the moment a parent closed its own
   copy of a pipe fd out from under still-using children.
+- **Known, confirmed-live panic: a producer whose own `write()` calls never block can OOM the
+  kernel heap.** `yes | head -n 3` reliably panics (`memory allocation of 67239936 bytes failed`),
+  found by `modules/oxfs/src/test_busybox.sh` (deliberately not exercised there — see that script's
+  own "NOT EXERCISED" comment for the full root-cause writeup). `yes` never yields (no blocking
+  syscall in its write loop), so with no preemption `head` never gets scheduled to read three lines
+  and close its end, and the unbounded `VecDeque<u8>` above grows without limit. Not specific to
+  `yes`/`head` — any pipeline where a non-blocking producer outpaces a consumer that stops reading
+  early has the same failure mode. A real fix needs either actual preemptive scheduling or a
+  bounded pipe buffer with a real blocking writer — a genuine architectural decision, not a patch.
 - **`IA32_FS_BASE` (TLS) is a single global MSR `context_switch::switch_context` never
   saved/restored per-process** — a musl-linked parent resuming after a musl-linked child exited
   would silently run with the dead child's leftover TLS base and fault on its own stack-protector
