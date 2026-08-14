@@ -25,8 +25,9 @@ Current state:
   `src/context_switch.rs`) with `fork`/`execve`/`wait4`/`getpid`, real `argv`/`envp` passthrough,
   blocking pipes, and per-process signal delivery.
 - pid 1 is BusyBox's `hush`, built against a patched musl fork — not the original hand-written
-  `userland/stsh/` shell (still buildable, no longer wired up). ~300 BusyBox applets run as
-  standalone static binaries, `execve`'d individually (not a multi-call `busybox` binary
+  `userland/stsh/` shell (still buildable, no longer wired up). 256 BusyBox applets run as
+  standalone static binaries (curated down from 314 before v0.1 — see the BusyBox port section's
+  own "Removed before v0.1" reference), `execve`'d individually (not a multi-call `busybox` binary
   dispatching on `argv[0]` — that passthrough exists now, but the roster hasn't been rebuilt to
   use it).
 - A real networking stack (`src/pci.rs`, `src/net/*`, `modules/net/`): PCI + an rtl8139 driver,
@@ -301,31 +302,43 @@ future syscall port, so re-check these when adding one:
 
 ## BusyBox port (`third_party/busybox`, `modules/posix_compat/`)
 
-~300 applets run today, each its own standalone single-applet static binary (see Project above for
-why). Vendored as a submodule (fork of `mirror/busybox`, tag `1_36_1`, `oxidebsd` branch — same
-pin/update procedure as musl). `build.rs`'s `build_busybox_applet` runs BusyBox's own
-`allnoconfig` → flip one applet's Kconfig symbol → `make oldconfig` → build, asserting
-`NUM_APPLETS == 1`; `sh` additionally forces on `CONFIG_HUSH_INTERACTIVE`/`HUSH_JOB`/
-`FEATURE_EDITING` and hush's real control-flow symbols (`HUSH_IF`/`HUSH_LOOPS`/`HUSH_CASE`/
-`HUSH_FUNCTIONS`/`HUSH_TICK`/`HUSH_TEST`/...) — `make allnoconfig` writes an explicit "not set"
-for every Kconfig symbol up front, so the later `oldconfig` pass never gets to apply hush's real
-`default y` for these; `configure_busybox_single_applet` flips those lines directly. Applets are
-embedded into oxfs's inode table by `modules/oxfs`'s `module_init` (data-driven from `build.rs`'s
-`BUSYBOX_APPLETS`/`BUSYBOX_APPLETS_PASS2` lists; each new applet needs one manual `seed_file` call
-added in oxfs). The roster grew from 24 to ~300 once `stat`/`fstat`/`lstat`/`getdents` existed, via
-an exhaustive per-applet build probe keeping every applet that built. **"Builds" is a much weaker
-bar than "works"** — plenty of applets that make no sense on this kernel still compile and fail
-cleanly at runtime (`ENOSYS`). `docs/BUSYBOX_APPLETS.md` is the full roster, tagged with what each
-applet still needs (`NEEDS_NETWORK`/`NEEDS_PROC`/`NEEDS_CLOCK`/`NEEDS_UID`/`NEEDS_SYSCALL`/
-`NEEDS_HARDWARE`/`NEEDS_BLOCKDEV`/`NEEDS_INIT`, or `WORKS`), plus what didn't build and why (almost
-entirely missing Linux uapi headers musl doesn't vendor). `modules/oxfs/src/test_busybox.sh`
-(seeded at `/test_busybox.sh`, run via `sh /test_busybox.sh` at the hush prompt) exercises ~40 real
-applet/control-flow checks with a real `PASS`/`FAIL` tally, and is the tool that found the
+256 applets run today (24 original + 232 from the second-pass roster), each its own standalone
+single-applet static binary (see Project above for why). Vendored as a submodule (fork of
+`mirror/busybox`, tag `1_36_1`, `oxidebsd` branch — same pin/update procedure as musl). `build.rs`'s
+`build_busybox_applet` runs BusyBox's own `allnoconfig` → flip one applet's Kconfig symbol →
+`make oldconfig` → build, asserting `NUM_APPLETS == 1`; `sh` additionally forces on
+`CONFIG_HUSH_INTERACTIVE`/`HUSH_JOB`/`FEATURE_EDITING` and hush's real control-flow symbols
+(`HUSH_IF`/`HUSH_LOOPS`/`HUSH_CASE`/`HUSH_FUNCTIONS`/`HUSH_TICK`/`HUSH_TEST`/...) — `make
+allnoconfig` writes an explicit "not set" for every Kconfig symbol up front, so the later
+`oldconfig` pass never gets to apply hush's real `default y` for these; `configure_busybox_single_
+applet` flips those lines directly. Applets are embedded into oxfs's inode table by
+`modules/oxfs`'s `module_init` (data-driven from `build.rs`'s `BUSYBOX_APPLETS`/
+`BUSYBOX_APPLETS_PASS2` lists; each new applet needs one manual `seed_file` call added in oxfs).
+The roster grew from 24 to 290 (287 from an exhaustive per-applet build probe run once
+`stat`/`fstat`/`lstat`/`getdents` existed, keeping every applet that built, plus `cryptpw`/`uname`/
+`hostname` added individually afterward — **"builds" is a much weaker bar than "works"**, plenty of
+applets that make no sense on this kernel still compile and fail cleanly at runtime, usually
+`ENOSYS`), then was deliberately curated down to 232 (256 total with the original 24) before v0.1
+by dropping 58 applets whose core function is structurally incapable of working under this
+kernel's current architecture (not "not yet fixed" — see `docs/BUSYBOX_APPLETS.md`'s own "Removed
+before v0.1" section for the full list and reasoning; a handful of others that looked similarly
+blocked, like `chroot`/`mknod`/`link`, had their blocker close in the meantime and were fixed
+forward into the roster instead). `docs/BUSYBOX_APPLETS.md` is the full roster (its own counts are
+scoped to the original 287-applet probe cohort, so don't include `cryptpw`/`uname`/`hostname`),
+tagged with what each applet still needs (`NEEDS_NETWORK`/`NEEDS_PROC`/`NEEDS_CLOCK`/`NEEDS_UID`,
+or `WORKS`; the once-populated `NEEDS_SYSCALL`/`NEEDS_HARDWARE`/`NEEDS_BLOCKDEV` categories are now
+empty — every applet in them was either fixed forward or cut), plus what didn't build and why
+(almost entirely missing Linux uapi headers musl doesn't vendor). `modules/oxfs/src/test_busybox.sh`
+(seeded at `/test_busybox.sh`, run via `sh /test_busybox.sh` at the hush prompt) started at ~40 real
+applet/control-flow checks and was expanded pre-v0.1 to ~95, covering most of the curated roster
+(what's deliberately left out — daemons, destructive/interactive/hardware-dependent applets — is
+listed under that script's own "NOT EXERCISED" comment), with a real `PASS`/`FAIL` tally, and is
+the tool that found the
 `wait4`/exit-status and `kill(pid,0)` bugs documented below.
 
 - `build_busybox_applet` is staleness-checked against `third_party/busybox`, `build.rs`, and
   `musl_sysroot`'s own `lib/libc.a` mtimes, and builds in parallel across
-  `available_parallelism()` workers — both load-bearing at ~300 applets. **Two real staleness bugs
+  `available_parallelism()` workers — both load-bearing at this roster size. **Two real staleness bugs
   found and fixed**: (1) `libc.a`'s own mtime wasn't originally in the freshness comparison, so a
   musl-side syscall fix left already-built applets linked against a stale libc silently. (2) Even
   with that fixed, BusyBox's own incremental build tracks its own sources but never musl's
@@ -680,7 +693,10 @@ controlling-tty, and login authentication" below adds a real second user.
   owned by a different uid (the one real access-denial check in the test).
 - **Not covered by this pass**: real login/session auth (`su`/`login`/`sulogin`/`getty` — see
   below), mutating `/etc/passwd`/`/etc/group` (applet-level gap, both files already real/writable),
-  `lchown`, `fchmod`/`fchown`, setuid/setgid/sticky bits (`oxfs_chmod` masks input to `0o777`).
+  `lchown`/`fchown`, setuid/setgid/sticky bits (`oxfs_chmod` masks input to `0o777`). `fchmod` is
+  done (`modules/oxfs`'s `oxfs_fchmod`, registered directly at real Linux's own unremapped
+  `__NR_fchmod = 91` — found live post-v0.1: `uudecode` restores a decoded file's mode via a real
+  `fchmod(fd, mode)` call on its still-open output fd, not a path-based `chmod()`).
 
 ## Session, controlling-tty, and login authentication (`src/process.rs`, `src/stdin.rs`, `src/interrupts.rs`, `modules/posix_compat/`, `modules/oxfs/`)
 
@@ -975,6 +991,37 @@ Closes most of the rest of `NEEDS_SYSCALL`: `link`/`ln`, `mknod`/`makedevs`, `ch
 - Verified via `modules/oxfs`'s own boot self-check and `tests/needs_syscall2_smoke.rs` +
   `userland/needs-syscall2-smoke/`.
 
+## Two syscalls found live by the expanded `test_busybox.sh` post-v0.1, both real Linux numbers used directly (`modules/oxfs`, `src/process.rs`)
+
+Running the pre-v0.1-expanded `sh /test_busybox.sh` against a real boot for the first time (the
+script's own comment had flagged it as never yet run live) surfaced two `[boot] unrecognized
+syscall number N]` lines — both real, live musl callers this ABI hadn't registered, not script
+bugs. Both landed at their real, unremapped Linux `__NR_*` values directly rather than an invented
+number: `third_party/musl/arch/x86_64/bits/syscall.h.in` never touches either one, so musl already
+calls `syscall(91, ...)`/`syscall(204, ...)` expecting real semantics, and neither value was
+already claimed anywhere else in this ABI's own registry (checked against every `SYS_*` constant in
+`src/`/`modules/` first — same collision-avoidance discipline as inventing a number, just run in
+reverse).
+
+- **`fchmod` (`modules/oxfs`'s `oxfs_fchmod`, real `__NR_fchmod = 91`)**: found via `uudecode`,
+  which restores a decoded file's mode with a real `fchmod(fd, mode)` call on its still-open output
+  fd, not a path-based `chmod()`. Silently `ENOSYS`'d before this — `uudecode` ignores the return
+  value, so the roundtrip test still passed on content alone; the restored mode was just silently
+  wrong. Resolves the fd the same way `oxfs_fstat`/`oxfs_ftruncate` already do (`resolve_write_fd_
+  inode`, covering a pre-existing or freshly-`O_CREAT`'d write fd, not just a plain read fd), then
+  the same owner-or-root check and `0o777` mask as `oxfs_chmod`.
+- **`sched_getaffinity` (`src/process.rs`'s `do_sched_getaffinity`, real `__NR_sched_getaffinity =
+  204`)**: found via `nproc`, which calls this to count set bits in the affinity mask — but silently
+  falls back to `count = 1` on any failure, so `nproc` printed the right answer by coincidence even
+  while this was a flat `ENOSYS`; the gap only showed up as a logged unrecognized-syscall line, not
+  a wrong result. Implemented anyway (single-core, so the mask is always just bit 0 set) rather than
+  left as a silently-tolerated `ENOSYS`, since a future `taskset`/affinity-querying caller landing on
+  `ENOSYS` isn't obviously as safe as `nproc`'s specific fallback. Real raw-syscall return-value
+  convention (bytes written, not glibc/musl's 0-or-error wrapper convention — see
+  `third_party/musl/src/sched/affinity.c`'s own `do_getaffinity`), so this only ever writes
+  `min(cpusetsize, 8)` real bytes and returns that count; musl's own wrapper zero-fills the rest of
+  the caller's buffer itself.
+
 ## TinyCC: a real, on-target C compiler (`third_party/tinycc`, `modules/oxfs`, `build.rs`)
 
 OxideBSD's first C compiler that runs *on* the target itself. GCC/Clang are a much bigger lift
@@ -1085,7 +1132,12 @@ cluster of applets at once. New syscall numbers should continue from the highest
 assigned (check `src/syscall.rs`/module sources rather than trusting stale numbers here).
 
 **`docs/BUSYBOX_APPLETS.md` is the authoritative, per-applet detail behind every row below** — the
-counts here (out of the 287 applets that built at all) are a summary, not the full picture.
+counts here (out of the 287 applets that built at all) are a summary, not the full picture. A
+pre-v0.1 pass cut 58 of those 287 from the roster entirely (not "not started" — structurally
+incapable of working under this kernel's current architecture: no VT/console/serial/framebuffer/
+syslog device model, namespaces, SysV IPC, ext2 ioctl/xattr, FIFOs, or partition-table/swap/
+hw-profile support) rather than continuing to carry them as dead weight; see that doc's own
+"Removed before v0.1" section for the full list and per-applet reasoning. 229 remain seeded.
 
 | Gap | Status | Blocks (of 287 built) | Placement |
 |---|---|---|---|
@@ -1098,23 +1150,23 @@ counts here (out of the 287 applets that built at all) are a summary, not the fu
 | Socket syscalls + real DNS | done | most of 38 (`NEEDS_NETWORK`) | see "Real networking" — `ping`/`nslookup`/`wget` (plain HTTP) confirmed live |
 | `socketpair`/`fcntl`/`shutdown`/`set_tid_address`/`readv` + `/dev/{u}random,null,zero` + real `tcp_read` EOF fix | done — `wget` HTTPS confirmed live end to end | `wget` HTTPS specifically | see "Real networking" known-gaps entry |
 | `alarm`/`setitimer` | done | `ping`'s receive-loop timeout | `SYS_SETITIMER=156`/`SYS_GETITIMER=157` in `modules/clock` |
-| `chmod`/`chown`/`chgrp` | done | — | `SYS_CHMOD=165`/`SYS_CHOWN=166` in `modules/oxfs` (`chown()` restricted to the group field covers `chgrp` too); `chattr`/`fatattr`/`lsattr`/`setfattr` are a distinct, unstarted ext2-`ioctl`/`xattr` gap |
-| `fsync`/`sync`/`ftruncate`/`fallocate`/`flock`/`statfs`/`setrlimit`/sched-priority/`reboot` | done | subset of 33 (down to 22, `NEEDS_SYSCALL`) | `SYS_FSYNC=471` through `SYS_REBOOT=486` |
-| `link`/`ln`, `mknod`/`makedevs`, `chroot`, `getrusage`/`time` | done | subset of the 22 `NEEDS_SYSCALL` | `SYS_LINK=488`/`SYS_MKNOD=489`/`SYS_CHROOT=490`/`SYS_GETRUSAGE=491` |
-| SysV IPC, namespaces (`unshare`/`nsenter`/`setarch`/`setpriv`), `inotify`, ext2 `ioctl`s/`xattr` | not started | remainder of the 22 `NEEDS_SYSCALL` | namespaces don't fit this kernel's single-address-space model at all |
+| `chmod`/`chown`/`chgrp` | done | — | `SYS_CHMOD=165`/`SYS_CHOWN=166` in `modules/oxfs` (`chown()` restricted to the group field covers `chgrp` too); `chattr`/`fatattr`/`lsattr`/`setfattr` needed a distinct ext2-`ioctl`/`xattr` gap this kernel doesn't implement — those 4 applets were removed from the roster before v0.1 rather than left as dead weight |
+| `fsync`/`sync`/`ftruncate`/`fallocate`/`flock`/`statfs`/`setrlimit`/sched-priority/`reboot` | done | was subset of 33 (`NEEDS_SYSCALL`) | `SYS_FSYNC=471` through `SYS_REBOOT=486` |
+| `link`/`ln`, `mknod`/`makedevs`, `chroot`, `getrusage`/`time` | done | was subset of `NEEDS_SYSCALL` | `SYS_LINK=488`/`SYS_MKNOD=489`/`SYS_CHROOT=490`/`SYS_GETRUSAGE=491` |
+| SysV IPC, namespaces (`unshare`/`nsenter`/`setarch`/`setpriv`), `inotify`, ext2 `ioctl`s/`xattr` | not started, and no longer blocking anything — the applets that needed these (`ipcrm`/`ipcs`, `linux32`/`linux64`/`nsenter`/`setarch`/`setpriv`/`unshare`, `inotifyd`, `chattr`/`fatattr`/`lsattr`/`setfattr`) were removed from the roster before v0.1 | 0 remaining (`NEEDS_SYSCALL` fully resolved: done or removed) | namespaces don't fit this kernel's single-address-space model at all |
 | `/proc` — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`) | done | — | special-cased path prefix in `modules/oxfs` (no VFS layer to plug a separate module into), synthesized from `src/process.rs` accessors. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
 | `/proc` — system-wide (`meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | `MemFree`/`MemAvailable` == `MemTotal` (no dealloc tracking); `/proc/stat`'s `cpu` line all-zero except `idle`. `free`/`uptime` call `sysinfo(2)` for their primary numbers — a distinct, unimplemented gap these don't unblock |
 | `/proc` — per-fd (`/proc/<pid>/fd/`) | done (enumeration only, not real symlinks) | subset of the above | needs a cross-module "describe this fd" mechanism to go further (oxfs doesn't know what a pipe/socket fd is) |
 | Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` | new `InodeKind::Symlink`; `resolve_path_impl` follows for every intermediate component always, final component only when `follow_last` — `MAX_SYMLINK_DEPTH=8`, `ELOOP=40` (musl's real value) |
-| Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started | 24 (`NEEDS_HARDWARE`) | several unrelated small gaps, see `docs/BUSYBOX_APPLETS.md` |
-| Real block device driver + oxfs persistence | done | subset of 17 (`NEEDS_BLOCKDEV`, down from 20) | see "Real disk persistence" — still a fixed, non-mountable backing store outside the scoped mount table below |
-| Mount table (`mount --bind`/`mount -t tmpfs`) | done | `mount`/`umount`/`mountpoint` | see "Mount table" — doesn't unblock `pivot_root`/`switch_root` or anything needing a real partition table |
+| Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started, and no longer blocking anything in the kept roster — `cttyhack`/`setsid` turned out to already work (real session/tty syscalls exist) and moved to WORKS; the other 22 applets in this category were removed before v0.1 | 0 remaining (was 24, `NEEDS_HARDWARE`) | several unrelated small gaps, see `docs/BUSYBOX_APPLETS.md` |
+| Real block device driver + oxfs persistence | done | — | see "Real disk persistence" — still a fixed, non-mountable backing store outside the scoped mount table below |
+| Mount table (`mount --bind`/`mount -t tmpfs`) | done | `mount`/`umount`/`mountpoint` | see "Mount table" — doesn't unblock `pivot_root`/`switch_root` or anything needing a real partition table; that whole remaining `NEEDS_BLOCKDEV` bucket (17 applets) was removed from the roster before v0.1 rather than left blocked indefinitely |
 | uid/passwd-db model | done | most of 16 (`NEEDS_UID`) | see "Permission model". `adduser`/`chpasswd`/`passwd`/... still need real *mutation* of `/etc/passwd`/`/etc/group` (applet-level gap now) |
 | real login/session auth (`su`/`login`/`sulogin`/`getty`) | done | 4 (subset of `NEEDS_UID`) | see "Session, controlling-tty, and login authentication" |
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` |
 | `nanosleep` | done | 9 (`NEEDS_CLOCK`) | `SYS_NANOSLEEP=139` |
-| Init-system/service-supervisor framework | not started, out of scope | 6 (`NEEDS_INIT`) | no init framework to plug into at all |
-| `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (folded into `NEEDS_HARDWARE`) | — |
+| Init-system/service-supervisor framework | not started, out of scope | 2 kept anyway (`bootchartd`/`start_stop_daemon` — their real mechanics don't need an init framework, just fork/exec/setsid/kill/pidfile this kernel already has); 4 removed before v0.1 (`runsv`/`runsvdir`/`svlogd`/`svok` — genuinely dead, the runit family needs FIFOs oxfs doesn't have) | no init framework to plug into at all |
+| `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (its old `NEEDS_HARDWARE` category is now empty — see above) | — |
 | `uname` | done | — | `SYS_UNAME=137` in `modules/posix_compat` |
 | `gethostname` | done | — | no new syscall — musl's `gethostname()` wraps `uname()` |
 

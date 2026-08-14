@@ -146,6 +146,9 @@ const SYS_SYMLINK: u64 = 155;
 /// `posix_compat` (same reasoning `SYS_STAT`/`SYS_FSTAT`/`SYS_LSTAT` already established).
 const SYS_CHMOD: u64 = 165;
 const SYS_CHOWN: u64 = 166;
+/// Real Linux's own `__NR_fchmod` value, used directly rather than an invented number -- see
+/// `oxfs_fchmod`'s own doc comment for why.
+const SYS_FCHMOD: u64 = 91;
 /// Next after `SYS_CHOWN=166` -- see `oxfs_utimensat`'s own doc comment for what this actually
 /// does (a real existence check, no real timestamp storage) and why that's enough to unblock
 /// BusyBox's `touch.c`.
@@ -1860,6 +1863,19 @@ enum OpenFile {
         /// append semantics for an existing file need this distinction: same inode number, same
         /// owner/mode, same directory entry, just new content.
         existing_inode: Option<u32>,
+        /// Set by a successful `SYS_FTRUNCATE`/`SYS_FALLOCATE` on this fd, cleared by any `write()`
+        /// call that actually buffers real bytes -- tells `commit_write_buffer` whether the real
+        /// resize `resize_inode_data` already performed should be left alone at `close()`/`fsync()`
+        /// time, or overwritten by this fd's own write buffer as usual. Found live: real BusyBox
+        /// `truncate FILE` (`open(O_CREAT) -> ftruncate(fd, size) -> close(fd)`, no `write()` call
+        /// at all) had its real resize silently undone the instant `close()` ran -- `commit_write_
+        /// buffer`'s existing-inode branch unconditionally re-committed `buffer[..len]`, and `len`
+        /// was still `0` (no `write()` ever happened), truncating the file straight back to empty.
+        /// A later `write()` on the same fd still wins over an earlier `ftruncate()`, matching real
+        /// Unix's own ordering (see `oxfs_ftruncate`'s own doc comment) -- this flag only guards
+        /// the specific case of `close()`/`fsync()` running with *zero* real `write()` calls ever
+        /// having happened on this fd.
+        resized_directly: bool,
     },
     /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
     /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
@@ -2500,6 +2516,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                         len,
                         owner_uid: inode.uid,
                         existing_inode: Some(resolved),
+                        resized_directly: false,
                     })
                 }
                 _ => register_open_file(OpenFile::FileRead {
@@ -2524,6 +2541,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                 len: 0,
                 owner_uid: uid as u32,
                 existing_inode: None,
+                resized_directly: false,
             })
         }
         None => -ENOENT,
@@ -2603,6 +2621,7 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
         OpenFile::Write {
             buffer,
             len: buf_len,
+            resized_directly,
             ..
         } => {
             let available = MAX_WRITE_BUFFER - *buf_len;
@@ -2614,6 +2633,12 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
             let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, n) };
             buffer[*buf_len..*buf_len + n].copy_from_slice(src);
             *buf_len += n;
+            // A real write() reasserts the normal buffer-wins-at-close behavior -- matches real
+            // Unix's own "whichever happens last" ordering between ftruncate() and write() (see
+            // `resized_directly`'s own doc comment).
+            if n > 0 {
+                *resized_directly = false;
+            }
             n as i64
         }
         // Matches real /dev/null's and /dev/zero's own write behavior (accept and discard); real
@@ -2642,6 +2667,7 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         len,
         owner_uid,
         existing_inode,
+        resized_directly,
     } = file
     else {
         return 0;
@@ -2650,7 +2676,15 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     // existing inode -- same inode number, same directory entry, same owner/mode -- rather
     // than allocating a second inode and re-inserting the name (which would either collide
     // with or orphan the original entry; see OpenFile::Write's own doc comment).
+    //
+    // Skipped entirely when `resized_directly` is still set (a `SYS_FTRUNCATE`/`SYS_FALLOCATE`
+    // already resized this same inode for real, and no `write()` has happened since to justify
+    // overwriting it with -- ordinarily empty -- buffer content) -- see that field's own doc
+    // comment for the real bug this guards against.
     if let Some(inode_num) = *existing_inode {
+        if *resized_directly {
+            return 0;
+        }
         return if write_inode_data(inode_num, &buffer[..*len]) {
             0
         } else {
@@ -2733,16 +2767,38 @@ extern "C" fn oxfs_sync(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     0
 }
 
-/// `SYS_FTRUNCATE`/`SYS_FALLOCATE`'s shared fd-to-inode resolution: `inode_of_open_file` alone
-/// (see its own doc comment) reports `None` for *every* `OpenFile::Write` fd, even one that
-/// already refers to a real, pre-existing inode (`O_WRONLY` on an existing path, not a fresh
+/// Shared fd-to-inode resolution for `SYS_FTRUNCATE`/`SYS_FALLOCATE`/`SYS_FSTAT`: `inode_of_open_
+/// file` alone (see its own doc comment) reports `None` for *every* `OpenFile::Write` fd, even one
+/// that already refers to a real, pre-existing inode (`O_WRONLY` on an existing path, not a fresh
 /// `O_CREAT`) -- exactly BusyBox `truncate`'s own common case (`open()` an existing file, then
 /// `ftruncate()` it). This falls through to that case specifically before giving up.
-fn inode_for_resize(real_fd: u64) -> Option<u32> {
+///
+/// **Also handles a freshly-`O_CREAT`'d file that hasn't been `close()`d yet** (`existing_inode`
+/// still `None` -- no real inode allocated at all until commit, see `OpenFile::Write`'s own doc
+/// comment). Found live twice, both real, common cases, not edge cases: (1) BusyBox `truncate
+/// FILE` on a *nonexistent* `FILE` does exactly `open(path, O_CREAT|O_WRONLY) ->
+/// ftruncate(fd, size)`, so this fd is always still `existing_inode: None` at the moment
+/// `ftruncate()` runs; (2) BusyBox `tar cf`/`ar rc` (once this build's own `FEATURE_TAR_CREATE`/
+/// `FEATURE_AR_CREATE` Kconfig gap closed -- see `build.rs`'s own doc comment) both `fstat()` their
+/// freshly-`O_CREAT`'d output fd before ever writing to it, to confirm it's a real file. Previously
+/// a flat `EBADF` in both cases, since neither match arm above covered it. Forces the same
+/// early-commit `commit_write_buffer` already does for `fsync()`/`sync()` (real inode + directory
+/// entry created *now*, not deferred to `close()`) so there's something real to resize/report on.
+fn resolve_write_fd_inode(real_fd: u64) -> Option<u32> {
     if let Some(inode_num) = inode_of_open_file(real_fd) {
         return Some(inode_num);
     }
-    match find_open_file(real_fd)? {
+    let file = find_open_file(real_fd)?;
+    if let OpenFile::Write {
+        existing_inode: None,
+        ..
+    } = file
+    {
+        if commit_write_buffer(file) != 0 {
+            return None;
+        }
+    }
+    match file {
         OpenFile::Write {
             existing_inode: Some(inode_num),
             ..
@@ -2755,34 +2811,45 @@ fn inode_for_resize(real_fd: u64) -> Option<u32> {
 /// if this fd is also still mid-write (an existing file opened `O_WRONLY`, not yet `close()`d),
 /// a later `write()`/`close()` on it will still overwrite this content again as usual, matching
 /// real Unix's own "whichever happens last wins" ordering between `ftruncate()` and `write()`.
+/// Marks the fd's own `resized_directly` (if it's a `Write` fd at all -- `resolve_write_fd_inode`
+/// also resolves plain read fds via `inode_of_open_file`, which have no such flag to set) so a
+/// later `close()`/`fsync()` with no intervening `write()` doesn't undo this resize -- see that
+/// field's own doc comment for the real bug this closes.
 extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
         return -EBADF;
     }
-    let Some(inode_num) = inode_for_resize(real_fd as u64) else {
+    let Some(inode_num) = resolve_write_fd_inode(real_fd as u64) else {
         return -EBADF;
     };
     if read_inode(inode_num).kind == InodeKind::Dir {
         return -EISDIR;
     }
-    if resize_inode_data(inode_num, len as usize) {
-        0
-    } else {
-        -ENOSPC
+    if !resize_inode_data(inode_num, len as usize) {
+        return -ENOSPC;
     }
+    if let Some(OpenFile::Write {
+        resized_directly, ..
+    }) = find_open_file(real_fd as u64)
+    {
+        *resized_directly = true;
+    }
+    0
 }
 
 /// Registered for `SYS_FALLOCATE`. `mode` is ignored -- always behaves like the default (no
 /// `FALLOC_FL_KEEP_SIZE`/`FALLOC_FL_PUNCH_HOLE`/... flag support, a known simplification no
 /// applet in this port's roster needs past). Zero-extends the file to `offset + len` if it's
-/// currently shorter; otherwise a real no-op (real `fallocate()` never shrinks a file).
+/// currently shorter; otherwise a real no-op (real `fallocate()` never shrinks a file). Marks the
+/// fd's own `resized_directly` on an actual resize -- see `oxfs_ftruncate`'s own doc comment for
+/// why (same real bug, same fix, shared with that syscall).
 extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 {
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
         return -EBADF;
     }
-    let Some(inode_num) = inode_for_resize(real_fd as u64) else {
+    let Some(inode_num) = resolve_write_fd_inode(real_fd as u64) else {
         return -EBADF;
     };
     let inode = read_inode(inode_num);
@@ -2793,11 +2860,16 @@ extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 
     if inode.size as usize >= target {
         return 0;
     }
-    if resize_inode_data(inode_num, target) {
-        0
-    } else {
-        -ENOSPC
+    if !resize_inode_data(inode_num, target) {
+        return -ENOSPC;
     }
+    if let Some(OpenFile::Write {
+        resized_directly, ..
+    }) = find_open_file(real_fd as u64)
+    {
+        *resized_directly = true;
+    }
+    0
 }
 
 /// Registered for `SYS_FLOCK`. See `SYS_FLOCK`'s own doc comment (up near its number's
@@ -3052,6 +3124,16 @@ extern "C" fn oxfs_getcwd(buf_ptr: u64, buf_len: u64, _a2: u64, _a3: u64) -> i64
 /// Registered for `SYS_MKDIR`. `path` may now be multi-component (`sub/nested`, as long as `sub`
 /// already exists) -- `resolve_parent` handles that the same way it does for `open`'s `O_CREAT`
 /// case.
+///
+/// **`mkdir("/")` (or any path with no leaf component after stripping trailing slashes) needs its
+/// own real `EEXIST`, not `resolve_parent`'s generic `EINVAL`.** Found live: BusyBox's own
+/// `mkdir -p` walks and creates every leading component of an *absolute* path, including
+/// attempting `mkdir("/")` itself as the very first step -- its own EEXIST-tolerant loop treats
+/// any other errno as a hard failure, so a real `mkdir -p /some/absolute/path` aborted outright.
+/// `resolve_parent` can't just be changed generically (`rmdir`/`rename`/`symlink`/`mknod` share it
+/// and have their own, different correct answers for "no leaf" -- real `rmdir("/")` is `EBUSY`,
+/// not `EEXIST`), so this is handled here, specific to `mkdir`'s own real semantics: create-target-
+/// already-exists is always `EEXIST`, regardless of whether that target happens to be the root.
 extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -3062,6 +3144,7 @@ extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 
     let (parent, leaf) = match resolve_parent(cwd, path) {
         Ok(v) => v,
+        Err(OxfsError::InvalidPath) if resolve_path(cwd, path).is_ok() => return -EEXIST,
         Err(e) => return errno_for(e),
     };
     if dir_lookup(parent, leaf).is_some() {
@@ -3582,6 +3665,41 @@ extern "C" fn oxfs_chown(path_ptr: u64, path_len: u64, uid: u64, gid: u64) -> i6
     0
 }
 
+/// Registered for `SYS_FCHMOD` at real Linux's own `__NR_fchmod = 91` -- unlike every other
+/// syscall in this module, this one needed no invented number and no musl-side remap at all:
+/// `third_party/musl/arch/x86_64/bits/syscall.h.in` never touches `__NR_fchmod`, so musl's
+/// `fchmod(2)` wrapper already calls `syscall(91, fd, mode)` directly, and `91` was still
+/// completely unassigned in this ABI's own registry (checked against every `SYS_*` constant in
+/// `src/`/`modules/` before landing here -- same collision-avoidance discipline as inventing a new
+/// number, just confirming the reverse: that using the real value directly doesn't collide with an
+/// already-invented one). Found live: BusyBox's `uudecode` restores the encoded file's mode via
+/// `fchmod(fd, mode)` on its still-open output fd, not a path-based `chmod()` -- previously a
+/// silent `ENOSYS` (uudecode ignores the return value, so the roundtrip test still passed on
+/// content alone; the restored mode was just silently wrong).
+///
+/// Uses `resolve_write_fd_inode`, not the narrower `inode_of_open_file` -- same reasoning as
+/// `oxfs_fstat`'s own doc comment: a still-open `OpenFile::Write` fd (pre-existing or freshly
+/// `O_CREAT`'d) needs to resolve to a real inode here too. Same owner-or-root permission check and
+/// `0o777` mode mask as `oxfs_chmod` above (see that function's own doc comment for why).
+extern "C" fn oxfs_fchmod(fd: u64, mode: u64, _a2: u64, _a3: u64) -> i64 {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let Some(inode_num) = resolve_write_fd_inode(real_fd as u64) else {
+        return -EBADF;
+    };
+    let mut inode = read_inode(inode_num);
+    let caller_uid = unsafe { oxidebsd_current_uid() };
+    if caller_uid != 0 && caller_uid != inode.uid as u64 {
+        return -EPERM;
+    }
+    inode.mode = (mode & 0o777) as u16;
+    write_inode(inode_num, inode);
+    0
+}
+
 /// Registered for `SYS_UTIMENSAT`. `(path_ptr, path_len, _times_ptr, _flags)` -- see
 /// `third_party/musl/src/stat/utimensat.c`'s own patch comment for the real wire-format story
 /// (dropped the always-`AT_FDCWD` `fd` argument, computed `path_len` explicitly). This filesystem
@@ -3794,13 +3912,20 @@ extern "C" fn oxfs_umount2(target_ptr: u64, target_len: u64, _flags: u64, _r10: 
 /// module's `real_fd` -- `oxidebsd_real_fd_of` (see its own doc comment in `src/fd.rs`) resolves
 /// that first, the same way `SYS_READ`/`SYS_WRITE` get it resolved for them automatically by
 /// `crate::fd::read`/`write` before ever reaching a registered callback.
+///
+/// **Uses `resolve_write_fd_inode`, not the narrower `inode_of_open_file`** -- see that function's
+/// own doc comment: a still-open `OpenFile::Write` fd (whether against a pre-existing inode or a
+/// freshly-`O_CREAT`'d one not yet committed) used to report a flat `EBADF` here, which is exactly
+/// what broke real BusyBox `tar cf`/`ar rc` (both `fstat()` their freshly-created output fd before
+/// writing anything to it, to confirm it's a real file) once this build's own archive-creation
+/// Kconfig gap closed.
 extern "C" fn oxfs_fstat(fd: u64, buf_ptr: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
         return -EBADF;
     }
-    match inode_of_open_file(real_fd as u64) {
+    match resolve_write_fd_inode(real_fd as u64) {
         Some(inode_num) => write_stat(inode_num, buf_ptr),
         None => -EBADF,
     }
@@ -4654,7 +4779,6 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"arch", include_bytes!(env!("OXFS_ARCH_ELF_PATH")));
     ok &= seed_file(bin, b"sysctl", include_bytes!(env!("OXFS_SYSCTL_ELF_PATH")));
     ok &= seed_file(bin, b"bc", include_bytes!(env!("OXFS_BC_ELF_PATH")));
-    ok &= seed_file(bin, b"blkid", include_bytes!(env!("OXFS_BLKID_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"bootchartd",
@@ -4669,7 +4793,6 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"bzip2", include_bytes!(env!("OXFS_BZIP2_ELF_PATH")));
     ok &= seed_file(bin, b"cal", include_bytes!(env!("OXFS_CAL_ELF_PATH")));
     ok &= seed_file(bin, b"chat", include_bytes!(env!("OXFS_CHAT_ELF_PATH")));
-    ok &= seed_file(bin, b"chattr", include_bytes!(env!("OXFS_CHATTR_ELF_PATH")));
     ok &= seed_file(bin, b"chgrp", include_bytes!(env!("OXFS_CHGRP_ELF_PATH")));
     ok &= seed_file(bin, b"chmod", include_bytes!(env!("OXFS_CHMOD_ELF_PATH")));
     ok &= seed_file(bin, b"chown", include_bytes!(env!("OXFS_CHOWN_ELF_PATH")));
@@ -4680,7 +4803,6 @@ fn format_fresh_filesystem() -> bool {
     );
     ok &= seed_file(bin, b"chroot", include_bytes!(env!("OXFS_CHROOT_ELF_PATH")));
     ok &= seed_file(bin, b"chrt", include_bytes!(env!("OXFS_CHRT_ELF_PATH")));
-    ok &= seed_file(bin, b"chvt", include_bytes!(env!("OXFS_CHVT_ELF_PATH")));
     ok &= seed_file(bin, b"cksum", include_bytes!(env!("OXFS_CKSUM_ELF_PATH")));
     ok &= seed_file(bin, b"clear", include_bytes!(env!("OXFS_CLEAR_ELF_PATH")));
     ok &= seed_file(bin, b"cmp", include_bytes!(env!("OXFS_CMP_ELF_PATH")));
@@ -4708,16 +4830,9 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"dd", include_bytes!(env!("OXFS_DD_ELF_PATH")));
     ok &= seed_file(
         bin,
-        b"deallocvt",
-        include_bytes!(env!("OXFS_DEALLOCVT_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
         b"delgroup",
         include_bytes!(env!("OXFS_DELGROUP_ELF_PATH")),
     );
-    ok &= seed_file(bin, b"devfsd", include_bytes!(env!("OXFS_DEVFSD_ELF_PATH")));
-    ok &= seed_file(bin, b"devmem", include_bytes!(env!("OXFS_DEVMEM_ELF_PATH")));
     ok &= seed_file(bin, b"df", include_bytes!(env!("OXFS_DF_ELF_PATH")));
     ok &= seed_file(
         bin,
@@ -4746,17 +4861,11 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"du", include_bytes!(env!("OXFS_DU_ELF_PATH")));
     ok &= seed_file(
         bin,
-        b"dumpkmap",
-        include_bytes!(env!("OXFS_DUMPKMAP_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
         b"dumpleases",
         include_bytes!(env!("OXFS_DUMPLEASES_ELF_PATH")),
     );
     ok &= seed_file(bin, b"ed", include_bytes!(env!("OXFS_ED_ELF_PATH")));
     ok &= seed_file(bin, b"egrep", include_bytes!(env!("OXFS_EGREP_ELF_PATH")));
-    ok &= seed_file(bin, b"eject", include_bytes!(env!("OXFS_EJECT_ELF_PATH")));
     ok &= seed_file(bin, b"env", include_bytes!(env!("OXFS_ENV_ELF_PATH")));
     ok &= seed_file(
         bin,
@@ -4776,40 +4885,11 @@ fn format_fresh_filesystem() -> bool {
         b"fallocate",
         include_bytes!(env!("OXFS_FALLOCATE_ELF_PATH")),
     );
-    ok &= seed_file(
-        bin,
-        b"fatattr",
-        include_bytes!(env!("OXFS_FATATTR_ELF_PATH")),
-    );
-    ok &= seed_file(bin, b"fbset", include_bytes!(env!("OXFS_FBSET_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"fdformat",
-        include_bytes!(env!("OXFS_FDFORMAT_ELF_PATH")),
-    );
-    ok &= seed_file(bin, b"fdisk", include_bytes!(env!("OXFS_FDISK_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"fgconsole",
-        include_bytes!(env!("OXFS_FGCONSOLE_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"fgrep", include_bytes!(env!("OXFS_FGREP_ELF_PATH")));
     ok &= seed_file(bin, b"find", include_bytes!(env!("OXFS_FIND_ELF_PATH")));
-    ok &= seed_file(bin, b"findfs", include_bytes!(env!("OXFS_FINDFS_ELF_PATH")));
     ok &= seed_file(bin, b"flock", include_bytes!(env!("OXFS_FLOCK_ELF_PATH")));
     ok &= seed_file(bin, b"fold", include_bytes!(env!("OXFS_FOLD_ELF_PATH")));
     ok &= seed_file(bin, b"free", include_bytes!(env!("OXFS_FREE_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"freeramdisk",
-        include_bytes!(env!("OXFS_FREERAMDISK_ELF_PATH")),
-    );
-    ok &= seed_file(bin, b"fsck", include_bytes!(env!("OXFS_FSCK_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"fsck_minix",
-        include_bytes!(env!("OXFS_FSCK_MINIX_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"fsync", include_bytes!(env!("OXFS_FSYNC_ELF_PATH")));
     ok &= seed_file(bin, b"ftpd", include_bytes!(env!("OXFS_FTPD_ELF_PATH")));
     ok &= seed_file(bin, b"ftpget", include_bytes!(env!("OXFS_FTPGET_ELF_PATH")));
@@ -4822,7 +4902,6 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"gunzip", include_bytes!(env!("OXFS_GUNZIP_ELF_PATH")));
     ok &= seed_file(bin, b"gzip", include_bytes!(env!("OXFS_GZIP_ELF_PATH")));
     ok &= seed_file(bin, b"halt", include_bytes!(env!("OXFS_HALT_ELF_PATH")));
-    ok &= seed_file(bin, b"hd", include_bytes!(env!("OXFS_HD_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"hexdump",
@@ -4849,59 +4928,29 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"inetd", include_bytes!(env!("OXFS_INETD_ELF_PATH")));
     ok &= seed_file(
         bin,
-        b"inotifyd",
-        include_bytes!(env!("OXFS_INOTIFYD_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
         b"install",
         include_bytes!(env!("OXFS_INSTALL_ELF_PATH")),
     );
     ok &= seed_file(bin, b"iostat", include_bytes!(env!("OXFS_IOSTAT_ELF_PATH")));
     ok &= seed_file(bin, b"ipcalc", include_bytes!(env!("OXFS_IPCALC_ELF_PATH")));
-    ok &= seed_file(bin, b"ipcrm", include_bytes!(env!("OXFS_IPCRM_ELF_PATH")));
-    ok &= seed_file(bin, b"ipcs", include_bytes!(env!("OXFS_IPCS_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"killall5",
         include_bytes!(env!("OXFS_KILLALL5_ELF_PATH")),
     );
-    ok &= seed_file(bin, b"klogd", include_bytes!(env!("OXFS_KLOGD_ELF_PATH")));
     ok &= seed_file(bin, b"less", include_bytes!(env!("OXFS_LESS_ELF_PATH")));
     ok &= seed_file(bin, b"link", include_bytes!(env!("OXFS_LINK_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"linux32",
-        include_bytes!(env!("OXFS_LINUX32_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"linux64",
-        include_bytes!(env!("OXFS_LINUX64_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"ln", include_bytes!(env!("OXFS_LN_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"loadkmap",
-        include_bytes!(env!("OXFS_LOADKMAP_ELF_PATH")),
-    );
-    ok &= seed_file(bin, b"logger", include_bytes!(env!("OXFS_LOGGER_ELF_PATH")));
     ok &= seed_file(bin, b"login", include_bytes!(env!("OXFS_LOGIN_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"logname",
         include_bytes!(env!("OXFS_LOGNAME_ELF_PATH")),
     );
-    ok &= seed_file(
-        bin,
-        b"logread",
-        include_bytes!(env!("OXFS_LOGREAD_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"lpd", include_bytes!(env!("OXFS_LPD_ELF_PATH")));
     ok &= seed_file(bin, b"lpq", include_bytes!(env!("OXFS_LPQ_ELF_PATH")));
     ok &= seed_file(bin, b"lpr", include_bytes!(env!("OXFS_LPR_ELF_PATH")));
     ok &= seed_file(bin, b"ls", include_bytes!(env!("OXFS_LS_ELF_PATH")));
-    ok &= seed_file(bin, b"lsattr", include_bytes!(env!("OXFS_LSATTR_ELF_PATH")));
     ok &= seed_file(bin, b"lsof", include_bytes!(env!("OXFS_LSOF_ELF_PATH")));
     ok &= seed_file(bin, b"lspci", include_bytes!(env!("OXFS_LSPCI_ELF_PATH")));
     ok &= seed_file(bin, b"lsscsi", include_bytes!(env!("OXFS_LSSCSI_ELF_PATH")));
@@ -4920,28 +4969,14 @@ fn format_fresh_filesystem() -> bool {
     );
     ok &= seed_file(bin, b"man", include_bytes!(env!("OXFS_MAN_ELF_PATH")));
     ok &= seed_file(bin, b"md5sum", include_bytes!(env!("OXFS_MD5SUM_ELF_PATH")));
-    ok &= seed_file(bin, b"mesg", include_bytes!(env!("OXFS_MESG_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"microcom",
-        include_bytes!(env!("OXFS_MICROCOM_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"minips", include_bytes!(env!("OXFS_MINIPS_ELF_PATH")));
-    ok &= seed_file(bin, b"mkfifo", include_bytes!(env!("OXFS_MKFIFO_ELF_PATH")));
-    ok &= seed_file(bin, b"mkfs", include_bytes!(env!("OXFS_MKFS_ELF_PATH")));
     ok &= seed_file(bin, b"mknod", include_bytes!(env!("OXFS_MKNOD_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"mkpasswd",
         include_bytes!(env!("OXFS_MKPASSWD_ELF_PATH")),
     );
-    ok &= seed_file(bin, b"mkswap", include_bytes!(env!("OXFS_MKSWAP_ELF_PATH")));
     ok &= seed_file(bin, b"mktemp", include_bytes!(env!("OXFS_MKTEMP_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"modinfo",
-        include_bytes!(env!("OXFS_MODINFO_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"mount", include_bytes!(env!("OXFS_MOUNT_ELF_PATH")));
     ok &= seed_file(
         bin,
@@ -4949,7 +4984,6 @@ fn format_fresh_filesystem() -> bool {
         include_bytes!(env!("OXFS_MOUNTPOINT_ELF_PATH")),
     );
     ok &= seed_file(bin, b"mpstat", include_bytes!(env!("OXFS_MPSTAT_ELF_PATH")));
-    ok &= seed_file(bin, b"mt", include_bytes!(env!("OXFS_MT_ELF_PATH")));
     ok &= seed_file(bin, b"nc", include_bytes!(env!("OXFS_NC_ELF_PATH")));
     ok &= seed_file(bin, b"netcat", include_bytes!(env!("OXFS_NETCAT_ELF_PATH")));
     ok &= seed_file(
@@ -4962,11 +4996,6 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"nmeter", include_bytes!(env!("OXFS_NMETER_ELF_PATH")));
     ok &= seed_file(bin, b"nohup", include_bytes!(env!("OXFS_NOHUP_ELF_PATH")));
     ok &= seed_file(bin, b"nproc", include_bytes!(env!("OXFS_NPROC_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"nsenter",
-        include_bytes!(env!("OXFS_NSENTER_ELF_PATH")),
-    );
     ok &= seed_file(
         bin,
         b"nslookup",
@@ -4985,11 +5014,6 @@ fn format_fresh_filesystem() -> bool {
         bin,
         b"pipe_progress",
         include_bytes!(env!("OXFS_PIPE_PROGRESS_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"pivot_root",
-        include_bytes!(env!("OXFS_PIVOT_ROOT_ELF_PATH")),
     );
     ok &= seed_file(bin, b"pkill", include_bytes!(env!("OXFS_PKILL_ELF_PATH")));
     ok &= seed_file(bin, b"pmap", include_bytes!(env!("OXFS_PMAP_ELF_PATH")));
@@ -5018,16 +5042,10 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"pwd", include_bytes!(env!("OXFS_PWD_ELF_PATH")));
     ok &= seed_file(bin, b"pwdx", include_bytes!(env!("OXFS_PWDX_ELF_PATH")));
     ok &= seed_file(bin, b"rdate", include_bytes!(env!("OXFS_RDATE_ELF_PATH")));
-    ok &= seed_file(bin, b"rdev", include_bytes!(env!("OXFS_RDEV_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"readlink",
         include_bytes!(env!("OXFS_READLINK_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"readprofile",
-        include_bytes!(env!("OXFS_READPROFILE_ELF_PATH")),
     );
     ok &= seed_file(
         bin,
@@ -5043,7 +5061,6 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(bin, b"renice", include_bytes!(env!("OXFS_RENICE_ELF_PATH")));
     ok &= seed_file(bin, b"reset", include_bytes!(env!("OXFS_RESET_ELF_PATH")));
     ok &= seed_file(bin, b"resize", include_bytes!(env!("OXFS_RESIZE_ELF_PATH")));
-    ok &= seed_file(bin, b"resume", include_bytes!(env!("OXFS_RESUME_ELF_PATH")));
     ok &= seed_file(bin, b"rev", include_bytes!(env!("OXFS_REV_ELF_PATH")));
     ok &= seed_file(bin, b"route", include_bytes!(env!("OXFS_ROUTE_ELF_PATH")));
     ok &= seed_file(bin, b"rpm", include_bytes!(env!("OXFS_RPM_ELF_PATH")));
@@ -5057,60 +5074,12 @@ fn format_fresh_filesystem() -> bool {
         b"rtcwake",
         include_bytes!(env!("OXFS_RTCWAKE_ELF_PATH")),
     );
-    ok &= seed_file(bin, b"runsv", include_bytes!(env!("OXFS_RUNSV_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"runsvdir",
-        include_bytes!(env!("OXFS_RUNSVDIR_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"run", include_bytes!(env!("OXFS_RUN_ELF_PATH")));
-    ok &= seed_file(bin, b"rx", include_bytes!(env!("OXFS_RX_ELF_PATH")));
-    ok &= seed_file(bin, b"script", include_bytes!(env!("OXFS_SCRIPT_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"scriptreplay",
-        include_bytes!(env!("OXFS_SCRIPTREPLAY_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"sed", include_bytes!(env!("OXFS_SED_ELF_PATH")));
     ok &= seed_file(
         bin,
         b"sendmail",
         include_bytes!(env!("OXFS_SENDMAIL_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setarch",
-        include_bytes!(env!("OXFS_SETARCH_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setconsole",
-        include_bytes!(env!("OXFS_SETCONSOLE_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setfattr",
-        include_bytes!(env!("OXFS_SETFATTR_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setkeycodes",
-        include_bytes!(env!("OXFS_SETKEYCODES_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setlogcons",
-        include_bytes!(env!("OXFS_SETLOGCONS_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setpriv",
-        include_bytes!(env!("OXFS_SETPRIV_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"setserial",
-        include_bytes!(env!("OXFS_SETSERIAL_ELF_PATH")),
     );
     ok &= seed_file(bin, b"setsid", include_bytes!(env!("OXFS_SETSID_ELF_PATH")));
     ok &= seed_file(
@@ -5172,24 +5141,7 @@ fn format_fresh_filesystem() -> bool {
         include_bytes!(env!("OXFS_SULOGIN_ELF_PATH")),
     );
     ok &= seed_file(bin, b"sum", include_bytes!(env!("OXFS_SUM_ELF_PATH")));
-    ok &= seed_file(bin, b"svlogd", include_bytes!(env!("OXFS_SVLOGD_ELF_PATH")));
-    ok &= seed_file(bin, b"svok", include_bytes!(env!("OXFS_SVOK_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"swapoff",
-        include_bytes!(env!("OXFS_SWAPOFF_ELF_PATH")),
-    );
-    ok &= seed_file(
-        bin,
-        b"switch_root",
-        include_bytes!(env!("OXFS_SWITCH_ROOT_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"sync", include_bytes!(env!("OXFS_SYNC_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"syslogd",
-        include_bytes!(env!("OXFS_SYSLOGD_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"tac", include_bytes!(env!("OXFS_TAC_ELF_PATH")));
     ok &= seed_file(bin, b"tar", include_bytes!(env!("OXFS_TAR_ELF_PATH")));
     ok &= seed_file(
@@ -5254,11 +5206,6 @@ fn format_fresh_filesystem() -> bool {
     );
     ok &= seed_file(bin, b"unlink", include_bytes!(env!("OXFS_UNLINK_ELF_PATH")));
     ok &= seed_file(bin, b"unlzma", include_bytes!(env!("OXFS_UNLZMA_ELF_PATH")));
-    ok &= seed_file(
-        bin,
-        b"unshare",
-        include_bytes!(env!("OXFS_UNSHARE_ELF_PATH")),
-    );
     ok &= seed_file(bin, b"unxz", include_bytes!(env!("OXFS_UNXZ_ELF_PATH")));
     ok &= seed_file(bin, b"unzip", include_bytes!(env!("OXFS_UNZIP_ELF_PATH")));
     ok &= seed_file(bin, b"uptime", include_bytes!(env!("OXFS_UPTIME_ELF_PATH")));
@@ -6242,6 +6189,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_GETDENTS, oxfs_getdents);
         oxidebsd_register_syscall(SYS_CHMOD, oxfs_chmod);
         oxidebsd_register_syscall(SYS_CHOWN, oxfs_chown);
+        oxidebsd_register_syscall(SYS_FCHMOD, oxfs_fchmod);
         oxidebsd_register_syscall(SYS_UTIMENSAT, oxfs_utimensat);
         oxidebsd_register_syscall(SYS_MOUNT_BIND, oxfs_mount_bind);
         oxidebsd_register_syscall(SYS_MOUNT_TMPFS, oxfs_mount_tmpfs);

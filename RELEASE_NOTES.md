@@ -18,7 +18,9 @@ involved (see "Not in this release," below).
   (not a Linux-compatibility shim) — real `malloc`, stdio, TLS, DNS resolution, `crypt(3)`, and
   more, all musl's own real code running against this kernel's real syscalls.
 - **A real shell and userland.** BusyBox's `hush` as pid 1, real shell control flow (`if`/`for`/
-  `while`/`case`/functions), ~300 BusyBox applets built and running as standalone binaries.
+  `while`/`case`/functions), 256 BusyBox applets built and running as standalone binaries
+  (curated down from an original 314-applet build probe — see `docs/BUSYBOX_APPLETS.md`'s
+  "Removed before v0.1" section for what was cut and why).
 - **A real filesystem.** `oxfs`, an in-memory-by-default Unix-shaped inode/block filesystem with
   real multi-component paths, per-process cwd, hard links, symlinks, device nodes, permissions —
   plus real, optional persistence to an attached ATA disk (ports a session survives a reboot on),

@@ -18,13 +18,33 @@ does, and is exactly what CLAUDE.md's "BusyBox gap analysis" tracks.
 `more`, `mkdir`, `rmdir`, `rm`, `mv`, `cp`, `touch`, `head`, `tail`, `wc`, `basename`, `dirname`,
 `printf`, `seq`, `cut`, `sort`, `uniq`, `kill`) and aren't re-listed here.
 
-## Build succeeded: 287 applets
+## Build succeeded: 287 applets (229 kept in the roster -- see "Removed before v0.1" below)
 
-### WORKS (112)
+**Pre-v0.1 roster cleanup**: 58 of these 287 built cleanly but their core function structurally
+cannot work on this kernel at all today (no VT/console/serial/framebuffer/syslog device model, no
+SysV IPC, namespaces that don't fit this kernel's single-address-space model, no ext2 ioctl/xattr
+support, no FIFO inode kind, no partition-table/swap/hw-profile concept) -- pure decoration that
+would waste a user's time discovering an instant `ENOSYS` instead of saving it. These are no
+longer built or seeded at all (removed from `build.rs`'s `BUSYBOX_APPLETS_PASS2` and
+`modules/oxfs`'s seed list) -- see "Removed before v0.1" below for the full list and reasoning.
+Everything else below reflects the current, kept roster; stale `NEEDS_*` tags on applets whose
+blocking syscall has since landed (`chroot`, `mknod`, `makedevs`, `link`, `time`, `cttyhack`,
+`setsid`) were corrected in the same pass and moved into WORKS.
+
+### WORKS (119)
 
 Builds and needs only syscalls OxideBSD already implements -- plain file/text/arg-processing tools, or terminal I/O covered by the existing termios/ioctl support.
 
-`ar`, `ascii`, `ash`, `awk`, `base32`, `base64`, `bash_is_ash`, `bash_is_hush`, `bbconfig`, `bb_arch`, `bc`, `bunzip2`, `bzcat`, `bzip2`, `cal`, `chat`, `cksum`, `clear`, `cmp`, `comm`, `cpio`, `crc32`, `dc`, `dd`, `diff`, `dos2unix`, `dpkg`, `dpkg_deb`, `du`, `ed`, `egrep`, `env`, `expand`, `expr`, `factor`, `fgrep`, `find`, `fold`, `getopt`, `grep`, `gunzip`, `gzip`, `hexdump`, `hexedit`, `hostid`, `install`, `ipcalc`, `less`, `ls`, `lzcat`, `lzop`, `makemime`, `man`, `md5sum`, `mktemp`, `nl`, `nohup`, `nuke`, `od`, `paste`, `patch`, `pipe_progress`, `printenv`, `pwd`, `pwdx`, `realpath`, `reformime`, `reset`, `resize`, `rev`, `rpm`, `rpm2cpio`, `run_parts`, `sed`, `sha1sum`, `sha256sum`, `sha3sum`, `sha512sum`, `shred`, `shuf`, `split`, `stat`, `strings`, `stty`, `sum`, `tac`, `tar`, `tee`, `test`, `tr`, `tree`, `ts`, `tsort`, `tty`, `ttysize`, `uncompress`, `unexpand`, `unit_test`, `unix2dos`, `unlink`, `unlzma`, `unxz`, `unzip`, `uudecode`, `uuencode`, `vi`, `volname`, `which`, `xargs`, `xxd`, `xzcat`, `zcat`
+`ar`, `ascii`, `ash`, `awk`, `base32`, `base64`, `bash_is_ash`, `bash_is_hush`, `bbconfig`, `bb_arch`, `bc`, `bunzip2`, `bzcat`, `bzip2`, `cal`, `chat`, `chroot`, `cksum`, `clear`, `cmp`, `comm`, `cpio`, `crc32`, `cttyhack`, `dc`, `dd`, `diff`, `dos2unix`, `dpkg`, `dpkg_deb`, `du`, `ed`, `egrep`, `env`, `expand`, `expr`, `factor`, `fgrep`, `find`, `fold`, `getopt`, `grep`, `gunzip`, `gzip`, `hexdump`, `hexedit`, `hostid`, `install`, `ipcalc`, `less`, `link`, `ls`, `lzcat`, `lzop`, `makedevs`, `makemime`, `man`, `md5sum`, `mknod`, `mktemp`, `nl`, `nohup`, `nuke`, `od`, `paste`, `patch`, `pipe_progress`, `printenv`, `pwd`, `pwdx`, `realpath`, `reformime`, `reset`, `resize`, `rev`, `rpm`, `rpm2cpio`, `run_parts`, `sed`, `setsid`, `sha1sum`, `sha256sum`, `sha3sum`, `sha512sum`, `shred`, `shuf`, `split`, `stat`, `strings`, `stty`, `sum`, `tac`, `tar`, `tee`, `test`, `time`, `tr`, `tree`, `ts`, `tsort`, `tty`, `ttysize`, `uncompress`, `unexpand`, `unit_test`, `unix2dos`, `unlink`, `unlzma`, `unxz`, `unzip`, `uudecode`, `uuencode`, `vi`, `volname`, `which`, `xargs`, `xxd`, `xzcat`, `zcat`
+
+- `chroot`/`mknod`/`makedevs`/`link`/`time` moved here from `NEEDS_SYSCALL` -- `SYS_CHROOT=490`/
+  `SYS_MKNOD=489`/`SYS_LINK=488`/real `wait4` rusage all landed (see CLAUDE.md's "Real hard links,
+  device nodes, per-process chroot, and getrusage/wait4 rusage" section); `makedevs` shares
+  `mknod`'s same underlying syscall and wasn't individually re-probed but has no other blocker.
+- `cttyhack`/`setsid` moved here from `NEEDS_HARDWARE` -- both were tagged as needing "a real
+  controlling-tty/session model beyond what termios covers", which now exists (`SYS_SETSID=112`,
+  `TIOCSCTTY`/`TIOCNOTTY`/`TIOCGPGRP`/`TIOCSPGRP`; see CLAUDE.md's "Session, controlling-tty, and
+  login authentication" section). Neither individually re-run end-to-end yet.
 
 
 ### NEEDS_NETWORK (38)
@@ -130,20 +150,20 @@ already exist and are already writable via ordinary `open`/`write`).
 - real login/session authentication -- **done**, see CLAUDE.md's "Session, controlling-tty, and login authentication" section: `getty`, `login`, `su`, `sulogin`
 
 
-### NEEDS_SYSCALL (22, down from 33 -- fsync/flock/fallocate/truncate/chrt/halt/nice/poweroff/sync/softlimit/df moved to done this pass)
+### NEEDS_SYSCALL (0 remaining in the kept roster -- see "Removed before v0.1" below for what was cut instead of fixed)
 
 Builds, but its core function needs a specific syscall OxideBSD hasn't registered (link, mknod, SysV IPC, chroot, namespaces, ext2 ioctls/xattr, ...).
 
 - `chmod`/`chown`/`chgrp` -- **done**: `SYS_CHMOD=165`/`SYS_CHOWN=166` (`modules/oxfs`),
   real per-inode `mode`/`uid`/`gid` plus `oxfs_open` permission enforcement. BusyBox's own
   `coreutils/chown.c` implements `chgrp` as the same `chown()` call restricted to the group field,
-  so all three are unblocked by the same two syscalls. `chattr`/`fatattr`/`lsattr`/`setfattr` are
-  **not** unblocked by this despite the original probe bucketing them together with chmod/chown
-  under one loose "no permission model" reason -- real `chattr`/`fatattr` use Linux-specific
-  `EXT2_IOC_GETFLAGS`/`SETFLAGS` ioctls on a regular file (`e2fsprogs/chattr.c`) and `setfattr`
-  uses `setxattr`/`lsetxattr` (`miscutils/setfattr.c`), neither of which this kernel's `SYS_IOCTL`
-  (tty-only) or syscall table implement at all -- a real, distinct gap, corrected here rather than
-  left mis-attributed: `chattr`, `fatattr`, `lsattr`, `setfattr`
+  so all three are unblocked by the same two syscalls. `chattr`/`fatattr`/`lsattr`/`setfattr`
+  were **not** unblocked by this despite the original probe bucketing them together with
+  chmod/chown under one loose "no permission model" reason -- real `chattr`/`fatattr` use
+  Linux-specific `EXT2_IOC_GETFLAGS`/`SETFLAGS` ioctls on a regular file (`e2fsprogs/chattr.c`) and
+  `setfattr` uses `setxattr`/`lsetxattr` (`miscutils/setfattr.c`), neither of which this kernel's
+  `SYS_IOCTL` (tty-only) or syscall table implement at all -- **removed from the roster before
+  v0.1** (see "Removed before v0.1" below), not left mis-attributed
 
 - `flock`/`fsync`/`fallocate`/`truncate` -- **done** this pass: `SYS_FLOCK=475`/`SYS_FSYNC=471`/
   `SYS_FALLOCATE=474`/`SYS_FTRUNCATE=473` (`modules/oxfs`) -- see CLAUDE.md's own "Filesystem/
@@ -151,16 +171,16 @@ Builds, but its core function needs a specific syscall OxideBSD hasn't registere
   force-commit for `fsync`, real block-level resize for `ftruncate`/`fallocate`, and why a
   conflicting `flock` request fails `EAGAIN` immediately rather than genuinely blocking)
 
-- no SYS_MKNOD / device-node model: `makedevs`, `mknod`
+- `makedevs`/`mknod` -- **done**: `SYS_MKNOD=489` (`modules/oxfs`), moved to WORKS
 
-- no SysV IPC syscalls: `ipcrm`, `ipcs`
+- `ipcrm`/`ipcs` (SysV IPC) -- **removed from the roster before v0.1**, no SysV IPC syscalls exist
 
-- no chroot(2)/namespace syscalls: `chroot`, `linux32`, `linux64`, `nsenter`, `setarch`, `setpriv`, `unshare`
-  -- namespaces in particular don't fit this kernel's single-address-space model at all; faking
-  them would be theater, not a real syscall, so this row is likely to stay open longer than the
-  others here even if `chroot` itself (just a per-process root-inode concept) gets picked up later
+- `chroot` -- **done**: `SYS_CHROOT=490` (`modules/oxfs`), moved to WORKS. `linux32`/`linux64`/
+  `nsenter`/`setarch`/`setpriv`/`unshare` (namespaces/personality) -- **removed from the roster
+  before v0.1**; namespaces don't fit this kernel's single-address-space model at all, faking them
+  would be theater, not a real syscall
 
-- no getrusage/real wait4 rusage reporting: `time`
+- `time` -- **done**: real `wait4` rusage reporting (`SYS_GETRUSAGE=491`), moved to WORKS
 
 - `chrt`/`halt`/`nice`/`poweroff`/`sync` -- **done** this pass: `SYS_SCHED_SETSCHEDULER=481`/
   `SYS_SCHED_GETSCHEDULER=482`/`SYS_SCHED_GETPARAM=483`/`SYS_SCHED_GET_PRIORITY_MAX=484`/
@@ -168,7 +188,8 @@ Builds, but its core function needs a specific syscall OxideBSD hasn't registere
   stored, no real scheduling effect), `SYS_REBOOT=486` (`halt`/`poweroff` -- a real QEMU ACPI
   shutdown / plain halt, `src/reboot.rs`), `SYS_SYNC=472` (`modules/oxfs`, all in
   `modules/posix_compat` unless noted) -- see CLAUDE.md's own "Filesystem/process misc syscalls"
-  section. `inotifyd`/`mesg` remain blocked (inotify/hardware, a distinct gap): `inotifyd`, `mesg`
+  section. `inotifyd`/`mesg` -- **removed from the roster before v0.1** (inotify/hardware, a
+  distinct gap that was never going to close on its own)
 
 - `softlimit` -- **done** this pass: `SYS_PRLIMIT64=478` (`modules/posix_compat`) backs real
   `setrlimit(2)`/`getrlimit(2)` (musl's own wrapper for both tries `prlimit64` first
@@ -179,50 +200,36 @@ Builds, but its core function needs a specific syscall OxideBSD hasn't registere
   `SYS_FSTATFS=477` (`modules/oxfs`), a real `struct statfs` built from this filesystem's own live
   usage counts: `df`
 
-- oxfs has no FIFO/special-file inode kind: `mkfifo`
+- `mkfifo` -- **removed from the roster before v0.1**; oxfs has no FIFO/special-file inode kind
 
-- oxfs has no hard links / no SYS_LINK -- **`ln -s`/`readlink` are done** (real
-  `InodeKind::Symlink`, `SYS_SYMLINK`/`SYS_READLINK`, `stat`/`lstat` divergence, confirmed live via
-  `modules/oxfs`'s own boot self-check -- symlinks and hard links are different mechanisms, and
-  only the former exists now): `link`
-
-
-### NEEDS_HARDWARE (24)
-
-Builds, but needs a real console/VT, serial device, framebuffer, pty pair, or syslog facility -- none of these are modeled.
-
-- hibernation resume-from-swap, not a concept that applies here: `resume`
-
-- needs SysV syslog(2)/a real /dev/log, no logging facility beyond serial: `klogd`, `logger`, `logread`, `syslogd`
-
-- needs a real controlling-tty/session model beyond what termios covers: `cttyhack`, `setsid`
-
-- needs a real framebuffer/serial device or a pty pair, not modeled here: `fbset`, `script`, `scriptreplay`, `setserial`
-
-- needs a real serial/tape/IPC device, not modeled here: `devfsd`, `microcom`, `modinfo`, `mt`, `rx`
-
-- no VT/console ioctl support (real Linux vt.h ioctls): `chvt`, `deallocvt`, `dumpkmap`, `fgconsole`, `loadkmap`, `setconsole`, `setkeycodes`, `setlogcons`
+- `link` -- **done**: real hard links (`SYS_LINK=488`), moved to WORKS. `ln -s`/`readlink` were
+  already done (real `InodeKind::Symlink`, `SYS_SYMLINK`/`SYS_READLINK`, `stat`/`lstat` divergence,
+  confirmed live via `modules/oxfs`'s own boot self-check -- symlinks and hard links are different
+  mechanisms, both exist now)
 
 
-### NEEDS_BLOCKDEV (17, down from 20 -- mount/mountpoint/umount moved to done this pass)
+### NEEDS_HARDWARE (0 remaining in the kept roster)
 
-Builds, but needs a real block device driver or mount table -- **stale as of both landing**: a
-real ATA PIO driver + oxfs mount/format persistence closed the driver half (see CLAUDE.md's own
-"Real disk persistence" section), and a real, deliberately scoped mount table (`mount --bind`/
-`mount -t tmpfs`, `SYS_MOUNT_BIND`/`SYS_MOUNT_TMPFS`/`SYS_UMOUNT2` in `modules/oxfs`, see that
-file's own "Mount table" section) closed enough of the mount-table half to unblock `mount`/
-`mountpoint`/`umount` specifically. Everything else below still needs either a real block-device-
-agnostic mount table (this design only ever redirects within oxfs's own single, already-mounted
-filesystem -- no second real device or on-disk format is ever attached) or a real partition-table/
-multiple-on-disk-format concept neither pass adds:
+Builds, but needs a real console/VT, serial device, framebuffer, pty pair, or syslog facility -- none of these are modeled. Every entry that was here is now resolved one way or the other:
 
-- needs a real, block-device-agnostic mount table this design doesn't add (only oxfs's own single,
-  fixed backing store is ever "mounted" at all): `pivot_root`, `switch_root`
-- needs a real partition table / multiple on-disk filesystem formats: `blkid`, `fdformat`, `fdisk`,
-  `findfs`, `fsck`, `fsck_minix`, `mkfs_minix`, `mkswap`, `rdev`
-- needs a real swap concept (no paging/virtual-memory swap infrastructure exists at all): `swapoff`
-- needs a real device-memory/hardware-profile mechanism, unrelated to the mount table: `devmem`,
-  `eject`, `freeramdisk`, `hd`, `readprofile`
+- `cttyhack`/`setsid` -- **done**, moved to WORKS (see that section's own note)
+- everything else in this category (hibernation resume, syslog, framebuffer/pty, serial/tape/IPC
+  device, VT/console ioctls) -- **removed from the roster before v0.1**, see "Removed before
+  v0.1" below
+
+### NEEDS_BLOCKDEV (0 remaining in the kept roster -- mount/mountpoint/umount were already done, everything else removed before v0.1)
+
+Builds, but needs a real block device driver or mount table. A real ATA PIO driver + oxfs
+mount/format persistence closed the driver half (see CLAUDE.md's own "Real disk persistence"
+section), and a real, deliberately scoped mount table (`mount --bind`/`mount -t tmpfs`,
+`SYS_MOUNT_BIND`/`SYS_MOUNT_TMPFS`/`SYS_UMOUNT2` in `modules/oxfs`, see that file's own "Mount
+table" section) closed enough of the mount-table half to unblock `mount`/`mountpoint`/`umount`
+specifically. Everything else in this category needed either a real block-device-agnostic mount
+table (this design only ever redirects within oxfs's own single, already-mounted filesystem -- no
+second real device or on-disk format is ever attached) or a real partition-table/multiple-on-disk-
+format concept, neither of which is planned -- **all removed from the roster before v0.1**: see
+"Removed before v0.1" below for the full list (`pivot_root`, `switch_root`, the partition-table/
+fsck/mkswap family, `swapoff`, and the device-memory/hardware-profile family).
 
 
 ### NEEDS_CLOCK (9)
@@ -237,11 +244,56 @@ landing (see CLAUDE.md's own "Real-time clock" section) -- not wholesale re-prob
   confirm they fully work end to end: `date`, `hwclock`, `rtcwake`, `adjtimex`, `crond`, `crontab`
 
 
-### NEEDS_INIT (6)
+### NEEDS_INIT (2, down from 6 -- runsv/runsvdir/svlogd/svok removed before v0.1)
 
 Builds, but is specific to an init-system/service-supervisor framework this kernel doesn't have.
 
-- init-system/service-supervisor specific, no init framework here: `bootchartd`, `runsv`, `runsvdir`, `start_stop_daemon`, `svlogd`, `svok`
+- init-system/service-supervisor specific, no init framework here, but kept in the roster: their
+  actual mechanics (fork/exec, `setsid`, pidfile via plain file I/O, `kill`) are all things this
+  kernel now supports even without a real init framework driving them, so cutting them would be
+  removing something that plausibly still saves a user time, not decoration: `bootchartd`,
+  `start_stop_daemon`
+- `runsv`/`runsvdir`/`svlogd`/`svok` -- **removed from the roster before v0.1**: the runit family
+  communicates via control fifos in a supervise directory, and oxfs has no FIFO inode kind at all
+  (same root cause as `mkfifo`'s own removal above) -- genuinely, not just nominally, dead
+
+
+## Removed before v0.1: 58 applets
+
+All 58 of these still build cleanly (unchanged in `docs/BUSYBOX_APPLETS.md`'s own build-probe
+history above), but were deliberately dropped from `build.rs`'s `BUSYBOX_APPLETS_PASS2` and
+`modules/oxfs`'s seed list before v0.1 -- not "not yet working," but structurally incapable of
+working under this kernel's current, deliberate architectural choices (no VT/console/serial/
+framebuffer/syslog device model, namespaces that don't fit the single-address-space model, no
+SysV IPC, no ext2 ioctl/xattr support, no FIFO inode kind, no partition-table/swap/hw-profile
+concept). Shipping an applet that can only ever print a clean `ENOSYS` doesn't save a user time --
+it costs them the time spent discovering that. Applets whose blocker *has* since closed (`chroot`,
+`mknod`, `makedevs`, `link`, `time`, `cttyhack`, `setsid`) were fixed forward into WORKS instead of
+cut -- see that section's own note. Two applets that looked similarly blocked on paper
+(`bootchartd`, `start_stop_daemon`) were kept rather than cut: their actual mechanics don't
+require an init framework to function, just primitives (fork/exec/setsid/kill/pidfile) this kernel
+already has.
+
+- **hardware/VT/serial/framebuffer/syslog** (22, all of the old `NEEDS_HARDWARE` bucket except
+  `cttyhack`/`setsid`): `resume`, `klogd`, `logger`, `logread`, `syslogd`, `fbset`, `script`,
+  `scriptreplay`, `setserial`, `devfsd`, `microcom`, `modinfo`, `mt`, `rx`, `chvt`, `deallocvt`,
+  `dumpkmap`, `fgconsole`, `loadkmap`, `setconsole`, `setkeycodes`, `setlogcons`
+- **namespaces** (6): `linux32`, `linux64`, `nsenter`, `setarch`, `setpriv`, `unshare`
+- **SysV IPC** (2): `ipcrm`, `ipcs`
+- **ext2 ioctl/xattr** (4): `chattr`, `fatattr`, `lsattr`, `setfattr`
+- **FIFO-dependent** (5, oxfs has no FIFO inode kind -- also takes down the runit family):
+  `mkfifo`, `runsv`, `runsvdir`, `svlogd`, `svok`
+- **misc** (2): `inotifyd` (no inotify syscall), `mesg` (needs a multi-session/other-user's-tty
+  concept that doesn't exist with one real console)
+- **partition-table/swap/hw-profile family** (17, all of the old `NEEDS_BLOCKDEV` bucket left
+  after mount/mountpoint/umount were already done): `pivot_root`, `switch_root`, `blkid`,
+  `fdformat`, `fdisk`, `findfs`, `fsck`, `fsck_minix`, `mkfs` (`MKFS_MINIX`'s applet name), `mkswap`, `rdev`, `swapoff`,
+  `devmem`, `eject`, `freeramdisk`, `hd`, `readprofile`
+
+**Note for anyone re-running the exhaustive build probe**: these 58 will still show up as "build
+succeeded" if the probe is re-run against `third_party/busybox`, since the probe just checks
+`musl-gcc` build success, not roster membership. They're absent from `build.rs`/`modules/oxfs`
+deliberately, not because they stopped building.
 
 
 ## Build failed: 83 applets

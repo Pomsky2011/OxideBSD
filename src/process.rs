@@ -1868,6 +1868,46 @@ pub fn do_sched_getparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u6
     Ok(0)
 }
 
+/// `SYS_SCHED_GETAFFINITY`'s real logic, registered directly at real Linux's own `__NR_sched_
+/// getaffinity = 204` (no invented number, no musl remap needed -- same "confirmed unassigned in
+/// this ABI's own registry, so the real value is safe to use directly" reasoning as `modules/
+/// oxfs`'s `SYS_FCHMOD`; see that constant's own doc comment). This kernel is single-core (see
+/// CLAUDE.md's own "no SMP" gap), so every process's affinity mask is always just bit 0 set.
+///
+/// Found live: BusyBox's `nproc` calls this to count set bits, but silently falls back to
+/// `count = 1` on any failure -- so `nproc` reported the right answer by coincidence even while
+/// this was a flat `ENOSYS`, and the gap only surfaced as a logged `unrecognized syscall number`
+/// line during a real boot/test run, not a wrong result. Implemented anyway rather than left as a
+/// silently-tolerated `ENOSYS`, since a real `taskset`/`pmap`-style CPU-affinity query landing on
+/// `ENOSYS` isn't obviously safe for every future caller the way `nproc`'s specific fallback is.
+///
+/// The raw syscall's real return value (not the glibc/musl *wrapper*'s 0-or-error convention --
+/// see `third_party/musl/src/sched/affinity.c`'s own `do_getaffinity`) is the number of bytes
+/// actually written into the caller's mask; musl's wrapper zero-fills the remainder of the
+/// caller's buffer itself, so this only ever needs to write `min(cpusetsize, size_of::<u64>())`
+/// real bytes and return that count. `EINVAL` for a zero-sized mask, matching real Linux (no mask
+/// fits in zero bytes).
+pub fn do_sched_getaffinity(
+    caller_pid: Pid,
+    pid: i64,
+    cpusetsize: u64,
+    mask_ptr: u64,
+) -> Result<u64, u64> {
+    let _target = resolve_target_pid(caller_pid, pid)?;
+    if cpusetsize == 0 {
+        return Err(EINVAL);
+    }
+    let mask: u64 = 1; // single core -- bit 0 set, every other bit clear
+    let to_write = (cpusetsize as usize).min(core::mem::size_of::<u64>());
+    let bytes = mask.to_ne_bytes();
+    // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
+    // already has.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), mask_ptr as *mut u8, to_write);
+    }
+    Ok(to_write as u64)
+}
+
 /// `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN`'s real logic -- fixed,
 /// real-Linux-matching ranges per policy (`SCHED_FIFO`/`SCHED_RR` -> `1..=99`, everything else
 /// (`SCHED_OTHER`/`SCHED_BATCH`/`SCHED_IDLE`/...) -> `0..=0`), not backed by any real scheduling

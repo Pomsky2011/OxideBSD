@@ -941,6 +941,18 @@ pub(crate) fn sys_sched_getparam(pid: u64, param_ptr: u64) -> Result<u64, u64> {
     crate::process::do_sched_getparam(crate::scheduler::current_pid(), pid as i64, param_ptr)
 }
 
+/// `SYS_SCHED_GETAFFINITY` — real Linux's own `__NR_sched_getaffinity = 204`, used directly (see
+/// `process::do_sched_getaffinity`'s own doc comment for why no invented number/musl remap was
+/// needed) — real `sched_getaffinity(2)`'s exact `(pid, cpusetsize, mask_ptr)` wire format.
+pub(crate) fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sched_getaffinity(
+        crate::scheduler::current_pid(),
+        pid as i64,
+        cpusetsize,
+        mask_ptr,
+    )
+}
+
 /// `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN` (`484`/`485`) — real
 /// `sched_get_priority_max/min(2)`'s exact single-`policy`-argument wire format. Pure functions of
 /// `policy` alone — no current-process state involved.
@@ -1480,6 +1492,14 @@ pub(crate) extern "C" fn oxidebsd_sys_sched_getscheduler(pid: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_sched_getparam(pid: u64, param_ptr: u64) -> i64 {
     result_to_ffi(sys_sched_getparam(pid, param_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_getaffinity(
+    pid: u64,
+    cpusetsize: u64,
+    mask_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_sched_getaffinity(pid, cpusetsize, mask_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_sched_get_priority_max(policy: u64) -> i64 {

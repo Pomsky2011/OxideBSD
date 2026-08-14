@@ -130,6 +130,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64) -> i64;
     fn oxidebsd_sys_sched_getscheduler(pid: u64) -> i64;
     fn oxidebsd_sys_sched_getparam(pid: u64, param_ptr: u64) -> i64;
+    fn oxidebsd_sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask_ptr: u64) -> i64;
     fn oxidebsd_sys_sched_get_priority_max(policy: u64) -> i64;
     fn oxidebsd_sys_sched_get_priority_min(policy: u64) -> i64;
     fn oxidebsd_sys_reboot(cmd: u64) -> i64;
@@ -190,6 +191,12 @@ const SYS_GETPRIORITY: u64 = 480;
 const SYS_SCHED_SETSCHEDULER: u64 = 481;
 const SYS_SCHED_GETSCHEDULER: u64 = 482;
 const SYS_SCHED_GETPARAM: u64 = 483;
+/// Real Linux's own `__NR_sched_getaffinity = 204`, used directly rather than continuing this
+/// module's `478`-`491` invented batch -- confirmed unassigned anywhere in this ABI's own registry
+/// before landing here (same reverse-direction check as always: no invented number already claims
+/// this real value). See `process::do_sched_getaffinity`'s own doc comment in `src/process.rs` for
+/// the real single-core-mask logic and the BusyBox `nproc` bug this closes.
+const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_SCHED_GET_PRIORITY_MAX: u64 = 484;
 const SYS_SCHED_GET_PRIORITY_MIN: u64 = 485;
 const SYS_REBOOT: u64 = 486;
@@ -314,6 +321,15 @@ extern "C" fn handle_sched_getparam(pid: u64, param_ptr: u64, _a2: u64, _a3: u64
     unsafe { oxidebsd_sys_sched_getparam(pid, param_ptr) }
 }
 
+extern "C" fn handle_sched_getaffinity(
+    pid: u64,
+    cpusetsize: u64,
+    mask_ptr: u64,
+    _a3: u64,
+) -> i64 {
+    unsafe { oxidebsd_sys_sched_getaffinity(pid, cpusetsize, mask_ptr) }
+}
+
 extern "C" fn handle_sched_get_priority_max(policy: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_sched_get_priority_max(policy) }
 }
@@ -367,6 +383,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SCHED_SETSCHEDULER, handle_sched_setscheduler);
         oxidebsd_register_syscall(SYS_SCHED_GETSCHEDULER, handle_sched_getscheduler);
         oxidebsd_register_syscall(SYS_SCHED_GETPARAM, handle_sched_getparam);
+        oxidebsd_register_syscall(SYS_SCHED_GETAFFINITY, handle_sched_getaffinity);
         oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MAX, handle_sched_get_priority_max);
         oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MIN, handle_sched_get_priority_min);
         oxidebsd_register_syscall(SYS_REBOOT, handle_reboot);
@@ -374,7 +391,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_GETRUSAGE, handle_getrusage);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE)\n",
     );
     0
 }

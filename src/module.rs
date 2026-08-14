@@ -812,6 +812,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_sched_getparam" => {
             Some(crate::syscall::oxidebsd_sys_sched_getparam as *const () as u64)
         }
+        "oxidebsd_sys_sched_getaffinity" => {
+            Some(crate::syscall::oxidebsd_sys_sched_getaffinity as *const () as u64)
+        }
         "oxidebsd_sys_sched_get_priority_max" => {
             Some(crate::syscall::oxidebsd_sys_sched_get_priority_max as *const () as u64)
         }
