@@ -31,7 +31,7 @@ members = [
 
 [package]
 name = "oxidebsd"
-version = "0.1.0"
+version = "0.1.1-dev"
 edition = "2024"
 license = "BSD-3-Clause"
 
