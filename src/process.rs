@@ -112,6 +112,11 @@ pub enum BlockReason {
     /// genuinely block (not just return `Ok(0)`/`EAGAIN`) for a pipeline to work at all on this
     /// single-core, cooperatively-scheduled kernel.
     WaitingForPipeData(u64),
+    /// Blocked in a `crate::pipe` write on a full, still-open pipe (identified by pipe id, same
+    /// convention as `WaitingForPipeData`) — the write-side counterpart, now that
+    /// `crate::pipe::PipeBuffer` is bounded rather than an unboundedly-growable `VecDeque`. Woken
+    /// by a reader draining space or by the read side closing (`EPIPE` once woken, if so).
+    WaitingForPipeSpace(u64),
     /// Blocked in `crate::stdin::read` on an empty keyboard ring buffer. Unlike every other
     /// `BlockReason`, nothing *schedulable* ever wakes this one — the only thing that ever will is
     /// the keyboard IRQ handler itself, which is why `scheduler::schedule()`'s own "nothing

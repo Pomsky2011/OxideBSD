@@ -248,6 +248,10 @@ name = "ping-syscall-smoke"
 version = "0.1.0"
 
 [[package]]
+name = "pipe-backpressure-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "poll-syscall-smoke"
 version = "0.1.0"
 

@@ -18,6 +18,7 @@ members = [
   "userland/needs-syscall2-smoke",
   "userland/tcc-syscall-smoke",
   "userland/access-syscall-smoke",
+  "userland/pipe-backpressure-syscall-smoke",
   "userland/lsoxmod",
   "modules/hello",
   "modules/native_abi",
@@ -150,6 +151,10 @@ harness = false
 
 [[test]]
 name = "access_syscall_smoke"
+harness = false
+
+[[test]]
+name = "pipe_backpressure_syscall_smoke"
 harness = false
 
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool

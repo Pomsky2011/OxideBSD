@@ -16,12 +16,16 @@
 //! on a child process — and `pipe_write`/`pipe_close` wake any process blocked on the pipe they
 //! just touched, the same way `process::do_exit` wakes a parent blocked in `wait4`.
 //!
-//! **Deliberately unbounded, so only the read side ever blocks.** A real pipe has a fixed capacity
-//! and blocks a writer once it's full; this one's buffer is a plain growable `VecDeque<u8>`, so
-//! `pipe_write` always succeeds immediately and completely. Simpler, and safe for this kernel's
-//! actual use case (a shell's own pipeline commands, not an adversarial or high-throughput
-//! producer) — a real bound (and the write-side blocking that would come with it) is a follow-up,
-//! not attempted here.
+//! **Bounded at `PIPE_CAPACITY` (64 KiB, matching real Linux's default pipe size), with a real
+//! blocking writer.** Earlier revisions left the buffer an unboundedly-growable `VecDeque<u8>`, so
+//! `pipe_write` always succeeded immediately and completely — fine for a shell's own interactive
+//! pipeline commands, but a real, live bug for a producer that never yields on its own (`yes |
+//! head`: `yes` has no blocking syscall in its write loop, so with no preemption `head` never gets
+//! scheduled to read its three lines and close its end, and the buffer grew without limit until
+//! the kernel heap allocator itself panicked — see CLAUDE.md's BusyBox section). `write_into` now
+//! blocks (`BlockReason::WaitingForPipeSpace`, the write-side mirror of `WaitingForPipeData`) once
+//! the buffer is full, writing what fits and looping rather than requiring the whole call to land
+//! in one shot — the same partial-write-then-block shape a real blocking pipe write has.
 //!
 //! **`SYS_SOCKETPAIR`'s `AF_UNIX`/`SOCK_STREAM` support (`do_socketpair` below) is built from this
 //! exact same `PipeBuffer`/blocking machinery**, not a separate abstraction — a full-duplex
@@ -75,6 +79,11 @@ struct SocketEnd {
 
 const EBADF: i64 = 9;
 
+/// Matches real Linux's default pipe capacity — chosen for authenticity as much as for the fix
+/// itself; any small-ish bound closes the unbounded-growth panic (see this module's own doc
+/// comment).
+const PIPE_CAPACITY: usize = 65536;
+
 /// Allocates a fresh, empty pipe buffer and returns its id — the shared first step `do_pipe` and
 /// `do_socketpair` both need (a socketpair is two of these, cross-wired, instead of one).
 fn new_pipe_buffer() -> u64 {
@@ -119,6 +128,8 @@ fn blocking_read(pipe_id: u64, ptr: u64, len: u64, real_fd: u64) -> i64 {
                 for slot in buf.iter_mut() {
                     *slot = pipe.data.pop_front().unwrap();
                 }
+                drop(pipes); // must drop before waking -- see process::table()'s own doc comment
+                wake_blocked_writers(pipe_id);
                 return n as i64;
             }
             if pipe.write_closed {
@@ -141,27 +152,69 @@ fn blocking_read(pipe_id: u64, ptr: u64, len: u64, real_fd: u64) -> i64 {
 }
 
 /// Shared write body for a plain pipe's write end (`pipe_write`) and a socketpair endpoint's
-/// write half (`sock_write`).
-fn write_into(pipe_id: u64, ptr: u64, len: u64) -> i64 {
-    {
-        let mut pipes = PIPES.lock();
-        let Some(pipe) = pipes.get_mut(&pipe_id) else {
-            // Already fully torn down -- only reachable the same way `blocking_read`'s own missing
-            // case is (a prior partial `shutdown()` on this same direction, now written to anyway).
-            return -(EPIPE as i64);
-        };
-        if pipe.read_closed || pipe.write_closed {
-            // `read_closed`: the peer doesn't want any more data. `write_closed`: *this* end
-            // already called `shutdown(SHUT_WR)` on itself (`syscall::sys_shutdown`) -- real
-            // `write()` after your own half-close fails the same way.
-            return -(EPIPE as i64);
-        }
-        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
-        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-        pipe.data.extend(bytes.iter().copied());
+/// write half (`sock_write`). Blocks (writing what fits first) once the buffer is at
+/// `PIPE_CAPACITY` — see this module's own doc comment for why an unbounded buffer here was a
+/// real, live bug. `real_fd` is consulted the same way `blocking_read`'s own is, for a real
+/// `O_NONBLOCK` writer.
+fn write_into(pipe_id: u64, ptr: u64, len: u64, real_fd: u64) -> i64 {
+    let total = len as usize;
+    let mut written = 0usize;
+    loop {
+        {
+            let mut pipes = PIPES.lock();
+            let Some(pipe) = pipes.get_mut(&pipe_id) else {
+                // Already fully torn down -- only reachable the same way `blocking_read`'s own
+                // missing case is (a prior partial `shutdown()` on this same direction, now
+                // written to anyway).
+                return if written > 0 {
+                    written as i64
+                } else {
+                    -(EPIPE as i64)
+                };
+            };
+            if pipe.read_closed || pipe.write_closed {
+                // `read_closed`: the peer doesn't want any more data. `write_closed`: *this* end
+                // already called `shutdown(SHUT_WR)` on itself (`syscall::sys_shutdown`) -- real
+                // `write()` after your own half-close fails the same way.
+                return if written > 0 {
+                    written as i64
+                } else {
+                    -(EPIPE as i64)
+                };
+            }
+            let available = PIPE_CAPACITY.saturating_sub(pipe.data.len());
+            if available > 0 {
+                let n = (total - written).min(available);
+                // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+                let bytes =
+                    unsafe { core::slice::from_raw_parts((ptr as *const u8).add(written), n) };
+                pipe.data.extend(bytes.iter().copied());
+                written += n;
+                drop(pipes); // must drop before waking -- see process::table()'s own doc comment
+                wake_blocked_readers(pipe_id);
+                if written == total {
+                    return written as i64;
+                }
+                continue; // more to write -- buffer is now full, loop back and block below
+            }
+            if crate::fd::is_nonblocking(real_fd) {
+                return if written > 0 {
+                    written as i64
+                } else {
+                    -(EAGAIN as i64)
+                };
+            }
+            // Full, read end still open -- block and let something else run (e.g. the reader
+            // that'll drain space) instead of growing the buffer without limit.
+            let caller = scheduler::current_pid();
+            let mut table = process::table().lock();
+            table.get_mut(&caller).unwrap().state =
+                ProcState::Blocked(BlockReason::WaitingForPipeSpace(pipe_id));
+        } // every lock dropped before schedule() -- see process::table()'s own doc comment
+        scheduler::schedule();
+        // Woken by blocking_read draining space or close_direction closing the read side -- loop
+        // back and re-check from the top.
     }
-    wake_blocked_readers(pipe_id);
-    len as i64
 }
 
 /// Marks one direction of `pipe_id`'s buffer closed, removing the buffer entirely once both
@@ -171,21 +224,27 @@ fn write_into(pipe_id: u64, ptr: u64, len: u64) -> i64 {
 /// once the real close eventually happens). That reuse is exactly why this doesn't `.expect()` a
 /// present `pipe_id` the way earlier revisions did -- a real close arriving after the peer already
 /// fully closed (or after this end's own prior partial shutdown let the buffer get removed first)
-/// must be a harmless no-op, not a panic. Returns whether this call closed the *write* side
-/// specifically, since that's the only direction a blocked reader ever waits on.
-fn close_direction(pipe_id: u64, dir: End) -> bool {
-    let mut pipes = PIPES.lock();
-    let Some(pipe) = pipes.get_mut(&pipe_id) else {
-        return false;
-    };
+/// must be a harmless no-op, not a panic. Wakes whichever side (if any) is blocked on the closed
+/// direction: a write close wakes a blocked reader (waiting to see EOF), a read close wakes a
+/// blocked writer (waiting to see `EPIPE`, now that closing the read side can never free space).
+fn close_direction(pipe_id: u64, dir: End) {
+    {
+        let mut pipes = PIPES.lock();
+        let Some(pipe) = pipes.get_mut(&pipe_id) else {
+            return;
+        };
+        match dir {
+            End::Read => pipe.read_closed = true,
+            End::Write => pipe.write_closed = true,
+        }
+        if pipe.read_closed && pipe.write_closed {
+            pipes.remove(&pipe_id);
+        }
+    } // must drop before waking -- see process::table()'s own doc comment
     match dir {
-        End::Read => pipe.read_closed = true,
-        End::Write => pipe.write_closed = true,
+        End::Write => wake_blocked_readers(pipe_id),
+        End::Read => wake_blocked_writers(pipe_id),
     }
-    if pipe.read_closed && pipe.write_closed {
-        pipes.remove(&pipe_id);
-    }
-    dir == End::Write
 }
 
 /// `SYS_PIPE`'s real logic. Allocates a fresh pipe id and buffer, allocates two fds
@@ -241,7 +300,7 @@ extern "C" fn pipe_write(real_fd: u64, ptr: u64, len: u64) -> i64 {
         End::Write,
         "pipe_write called against a pipe's read end"
     );
-    write_into(pipe_id, ptr, len)
+    write_into(pipe_id, ptr, len, real_fd)
 }
 
 extern "C" fn pipe_close(real_fd: u64) -> i64 {
@@ -249,10 +308,10 @@ extern "C" fn pipe_close(real_fd: u64) -> i64 {
         return -EBADF;
     };
     // A blocked reader needs to wake up and re-check even without new data if this was the write
-    // end -- it's waiting to see write_closed flip to true (EOF), not just for data.
-    if close_direction(pipe_id, end) {
-        wake_blocked_readers(pipe_id);
-    }
+    // end (waiting to see write_closed flip to true, i.e. EOF) -- and symmetrically a blocked
+    // writer needs waking if this was the read end (waiting to see read_closed, i.e. EPIPE, now
+    // that the buffer can never drain further). `close_direction` wakes whichever applies.
+    close_direction(pipe_id, end);
     0
 }
 
@@ -304,7 +363,7 @@ extern "C" fn sock_write(real_fd: u64, ptr: u64, len: u64) -> i64 {
     let Some(end) = SOCK_ENDS.lock().get(&real_fd).copied() else {
         return -EBADF;
     };
-    write_into(end.write_pipe, ptr, len)
+    write_into(end.write_pipe, ptr, len, real_fd)
 }
 
 extern "C" fn sock_close(real_fd: u64) -> i64 {
@@ -312,11 +371,11 @@ extern "C" fn sock_close(real_fd: u64) -> i64 {
         return -EBADF;
     };
     // Closing an endpoint closes both directions it owns: its own outgoing buffer's write side
-    // (the peer's next read sees EOF once drained) and its own incoming buffer's read side (the
-    // peer's next write sees EPIPE). Only the write side ever has a blocked reader to wake.
+    // (the peer's next read sees EOF once drained, waking any blocked reader) and its own
+    // incoming buffer's read side (the peer's next write sees EPIPE, waking any blocked writer).
+    // `close_direction` wakes whichever applies for each.
     close_direction(end.write_pipe, End::Write);
     close_direction(end.read_pipe, End::Read);
-    wake_blocked_readers(end.write_pipe);
     0
 }
 
@@ -340,15 +399,11 @@ pub(crate) fn do_shutdown(real_fd: u64, how: u64) -> Result<u64, u64> {
             close_direction(end.read_pipe, End::Read);
         }
         SHUT_WR => {
-            if close_direction(end.write_pipe, End::Write) {
-                wake_blocked_readers(end.write_pipe);
-            }
+            close_direction(end.write_pipe, End::Write);
         }
         SHUT_RDWR => {
             close_direction(end.read_pipe, End::Read);
-            if close_direction(end.write_pipe, End::Write) {
-                wake_blocked_readers(end.write_pipe);
-            }
+            close_direction(end.write_pipe, End::Write);
         }
         _ => return Err(crate::syscall::EINVAL),
     }
@@ -359,6 +414,16 @@ fn wake_blocked_readers(pipe_id: u64) {
     let mut table = process::table().lock();
     for (&pid, proc) in table.iter_mut() {
         if proc.state == ProcState::Blocked(BlockReason::WaitingForPipeData(pipe_id)) {
+            proc.state = ProcState::Ready;
+            scheduler::enqueue_ready(pid);
+        }
+    }
+}
+
+fn wake_blocked_writers(pipe_id: u64) {
+    let mut table = process::table().lock();
+    for (&pid, proc) in table.iter_mut() {
+        if proc.state == ProcState::Blocked(BlockReason::WaitingForPipeSpace(pipe_id)) {
             proc.state = ProcState::Ready;
             scheduler::enqueue_ready(pid);
         }

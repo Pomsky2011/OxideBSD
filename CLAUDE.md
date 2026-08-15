@@ -351,19 +351,22 @@ the tool that found the
   `PATH=/bin`, so `/bin/<name>` resolves from any cwd. `modules/oxfs`'s `module_init` seeds every
   applet under its bare name in `/bin`; data fixtures (`hello.txt`, ...) stay at root.
 - New kernel-resident pieces `sh` required: the real 4th syscall arg (`R10`, for `envp`), real
-  blocking `pipe(2)`/`dup2(2)` (`src/pipe.rs` — unbounded `VecDeque<u8>`, blocks via
-  `BlockReason::WaitingForPipeData` + `scheduler::schedule()`), and a **per-process** `(Pid, fd)`
-  fd table (`src/fd.rs`) — a flat table broke real pipelines the moment a parent closed its own
-  copy of a pipe fd out from under still-using children.
-- **Known, confirmed-live panic: a producer whose own `write()` calls never block can OOM the
-  kernel heap.** `yes | head -n 3` reliably panics (`memory allocation of 67239936 bytes failed`),
-  found by `modules/oxfs/src/test_busybox.sh` (deliberately not exercised there — see that script's
-  own "NOT EXERCISED" comment for the full root-cause writeup). `yes` never yields (no blocking
-  syscall in its write loop), so with no preemption `head` never gets scheduled to read three lines
-  and close its end, and the unbounded `VecDeque<u8>` above grows without limit. Not specific to
-  `yes`/`head` — any pipeline where a non-blocking producer outpaces a consumer that stops reading
-  early has the same failure mode. A real fix needs either actual preemptive scheduling or a
-  bounded pipe buffer with a real blocking writer — a genuine architectural decision, not a patch.
+  blocking `pipe(2)`/`dup2(2)` (`src/pipe.rs` — bounded at `PIPE_CAPACITY` (64 KiB, matching real
+  Linux's own default) with a real blocking writer, blocks via `BlockReason::WaitingForPipeData`/
+  `WaitingForPipeSpace` + `scheduler::schedule()`), and a **per-process** `(Pid, fd)` fd table
+  (`src/fd.rs`) — a flat table broke real pipelines the moment a parent closed its own copy of a
+  pipe fd out from under still-using children.
+- **Fixed: a producer whose own `write()` calls never block used to be able to OOM the kernel
+  heap.** `yes | head -n 3` used to reliably panic (`memory allocation of 67239936 bytes failed`),
+  found by `modules/oxfs/src/test_busybox.sh`. Root cause: `src/pipe.rs`'s buffer used to be an
+  unbounded `VecDeque<u8>` — `yes` never yields (no blocking syscall in its write loop), so with no
+  preemption `head` never got scheduled to read three lines and close its end, and the buffer grew
+  without limit. Not specific to `yes`/`head` — any pipeline where a non-blocking producer outpaces
+  a consumer that stops reading early had the same failure mode. Fixed by bounding the buffer (see
+  above) rather than adding preemptive scheduling — once full, `write_into` blocks the producer
+  (`BlockReason::WaitingForPipeSpace`) until the consumer drains space or closes its read end
+  (`EPIPE` for the still-blocked writer once woken, via the same `close_direction` codepath that
+  already delivered `EOF` to a blocked reader on a write-end close).
 - **`IA32_FS_BASE` (TLS) is a single global MSR `context_switch::switch_context` never
   saved/restored per-process** — a musl-linked parent resuming after a musl-linked child exited
   would silently run with the dead child's leftover TLS base and fault on its own stack-protector
