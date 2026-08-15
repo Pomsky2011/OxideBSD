@@ -501,10 +501,24 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     // see CLAUDE.md's BusyBox section.) `PATH=/bin` beats musl's own hardcoded
     // `/usr/local/bin:/bin:/usr/bin` fallback (used only when `$PATH` is unset entirely), since
     // none of *those* directories exist in oxfs.
+    // `TERM=linux` matches this console's real nature (a VGA text-mode VT, see `src/vga.rs`'s own
+    // SGR/CSI parser) -- most BusyBox tools treat unset `TERM` as non-dumb already
+    // (`is_TERM_dumb()` only fires on an exact "dumb" match), but ncurses-shaped tools (`vi`,
+    // `clear`, `reset`) key off a real value. `PS1` uses `hush`'s already-compiled
+    // `CONFIG_FEATURE_EDITING_FANCY_PROMPT` escapes (`build.rs`'s HUSH-specific Kconfig flip) --
+    // these are literal two-byte `\e`/`\[`/`\]`/`\u`/`\h`/`\w`/`\$` sequences that `lineedit.c`'s
+    // own `parse_prompt` expands at print time (NOT a raw ESC byte here -- that's what `\e` itself
+    // expands to). `\[`/`\]` mark non-printing spans so line-editing cursor math ignores the color
+    // codes, `\u`/`\h` resolve via /etc/passwd + uname()'s nodename (both already real), `\w` is
+    // cwd, `\$` is euid-sensitive ('#' for root).
     let initial_rsp = crate::user_stack::build(
         &elf,
         &[b"(init)"],
-        &[b"PATH=/bin"],
+        &[
+            b"PATH=/bin",
+            b"TERM=linux",
+            b"PS1=\\[\\e[1;32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\$ ",
+        ],
         stack_top,
         user_stack_bottom(stack_top),
         &mapped_pages,
@@ -571,6 +585,16 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         }
         table.insert(pid, Box::new(process));
     }
+    // spawn() is only ever called once, for pid 1, with stdin/stdout/stderr already wired
+    // directly to the real console (never through a real `open()` syscall -- see the envp comment
+    // above). On a real kernel, a session leader's first real `open()` of a tty auto-associates it
+    // as that session's controlling terminal; since pid 1 never takes that path here, nothing ever
+    // would otherwise. Granting it directly mirrors that real behavior and is what lets `hush`'s
+    // own already-compiled job-control startup (`tcgetpgrp`/`bb_setpgrp`/`tcsetpgrp`, gated on
+    // `isatty()` succeeding via a real controlling session -- see `src/stdin.rs`'s `TIOCGPGRP`/
+    // `TIOCSPGRP` handling) actually activate instead of sitting permanently dormant -- this is
+    // what makes Ctrl+C interrupt a running foreground job for real.
+    crate::stdin::set_controlling_session(pid);
     // Bootstraps this process's own stdin/stdout/stderr from crate::fd::init's own pseudo-pid
     // registration -- the same fork_inherit path a real fork() uses, see that function's own doc
     // comment.
@@ -1209,9 +1233,11 @@ fn terminate_process(pid: Pid, code: i32) {
     }
 }
 
-/// `SYS_KILL`'s real logic. Only a positive `target_pid` (no process-group/broadcast targeting —
-/// real `kill(2)`'s `pid <= 0` cases) and signals `1..=31` are supported; anything else is
-/// `EINVAL`, matching real `kill()`'s own validation.
+/// `SYS_KILL`'s real logic. Signals `1..=31` only; anything else is `EINVAL`, matching real
+/// `kill()`'s own validation. `target_pid == 0`/`< 0` are real POSIX process-group broadcasts
+/// (`0` = the caller's own group, `< 0` = group `|target_pid|`) — see the `target_pid <= 0` branch
+/// below for that path; everything past this doc comment's remaining bullets describes the
+/// positive, single-target case.
 ///
 /// Sending to *self* just sets the pending bit and returns — actual delivery happens naturally at
 /// this exact syscall's own dispatch tail (`src/syscall.rs`'s `deliver_pending_signal`), since the
@@ -1237,8 +1263,42 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     if !(0..=31).contains(&sig) {
         return Err(EINVAL);
     }
+
     if target_pid <= 0 {
-        return Err(EINVAL);
+        // Real POSIX process-group broadcast: `0` targets the caller's own group, `< 0` targets
+        // group `|target_pid|` -- both real `kill(2)` shapes, not this ABI's own invention. Found
+        // live, not preemptively added: hush's own `fg`/`bg` builtins (`kill(-pgrp, SIGCONT)`) and
+        // its job-cleanup path (`kill(-pgrp, SIGHUP)`/`kill(-pgrp, SIGCONT)`) both depend on this
+        // -- previously unreachable dead code until real job control (`process::spawn`'s
+        // controlling-tty auto-claim, see CLAUDE.md's session/controlling-tty notes) made hush's
+        // own job-control startup actually activate for the first time. Reuses
+        // `signal_foreground_group`'s exact per-process Discard/Terminate/SetPending resolution
+        // unchanged -- it already just takes a plain `pgid`, "foreground" was never load-bearing
+        // to its own logic, only to its one existing caller.
+        let pgid = if target_pid == 0 {
+            let table = PROCESS_TABLE.lock();
+            table
+                .get(&caller_pid)
+                .expect("kill: current process missing from table")
+                .pgid
+        } else {
+            target_pid.checked_neg().ok_or(EINVAL)? as u64
+        };
+        let has_target = {
+            let table = PROCESS_TABLE.lock();
+            table
+                .values()
+                .any(|p| p.pgid == pgid && !matches!(p.state, ProcState::Zombie(_)))
+        };
+        if !has_target {
+            return Err(ESRCH);
+        }
+        // sig == 0: real kill(pgrp, 0) is an existence-only check, same convention as the
+        // single-target sig == 0 case below -- has_target above already established that.
+        if sig != 0 {
+            signal_foreground_group(pgid, sig as u64);
+        }
+        return Ok(0);
     }
     let target = target_pid as u64;
 
