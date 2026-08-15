@@ -35,7 +35,14 @@ const PAGE_SIZE: u64 = 4096;
 /// writes it into the top of the already-mapped user stack described by `mapped_pages` (the same
 /// `(Page, PhysFrame)` map `elf::load`'s own BSS-zeroing loop builds — see `process.rs`'s
 /// `map_user_stack`), via the phys-offset technique used throughout this codebase for writing into
-/// a not-necessarily-active address space. Returns the final, 16-byte-aligned `RSP`.
+/// a not-necessarily-active address space. `interp_base`, when `Some`, is a `PT_INTERP`
+/// interpreter's own real runtime bias (`src/process.rs`'s `INTERP_LOAD_BASE`, the same value
+/// passed as `elf::load`'s own `bias` parameter when loading it) and becomes `AT_BASE`; `None` for
+/// every static binary (today's only case), which keeps `AT_BASE`
+/// at `0`. This isn't just "no bias to report" — musl's own dynamic-linker bootstrap treats
+/// `AT_BASE == 0` as "I was invoked directly as the main program, not as someone else's
+/// interpreter," so passing a real base here is required, not cosmetic, once a caller starts
+/// loading an interpreter. Returns the final, 16-byte-aligned `RSP`.
 ///
 /// # Panics
 ///
@@ -50,6 +57,7 @@ pub fn build(
     stack_bottom: VirtAddr,
     mapped_pages: &BTreeMap<Page<Size4KiB>, PhysFrame<Size4KiB>>,
     physical_memory_offset: VirtAddr,
+    interp_base: Option<u64>,
 ) -> VirtAddr {
     let phdr_vaddr = elf.phdr_vaddr();
 
@@ -84,7 +92,7 @@ pub fn build(
         (AT_PHENT, elf.phentsize()),
         (AT_PHNUM, elf.phnum()),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, 0),
+        (AT_BASE, interp_base.unwrap_or(0)),
         (AT_ENTRY, elf.entry_point().as_u64()),
         (AT_UID, 0),
         (AT_EUID, 0),

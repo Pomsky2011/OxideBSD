@@ -5331,6 +5331,32 @@ fn format_fresh_filesystem() -> bool {
     let usr_lib_tcc = ensure_dir(usr_lib, b"tcc");
     ok &= seed_tree(usr_lib_tcc, TCC_RUNTIME_FILES);
 
+    // Real PT_INTERP / dynamic-linking milestone 1 -- see `build.rs`'s `build_musl_sysroot_shared`
+    // for the separate, real `-fPIC`/`-shared` musl build this comes from (distinct from the
+    // static `libc.a` seeded into `/usr/lib` above). musl has no separate `ld.so` binary -- real
+    // upstream musl's own `make install` symlinks its interpreter path directly to `libc.so`
+    // itself (confirmed empirically before writing this) -- so `libc.so`'s real bytes live once,
+    // under `/usr/lib`, and `/lib/ld-musl-x86_64.so.1` is just a symlink to it. `/lib` is seeded as
+    // a real directory containing only that one symlink (not a whole-directory `/lib -> /usr/lib`
+    // alias) to match that same real upstream convention exactly, not invent a different one.
+    ok &= seed_file(
+        usr_lib,
+        b"libc.so",
+        include_bytes!(env!("OXFS_DYNLINK_LIBC_SO_PATH")),
+    );
+    let lib = ensure_dir(root, b"lib");
+    ok &= seed_symlink(lib, b"ld-musl-x86_64.so.1", b"/usr/lib/libc.so");
+
+    // A real, minimal, dynamically-linked fixture binary (one `write()` call) -- see
+    // `userland/dynlink-smoke/main.c` -- for exercising a genuine `PT_INTERP` load end to end via
+    // `tests/dynlink_syscall_smoke.rs`: real `fork`+`execve` of this path, through a real `SYSCALL`,
+    // loading both this binary and the interpreter above into the same address space.
+    ok &= seed_file(
+        root,
+        b"dynlink-smoke.elf",
+        include_bytes!(env!("OXFS_DYNLINK_SMOKE_ELF_PATH")),
+    );
+
     // A real fixture for exercising the compiler end to end (`tcc -static -o hello.elf hello.c`,
     // by hand at the hush prompt or via `tests/tcc_syscall_smoke.rs`) -- a real `printf`, not a
     // bare `return`, so it exercises musl's stdio/writev path, not just process exit.

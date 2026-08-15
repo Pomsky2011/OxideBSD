@@ -43,6 +43,10 @@ fn main() {
         "pipe-backpressure-syscall-smoke",
         "PIPE_BACKPRESSURE_SYSCALL_SMOKE_ELF_PATH",
     );
+    build_userland_crate(
+        "dynlink-syscall-smoke",
+        "DYNLINK_SYSCALL_SMOKE_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -77,6 +81,22 @@ fn main() {
     let tinycc_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/tinycc");
     let tcc_elf_path = build_tinycc(&musl_sysroot);
     let tcc_runtime_manifest_path = write_tcc_runtime_manifest(&musl_sysroot, &tinycc_dir);
+
+    // Real PT_INTERP / dynamic-linking milestone 1: a real, separate shared musl build (see
+    // `build_musl_sysroot_shared`'s own doc comment for why it can't reuse the static sysroot
+    // above, and why it's linked at its own natural base rather than a fixed one) producing
+    // `libc.so` (which doubles as `ld-musl-x86_64.so.1`, musl's own convention) -- the kernel
+    // itself picks its real runtime placement (`src/process.rs`'s `INTERP_LOAD_BASE`, `0xc000000`)
+    // at `execve` time, not this build. The fixture binary
+    // (`userland/dynlink-smoke/main.c`) is fixed at `0x4d00000` -- an ordinary `ET_EXEC` main
+    // binary, same fixed-link-time-base treatment every other userland crate here gets, distinct
+    // from `INTERP_LOAD_BASE` since the two must be *co-resident* in the same address space for a
+    // real `PT_INTERP` exec to work at all.
+    let dynlink_fixture_base: u64 = 0x4d00000;
+    let dynlink_musl_sysroot = build_musl_sysroot_shared();
+    let dynlink_libc_so_path = dynlink_musl_sysroot.join("lib/libc.so");
+    let dynlink_smoke_elf_path =
+        build_dynlink_smoke(&dynlink_musl_sysroot, dynlink_fixture_base);
 
     // BusyBox applets ported to OxideBSD -- see CLAUDE.md's BusyBox section. Each is its own
     // genuinely standalone, single-applet static binary (not a multi-call `busybox` binary
@@ -506,6 +526,14 @@ fn main() {
             "TCC_RUNTIME_MANIFEST_PATH",
             tcc_runtime_manifest_path.to_str().unwrap(),
         ),
+        (
+            "OXFS_DYNLINK_LIBC_SO_PATH",
+            dynlink_libc_so_path.to_str().unwrap(),
+        ),
+        (
+            "OXFS_DYNLINK_SMOKE_ELF_PATH",
+            dynlink_smoke_elf_path.to_str().unwrap(),
+        ),
     ];
     oxfs_extra_env.extend(
         oxfs_applet_paths
@@ -669,6 +697,159 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("failed to run musl-gcc for musl-smoke: {e}"));
     if !status.success() {
         panic!("building musl-smoke failed: {status}");
+    }
+    out
+}
+
+/// A **second, separate** musl build producing real shared objects (`libc.so`, and
+/// `ld-musl-x86_64.so.1` as musl's own install step symlinks it to the same file -- upstream musl
+/// has no separate `ld.so` binary) with genuine `-fPIC` codegen, linked at its own natural
+/// (near-zero) default base -- **deliberately not** fixed at link time via `-Wl,-Ttext-segment=`
+/// the way every other userland binary in this codebase is. Found the hard way, via a real page
+/// fault: a fixed-link-time base bakes *already-absolute* addresses into the interpreter's own
+/// `.rela.dyn`/`DT_RELA` table (confirmed via `readelf -r`), and real musl's own self-relocation
+/// bootstrap (`ldso/dlstart.c`) always computes `real_addr = AT_BASE + stored_value`, expecting
+/// `stored_value` to be zero-based -- a fixed-base link double-counts the base and produces a wild
+/// pointer. `src/elf.rs`'s `elf::load` now applies a real, kernel-chosen runtime bias instead (see
+/// its own doc comment and `src/process.rs`'s `INTERP_LOAD_BASE`) -- this build only needs to
+/// produce a normally-linked, real `-fPIC` shared object, the same shape any real musl
+/// distro ships.
+///
+/// **Deliberately builds from a fresh copy of `third_party/musl`, not in the same tree
+/// `build_musl_sysroot` already builds the static sysroot in.** That static build configures with
+/// `--disable-shared CFLAGS=-fno-pie -fno-PIC` -- exactly wrong for real shared objects (genuine
+/// PIC codegen, not the anti-PIE workaround TinyCC's static linking needed, see that function's
+/// own doc comment) -- and both builds happen in-place (no out-of-tree `O=` mechanism musl's
+/// Makefile supports, confirmed against `build_musl_sysroot`'s own precedent). Running a second,
+/// differently-flagged configure+make in the same source directory would silently corrupt the
+/// static `libc.a` that TinyCC and the whole BusyBox roster already depend on. The copy is a
+/// one-time cost (gated on the destination not already existing) -- this deliberately does not try
+/// to detect a stale copy against upstream source changes the way `build_busybox_applet`'s
+/// staleness floor does; re-syncing this copy after a real `third_party/musl` patch is a manual
+/// step for now (`rm -rf target/musl-src-shared`), matching this milestone's own deliberately
+/// narrow scope.
+///
+/// **`--prefix`/`--syslibdir` both point inside the sysroot itself** (not a real target-visible
+/// path like `/usr`/`/lib`), matching `build_musl_sysroot`'s own "no `DESTDIR`, prefix ==
+/// final-usage location" shape -- confirmed empirically the only way `musl-gcc`'s own installed
+/// wrapper (which bakes in `-specs <libdir>/musl-gcc.specs` at install time, read at every future
+/// invocation) stays directly usable as a host-side cross-compiler without a second relocation
+/// step. This means the *default* dynamic-linker path baked into anything linked against this
+/// sysroot would be this host's own absolute sysroot path, not the real target path
+/// (`/lib/ld-musl-x86_64.so.1`, matching where `modules/oxfs` seeds it) -- `build_dynlink_smoke`
+/// below overrides it explicitly per-link via `-Wl,--dynamic-linker=...` rather than trying to
+/// thread a real target-relative prefix through (confirmed via direct `readelf -p .interp`
+/// experimentation that this override wins over the specs file's own default).
+fn build_musl_sysroot_shared() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let real_musl_dir = Path::new(manifest_dir).join("third_party/musl");
+    let musl_dir = Path::new(manifest_dir).join("target/musl-src-shared");
+    let sysroot = Path::new(manifest_dir).join("target/musl-sysroot-shared");
+
+    if !musl_dir.exists() {
+        let status = Command::new("cp")
+            .args(["-a", "--", "."])
+            .arg(&musl_dir)
+            .current_dir(&real_musl_dir)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to copy third_party/musl for the shared build: {e}"));
+        if !status.success() {
+            panic!("copying third_party/musl for the shared build failed: {status}");
+        }
+        // `cp -a` faithfully copies whatever build state `third_party/musl` itself happens to be
+        // in right now -- including, almost always, `build_musl_sysroot`'s own already-built
+        // static `config.mak`/`obj/`/`lib/*.a` (musl builds in place, no `O=` out-of-tree
+        // mechanism, same reasoning `build_musl_sysroot`'s own doc comment already gives). Left
+        // alone, the copy's `config.mak` presence check right below would wrongly treat *that*
+        // static config as "already configured for this shared build" and skip `./configure`
+        // entirely -- and even a plain `rm config.mak` alone wouldn't be enough, since `make`'s own
+        // incremental tracking compares object mtimes against source mtimes, not compiler flags,
+        // so stale non-PIC `.o`/`.lo` files from the static build would silently survive into a
+        // supposedly-`-fPIC` build (the same class of bug CLAUDE.md's BusyBox section documents
+        // for a stale out-of-tree build directory). `make distclean` (`rm -rf obj lib` +
+        // `rm -f config.mak`) guarantees a truly pristine tree regardless of what state
+        // `third_party/musl` was in at copy time -- run exactly once, right after a fresh copy,
+        // not on every subsequent `cargo build` (which would defeat this build's own incremental
+        // compilation once it's genuinely configured for real).
+        let status = Command::new("make")
+            .args(["distclean"])
+            .current_dir(&musl_dir)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to distclean the copied musl tree: {e}"));
+        if !status.success() {
+            panic!("distclean of the copied musl tree failed: {status}");
+        }
+    }
+
+    if !musl_dir.join("config.mak").exists() {
+        let status = Command::new("./configure")
+            .current_dir(&musl_dir)
+            .args([
+                &format!("--prefix={}", sysroot.display()),
+                &format!("--syslibdir={}", sysroot.join("lib").display()),
+                "CFLAGS=-fPIC",
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run musl's configure (shared): {e}"));
+        if !status.success() {
+            panic!("musl configure (shared) failed: {status}");
+        }
+    }
+
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let status = Command::new("make")
+        .current_dir(&musl_dir)
+        .args(["-j", &jobs.to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make for musl (shared): {e}"));
+    if !status.success() {
+        panic!("musl build (shared) failed: {status}");
+    }
+
+    let status = Command::new("make")
+        .current_dir(&musl_dir)
+        .arg("install")
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make install for musl (shared): {e}"));
+    if !status.success() {
+        panic!("musl install (shared) failed: {status}");
+    }
+
+    sysroot
+}
+
+/// Cross-builds `userland/dynlink-smoke/main.c` (one `write()` call) against `sysroot` (see
+/// `build_musl_sysroot_shared` above) as a real, dynamically-linked `ET_EXEC` binary: `-no-pie`
+/// (matching `build_musl_smoke`'s own reasoning -- keeps this the *main binary*, not itself an
+/// `ET_DYN` image, so only the interpreter needs `src/elf.rs`'s new `ET_DYN` handling), fixed at
+/// `fixture_base` (must stay clear of `src/process.rs`'s `INTERP_LOAD_BASE` -- both images load
+/// into the *same* address space for a real `PT_INTERP` exec, unlike every other fixed-base
+/// userland binary in this codebase, which never coexists with another image), and an explicit
+/// `-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1` overriding the sysroot's own host-path default
+/// (see `build_musl_sysroot_shared`'s own doc comment) so the baked-in `PT_INTERP` string matches
+/// the real target path `modules/oxfs` seeds this at.
+fn build_dynlink_smoke(sysroot: &Path, fixture_base: u64) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest_dir).join("userland/dynlink-smoke/main.c");
+    let target_dir = Path::new(manifest_dir).join("target/dynlink-smoke");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/dynlink-smoke");
+    let out = target_dir.join("dynlink-smoke");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let musl_gcc = sysroot.join("bin/musl-gcc");
+    let status = Command::new(&musl_gcc)
+        .arg("-no-pie")
+        .arg(format!("-Wl,-Ttext-segment={fixture_base:#x}"))
+        .arg("-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for dynlink-smoke: {e}"));
+    if !status.success() {
+        panic!("building dynlink-smoke failed: {status}");
     }
     out
 }

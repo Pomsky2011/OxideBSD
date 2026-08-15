@@ -1617,6 +1617,10 @@ pub(crate) extern "C" fn oxidebsd_sys_brk(addr: u64) -> i64 {
     ))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    result_to_ffi(crate::process::do_mprotect(addr, len, prot))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_getpid() -> i64 {
     crate::process::do_getpid() as i64
 }

@@ -484,7 +484,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     let mut mapper = unsafe { address_space.mapper(phys_offset) };
 
     let elf = Elf::parse(elf_bytes).map_err(SpawnError::Elf)?;
-    let entry = with_frame_allocator(|fa| elf::load(&elf, &mut mapper, fa, phys_offset))
+    let entry = with_frame_allocator(|fa| elf::load(&elf, &mut mapper, fa, phys_offset, 0))
         .map_err(SpawnError::Elf)?;
 
     let stack_top = VirtAddr::new(USER_STACK_TOP);
@@ -509,6 +509,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         user_stack_bottom(stack_top),
         &mapped_pages,
         phys_offset,
+        None,
     );
 
     let pid = alloc_pid();
@@ -921,6 +922,15 @@ fn parse_shebang_line(bytes: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
 /// small, independently-chosen bound of the same shape.
 const MAX_SHEBANG_DEPTH: u32 = 4;
 
+/// Real, kernel-chosen runtime base for a `PT_INTERP` interpreter, added as `elf::load`'s `bias`
+/// parameter (see that function's own doc comment for why this must be a real additive bias, not
+/// a link-time-fixed address the interpreter file itself assumes). Clear of every existing fixed
+/// userland load base (`0x4000000`-`0xbf00000`, see every `userland/*/linker.ld`) and of
+/// `module::MODULE_VA_BASE`/`BRK_REGION_CEILING` (`0x10000000`) -- picked once, reused for every
+/// `PT_INTERP` load rather than per-binary, since nothing here needs more than one interpreter
+/// image loaded at a time.
+const INTERP_LOAD_BASE: u64 = 0xc000000;
+
 pub fn do_execve(
     caller_pid: Pid,
     path_ptr: u64,
@@ -983,8 +993,33 @@ pub fn do_execve(
     // SAFETY: phys_offset is the bootloader's phys-memory mapping; this is the only live view of
     // new_address_space's own (not-yet-active) level 4 table right now.
     let mut mapper = unsafe { new_address_space.mapper(phys_offset) };
-    let entry = with_frame_allocator(|fa| elf::load(&elf, &mut mapper, fa, phys_offset))
+    let entry = with_frame_allocator(|fa| elf::load(&elf, &mut mapper, fa, phys_offset, 0))
         .map_err(|_| ENOEXEC)?;
+
+    // A real PT_INTERP dynamic linker, if the binary carries one, gets loaded into the same
+    // not-yet-active address space right here, immediately after the main binary's own segments --
+    // `SYSRETQ` needs to land in the interpreter's own entry, not the main binary's (the
+    // interpreter relocates/resolves itself, then jumps to the main binary's real entry on its
+    // own, via AT_ENTRY -- see `user_stack.rs`). `jump_entry`/`interp_base` stay `entry`/`None`
+    // (today's only case, unchanged) when there's no interpreter. `INTERP_LOAD_BASE` is a real,
+    // kernel-chosen runtime bias applied by `elf::load` itself, not a link-time address the
+    // interpreter file assumes -- see that function's own doc comment for the real bug (a wild
+    // pointer inside the interpreter's own relocation self-processing) a fixed-link-time-base
+    // interpreter caused, and why this bias has to be applied here instead.
+    let mut jump_entry = entry;
+    let mut interp_base: Option<u64> = None;
+    if let Some(interp_path) = elf.interpreter().map_err(|_| ENOEXEC)? {
+        let interp_bytes =
+            read_file_via_syscall(interp_path.as_ptr() as u64, interp_path.len() as u64)?;
+        let interp_elf = Elf::parse(&interp_bytes).map_err(|_| ENOEXEC)?;
+        let interp_entry = with_frame_allocator(|fa| {
+            elf::load(&interp_elf, &mut mapper, fa, phys_offset, INTERP_LOAD_BASE)
+        })
+        .map_err(|_| ENOEXEC)?;
+        jump_entry = interp_entry;
+        interp_base = Some(INTERP_LOAD_BASE);
+    }
+
     let stack_top = VirtAddr::new(USER_STACK_TOP);
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
     // raw_argv (read above, while the caller's own address space was still active) is the caller's
@@ -1020,6 +1055,7 @@ pub fn do_execve(
         user_stack_bottom(stack_top),
         &mapped_pages,
         phys_offset,
+        interp_base,
     );
 
     // ---- commit point: nothing above may fail past here ----
@@ -1039,7 +1075,12 @@ pub fn do_execve(
         // `AddressSpace::new` never freeing anything either.
         me.address_space = new_address_space;
         me.user_stack_top = initial_rsp;
-        me.entry_point = entry;
+        // The real jump target (interpreter's own entry when PT_INTERP loaded one, else the main
+        // binary's) -- not read again for this exact pid (only a never-run process's first switch,
+        // via spawn_trampoline_inner, ever consults entry_point; an execve'd process is already
+        // running and jumps immediately via redirect_frame below), kept in sync anyway since it's
+        // the honest answer to "where does this process's AddressSpace currently expect to run".
+        me.entry_point = jump_entry;
         me.brk = VirtAddr::new(elf.highest_loaded_address());
         // effective_path is whichever path actually got loaded as the real ELF above -- the
         // caller's own original path_bytes when there was no `#!` to follow, or the final
@@ -1071,7 +1112,7 @@ pub fn do_execve(
     // SAFETY: frame is this exact syscall's own live frame -- do_execve is only ever reached via
     // dispatch(SYS_EXECVE, ...), called from within syscall_dispatch, which set CURRENT_FRAME to
     // it just before.
-    unsafe { syscall::redirect_frame(frame, entry, initial_rsp) };
+    unsafe { syscall::redirect_frame(frame, jump_entry, initial_rsp) };
     Ok(0)
 }
 
@@ -2550,6 +2591,19 @@ pub fn do_mmap(caller_pid: Pid, addr_hint: u64, len: u64, prot: u64) -> Result<u
 /// `FrameDeallocator`; only *freeing* the backing frames needs one).
 pub fn do_munmap(addr: u64, len: u64) -> Result<u64, u64> {
     let _ = (addr, len);
+    Ok(0)
+}
+
+/// `SYS_MPROTECT`'s real logic — a permissive no-op success stub, exactly like `do_munmap` above.
+/// This kernel doesn't enforce page protection anywhere yet (`do_mmap` already ignores its own
+/// `prot` argument and unconditionally grants `WRITABLE`; `NO_EXECUTE`/`EFER.NXE` isn't plumbed at
+/// all) — so a caller that successfully changed nothing is an honest, not a regressive, answer,
+/// same tier as `getrusage`'s all-zero-but-correctly-shaped struct. Registered mainly so a real
+/// dynamic linker's own RELRO-protection step (`mprotect`ing its relocated `PT_GNU_RELRO` segment
+/// read-only after relocation) doesn't surface as an unrecognized-syscall `ENOSYS` — real
+/// enforcement is future work, once something actually depends on W^X being real.
+pub fn do_mprotect(addr: u64, len: u64, prot: u64) -> Result<u64, u64> {
+    let _ = (addr, len, prot);
     Ok(0)
 }
 

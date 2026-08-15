@@ -56,6 +56,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_mmap(addr_hint: u64, len: u64, prot: u64) -> i64;
     fn oxidebsd_sys_munmap(addr: u64, len: u64) -> i64;
     fn oxidebsd_sys_brk(addr: u64) -> i64;
+    fn oxidebsd_sys_mprotect(addr: u64, len: u64, prot: u64) -> i64;
     fn oxidebsd_sys_set_fs_base(base: u64) -> i64;
     fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
     fn oxidebsd_sys_set_tid_address(tidptr: u64) -> i64;
@@ -77,6 +78,14 @@ const SYS_WRITEV: u64 = 104;
 const SYS_GETPPID: u64 = 107;
 const SYS_SET_TID_ADDRESS: u64 = 150;
 const SYS_READV: u64 = 153;
+/// Continues the ABI's own invented-number sequence from `modules/oxfs`'s/`modules/posix_compat`'s
+/// `SYS_GETRUSAGE = 491` (the current highest assigned anywhere in this ABI as of this addition),
+/// not real Linux's `mprotect = 10` — same collision-avoidance discipline as that whole `471+`
+/// block (see `src/syscall.rs`'s own module doc comment for the full history of why). Lives here,
+/// not in a feature module, for the same reason `SYS_MMAP`/`SYS_MUNMAP`/`SYS_BRK` above do: a real
+/// dynamic linker's own RELRO-protection step needs this at the same "core, every real program
+/// eventually calls it" tier once dynamic linking exists at all.
+const SYS_MPROTECT: u64 = 492;
 
 extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
@@ -129,6 +138,10 @@ extern "C" fn handle_set_fs_base(base: u64, _arg1: u64, _arg2: u64, _arg3: u64) 
     unsafe { oxidebsd_sys_set_fs_base(base) }
 }
 
+extern "C" fn handle_mprotect(addr: u64, len: u64, prot: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_mprotect(addr, len, prot) }
+}
+
 extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_writev(fd, iov_ptr, iovcnt) }
 }
@@ -155,6 +168,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MMAP, handle_mmap);
         oxidebsd_register_syscall(SYS_MUNMAP, handle_munmap);
         oxidebsd_register_syscall(SYS_BRK, handle_brk);
+        oxidebsd_register_syscall(SYS_MPROTECT, handle_mprotect);
         oxidebsd_register_syscall(SYS_SET_FS_BASE, handle_set_fs_base);
         oxidebsd_register_syscall(SYS_WRITEV, handle_writev);
         oxidebsd_register_syscall(SYS_SET_TID_ADDRESS, handle_set_tid_address);

@@ -1,9 +1,19 @@
 //! A hand-rolled, minimal ELF64 parser and loader.
 //!
 //! Deliberately not a dependency (see `CLAUDE.md`'s dependency notes): this only needs to handle
-//! the narrow slice of the format our own toolchain produces — a static, non-PIE, non-relocatable
-//! `ET_EXEC` binary with a handful of `PT_LOAD` segments and nothing else (no dynamic linking, no
-//! relocations, no interpreter) — which is small and mechanical enough to own outright.
+//! the narrow slice of the format our own toolchain produces — a non-relocatable `ET_EXEC` or
+//! `ET_DYN` binary with a handful of `PT_LOAD` segments, optionally one `PT_INTERP`, and nothing
+//! else — which is small and mechanical enough to own outright. Still no real *relocation
+//! processing* here (no `R_X86_64_RELATIVE`/GOT/PLT patching) — `load()` does support a real,
+//! caller-chosen additive `bias` applied to every segment's `p_vaddr`, needed for a `PT_INTERP`
+//! interpreter loaded at a kernel-chosen runtime address (see `load()`'s own doc comment for why
+//! this is real, necessary arithmetic, not optional): a naturally-linked `ET_DYN` image's own
+//! `.dynamic`/`.rela.dyn` entries are stored *as if* loaded at bias `0`, and it's the loaded
+//! image's own userspace bootstrap code (real musl `ldso/dlstart.c`, in this codebase's case) that
+//! applies the real runtime bias to them at startup, reading it back from `AT_BASE` — this file's
+//! only job is to place the image correctly and report that same bias truthfully, never to touch
+//! the relocation table itself. Every other caller (every `ET_EXEC` main binary) passes `bias: 0`,
+//! matching each one's own fixed `linker.ld` load address unchanged.
 //!
 //! Multi-byte fields are read via explicit `from_le_bytes` on byte slices rather than casting the
 //! input to a `#[repr(C)]` struct: `include_bytes!` output has no alignment guarantee, and an
@@ -20,9 +30,11 @@ const MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const CLASS_64: u8 = 2;
 const DATA_LITTLE_ENDIAN: u8 = 1;
 const TYPE_EXEC: u16 = 2;
+const TYPE_DYN: u16 = 3;
 const MACHINE_X86_64: u16 = 62;
 
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PF_WRITE: u32 = 1 << 1;
 
 const EHDR_SIZE: usize = 64;
@@ -75,7 +87,13 @@ impl<'a> Elf<'a> {
         if bytes[5] != DATA_LITTLE_ENDIAN {
             return Err(ElfError::UnsupportedEndianness);
         }
-        if read_u16(bytes, 16) != TYPE_EXEC {
+        let e_type = read_u16(bytes, 16);
+        // ET_DYN is accepted alongside ET_EXEC solely for a PT_INTERP dynamic-linker image, which
+        // is always ET_DYN — never a real position-independent load: this kernel does no
+        // relocation-at-arbitrary-base anywhere, so any ET_DYN image handed to `load()` must
+        // already be linked at a fixed, correct address (matching every userland crate's own
+        // `linker.ld`-fixed load base), not actually relocated by the kernel.
+        if e_type != TYPE_EXEC && e_type != TYPE_DYN {
             return Err(ElfError::UnsupportedType);
         }
         if read_u16(bytes, 18) != MACHINE_X86_64 {
@@ -161,6 +179,32 @@ impl<'a> Elf<'a> {
         highest.div_ceil(PAGE_SIZE) * PAGE_SIZE
     }
 
+    /// The `PT_INTERP` segment's content, if present — the NUL-terminated interpreter path a real
+    /// dynamically-linked binary embeds (e.g. `/lib/ld-musl-x86_64.so.1`). Trims exactly the one
+    /// trailing NUL `p_filesz` always includes (a real interpreter string), returning the bare
+    /// path bytes. Bounds-checked the same way `elf::load`'s own `PT_LOAD` handling is — this data
+    /// comes from the same untrusted file bytes.
+    pub fn interpreter(&self) -> Result<Option<&'a [u8]>, ElfError> {
+        for header in self.program_headers() {
+            if header.p_type != PT_INTERP {
+                continue;
+            }
+            let end = header
+                .p_offset
+                .checked_add(header.p_filesz)
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            if end as usize > self.bytes.len() {
+                return Err(ElfError::SegmentOutOfBounds);
+            }
+            let mut path = &self.bytes[header.p_offset as usize..end as usize];
+            if path.last() == Some(&0) {
+                path = &path[..path.len() - 1];
+            }
+            return Ok(Some(path));
+        }
+        Ok(None)
+    }
+
     fn program_headers(&self) -> impl Iterator<Item = ProgramHeader> + '_ {
         (0..self.phnum).map(move |i| {
             let offset = self.phoff + i * self.phentsize;
@@ -178,15 +222,34 @@ impl<'a> Elf<'a> {
 }
 
 /// Maps and copies every `PT_LOAD` segment of `elf` into `mapper`'s address space, returning the
-/// entry point. `physical_memory_offset` is used to write segment bytes into freshly allocated
-/// frames directly (rather than through `mapper`'s own mapping, which may be read-only, and which
-/// may belong to an address space that isn't active yet) — the same technique used throughout
-/// `src/memory.rs` and `src/address_space.rs`.
+/// real runtime entry point (`elf.entry_point() + bias`). `physical_memory_offset` is used to
+/// write segment bytes into freshly allocated frames directly (rather than through `mapper`'s own
+/// mapping, which may be read-only, and which may belong to an address space that isn't active
+/// yet) — the same technique used throughout `src/memory.rs` and `src/address_space.rs`.
+///
+/// `bias` is added to every segment's `p_vaddr` (and to the returned entry point) before mapping —
+/// `0` for every `ET_EXEC` main binary (its own `p_vaddr`s already *are* its real, fixed runtime
+/// addresses, matching its own `linker.ld`), a real, kernel-chosen nonzero value for a `PT_INTERP`
+/// interpreter (`src/process.rs`'s `do_execve`). **Found the hard way, via a real page fault, why
+/// this can't just be `0` for the interpreter case too** (which was this file's original
+/// milestone-1 design): a naturally-linked `ET_DYN` shared object's own `.rela.dyn`/`DT_RELA`
+/// table already stores addresses "as if loaded at bias `0`" — its own userspace bootstrap
+/// (`ldso/dlstart.c`, real musl) computes `real_addr = AT_BASE + stored_value`, so mapping it at a
+/// *fixed link-time* base (via `-Wl,-Ttext-segment=`, as if it needed no further adjustment) bakes
+/// *already-absolute* addresses into that same table — and reporting that fixed base as `AT_BASE`
+/// then double-counts it, producing a wild pointer (confirmed directly: `readelf -r` on such a
+/// build showed `.rela.dyn` entries already absolute, e.g. `Offset=00000c0aab20`, not
+/// zero-based — and the observed fault address matched `AT_BASE + that_same_value` almost
+/// exactly). The fix is this real, if small, bias: link the interpreter *naturally* (near-zero
+/// base, like any ordinary `.so`), let this function shift it to wherever the kernel actually
+/// wants it, and report that same shift as `AT_BASE` — exactly the same math a real kernel's own
+/// ELF loader performs for a `PT_INTERP` interpreter, not a shortcut.
 pub fn load(
     elf: &Elf,
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
+    bias: u64,
 ) -> Result<VirtAddr, ElfError> {
     // Tiny binaries routinely have multiple PT_LOAD segments (e.g. `.text` then `.rodata`)
     // sharing a page, since segments aren't aligned to each other, just each internally aligned
@@ -210,9 +273,11 @@ pub fn load(
             return Err(ElfError::SegmentOutOfBounds);
         }
 
-        let mem_start = header.p_vaddr;
-        let mem_end = header
+        let mem_start = header
             .p_vaddr
+            .checked_add(bias)
+            .ok_or(ElfError::SegmentOutOfBounds)?;
+        let mem_end = mem_start
             .checked_add(header.p_memsz)
             .ok_or(ElfError::SegmentOutOfBounds)?;
         // The file-backed portion of the segment; anything in [file_backed_end, mem_end) is BSS.
@@ -272,7 +337,7 @@ pub fn load(
         }
     }
 
-    Ok(elf.entry_point())
+    Ok(VirtAddr::new(elf.entry_point().as_u64().wrapping_add(bias)))
 }
 
 // pub(crate), not private: src/module.rs's ET_REL parser reads the same little-endian ELF64
