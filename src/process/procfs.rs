@@ -46,6 +46,7 @@ fn state_char(state: ProcState) -> u8 {
         ProcState::Ready | ProcState::Running => b'R',
         ProcState::Blocked(_) => b'S',
         ProcState::Zombie(_) => b'Z',
+        ProcState::Stopped(_) => b'T',
     }
 }
 
@@ -144,6 +145,7 @@ pub(crate) extern "C" fn oxidebsd_proc_status(pid: u64, buf_ptr: *mut u8, buf_ca
         ProcState::Ready | ProcState::Running => b"R (running)".as_slice(),
         ProcState::Blocked(_) => b"S (sleeping)".as_slice(),
         ProcState::Zombie(_) => b"Z (zombie)".as_slice(),
+        ProcState::Stopped(_) => b"T (stopped)".as_slice(),
     });
     out.push(b'\n');
     out.extend_from_slice(b"Tgid:\t");

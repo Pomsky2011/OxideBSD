@@ -1484,6 +1484,29 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
             ),
         ]);
     }
+    if applet_symbol == "LS" {
+        // `FEATURE_LS_COLOR`/`FEATURE_LS_COLOR_IS_DEFAULT` (`depends on LS && LONG_OPTS`) all have
+        // a real upstream `default y`, same "allnoconfig writes an explicit not-set line before
+        // the parent symbol is even visible, so oldconfig never gets a chance to apply the real
+        // default" reason as every other flip in this function. Without these, `ls` never colors
+        // its output at all, `--color` included -- real Ctrl+C/job-control work landed alongside
+        // this (see CLAUDE.md's session/controlling-tty notes) made a working interactive prompt
+        // worth actually looking at.
+        flips.extend([
+            (
+                "# CONFIG_LONG_OPTS is not set".to_string(),
+                "CONFIG_LONG_OPTS=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_LS_COLOR is not set".to_string(),
+                "CONFIG_FEATURE_LS_COLOR=y".to_string(),
+            ),
+            (
+                "# CONFIG_FEATURE_LS_COLOR_IS_DEFAULT is not set".to_string(),
+                "CONFIG_FEATURE_LS_COLOR_IS_DEFAULT=y".to_string(),
+            ),
+        ]);
+    }
     if applet_symbol == "TAR" || applet_symbol == "CPIO" || applet_symbol == "AR" {
         // These three archive-creation features (`FEATURE_TAR_CREATE`/`FEATURE_CPIO_O`/
         // `FEATURE_AR_CREATE`) all have a real upstream `default y` -- but that default never

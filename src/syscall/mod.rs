@@ -550,6 +550,9 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
         crate::process::SignalDelivery::Terminate(code) => {
             crate::process::do_exit(pid, code);
         }
+        crate::process::SignalDelivery::Stop(signum) => {
+            crate::process::do_stop_self(pid, signum);
+        }
         crate::process::SignalDelivery::Handler {
             signum,
             handler,

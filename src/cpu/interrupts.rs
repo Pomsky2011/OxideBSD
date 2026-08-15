@@ -316,6 +316,25 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                         }
                         return;
                     }
+                    // Real tty-driver SUSP behavior, same shape as the Ctrl+C/SIGINT interception
+                    // directly above (ASCII SUB, `0x1a`, is Ctrl+Z's real terminal-driver INTR-
+                    // family byte) -- delivers a real SIGTSTP to the foreground group instead of
+                    // SIGINT (see `ProcState::Stopped`/`process::signals`'s `Action::Stop` for what
+                    // happens next: the target genuinely stops, observable via `wait4(WUNTRACED)`,
+                    // resumable via a later `SIGCONT` -- `hush`'s own `fg`/`bg`/`jobs` builtins
+                    // already send/observe that real machinery unmodified). Same `ISIG`/
+                    // `foreground_pgid()` gating and not-also-pushed-to-stdin behavior.
+                    if byte == 0x1a
+                        && crate::console::stdin::get_termios().c_lflag & crate::console::stdin::ISIG != 0
+                        && let Some(pgid) = crate::console::stdin::foreground_pgid()
+                    {
+                        serial_print!("^Z\n");
+                        crate::process::signal_foreground_group(pgid, crate::process::SIGTSTP);
+                        unsafe {
+                            pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+                        }
+                        return;
+                    }
                     if crate::console::stdin::echo_enabled()
                         && (byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte))
                     {

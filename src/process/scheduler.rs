@@ -60,6 +60,16 @@ pub fn enqueue_ready(pid: Pid) {
     READY_QUEUE.lock().push_back(pid);
 }
 
+/// Removes `pid` from `READY_QUEUE` if it's sitting in it -- needed only for a cross-process
+/// `SIGSTOP`/`SIGTSTP` (see `process::signals`'s `Action::Stop` handling) landing on a target
+/// that's `Ready` but hasn't actually run yet. Without this, the scheduler would still pop and run
+/// it on its next turn regardless of `state` having been flipped to `Stopped` — nothing else in
+/// this cooperative scheduler ever needs to retract a pid it already enqueued, so this has no
+/// other caller.
+pub fn remove_ready(pid: Pid) {
+    READY_QUEUE.lock().retain(|&p| p != pid);
+}
+
 /// Voluntarily gives up the CPU. If the caller is still `Ready` or `Running` (i.e. it didn't just
 /// block or exit), it's re-enqueued so it gets another turn later — a caller that transitioned to
 /// `Blocked`/`Zombie` just before calling this is deliberately *not* re-enqueued, which is how

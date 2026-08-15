@@ -58,10 +58,24 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     // see CLAUDE.md's BusyBox section.) `PATH=/bin` beats musl's own hardcoded
     // `/usr/local/bin:/bin:/usr/bin` fallback (used only when `$PATH` is unset entirely), since
     // none of *those* directories exist in oxfs.
+    // `TERM=linux` matches this console's real nature (a VGA text-mode VT, see
+    // `src/console/vga.rs`'s own SGR/CSI parser) -- most BusyBox tools treat unset `TERM` as
+    // non-dumb already (`is_TERM_dumb()` only fires on an exact "dumb" match), but ncurses-shaped
+    // tools (`vi`, `clear`, `reset`) key off a real value. `PS1` uses `hush`'s already-compiled
+    // `CONFIG_FEATURE_EDITING_FANCY_PROMPT` escapes (`build.rs`'s HUSH-specific Kconfig flip) --
+    // these are literal two-byte `\e`/`\[`/`\]`/`\u`/`\h`/`\w`/`\$` sequences that `lineedit.c`'s
+    // own `parse_prompt` expands at print time (NOT a raw ESC byte here -- that's what `\e` itself
+    // expands to). `\[`/`\]` mark non-printing spans so line-editing cursor math ignores the color
+    // codes, `\u`/`\h` resolve via /etc/passwd + uname()'s nodename (both already real), `\w` is
+    // cwd, `\$` is euid-sensitive ('#' for root).
     let initial_rsp = crate::process::user_stack::build(
         &elf,
         &[b"(init)"],
-        &[b"PATH=/bin"],
+        &[
+            b"PATH=/bin",
+            b"TERM=linux",
+            b"PS1=\\[\\e[1;32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\$ ",
+        ],
         stack_top,
         user_stack_bottom(stack_top),
         &mapped_pages,
@@ -118,6 +132,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sched_policy: SCHED_RR_DEFAULT,
         sched_priority: 0,
         umask: 0o022,
+        stop_notify_pending: false,
+        cont_notify_pending: false,
     };
 
     {
@@ -129,6 +145,16 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         }
         table.insert(pid, Box::new(process));
     }
+    // spawn() is only ever called once, for pid 1, with stdin/stdout/stderr already wired
+    // directly to the real console (never through a real `open()` syscall -- see the envp comment
+    // above). On a real kernel, a session leader's first real `open()` of a tty auto-associates it
+    // as that session's controlling terminal; since pid 1 never takes that path here, nothing ever
+    // would otherwise. Granting it directly mirrors that real behavior and is what lets `hush`'s
+    // own already-compiled job-control startup (`tcgetpgrp`/`bb_setpgrp`/`tcsetpgrp`, gated on
+    // `isatty()` succeeding via a real controlling session -- see `src/console/stdin.rs`'s
+    // `TIOCGPGRP`/`TIOCSPGRP` handling) actually activate instead of sitting permanently dormant --
+    // this is what makes Ctrl+C interrupt a running foreground job for real.
+    crate::console::stdin::set_controlling_session(pid);
     // Bootstraps this process's own stdin/stdout/stderr from crate::fs::fd::init's own pseudo-pid
     // registration -- the same fork_inherit path a real fork() uses, see that function's own doc
     // comment.
@@ -302,6 +328,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         sched_policy: parent_sched_policy,
         sched_priority: parent_sched_priority,
         umask: parent_umask,
+        // A forked child is never born stopped, and hasn't just resumed from anything -- real
+        // POSIX fork() semantics, same "starts fresh" story as real_timer_deadline above.
+        stop_notify_pending: false,
+        cont_notify_pending: false,
     };
 
     {
@@ -671,78 +701,141 @@ pub fn do_execve(
     unsafe { syscall::redirect_frame(frame, jump_entry, initial_rsp) };
     Ok(0)
 }
+/// Real `wait4(2)` `options` bits (`third_party/musl/include/sys/wait.h`) -- musl's own wrapper
+/// passes these straight through as the real 3rd syscall argument, no call-site patch needed.
+pub const WNOHANG: u64 = 1;
+pub const WUNTRACED: u64 = 2;
+pub const WCONTINUED: u64 = 8;
+
+/// What `do_wait4` found to report back, before it's translated into the real wire-format
+/// `status` value below -- kept distinct from that encoding so the three real, mutually exclusive
+/// shapes (exited/stopped/continued) can't be confused with each other while being decided.
+enum Reported {
+    Exited(Pid, i32),
+    Stopped(Pid, u64),
+    Continued(Pid),
+}
+
 /// `sys_wait4`'s real logic. If the caller already has a `Zombie` child matching `target_pid`
 /// (`-1` = any), reaps it immediately (removes it from the table, writes its exit code through the
-/// optional `status_ptr`, returns its pid). If the caller has no child matching `target_pid` at
-/// all, `ECHILD`. Otherwise blocks (`ProcState::Blocked`) and calls `scheduler::schedule()`, which
-/// only returns once something (`do_exit`, on a matching child) wakes it back to `Ready` and the
-/// scheduler picks it again — at which point the loop re-checks from the top, since `do_exit` only
-/// wakes the parent, it doesn't hand the child's info across directly.
+/// optional `status_ptr`, returns its pid). Real `WUNTRACED`/`WCONTINUED` support: if `options`
+/// requests them and a matching child has `stop_notify_pending`/`cont_notify_pending` set (see
+/// `ProcState::Stopped`'s own doc comment for why a plain state flip is enough to make this safe),
+/// reports that instead -- without reaping, since the child is still alive. If the caller has no
+/// child matching `target_pid` at all, `ECHILD`. If nothing reportable exists yet and `options`
+/// includes real `WNOHANG`, returns `0` immediately rather than blocking -- load-bearing, not just
+/// a nice-to-have: `hush`'s own `checkjobs()` (background job-status polling, run throughout its
+/// interactive main loop) always passes `WUNTRACED | WNOHANG`, and this kernel never delivers a
+/// real `SIGCHLD` to a parent at all (nothing `do_kill`'s it anywhere), so `hush`'s own
+/// `CONFIG_HUSH_FAST` short-circuit (skip the real syscall unless a `SIGCHLD` counter changed) is
+/// silently permanently active for that call today -- without a real `WNOHANG`, any call that ever
+/// did reach the real syscall with a still-running child would block the entire interactive shell.
+/// Otherwise blocks (`ProcState::Blocked`) and calls `scheduler::schedule()`, which only returns
+/// once something (`do_exit`/the real stop/continue transitions in `process::signals`/
+/// `do_stop_self`) wakes the parent — at which point the loop re-checks from the top, since a
+/// wakeup never hands the child's info across directly (and, per `ProcState::Stopped`'s own doc
+/// comment, a wakeup that turns out not to match what this exact call actually asked for is safe
+/// to just re-block on).
 pub fn do_wait4(
     caller_pid: Pid,
     target_pid: i64,
+    options: u64,
     status_ptr: u64,
     rusage_ptr: u64,
 ) -> Result<u64, u64> {
     let matches = |pid: Pid| target_pid == -1 || target_pid as u64 == pid;
 
     loop {
-        let reaped = {
+        let reported = {
             let mut table = PROCESS_TABLE.lock();
 
-            let has_matching_child = table
+            let children: Vec<Pid> = table
                 .get(&caller_pid)
                 .expect("wait4: current process missing from table")
                 .children
                 .iter()
-                .any(|&c| matches(c));
-            if !has_matching_child {
+                .copied()
+                .filter(|&c| matches(c))
+                .collect();
+            if children.is_empty() {
                 return Err(ECHILD);
             }
 
-            let zombie = table
-                .get(&caller_pid)
-                .unwrap()
-                .children
+            let zombie = children
                 .iter()
                 .copied()
-                .filter(|&c| matches(c))
                 .find_map(|c| match table.get(&c).map(|p| p.state) {
                     Some(ProcState::Zombie(code)) => Some((c, code)),
                     _ => None,
                 });
 
-            match zombie {
-                Some((child_pid, code)) => {
-                    table.remove(&child_pid);
-                    table
-                        .get_mut(&caller_pid)
-                        .unwrap()
-                        .children
-                        .retain(|&c| c != child_pid);
-                    Some((child_pid, code))
-                }
-                None => {
-                    let target = if target_pid == -1 {
-                        None
-                    } else {
-                        Some(target_pid as u64)
-                    };
-                    table.get_mut(&caller_pid).unwrap().state =
-                        ProcState::Blocked(BlockReason::WaitingForChild(target));
+            if let Some((child_pid, code)) = zombie {
+                table.remove(&child_pid);
+                table
+                    .get_mut(&caller_pid)
+                    .unwrap()
+                    .children
+                    .retain(|&c| c != child_pid);
+                Some(Reported::Exited(child_pid, code))
+            } else if options & WUNTRACED != 0
+                && let Some(&child_pid) = children
+                    .iter()
+                    .find(|&&c| table.get(&c).is_some_and(|p| p.stop_notify_pending))
+            {
+                let ProcState::Stopped(stopsig) = table.get(&child_pid).unwrap().state else {
+                    unreachable!(
+                        "stop_notify_pending is always cleared in the same lock as the state \
+                         transition back out of Stopped -- see Process::stop_notify_pending's own \
+                         doc comment"
+                    )
+                };
+                table.get_mut(&child_pid).unwrap().stop_notify_pending = false;
+                Some(Reported::Stopped(child_pid, stopsig))
+            } else if options & WCONTINUED != 0
+                && let Some(&child_pid) = children
+                    .iter()
+                    .find(|&&c| table.get(&c).is_some_and(|p| p.cont_notify_pending))
+            {
+                table.get_mut(&child_pid).unwrap().cont_notify_pending = false;
+                Some(Reported::Continued(child_pid))
+            } else if options & WNOHANG != 0 {
+                return Ok(0);
+            } else {
+                let target = if target_pid == -1 {
                     None
-                }
+                } else {
+                    Some(target_pid as u64)
+                };
+                table.get_mut(&caller_pid).unwrap().state =
+                    ProcState::Blocked(BlockReason::WaitingForChild(target));
+                None
             }
         }; // table lock dropped here, before schedule() -- see table()'s own doc comment
 
-        if let Some((child_pid, code)) = reaped {
+        if let Some(reported) = reported {
+            let (child_pid, status) = match reported {
+                // `code` is already the real, fully wait(2)-encoded status by the time it reaches
+                // Zombie(code) -- either WEXITSTATUS-shifted at oxidebsd_sys_exit (normal exit) or
+                // the pre-encoded 128+sig value terminate_process's own Terminate path passes
+                // directly (signal termination) -- see CLAUDE.md's own note on this. Written
+                // through verbatim, not re-shifted.
+                Reported::Exited(child_pid, code) => (child_pid, code),
+                // 0x7f | (stopsig << 8) -- real WIFSTOPPED wire shape (confirmed disjoint from
+                // both the exit encoding above, low byte always 0x00, and terminate_process's own
+                // 128+sig signal-termination encoding, low byte always 0x81..0x9f).
+                Reported::Stopped(child_pid, stopsig) => {
+                    (child_pid, 0x7f | ((stopsig as i32) << 8))
+                }
+                // The real, exact WIFCONTINUED wire value -- no other bits allowed.
+                Reported::Continued(child_pid) => (child_pid, 0xffff),
+            };
             if status_ptr != 0 {
                 // SAFETY: same known pointer-validation gap src/syscall.rs's sys_read/sys_write
                 // already document -- status_ptr isn't checked against the caller's actual
                 // mappings first. The caller's own address space is active right now (we're still
                 // running on its behalf), so a genuinely valid pointer here is really writable; an
                 // invalid one page-faults, handled safely elsewhere (log + reboot).
-                unsafe { (status_ptr as *mut i32).write(code) };
+                unsafe { (status_ptr as *mut i32).write(status) };
             }
             // No per-process CPU-time/memory-usage accounting exists anywhere in this kernel --
             // see `RawRusage`'s own doc comment (`src/syscall.rs`) for why an honest all-zero
@@ -788,20 +881,55 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
         Some(me) => me.state = ProcState::Zombie(code),
         None => return,
     }
-    let parent_pid = table.get(&pid).and_then(|p| p.parent);
-    if let Some(parent_pid) = parent_pid
-        && let Some(parent) = table.get_mut(&parent_pid)
-    {
-        let should_wake = matches!(
-            parent.state,
-            ProcState::Blocked(BlockReason::WaitingForChild(target))
-                if target.is_none() || target == Some(pid)
-        );
-        if should_wake {
-            parent.state = ProcState::Ready;
-            scheduler::enqueue_ready(parent_pid);
-        }
+    wake_parent_if_waiting(&mut table, pid);
+}
+
+/// Wakes `child_pid`'s parent if it's blocked in `wait4` waiting on this child (or on any child) --
+/// shared by `terminate_process` (a real exit) and the real stop/continue transitions in
+/// `process::signals`/`do_stop_self` below (a `WUNTRACED`/`WCONTINUED`-observable state change,
+/// not just exit). Spurious wakes are safe: `do_wait4`'s own loop always re-checks its real
+/// condition fresh after `scheduler::schedule()` returns rather than trusting "state==Ready now"
+/// to mean "my specific event happened" (see `ProcState::Stopped`'s own doc comment) -- so waking a
+/// parent whose particular `wait4` call didn't actually request `WUNTRACED`/`WCONTINUED` just costs
+/// it one harmless extra reschedule before it re-blocks.
+pub(crate) fn wake_parent_if_waiting(table: &mut BTreeMap<Pid, Box<Process>>, child_pid: Pid) {
+    let Some(parent_pid) = table.get(&child_pid).and_then(|p| p.parent) else {
+        return;
+    };
+    let Some(parent) = table.get_mut(&parent_pid) else {
+        return;
+    };
+    let should_wake = matches!(
+        parent.state,
+        ProcState::Blocked(BlockReason::WaitingForChild(target))
+            if target.is_none() || target == Some(child_pid)
+    );
+    if should_wake {
+        parent.state = ProcState::Ready;
+        scheduler::enqueue_ready(parent_pid);
     }
+}
+
+/// Real self-targeted `SIGSTOP`/`SIGTSTP` (default disposition) -- reached from
+/// `deliver_pending_signal`'s new `SignalDelivery::Stop` arm, the self-signal counterpart to
+/// `process::signals`'s cross-process `Action::Stop` handling (`do_kill`/
+/// `signal_foreground_group` -- a self-stop can only happen via an explicit
+/// `kill(getpid(), SIGSTOP/SIGTSTP)`, since the interactive Ctrl+Z path always targets a
+/// *different*, not-currently-running process). Sets `Stopped(signum)` + `stop_notify_pending`,
+/// wakes a waiting parent, then blocks via the same `scheduler::schedule()` shape `do_nanosleep`
+/// already uses -- resumes normally (does not diverge) once a later `SIGCONT` flips `state` back
+/// to `Ready`.
+pub(crate) fn do_stop_self(pid: Pid, signum: u64) {
+    {
+        let mut table = PROCESS_TABLE.lock();
+        let me = table
+            .get_mut(&pid)
+            .expect("do_stop_self: current process missing from table");
+        me.state = ProcState::Stopped(signum);
+        me.stop_notify_pending = true;
+        wake_parent_if_waiting(&mut table, pid);
+    } // table lock dropped before schedule() -- see table()'s own doc comment
+    scheduler::schedule();
 }
 /// Real Linux `reboot(2)` magic values (`third_party/musl/include/sys/reboot.h`) -- `reboot.c`'s
 /// own musl wrapper passes these straight through as the real 3rd syscall argument, no call-site

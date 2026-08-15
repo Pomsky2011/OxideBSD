@@ -49,12 +49,25 @@ pub fn do_nanosleep(pid: Pid, req_ptr: u64, rem_ptr: u64) -> Result<u64, u64> {
 
     if requested_ticks > 0 {
         let deadline = crate::cpu::interrupts::ticks() + requested_ticks;
-        {
-            let mut table = PROCESS_TABLE.lock();
-            table.get_mut(&pid).unwrap().state =
-                ProcState::Blocked(BlockReason::Sleeping(deadline));
-        } // lock dropped before schedule() -- see process::table()'s own doc comment
-        crate::process::scheduler::schedule();
+        // Loops and re-checks the real deadline, the same self-correcting pattern
+        // `crate::fs::pipe`/`crate::console::stdin::read` already use -- normally the timer IRQ
+        // handler is the only thing that ever sets this process back to `Ready` (only once the
+        // real deadline has actually passed), so a single `schedule()` call used to be enough.
+        // Real `SIGCONT` resuming a `Stopped` process (see `ProcState::Stopped`'s own doc comment)
+        // broke that assumption: it unconditionally flips `state` back to `Ready` regardless of
+        // what `BlockReason` it's interrupting -- found live (Ctrl+Z-ing a `sleep`, then `bg`,
+        // resumed it far short of its real deadline). Re-blocking on the same deadline if it
+        // hasn't actually passed yet also gets real semantics for free: `ticks()` keeps advancing
+        // while `Stopped` (it's a global counter, not paused per-process), so time spent stopped
+        // still counts toward the sleep, matching real Linux's own wall-clock-deadline behavior.
+        while crate::cpu::interrupts::ticks() < deadline {
+            {
+                let mut table = PROCESS_TABLE.lock();
+                table.get_mut(&pid).unwrap().state =
+                    ProcState::Blocked(BlockReason::Sleeping(deadline));
+            } // lock dropped before schedule() -- see process::table()'s own doc comment
+            crate::process::scheduler::schedule();
+        }
     }
 
     if rem_ptr != 0 {

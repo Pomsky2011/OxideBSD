@@ -6,9 +6,11 @@ use alloc::vec::Vec;
 use crate::syscall::{EINVAL, ESRCH, SyscallFrame};
 use super::*;
 
-/// `SYS_KILL`'s real logic. Only a positive `target_pid` (no process-group/broadcast targeting —
-/// real `kill(2)`'s `pid <= 0` cases) and signals `1..=31` are supported; anything else is
-/// `EINVAL`, matching real `kill()`'s own validation.
+/// `SYS_KILL`'s real logic. Signals `1..=31` only; anything else is `EINVAL`, matching real
+/// `kill()`'s own validation. `target_pid == 0`/`< 0` are real POSIX process-group broadcasts
+/// (`0` = the caller's own group, `< 0` = group `|target_pid|`) — see the `target_pid <= 0` branch
+/// below for that path; everything past this doc comment's remaining bullets describes the
+/// positive, single-target case.
 ///
 /// Sending to *self* just sets the pending bit and returns — actual delivery happens naturally at
 /// this exact syscall's own dispatch tail (`src/syscall.rs`'s `deliver_pending_signal`), since the
@@ -30,12 +32,52 @@ use super::*;
 ///   gap than the `Terminate` case above, since a process sitting in a long/indefinite block with
 ///   a handler installed won't see the signal promptly. Acceptable for this pass: the common,
 ///   high-value case (killing something with no handler) works correctly and immediately.
+/// - Real `SIGSTOP`/default-disposition `SIGTSTP` are also *immediate* (uncatchable for `SIGSTOP`
+///   -- `sys_sigaction` already rejects installing a handler for it -- and job-control-critical for
+///   `SIGTSTP`, matching real Ctrl+Z): the target's `state` flips straight to `ProcState::Stopped`
+///   right here, the same "doesn't need the target to ever be scheduled again" property `Terminate`
+///   has. `SIGCONT` gets its own pre-dispatch step *before* any of the above: an actually-`Stopped`
+///   target always resumes regardless of its own `SIGCONT` disposition, real POSIX semantics.
 pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     if !(0..=31).contains(&sig) {
         return Err(EINVAL);
     }
+
     if target_pid <= 0 {
-        return Err(EINVAL);
+        // Real POSIX process-group broadcast: `0` targets the caller's own group, `< 0` targets
+        // group `|target_pid|` -- both real `kill(2)` shapes, not this ABI's own invention. Found
+        // live, not preemptively added: hush's own `fg`/`bg` builtins (`kill(-pgrp, SIGCONT)`) and
+        // its job-cleanup path (`kill(-pgrp, SIGHUP)`/`kill(-pgrp, SIGCONT)`) both depend on this
+        // -- previously unreachable dead code until real job control (`process::spawn`'s
+        // controlling-tty auto-claim, see CLAUDE.md's session/controlling-tty notes) made hush's
+        // own job-control startup actually activate for the first time. Reuses
+        // `signal_foreground_group`'s exact per-process Discard/Terminate/Stop/SetPending
+        // resolution unchanged -- it already just takes a plain `pgid`, "foreground" was never
+        // load-bearing to its own logic, only to its one existing caller.
+        let pgid = if target_pid == 0 {
+            let table = PROCESS_TABLE.lock();
+            table
+                .get(&caller_pid)
+                .expect("kill: current process missing from table")
+                .pgid
+        } else {
+            target_pid.checked_neg().ok_or(EINVAL)? as u64
+        };
+        let has_target = {
+            let table = PROCESS_TABLE.lock();
+            table
+                .values()
+                .any(|p| p.pgid == pgid && !matches!(p.state, ProcState::Zombie(_)))
+        };
+        if !has_target {
+            return Err(ESRCH);
+        }
+        // sig == 0: real kill(pgrp, 0) is an existence-only check, same convention as the
+        // single-target sig == 0 case below -- has_target above already established that.
+        if sig != 0 {
+            signal_foreground_group(pgid, sig as u64);
+        }
+        return Ok(0);
     }
     let target = target_pid as u64;
 
@@ -68,23 +110,38 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     enum Action {
         Discard,
         Terminate,
+        Stop,
         SetPending,
     }
 
     let action = {
-        // Scoped so this lock is dropped before terminate_process/the SetPending branch below
-        // re-lock the table -- spin::Mutex isn't reentrant (same discipline table()'s own doc
-        // comment already establishes for every other function here).
-        let table = PROCESS_TABLE.lock();
+        // Scoped so this lock is dropped before terminate_process/the Stop/SetPending branches
+        // below re-lock the table -- spin::Mutex isn't reentrant (same discipline table()'s own
+        // doc comment already establishes for every other function here).
+        let mut table = PROCESS_TABLE.lock();
         let proc = table.get(&target).ok_or(ESRCH)?;
         if matches!(proc.state, ProcState::Zombie(_)) {
             return Ok(0); // still "exists" until reaped, but there's nothing left to signal
         }
+        // Real SIGCONT semantics: always resumes an actually-stopped target regardless of its own
+        // disposition for SIGCONT (SIG_IGN/a caught handler still get to additionally fire below,
+        // via the normal dispatch this falls through to). See ProcState::Stopped's own doc comment
+        // for why a plain state flip + re-enqueue is sufficient here.
+        if sig == SIGCONT && matches!(proc.state, ProcState::Stopped(_)) {
+            let proc = table.get_mut(&target).unwrap();
+            proc.state = ProcState::Ready;
+            proc.cont_notify_pending = true;
+            proc.stop_notify_pending = false; // see Process::stop_notify_pending's own doc comment
+            proc.pending_signals &= !((1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)));
+            scheduler::enqueue_ready(target);
+        }
+        let proc = table.get(&target).unwrap();
         match proc.sigactions[sig as usize].handler {
             1 => Action::Discard, // SIG_IGN
             0 => match default_disposition(sig) {
                 DefaultDisposition::Ignore => Action::Discard,
                 DefaultDisposition::Terminate => Action::Terminate,
+                DefaultDisposition::Stop => Action::Stop,
             },
             _ => Action::SetPending,
         }
@@ -93,6 +150,23 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     match action {
         Action::Discard => {}
         Action::Terminate => terminate_process(target, 128 + sig as i32),
+        Action::Stop => {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(proc) = table.get_mut(&target) {
+                // Real SIGSTOP is uncatchable and never reaches Action::Stop with a target that
+                // isn't Blocked/Ready -- Zombie already returned above, and Running is never a
+                // valid cross-process stop target (only the caller can be Running). A Ready target
+                // must also be dequeued, or the scheduler would still pop and run it next turn
+                // regardless of this state flip.
+                if proc.state == ProcState::Ready {
+                    scheduler::remove_ready(target);
+                }
+                proc.state = ProcState::Stopped(sig);
+                proc.stop_notify_pending = true;
+                proc.pending_signals &= !(1 << (SIGCONT - 1));
+                wake_parent_if_waiting(&mut table, target);
+            }
+        }
         Action::SetPending => {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {
@@ -104,34 +178,60 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
 }
 
 /// Delivers `sig` to every live (non-zombie) process whose `pgid` equals `pgid` — the real tty
-/// "INTR character signals the whole foreground process group" contract, driven by
-/// `interrupts::keyboard_interrupt_handler`'s own Ctrl+C handling once a real foreground group has
-/// actually been claimed (`TIOCSCTTY`/`TIOCSPGRP` — see CLAUDE.md's session/controlling-tty
-/// notes). Reuses the exact same Discard/Terminate/SetPending logic `do_kill`'s own cross-process
-/// branch already established per target (including its own documented gap: an installed-handler
-/// target only gets a deferred pending bit, not forced-immediate delivery) — just applied to every
-/// matching pid instead of one. Two passes (collect targets+actions under one lock, then act) for
-/// the same reason `do_kill` drops its own read lock before `terminate_process`/re-locking for
-/// `SetPending`: `terminate_process` takes the table lock itself, and `spin::Mutex` isn't
-/// reentrant.
+/// "INTR/SUSP character signals the whole foreground process group" contract, driven by
+/// `interrupts::keyboard_interrupt_handler`'s own Ctrl+C/Ctrl+Z handling once a real foreground
+/// group has actually been claimed (`TIOCSCTTY`/`TIOCSPGRP` — see CLAUDE.md's session/
+/// controlling-tty notes). Reuses the exact same Discard/Terminate/Stop/SetPending logic `do_kill`'s
+/// own cross-process branch already established per target (including its own documented gap: an
+/// installed-handler target only gets a deferred pending bit, not forced-immediate delivery) —
+/// just applied to every matching pid instead of one. Two passes (collect targets+actions under one
+/// lock, then act) for the same reason `do_kill` drops its own read lock before
+/// `terminate_process`/re-locking for `Stop`/`SetPending`: those re-lock the table themselves, and
+/// `spin::Mutex` isn't reentrant.
 pub fn signal_foreground_group(pgid: Pid, sig: u64) {
     enum Action {
         Discard,
         Terminate,
+        Stop,
         SetPending,
     }
 
     let targets: Vec<(Pid, Action)> = {
-        let table = PROCESS_TABLE.lock();
-        table
+        // Mutable, not just read-locked, so the real SIGCONT-resume pre-check below (same
+        // "always wakes an actually-stopped target regardless of its own disposition" semantics
+        // do_kill's own cross-process branch establishes) can flip a Stopped member's state
+        // in-place before the action-resolution pass below reads it back.
+        let mut table = PROCESS_TABLE.lock();
+        let matching: Vec<Pid> = table
             .iter()
             .filter(|(_, p)| p.pgid == pgid && !matches!(p.state, ProcState::Zombie(_)))
-            .map(|(&pid, proc)| {
+            .map(|(&pid, _)| pid)
+            .collect();
+
+        if sig == SIGCONT {
+            for &pid in &matching {
+                if let Some(proc) = table.get_mut(&pid)
+                    && matches!(proc.state, ProcState::Stopped(_))
+                {
+                    proc.state = ProcState::Ready;
+                    proc.cont_notify_pending = true;
+                    proc.stop_notify_pending = false; // see Process::stop_notify_pending's own doc comment
+                    proc.pending_signals &= !((1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)));
+                    scheduler::enqueue_ready(pid);
+                }
+            }
+        }
+
+        matching
+            .into_iter()
+            .map(|pid| {
+                let proc = table.get(&pid).unwrap();
                 let action = match proc.sigactions[sig as usize].handler {
                     1 => Action::Discard, // SIG_IGN
                     0 => match default_disposition(sig) {
                         DefaultDisposition::Ignore => Action::Discard,
                         DefaultDisposition::Terminate => Action::Terminate,
+                        DefaultDisposition::Stop => Action::Stop,
                     },
                     _ => Action::SetPending,
                 };
@@ -144,6 +244,19 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
         match action {
             Action::Discard => {}
             Action::Terminate => terminate_process(pid, 128 + sig as i32),
+            Action::Stop => {
+                let mut table = PROCESS_TABLE.lock();
+                if let Some(proc) = table.get_mut(&pid) {
+                    // Same Ready-must-be-dequeued reasoning as do_kill's own Action::Stop arm.
+                    if proc.state == ProcState::Ready {
+                        scheduler::remove_ready(pid);
+                    }
+                    proc.state = ProcState::Stopped(sig);
+                    proc.stop_notify_pending = true;
+                    proc.pending_signals &= !(1 << (SIGCONT - 1));
+                    wake_parent_if_waiting(&mut table, pid);
+                }
+            }
             Action::SetPending => {
                 let mut table = PROCESS_TABLE.lock();
                 if let Some(proc) = table.get_mut(&pid) {
@@ -273,6 +386,7 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
                 DefaultDisposition::Terminate => {
                     return Some(SignalDelivery::Terminate(128 + signum as i32));
                 }
+                DefaultDisposition::Stop => return Some(SignalDelivery::Stop(signum)),
             },
             handler_addr => {
                 let mut mask_to_add = action.mask | (1 << (signum - 1));

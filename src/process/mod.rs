@@ -87,6 +87,15 @@ pub enum ProcState {
     Running,
     Blocked(BlockReason),
     Zombie(i32),
+    /// Real `SIGSTOP`/`SIGTSTP` job-control stop — payload is the stopping signal (`WSTOPSIG`'s
+    /// source). A top-level variant, not a `BlockReason`, deliberately: every existing block/wake
+    /// site (`console/stdin.rs::read`, `fs/pipe.rs`, `do_wait4`) already re-checks its own real
+    /// condition fresh after `scheduler::schedule()` returns rather than trusting "state==Ready
+    /// now" to mean "my specific event happened" — so resuming a stopped process is just flipping
+    /// this back to `Ready`/re-enqueueing; nothing needs to remember which `BlockReason` (if any)
+    /// it had. See `do_kill`/`signal_foreground_group`'s own `Action::Stop`/`Action::Cont` arms and
+    /// `do_wait4`'s `WUNTRACED`/`WCONTINUED` handling.
+    Stopped(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -199,20 +208,28 @@ pub(crate) const SA_SIGINFO: u64 = 0x00000004;
 enum DefaultDisposition {
     Terminate,
     Ignore,
+    /// Real `SIGSTOP`/`SIGTSTP` job-control stop -- see `ProcState::Stopped`'s own doc comment.
+    Stop,
 }
 
-/// Real POSIX default dispositions for the signals this ABI recognizes (`1..=31`), collapsed to
-/// just two outcomes -- this kernel has no core-dump concept (`Terminate` covers both "term" and
-/// "core" defaults identically) and no real job control (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`
-/// default to `Ignore` here rather than a real "stopped" process state -- a deliberate, documented
-/// simplification; see CLAUDE.md's BusyBox gap-analysis section on signals: stop/continue is only
-/// valuable bundled with real job control, not attempted standalone in this pass). A signal number
-/// outside `1..=31` (real-time signals, or garbage) isn't reachable here at all -- every caller
-/// (`sys_kill`/`sys_sigaction`, `take_deliverable_signal`'s own pending-bit scan) is already
-/// bounded to that range before this is consulted.
+/// Real POSIX default dispositions for the signals this ABI recognizes (`1..=31`) -- this kernel
+/// has no core-dump concept (`Terminate` covers both "term" and "core" defaults identically).
+/// `SIGSTOP`/`SIGTSTP` now get a real `Stop` outcome (see `ProcState::Stopped`) rather than the
+/// `Ignore` this used to collapse them to before real job control existed; `SIGTTIN`/`SIGTTOU`
+/// stay `Ignore` (no real background-terminal-I/O-stop model here -- only `SIGINT`/`SIGTSTP` are
+/// ever actually delivered to a foreground group, see `interrupts::keyboard_interrupt_handler`).
+/// `SIGCONT` also stays `Ignore` here: waking a `Stopped` target is handled as a pre-dispatch step
+/// at every call site *before* this function is even consulted (see `do_kill`/
+/// `signal_foreground_group`'s own doc comments) -- a `SIGCONT` that reaches this function at all
+/// (self-signal, or a target that wasn't actually stopped) really does just mean "ignore" by
+/// default, matching real POSIX. A signal number outside `1..=31` (real-time signals, or garbage)
+/// isn't reachable here at all -- every caller (`sys_kill`/`sys_sigaction`,
+/// `take_deliverable_signal`'s own pending-bit scan) is already bounded to that range before this
+/// is consulted.
 fn default_disposition(sig: u64) -> DefaultDisposition {
     match sig {
-        SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGIO | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => {
+        SIGSTOP | SIGTSTP => DefaultDisposition::Stop,
+        SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGIO | SIGTTIN | SIGTTOU => {
             DefaultDisposition::Ignore
         }
         _ => DefaultDisposition::Terminate,
@@ -224,6 +241,12 @@ pub(crate) enum SignalDelivery {
     /// Terminate the process with this exit code (`128 + signum`, the real shell/POSIX
     /// convention for "died from a signal").
     Terminate(i32),
+    /// Real self-targeted `SIGSTOP`/`SIGTSTP` (default disposition) -- payload is the stopping
+    /// signal. Only reachable via a self `kill(getpid(), SIGSTOP/SIGTSTP)`; the interactive
+    /// Ctrl+Z path (`interrupts::keyboard_interrupt_handler` -> `signal_foreground_group`) always
+    /// targets a *different*, not-currently-running process, so it goes through `do_kill`'s own
+    /// cross-process `Action::Stop` arm instead of this one. See `process::do_stop_self`.
+    Stop(u64),
     /// Redirect the live frame into this handler.
     Handler {
         signum: u64,
@@ -435,6 +458,22 @@ pub struct Process {
     /// "stored, not enforced" tier as `rlimits`/`nice`/`sched_policy` otherwise — oxfs doesn't
     /// consult this anywhere it creates a new inode. Copied by `fork`; preserved by `execve`.
     pub umask: u32,
+    /// Set when this process transitions into `ProcState::Stopped` (real `SIGSTOP`/`SIGTSTP`),
+    /// cleared once a parent's `wait4(WUNTRACED)` observes it — the real POSIX "report a stop
+    /// once" contract. Also cleared the moment a `SIGCONT` resumes this process (a deliberate
+    /// simplification from real Linux, which would still let a parent observe the stop after the
+    /// fact even post-resume): `ProcState::Stopped`'s payload -- the only place the stopping
+    /// signal number is stored -- is gone the instant `state` flips back to `Ready`, so reporting
+    /// a stop after resume would need a second field just to remember which signal it was. Not
+    /// worth it for a real practical shell's own polling cadence (`hush`'s own `checkjobs()`
+    /// only reaches `fg`/`bg`'s `SIGCONT` after the user has already seen the job listed as
+    /// stopped). Not copied by `fork` (a freshly forked child is never born stopped); not touched
+    /// by `execve`.
+    pub stop_notify_pending: bool,
+    /// Set when a `SIGCONT` actually resumes this process from `Stopped` -- same "report once,
+    /// cleared by a matching `wait4(WCONTINUED)`" shape as `stop_notify_pending` above. Not copied
+    /// by `fork`; not touched by `execve`.
+    pub cont_notify_pending: bool,
 }
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());

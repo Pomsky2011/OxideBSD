@@ -1145,10 +1145,10 @@ pub(crate) extern "C" fn oxidebsd_sys_wait4(
     options: u64,
     rusage_ptr: u64,
 ) -> i64 {
-    let _ = options; // no WNOHANG/etc support this pass -- always blocks until a match exists
     result_to_ffi(crate::process::do_wait4(
         crate::process::scheduler::current_pid(),
         pid as i64,
+        options,
         status_ptr,
         rusage_ptr,
     ))
