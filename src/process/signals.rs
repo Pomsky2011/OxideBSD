@@ -231,6 +231,23 @@ pub fn do_sigprocmask(pid: Pid, how: u64, set_ptr: u64, oldset_ptr: u64) -> Resu
     }
     Ok(0)
 }
+
+/// `SYS_SIGPENDING`'s real logic — a direct readback of `pending_signals`, the same field
+/// `do_kill` already sets and `deliver_pending_signal` already drains; no new state needed. `set`
+/// is written as a plain `u64`, same "always one `u64`, matching what musl's callers always pass
+/// anyway" story as `do_sigprocmask`'s own `blocked_signals` readback above.
+pub fn do_sigpending(pid: Pid, set_ptr: u64) -> Result<u64, u64> {
+    let table = PROCESS_TABLE.lock();
+    let proc = table
+        .get(&pid)
+        .expect("sigpending: current process missing from table");
+    if set_ptr != 0 {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        unsafe { (set_ptr as *mut u64).write(proc.pending_signals) };
+    }
+    Ok(0)
+}
+
 /// Called once, at the tail of every completed syscall (`src/syscall.rs`'s
 /// `deliver_pending_signal`) for whichever process is currently running. Picks the
 /// lowest-numbered pending, unblocked signal (if any), removes it from `pending_signals`, and

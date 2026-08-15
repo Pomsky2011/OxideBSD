@@ -728,6 +728,10 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_sigprocmask" => {
             Some(crate::syscall::oxidebsd_sys_sigprocmask as *const () as u64)
         }
+        "oxidebsd_sys_sigpending" => {
+            Some(crate::syscall::oxidebsd_sys_sigpending as *const () as u64)
+        }
+        "oxidebsd_sys_tkill" => Some(crate::syscall::oxidebsd_sys_tkill as *const () as u64),
         "oxidebsd_sys_setpgid" => Some(crate::syscall::oxidebsd_sys_setpgid as *const () as u64),
         "oxidebsd_sys_getpgid" => Some(crate::syscall::oxidebsd_sys_getpgid as *const () as u64),
         "oxidebsd_sys_setsid" => Some(crate::syscall::oxidebsd_sys_setsid as *const () as u64),
@@ -826,6 +830,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_getrusage" => {
             Some(crate::syscall::oxidebsd_sys_getrusage as *const () as u64)
         }
+        "oxidebsd_sys_times" => Some(crate::syscall::oxidebsd_sys_times as *const () as u64),
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {

@@ -307,6 +307,29 @@ pub(crate) fn sys_sigprocmask(
     crate::process::do_sigprocmask(crate::process::scheduler::current_pid(), how, set_ptr, oldset_ptr)
 }
 
+/// `SYS_SIGPENDING` (real `rt_sigpending`'s own wire slot, `494` after the collision sweep in
+/// `docs/MISSING_POSIX_SYSCALLS.md` redirected it off its previous accidental home at `SYS_STAT =
+/// 127`) — matches real `sigpending(2)`'s exact `(set_ptr, sigsetsize)` wire format, same
+/// "sigsetsize read but not otherwise validated" story `sys_sigaction`/`sys_sigprocmask` already
+/// have. Delegates to `process::do_sigpending`.
+pub(crate) fn sys_sigpending(set_ptr: u64, sigsetsize: u64) -> Result<u64, u64> {
+    let _ = sigsetsize;
+    crate::process::do_sigpending(crate::process::scheduler::current_pid(), set_ptr)
+}
+
+/// `SYS_TKILL` (real, unclaimed Linux number `200` — used directly, no invented number or musl-
+/// side remap needed, same "still completely unassigned in this ABI's own registry" story
+/// `SYS_FCHMOD`/`SYS_FCHDIR` already have). Matches real `tkill(2)`'s exact `(tid, sig)` wire
+/// format. `raise()`/`abort()`/`pthread_kill()`/`pthread_cancel()`/`timer_delete()` all call this
+/// directly (`third_party/musl/src/signal/raise.c`, `src/exit/abort.c`), never through `kill()` —
+/// previously a flat `ENOSYS`, so `abort()`/`assert()` fell through to a raw trap instead of real
+/// `SIGABRT` delivery. Since `SYS_SET_TID_ADDRESS` already returns the real pid as `tid` on this
+/// single-threaded kernel, `tkill(tid, sig)` is exactly `kill(tid, sig)` — a thin wrapper over the
+/// existing `do_kill`, not a new primitive.
+pub(crate) fn sys_tkill(tid: u64, sig: u64) -> Result<u64, u64> {
+    crate::process::do_kill(crate::process::scheduler::current_pid(), tid as i64, sig as i64)
+}
+
 /// `SYS_SETPGID` (`120`) — matches real `setpgid(2)`'s exact `(pid, pgid)` wire format, same
 /// "no argument-convention patch needed" story `sys_pipe`/`sys_dup2`/`sys_kill` already
 /// established. Delegates to `process::do_setpgid` — see that function's own doc comment for the
@@ -748,6 +771,39 @@ pub(crate) fn sys_getrusage(who: u64, rusage_ptr: u64) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// musl's own `struct tms` on x86_64 (`third_party/musl/include/sys/times.h`): four `clock_t`
+/// (`long`, 8 bytes on this arch) fields, no padding -- 32 bytes total.
+#[repr(C)]
+#[derive(Default)]
+struct RawTms {
+    tms_utime: i64,
+    tms_stime: i64,
+    tms_cutime: i64,
+    tms_cstime: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<RawTms>() == 32);
+
+/// `SYS_TIMES` (real `times`'s own wire slot, `493` after the collision sweep in
+/// `docs/MISSING_POSIX_SYSCALLS.md` redirected it off its previous accidental home at
+/// `SYS_MMAP = 100`) -- matches real `times(2)`'s exact `(tms_ptr)` wire format
+/// (`third_party/musl/src/time/times.c` is a bare `__syscall(SYS_times, tms)`, no call-site patch
+/// needed). The `tms` fields are an honest all-zero placeholder, same tier and same reasoning as
+/// `RawRusage` above -- this kernel tracks no per-process CPU time at all, so a real per-field
+/// breakdown would just be a fabricated number. The return value (real `times(2)`'s "clock ticks
+/// since an arbitrary point in the past") is `crate::cpu::interrupts::ticks()` itself, the same
+/// real `TIMER_HZ`-cadence counter `sys_clock_gettime`'s own `CLOCK_MONOTONIC` arm already uses --
+/// an honest, non-fabricated value, just not tied to any particular epoch (matching the standard's
+/// own "arbitrary point" wording).
+pub(crate) fn sys_times(tms_ptr: u64) -> Result<u64, u64> {
+    if tms_ptr != 0 {
+        // SAFETY: same known pointer-validation gap every other user-memory write in this file
+        // already has.
+        unsafe { (tms_ptr as *mut RawTms).write_unaligned(RawTms::default()) };
+    }
+    Ok(crate::cpu::interrupts::ticks())
+}
+
 /// musl's own `struct timespec` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
 /// timespec` template, `time_t`/`long` both 8 bytes on this arch): two `i64`s, no padding.
 #[repr(C)]
@@ -921,6 +977,14 @@ pub(crate) extern "C" fn oxidebsd_sys_sigprocmask(
     result_to_ffi(sys_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
+    result_to_ffi(sys_sigpending(set_ptr, sigsetsize))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_tkill(tid: u64, sig: u64) -> i64 {
+    result_to_ffi(sys_tkill(tid, sig))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_setpgid(pid: u64, pgid: u64) -> i64 {
     result_to_ffi(sys_setpgid(pid, pgid))
 }
@@ -1092,6 +1156,10 @@ pub(crate) extern "C" fn oxidebsd_sys_wait4(
 
 pub(crate) extern "C" fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64 {
     result_to_ffi(sys_getrusage(who, rusage_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_times(tms_ptr: u64) -> i64 {
+    result_to_ffi(sys_times(tms_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_execve(

@@ -149,6 +149,8 @@ const SYS_CHOWN: u64 = 166;
 /// Real Linux's own `__NR_fchmod` value, used directly rather than an invented number -- see
 /// `oxfs_fchmod`'s own doc comment for why.
 const SYS_FCHMOD: u64 = 91;
+/// Real Linux's own `__NR_fchdir` value, used directly -- see `oxfs_fchdir`'s own doc comment.
+const SYS_FCHDIR: u64 = 81;
 /// Next after `SYS_CHOWN=166` -- see `oxfs_utimensat`'s own doc comment for what this actually
 /// does (a real existence check, no real timestamp storage) and why that's enough to unblock
 /// BusyBox's `touch.c`.
@@ -3700,6 +3702,34 @@ extern "C" fn oxfs_fchmod(fd: u64, mode: u64, _a2: u64, _a3: u64) -> i64 {
     0
 }
 
+/// Registered for `SYS_FCHDIR` at real Linux's own `__NR_fchdir = 81` -- same "still completely
+/// unassigned in this ABI's own registry, no invented number or musl-side remap needed" story as
+/// `SYS_FCHMOD` above (checked against every `SYS_*` constant in `src/`/`modules/` first). Found
+/// live via `docs/MISSING_POSIX_SYSCALLS.md`'s own POSIX-vs-musl sweep -- `third_party/musl/src/
+/// unistd/fchdir.c` calls this directly, though no BusyBox-roster applet was confirmed to call it
+/// yet; cheap enough to close anyway.
+///
+/// Uses `resolve_write_fd_inode`, not the narrower `inode_of_open_file` -- same reasoning as
+/// `oxfs_fstat`/`oxfs_fchmod` above. Rejects a non-directory target with `-ENOTDIR`, matching real
+/// `fchdir(2)`; otherwise reuses `oxfs_chdir`'s own `set_current_cwd_real` tail directly (no `/proc`
+/// case to consider here -- a `/proc` entry has no real inode for a fd to resolve to in the first
+/// place, see `inode_of_open_file`'s own `ProcRead`/`ProcDir` doc comment above).
+extern "C" fn oxfs_fchdir(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
+    let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
+    if real_fd < 0 {
+        return -EBADF;
+    }
+    let Some(inode_num) = resolve_write_fd_inode(real_fd as u64) else {
+        return -EBADF;
+    };
+    if read_inode(inode_num).kind != InodeKind::Dir {
+        return -ENOTDIR;
+    }
+    set_current_cwd_real(inode_num);
+    0
+}
+
 /// Registered for `SYS_UTIMENSAT`. `(path_ptr, path_len, _times_ptr, _flags)` -- see
 /// `third_party/musl/src/stat/utimensat.c`'s own patch comment for the real wire-format story
 /// (dropped the always-`AT_FDCWD` `fd` argument, computed `path_len` explicitly). This filesystem
@@ -6216,6 +6246,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_CHMOD, oxfs_chmod);
         oxidebsd_register_syscall(SYS_CHOWN, oxfs_chown);
         oxidebsd_register_syscall(SYS_FCHMOD, oxfs_fchmod);
+        oxidebsd_register_syscall(SYS_FCHDIR, oxfs_fchdir);
         oxidebsd_register_syscall(SYS_UTIMENSAT, oxfs_utimensat);
         oxidebsd_register_syscall(SYS_MOUNT_BIND, oxfs_mount_bind);
         oxidebsd_register_syscall(SYS_MOUNT_TMPFS, oxfs_mount_tmpfs);

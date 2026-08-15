@@ -88,6 +88,22 @@ names (`times`, `sigpending`, `sigtimedwait`, `sigqueue`, `setresuid`, etc.) —
 guarantees each now lands on a clean, unclaimed number and `ENOSYS`s honestly instead of
 misrouting; implementing any of them is separate future work, tracked in the tables below.
 
+## Implemented this session
+
+Four of the cheap, no-new-primitive entries from the table below now have real handlers:
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `raise`, `abort`, `pthread_kill`, `pthread_cancel`, `timer_delete` | `SYS_TKILL = 200` (real, unclaimed) | `modules/signal` → `src/syscall/ffi.rs`'s `sys_tkill` → `process::do_kill` | Thin wrapper — `tkill(tid,sig)` is exactly `kill(tid,sig)` since `SYS_SET_TID_ADDRESS` already returns the real pid as `tid`. `abort()`/`assert()` now deliver real `SIGABRT` instead of trapping. |
+| `times` | `SYS_TIMES = 493` | `modules/posix_compat` → `sys_times`/`RawTms` | Honest all-zero `struct tms` (same tier as `getrusage`'s `RawRusage`); return value is the real `ticks()` counter, not fabricated. |
+| `sigpending` | `SYS_SIGPENDING = 494` | `modules/signal` → `sys_sigpending` → `process::do_sigpending` | Direct readback of the existing `pending_signals` bitmask. |
+| `fchdir` | `SYS_FCHDIR = 81` (real, unclaimed) | `modules/oxfs`'s `oxfs_fchdir` | Resolves the fd via the existing `resolve_write_fd_inode`, rejects non-directories with `ENOTDIR`, reuses `oxfs_chdir`'s own `set_current_cwd_real` tail. |
+
+Not yet built and verified end-to-end through a real `SYSCALL` (see this doc's own testing-discipline
+note below) — only fast, scoped `cargo check` on the individual module crates so far, plus a full
+`cargo build` kicked off separately. Update this note once a real syscall-smoke test exists per
+this codebase's own established pattern (`tests/*_syscall_smoke.rs` + `userland/*-syscall-smoke/`).
+
 ## Missing, live caller confirmed
 
 Interfaces musl's own C source calls directly (grepped, not inferred) that have no registered
@@ -95,14 +111,10 @@ OxideBSD handler.
 
 | POSIX interface(s) | Backing syscall | Live caller | Suggested number | Notes |
 |---|---|---|---|---|
-| `raise`, `abort`, `pthread_kill`, `pthread_cancel`, `timer_delete` | `tkill(tid, sig)` | `src/signal/raise.c:10`, `src/exit/abort.c:22` | real `200` (`__NR_tkill`, confirmed unclaimed) | `SYS_SET_TID_ADDRESS` already returns the real pid as `tid`, so `tkill(tid,sig)` is a thin wrapper around the existing `do_kill(pid,sig)` path on this single-threaded kernel. `abort()`/`assert()` currently ENOSYS and fall through to a raw trap instead of real `SIGABRT` delivery — cheapest, highest-value fix in this doc. |
-| `times` | `times(2)` | `src/time/times.c:6` | `493` (already remapped, see sweep above — no handler registered yet) | Report an honest all-zero `struct tms` (no per-process CPU-time accounting exists, same tier as `getrusage`'s all-zero `RawRusage`). |
-| `sigpending` | `rt_sigpending(2)` | `src/signal/sigpending.c:6` | `494` (already remapped, see sweep above — no handler registered yet) | `Process` already has `pending_signals`; this is a direct readback. |
 | `sigtimedwait`, `sigwaitinfo` | `rt_sigtimedwait(2)` | `src/signal/sigtimedwait.c:19,22` | `495` (already remapped, see sweep above — no handler registered yet) | No blocking-on-signal primitive exists yet; would need a new `BlockReason` variant, more than a number remap. |
 | `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496` (already remapped, see sweep above — no handler registered yet) | Only 1-arg `void(*)(int)` handlers exist (per `modules/signal/`'s own scope note) — `sigqueue`'s payload (`union sigval`) has nowhere to go without `SA_SIGINFO` support first. |
 | `sigsuspend` | `rt_sigsuspend(2)` | `src/signal/sigsuspend.c:6` | real `130` (`__NR_rt_sigsuspend`, confirmed unclaimed) | Needs a real block/wake primitive tied to signal delivery, not just a number. |
 | `sigaltstack` | `sigaltstack(2)` | `src/signal/sigaltstack.c:19` | real `131` (`__NR_sigaltstack`, confirmed unclaimed) | Lower priority — `modules/signal/`'s own scope note already documents "no real signal stack" as a known gap (a second signal during handler execution overwrites `signal_saved_frame` rather than nesting); a real `sigaltstack` doesn't fix that by itself. |
-| `fchdir` | `fchdir(2)` | `src/unistd/fchdir.c:8` | real `81` (`__NR_fchdir`, confirmed unclaimed) | No confirmed BusyBox-roster caller yet (checked — none call it directly), but it's musl-live and cheap: resolve the fd's inode the same way `oxfs_fstat` does, then reuse `chdir`'s existing cwd-set logic. |
 | `pause` | `pause(2)` | no direct `.c` call site found (likely inlined/aliased) | real `34` (`__NR_pause`, confirmed unclaimed) | Low priority — no confirmed live path in the current roster. |
 
 ## Missing, POSIX-mandated, no live caller yet in ported userland
