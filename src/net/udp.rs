@@ -60,10 +60,10 @@ const EHOSTUNREACH: i64 = 65;
 const HEADER_LEN: usize = 8;
 const SOCKADDR_LEN: usize = 16;
 const EPHEMERAL_PORT_START: u16 = 49152;
-/// Bounded so a socket nobody's reading from can't grow without limit -- this kernel's usual
-/// preference for fixed backpressure over an unbounded queue (unlike `src/pipe.rs`'s own
-/// `VecDeque`, which can stay unbounded because a pipe always has a bounded number of writers
-/// actively blocked on it; nothing here blocks a sender who's outrunning a slow/absent reader).
+/// Bounded so a socket nobody's reading from can't grow without limit -- same backpressure
+/// reasoning as `src/pipe.rs`'s own bounded buffer, except nothing here blocks an outrunning
+/// sender (UDP is unreliable by nature; a full queue just drops the newest datagram instead of
+/// backpressuring the network stack itself).
 const MAX_QUEUED_DATAGRAMS: usize = 32;
 
 struct UdpSocket {

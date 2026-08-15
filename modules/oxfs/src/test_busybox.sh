@@ -300,9 +300,13 @@ check_status "true exits 0" $?
 false
 [ $? -ne 0 ]
 check_status "false exits nonzero" $?
-# `yes` deliberately NOT piped into anything here -- see "NOT EXERCISED" below, this is a real,
-# newly-found kernel panic, not a script mistake: `yes | head -n 3` reliably OOMs and panics the
-# kernel (`memory allocation of 67239936 bytes failed`) on this kernel's current architecture.
+# `yes | head -n 3`: used to reliably OOM and panic the kernel (`memory allocation of 67239936
+# bytes failed`) -- src/pipe.rs's buffer was an unbounded VecDeque<u8>, so a producer with no
+# blocking syscall in its write loop (yes) never yielded the CPU on this non-preemptive kernel,
+# starving the consumer (head) that would've closed its end and stopped it. Fixed by bounding the
+# pipe at 64 KiB (real Linux's own default) with a real blocking writer -- see CLAUDE.md's BusyBox
+# section and src/pipe.rs's module doc comment.
+check "yes | head -n 3" "$(yes | head -n 3)" "$(printf 'y\ny\ny')"
 
 # --- expr / factor / bc / dc (real arithmetic tools, not the shell's own $(( )) ) ---
 check "expr multiplication" "$(expr 6 \* 7)" "42"
@@ -578,20 +582,6 @@ makemime -o mime_out.txt comp_src.txt
 
 # NOT EXERCISED, deliberately, and why:
 #
-# - `yes` piped into anything: a REAL kernel panic, found live by an earlier version of this exact
-#   script (`yes | head -n 3` -> `memory allocation of 67239936 bytes failed`), not a script
-#   mistake. Root cause: `src/pipe.rs`'s buffer is an unbounded `VecDeque<u8>` (write() never
-#   blocks, so there's no backpressure), and this kernel has no preemptive scheduling (see
-#   CLAUDE.md's own "no preemption" gap) -- a process only ever yields the CPU at an explicit
-#   blocking point (a blocking syscall calling `scheduler::schedule()`). `yes` calls write() in a
-#   tight loop that never blocks, so it never yields, so `head` never gets scheduled to read three
-#   lines and exit/close its end of the pipe -- `yes` just keeps winning every scheduling
-#   opportunity forever, growing the pipe buffer without limit until the kernel heap allocator
-#   fails. This isn't specific to `yes`/`head`: *any* pipeline where a producer's own write() calls
-#   never block on their own and outpaces a consumer that would otherwise read only part of the
-#   output has the same failure mode. A real fix would need either actual preemptive scheduling or
-#   a bounded pipe buffer with a real blocking writer -- a genuine architectural decision, not
-#   something to sneak in as part of a test script.
 # - daemons that listen/block and would hang this script rather than return: httpd, ftpd, telnetd,
 #   inetd, dnsd, tcpsvd, udpsvd, udhcpd, lpd, crond, ntpd.
 # - needs a real remote peer or infrastructure this environment doesn't guarantee: nc, netcat,
