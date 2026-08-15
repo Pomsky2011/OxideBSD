@@ -414,9 +414,11 @@ buildable, no longer pid 1 (superseded by `hush`). Its design remains the refere
   (accepted/discarded); else `ENOTTY`. Only succeeds against the real console (`crate::
   fd::real_fd_of`, so a `dup2`'d pipe end still reports non-tty — load-bearing for `isatty()`).
   This is what lets `hush` reach a real `/ #` prompt with line editing.
-- No pty/foreground-process-group layer at this file's level — `tcsetpgrp`/`bg`/`fg` are
-  unimplemented here (a real session/controlling-tty model exists at the process level — see
-  "Session, controlling-tty, and login authentication" below).
+- No pty/foreground-process-group layer at this file's level — `tcsetpgrp`/`bg`/`fg` are driven
+  entirely by the real session/controlling-tty model at the process level (see "Session,
+  controlling-tty, and login authentication" and "Real job control" below), not by anything here;
+  this file's only involvement is the Ctrl+C/Ctrl+Z keyboard intercepts in
+  `interrupts::keyboard_interrupt_handler`.
 
 ## Process abstraction, scheduler, and fork/exec/wait (`src/process/`)
 
@@ -752,11 +754,13 @@ foreground-process-group model.
     `SIGTTIN` retry loop).
   - **Real Ctrl+C → `SIGINT` to the foreground process group**: `interrupts::
     keyboard_interrupt_handler` intercepts ASCII ETX (`0x03`) before the stdin ring buffer, only
-    when `ISIG` is set **and** `FOREGROUND_PGID` has actually been claimed — otherwise falls
-    through unchanged (today's common case). `process::signal_foreground_group` reuses `do_kill`'s
-    own Discard/Terminate/SetPending logic, applied to every process sharing that `pgid`.
-  - **Not covered**: real `SIGTSTP`/`SIGTTIN`/`SIGTTOU`-driven job control (`^Z`) — still `Ignore`
-    disposition; only `SIGINT` was wired to the foreground-group concept.
+    when `ISIG` is set **and** `FOREGROUND_PGID` has actually been claimed. `FOREGROUND_PGID` *is*
+    claimed for the common interactive case now — see "Real job control" below for how pid 1 gets
+    a controlling tty automatically and what that unlocks; `process::signal_foreground_group`
+    reuses `do_kill`'s own Discard/Terminate/Stop/SetPending logic, applied to every process
+    sharing that `pgid`.
+  - Ctrl+Z/`SIGTSTP`-driven stop/continue is covered by "Real job control" below, not here — this
+    bullet originally shipped Ctrl+C only; that section is the up-to-date reference for both.
   - Verified via `tests/session_syscall_smoke.rs` + `userland/session-syscall-smoke/`, run as a
     *forked child* of pid 1 (pid 1 is already its own pgroup leader, so `setsid()` on it directly
     would always `EPERM` before reaching anything interesting). Real Ctrl+C delivery itself is
@@ -797,8 +801,116 @@ hardcoded restorer-stub literal, `src/signal/x86_64/restore.s`). Real signal num
   number not registered in `SYSCALL_TABLE` at all.
 - `do_kill` cross-process: immediate for the common case (no handler → terminate right there, even
   against a blocked target); deferred until next-scheduled only if the target has a custom handler.
-  No process-group targeting, no permission checks.
+  No permission checks. **Real process-group targeting** (`target_pid == 0`/`< 0`, POSIX
+  `kill(-pgrp, sig)`) — see "Real job control" below.
 - Only 1-argument `void (*)(int)` handlers — no `SA_SIGINFO`.
+
+## Real job control: Ctrl+C/Ctrl+Z, colored tty, `kill(-pgrp)` (`src/process/`, `src/cpu/interrupts.rs`, `build.rs`)
+
+Closes the "Session, controlling-tty..." section's own `FOREGROUND_PGID`/Ctrl+C machinery being
+practically dead code, and the `tcsetpgrp`/real-job-control gap-analysis row below (previously
+"blocked on a pty/foreground-pgrp concept" — it wasn't; see the root-cause finding directly below).
+Landed on both `master` and `v0.1.x`, split by scope: both branches get real Ctrl+C, colors, and
+`kill(-pgrp)`; only `master` (0.2.0-dev) gets real Ctrl+Z suspend/resume — `v0.1.x` stays
+bugfix-only per its own branch charter (see "v0.2.x goals" in `ROADMAP.md`).
+
+**Root cause, and why the fix needed no BusyBox source patch**: `third_party/busybox/shell/hush.c`
+(`CONFIG_HUSH_JOB`/`CONFIG_HUSH_INTERACTIVE` already forced on for `hush` in `build.rs`, see the
+BusyBox port section above) has always shipped a complete, real job-control startup sequence
+(`tcgetpgrp`/loop-until-foreground/`bb_setpgrp`/`tcsetpgrp`) that activates itself automatically —
+*if* it ever discovers it has a controlling tty. It never did: pid 1's stdin/stdout are wired
+directly to the console in `process::spawn`, never through a real `open()` syscall — the exact path
+that would, on a real kernel, auto-associate a session leader's first tty use as its controlling
+terminal. **Fix**: `process::spawn` now calls `crate::console::stdin::set_controlling_session(pid)`
+directly right after inserting pid 1 into the table (kernel-internal, bypassing the `ioctl` path),
+mirroring what a real kernel does for a console-attached init process. That one call is what makes
+`FOREGROUND_PGID` actually get claimed (via `hush`'s own subsequent real `TIOCSPGRP` call), which is
+what `interrupts::keyboard_interrupt_handler`'s pre-existing Ctrl+C interception was gated on all
+along.
+
+- **Colors**: `TERM=linux` and a colored `PS1` (`\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$
+  `) added to pid 1's `envp` in `process::spawn` (previously just `PATH=/bin`) —
+  `CONFIG_FEATURE_EDITING_FANCY_PROMPT` was already forced on for `hush`, so the `\[`/`\]`/`\u`/
+  `\h`/`\w`/`\$`/`\e` escapes `lineedit.c`'s own `parse_prompt` expands already worked, this just
+  needed the env var. Real `ls --color` needed its own per-applet Kconfig flip in `build.rs`
+  (`CONFIG_LONG_OPTS`/`CONFIG_FEATURE_LS_COLOR`/`CONFIG_FEATURE_LS_COLOR_IS_DEFAULT` — same
+  "`allnoconfig` writes an explicit not-set line before the parent symbol is even visible" story as
+  every other per-applet flip in that function). This BusyBox fork's `grep` has no color feature at
+  all — not in scope.
+- **Real `kill(-pgrp, sig)` process-group broadcast** (`process::do_kill`'s `target_pid <= 0`
+  branch — `0` = caller's own group, `< 0` = group `|target_pid|`): previously an unconditional
+  `EINVAL` (documented as "no process-group/broadcast targeting" in the Signal handling module
+  section above) — found live, not preemptively fixed: `hush`'s own `fg`/`bg` builtins
+  (`kill(-pgrp, SIGCONT)`) and its job-cleanup path (`kill(-pgrp, SIGHUP)`/`kill(-pgrp, SIGCONT)`)
+  both depend on it, and were unreachable dead code until the controlling-tty fix above made
+  `hush`'s job control activate for the first time. Reuses `signal_foreground_group`'s exact
+  per-process action resolution unchanged — it already only needed a plain `pgid`, "foreground" was
+  never load-bearing to its own logic, only to its one prior caller.
+- **Master-only: real `SIGSTOP`/`SIGTSTP`/`SIGCONT`** (genuine Ctrl+Z suspend/`bg`/`fg` resume, not
+  just backgrounding-while-still-running):
+  - **`ProcState::Stopped(u64)`** (payload = stopping signal, for `WSTOPSIG`) — a new top-level
+    `ProcState` variant, deliberately **not** nested under `BlockReason`: every existing block/wake
+    site (`console::stdin::read`, `fs::pipe`, `do_wait4`) already re-checks its own real condition
+    fresh after `scheduler::schedule()` returns rather than trusting "state==Ready now" to mean "my
+    specific event happened," so resuming a stopped process is just flipping `state` back to
+    `Ready`/re-enqueueing — nothing needs to remember which `BlockReason` (if any) it had. A
+    cross-process stop targeting a `Ready` process still sitting in `READY_QUEUE` also needs
+    dequeuing first (new `scheduler::remove_ready`), or the scheduler would run it next turn
+    regardless of the state flip.
+  - **`DefaultDisposition::Stop`** (`SIGSTOP`/`SIGTSTP` split out of the old blanket `Ignore`
+    bucket — `SIGCONT` stays `Ignore`, see below). `SIGSTOP` is always immediate and uncatchable
+    (`sys_sigaction` already rejected installing a handler for it, so `default_disposition` is
+    always consulted); default-disposition `SIGTSTP` is also immediate, matching real Ctrl+Z. A
+    `SIGTSTP` with a real installed handler still falls into the pre-existing `Handler`/
+    `SetPending` arms unmodified — `hush.c` itself installs a real `SIGTSTP` catch-handler for the
+    interactive shell process, so Ctrl+Z with no foreground job correctly does *not* stop the shell,
+    free from this design.
+  - **`SIGCONT`** gets its own pre-dispatch step at every cross-process-capable call site, *before*
+    the normal disposition lookup: an actually-`Stopped` target always resumes (state → `Ready`,
+    `Process::cont_notify_pending = true`) regardless of its own `SIGCONT` disposition, real POSIX
+    semantics, then still falls through to the normal dispatch for whether a caught handler
+    *additionally* fires. `Process::stop_notify_pending` is cleared the moment `SIGCONT` resumes a
+    process — a deliberate simplification from real Linux (which would still let a parent observe
+    the stop after the fact post-resume): `ProcState::Stopped`'s payload is the only place the
+    stopping signal number lives, and it's gone the instant `state` flips back, so reporting a stop
+    after resume would need a second field just to remember which signal it was — not worth it for a
+    real shell's own polling cadence.
+  - **`do_wait4` real `WUNTRACED`/`WCONTINUED`/`WNOHANG`** — `oxidebsd_sys_wait4` used to discard
+    `options` entirely. `WNOHANG` is the load-bearing half, not just the stop/continue reporting:
+    `hush.c`'s own `checkjobs(NULL, 0)` (background job-status polling, called throughout its
+    interactive main loop) always passes `WUNTRACED | WNOHANG`, and this kernel never delivers a
+    real `SIGCHLD` to a parent at all — without real `WNOHANG`, any such call would block the whole
+    interactive shell instead of just missing a status update. New wire status shape (confirmed
+    disjoint from the two already in use — normal exit's `(code & 0xff) << 8` always has low byte
+    `0x00`, signal-termination's `128 + sig` always has low byte `0x81..0x9f`): `WIFSTOPPED` writes
+    `0x7f | (stopsig << 8)`; `WIFCONTINUED` writes the literal `0xffff`.
+  - **Ctrl+Z keyboard intercept**: `interrupts::keyboard_interrupt_handler` gained a second
+    intercepted byte (ASCII SUB, `0x1a`), mirroring the existing Ctrl+C block exactly (same `ISIG`/
+    `FOREGROUND_PGID` gating) but sending `SIGTSTP` instead of `SIGINT`.
+  - **A real regression found live, not by review**: `process::timers::do_nanosleep` was the one
+    blocking call in this codebase that didn't loop and re-check its own wake condition after
+    `scheduler::schedule()` returns (every other one — pipe reads, `do_wait4`, stdin — already did).
+    It got away with that because historically the *only* thing that ever set a sleeping process
+    back to `Ready` was the timer IRQ handler itself finding the deadline actually passed. Real
+    `SIGCONT` broke that assumption silently: it unconditionally wakes a `Stopped` process
+    regardless of what it was blocked on, so `bg`-ing a Ctrl+Z-stopped `sleep 100` woke it almost
+    immediately instead of at its real ~100s deadline — found by the user noticing the timing was
+    off, in an already-clean `cargo build`/`cargo clippy`. Fixed by looping and re-checking
+    `ticks() < deadline`, the same self-correcting pattern as everywhere else — which also gets real
+    Linux semantics for free: `ticks()` is a global counter that keeps advancing while a process is
+    `Stopped`, so time spent stopped still counts toward the sleep. **Any future mechanism that can
+    force an arbitrary process back to `Ready` cross-process needs the same audit**: every
+    non-looping `scheduler::schedule()` call site must be re-checked for this exact assumption.
+  - Not covered: real `SIGTTIN`/`SIGTTOU`-driven job control (still `Ignore` disposition — only
+    `SIGINT`/`SIGTSTP` are ever delivered to a foreground group).
+- **Verification**: `cargo build`/`cargo clippy` clean on both branches (no new warnings). Ctrl+C/
+  Ctrl+Z/`fg`/`bg`/`jobs`/colored `ls`/prompt all live-verified interactively by the user
+  (manual-QEMU-only, real PS/2 IRQ, unscriptable — same as every other Ctrl+C-shaped feature in this
+  codebase). No new automated smoke test for the stop/continue machinery specifically, given the
+  Ctrl+Z trigger is inherently interactive — a `SYS_TEST_*`-style synthetic-signal-injection test
+  (same pattern as the existing `*_syscall_smoke` tests) could exercise
+  `do_kill(SIGSTOP)`/`wait4(WUNTRACED)`/`SIGCONT` without a real keypress if this needs regression
+  coverage later.
 
 ## Real-time clock (`modules/clock/`, `src/cpu/pit.rs`, `src/cpu/rtc.rs`, `src/syscall/`)
 
@@ -1187,7 +1299,7 @@ hw-profile support) rather than continuing to carry them as dead weight; see tha
 | `clock_gettime`/`gettimeofday`/`time` | done | — | `SYS_CLOCK_GETTIME=138` in `modules/clock` |
 | `nanosleep` | done | 9 (`NEEDS_CLOCK`) | `SYS_NANOSLEEP=139` |
 | Init-system/service-supervisor framework | not started, out of scope | 2 kept anyway (`bootchartd`/`start_stop_daemon` — their real mechanics don't need an init framework, just fork/exec/setsid/kill/pidfile this kernel already has); 4 removed before v0.1 (`runsv`/`runsvdir`/`svlogd`/`svok` — genuinely dead, the runit family needs FIFOs oxfs doesn't have) | no init framework to plug into at all |
-| `tcsetpgrp`/real job control | blocked on a pty/foreground-pgrp concept | — (its old `NEEDS_HARDWARE` category is now empty — see above) | — |
+| `tcsetpgrp`/real job control | done | — (its old `NEEDS_HARDWARE` category is now empty — see above) | see "Real job control" — real Ctrl+C/`kill(-pgrp)`/colors on both branches, real Ctrl+Z stop/continue on `master` only |
 | `uname` | done | — | `SYS_UNAME=137` in `modules/posix_compat` |
 | `gethostname` | done | — | no new syscall — musl's `gethostname()` wraps `uname()` |
 
