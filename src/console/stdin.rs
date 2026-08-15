@@ -12,7 +12,7 @@
 //! argument, able to actually read a line from the keyboard instead of seeing an instant EOF and
 //! exiting: a real blocking `read()` on stdin, from `hush`'s own perspective, is indistinguishable
 //! from a real OS's. `push_byte` wakes any process blocked on `BlockReason::WaitingForStdin` the
-//! moment a byte arrives, the same way `crate::pipe::pipe_write` wakes a blocked pipe reader.
+//! moment a byte arrives, the same way `crate::fs::pipe::pipe_write` wakes a blocked pipe reader.
 //! `stsh`'s own `read_byte` (a busy-poll loop around a call that used to always return `0`
 //! immediately when empty) still works completely unmodified against a blocking `read` — each
 //! call simply returns exactly when a byte becomes available instead of needing several
@@ -40,7 +40,7 @@
 use spin::Mutex;
 
 use crate::process::{self, BlockReason, ProcState};
-use crate::scheduler;
+use crate::process::scheduler;
 
 const CAPACITY: usize = 256;
 

@@ -1,6 +1,6 @@
 //! A hardware time source immune to `src/syscall.rs`'s own SFMASK clearing
 //! `RFLAGS::INTERRUPT_FLAG` for a syscall's *entire* duration (see that file's own module doc
-//! comment). `crate::interrupts::ticks()` is driven entirely by the timer IRQ, which cannot fire
+//! comment). `crate::cpu::interrupts::ticks()` is driven entirely by the timer IRQ, which cannot fire
 //! while a real ring-3 `SYSCALL` has interrupts masked -- so any tick-based deadline check spun
 //! *inside* a syscall handler (`net::oxidebsd_sys_poll`'s timeout, `ipv4::resolve_with_retry`'s
 //! ARP wait, `tcp::oxidebsd_sys_connect`'s handshake wait) can never actually elapse when reached
@@ -18,7 +18,7 @@
 //!
 //! `RDTSC` is a plain CPU cycle counter, not interrupt-driven -- it keeps advancing regardless of
 //! `RFLAGS::INTERRUPT_FLAG`. Calibrated once at boot, in `crate::init`, while running ordinary
-//! interrupt-enabled kernel code (never inside a syscall), against `crate::interrupts::ticks()`'s
+//! interrupt-enabled kernel code (never inside a syscall), against `crate::cpu::interrupts::ticks()`'s
 //! own known `TIMER_HZ` rate -- the same "plain hardware register, no CPUID gate needed" RDTSC
 //! use `src/random.rs` already established.
 
@@ -26,7 +26,7 @@ use core::arch::x86_64::_rdtsc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Cycles per millisecond, set once by `init()`. `0` means "not yet calibrated" -- every caller
-/// here runs after `crate::init`, same ordering requirement `crate::interrupts::ticks()` already
+/// here runs after `crate::init`, same ordering requirement `crate::cpu::interrupts::ticks()` already
 /// has on the PIT being programmed first.
 static CYCLES_PER_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -45,9 +45,9 @@ pub fn init() {
     const CALIBRATION_TICKS: u64 = 10;
     const MS_PER_TICK: u64 = 10;
 
-    let start_tick = crate::interrupts::ticks();
+    let start_tick = crate::cpu::interrupts::ticks();
     let start_tsc = now();
-    while crate::interrupts::ticks() < start_tick + CALIBRATION_TICKS {
+    while crate::cpu::interrupts::ticks() < start_tick + CALIBRATION_TICKS {
         core::hint::spin_loop();
     }
     let elapsed_cycles = now() - start_tsc;

@@ -43,7 +43,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use spin::Mutex;
 
 use crate::process::{self, BlockReason, ProcState};
-use crate::scheduler;
+use crate::process::scheduler;
 use crate::syscall::{EAGAIN, ENOTSOCK, EPIPE};
 
 struct PipeBuffer {
@@ -61,7 +61,7 @@ enum End {
 static NEXT_PIPE_ID: Mutex<u64> = Mutex::new(1);
 static PIPES: Mutex<BTreeMap<u64, PipeBuffer>> = Mutex::new(BTreeMap::new());
 /// Keyed by a pipe end's own `real_fd` (see `src/fd.rs`'s module doc comment) — stable across any
-/// `dup2` alias of that end, since `crate::fd::read`/`write`/`close` always invoke a registered
+/// `dup2` alias of that end, since `crate::fs::fd::read`/`write`/`close` always invoke a registered
 /// callback with `real_fd`, never whichever fd was actually looked up.
 static PIPE_ENDS: Mutex<BTreeMap<u64, (u64, End)>> = Mutex::new(BTreeMap::new());
 /// Same keying convention as `PIPE_ENDS`, but for a socketpair endpoint: each entry names *two*
@@ -135,7 +135,7 @@ fn blocking_read(pipe_id: u64, ptr: u64, len: u64, real_fd: u64) -> i64 {
             if pipe.write_closed {
                 return 0; // EOF: no data, and nothing left to ever write more
             }
-            if crate::fd::is_nonblocking(real_fd) {
+            if crate::fs::fd::is_nonblocking(real_fd) {
                 return -(EAGAIN as i64);
             }
             // Empty, write end still open -- block and let something else run (see this module's
@@ -197,7 +197,7 @@ fn write_into(pipe_id: u64, ptr: u64, len: u64, real_fd: u64) -> i64 {
                 }
                 continue; // more to write -- buffer is now full, loop back and block below
             }
-            if crate::fd::is_nonblocking(real_fd) {
+            if crate::fs::fd::is_nonblocking(real_fd) {
                 return if written > 0 {
                     written as i64
                 } else {
@@ -248,19 +248,19 @@ fn close_direction(pipe_id: u64, dir: End) {
 }
 
 /// `SYS_PIPE`'s real logic. Allocates a fresh pipe id and buffer, allocates two fds
-/// (`crate::fd::oxidebsd_alloc_fd`) and registers each end's own callbacks against them, then
+/// (`crate::fs::fd::oxidebsd_alloc_fd`) and registers each end's own callbacks against them, then
 /// writes `[read_fd, write_fd]` at `fds_ptr` as two `i32`s — matching real `pipe(2)`'s exact wire
 /// format (a pointer to `int pipefd[2]`), since nothing about this call's shape needed inventing
 /// the way `open`/`execve` did (see `src/syscall.rs`'s own doc comment on `sys_pipe`).
 pub(crate) fn do_pipe(fds_ptr: u64) -> Result<u64, u64> {
     let pipe_id = new_pipe_buffer();
 
-    let read_fd = crate::fd::oxidebsd_alloc_fd();
-    let write_fd = crate::fd::oxidebsd_alloc_fd();
+    let read_fd = crate::fs::fd::oxidebsd_alloc_fd();
+    let write_fd = crate::fs::fd::oxidebsd_alloc_fd();
     PIPE_ENDS.lock().insert(read_fd, (pipe_id, End::Read));
     PIPE_ENDS.lock().insert(write_fd, (pipe_id, End::Write));
-    crate::fd::oxidebsd_register_fd_ops(read_fd, pipe_read, write_denied, pipe_close);
-    crate::fd::oxidebsd_register_fd_ops(write_fd, read_denied, pipe_write, pipe_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(read_fd, pipe_read, write_denied, pipe_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(write_fd, read_denied, pipe_write, pipe_close);
 
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
     // already has -- fds_ptr isn't checked against the caller's actual mappings first.
@@ -324,8 +324,8 @@ pub(crate) fn do_socketpair(fds_ptr: u64) -> Result<u64, u64> {
     let pipe_a = new_pipe_buffer(); // fd0 -> fd1 direction
     let pipe_b = new_pipe_buffer(); // fd1 -> fd0 direction
 
-    let fd0 = crate::fd::oxidebsd_alloc_fd();
-    let fd1 = crate::fd::oxidebsd_alloc_fd();
+    let fd0 = crate::fs::fd::oxidebsd_alloc_fd();
+    let fd1 = crate::fs::fd::oxidebsd_alloc_fd();
     SOCK_ENDS.lock().insert(
         fd0,
         SocketEnd {
@@ -340,8 +340,8 @@ pub(crate) fn do_socketpair(fds_ptr: u64) -> Result<u64, u64> {
             read_pipe: pipe_a,
         },
     );
-    crate::fd::oxidebsd_register_fd_ops(fd0, sock_read, sock_write, sock_close);
-    crate::fd::oxidebsd_register_fd_ops(fd1, sock_read, sock_write, sock_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(fd0, sock_read, sock_write, sock_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(fd1, sock_read, sock_write, sock_close);
 
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
     // already has -- fds_ptr isn't checked against the caller's actual mappings first.

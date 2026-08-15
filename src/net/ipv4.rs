@@ -134,7 +134,7 @@ fn resolve_with_retry(ip: Ipv4Addr) -> Option<[u8; 6]> {
         return Some(mac);
     }
     arp::send_request(ip);
-    // Bounded by `crate::tsc`, not `crate::interrupts::ticks()`/an arbitrary spin count -- see
+    // Bounded by `crate::tsc`, not `crate::cpu::interrupts::ticks()`/an arbitrary spin count -- see
     // rtl8139_smoke's own precedent for why a few seconds of budget is generous headroom, not a
     // tight timing assumption.
     //
@@ -153,8 +153,8 @@ fn resolve_with_retry(ip: Ipv4Addr) -> Option<[u8; 6]> {
     // never actually elapse, turning "give up after N ticks" into "never gives up" for a
     // genuinely unreachable destination. Confirmed live by the identical bug in `net::
     // oxidebsd_sys_poll` (see `crate::tsc`'s own doc comment) -- fixed here for the same reason.
-    let deadline = crate::tsc::now() + crate::tsc::ms_to_cycles(5000);
-    while crate::tsc::now() < deadline {
+    let deadline = crate::cpu::tsc::now() + crate::cpu::tsc::ms_to_cycles(5000);
+    while crate::cpu::tsc::now() < deadline {
         super::poll();
         if let Some(mac) = arp::resolve(ip) {
             return Some(mac);

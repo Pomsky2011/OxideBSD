@@ -7,35 +7,18 @@
 
 extern crate alloc;
 
-pub mod address_space;
-pub mod allocator;
-pub mod ata;
-pub mod context_switch;
-pub mod elf;
-pub mod fd;
-pub mod fpu;
-pub mod gdt;
-pub mod interrupts;
+pub mod console;
+pub mod cpu;
+pub mod drivers;
+pub mod fs;
 pub mod memory;
 pub mod module;
 pub mod net;
-pub mod pci;
-pub mod pic;
-pub mod pipe;
-pub mod pit;
 pub mod process;
 pub mod qemu;
 pub mod random;
 pub mod reboot;
-pub mod rtc;
-pub mod scheduler;
-pub mod serial;
-pub mod stdin;
 pub mod syscall;
-pub mod tsc;
-pub mod user_stack;
-pub mod usermode;
-pub mod vga;
 
 use core::panic::PanicInfo;
 
@@ -58,27 +41,27 @@ pub fn init(
 ) {
     serial_println!("[boot] kernel initialization starting");
 
-    gdt::init();
-    fpu::init();
-    interrupts::init_idt();
-    interrupts::init_pics();
+    cpu::gdt::init();
+    cpu::fpu::init();
+    cpu::interrupts::init_idt();
+    cpu::interrupts::init_pics();
     unsafe {
-        pit::init();
+        cpu::pit::init();
     }
     syscall::init();
 
     serial_println!("[boot] enabling interrupts");
     x86_64::instructions::interrupts::enable();
 
-    tsc::init();
+    cpu::tsc::init();
 
     let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
     let mut frame_allocator =
         unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
 
-    let heap_size = allocator::compute_heap_size(memory::usable_ram_bytes());
-    allocator::init_heap(&mut mapper, &mut frame_allocator, heap_size)
+    let heap_size = memory::allocator::compute_heap_size(memory::usable_ram_bytes());
+    memory::allocator::init_heap(&mut mapper, &mut frame_allocator, heap_size)
         .expect("heap initialization failed");
 
     serial_println!("[boot] kernel initialization complete");
@@ -143,11 +126,11 @@ fn test_breakpoint_exception() {
 
 #[test_case]
 fn test_timer_interrupt_fires() {
-    let ticks_before = interrupts::ticks();
-    while interrupts::ticks() == ticks_before {
+    let ticks_before = cpu::interrupts::ticks();
+    while cpu::interrupts::ticks() == ticks_before {
         x86_64::instructions::hlt();
     }
-    assert!(interrupts::ticks() > ticks_before);
+    assert!(cpu::interrupts::ticks() > ticks_before);
 }
 
 #[test_case]

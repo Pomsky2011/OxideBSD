@@ -79,8 +79,8 @@ fn gather_seed() -> [u8; 32] {
     let tsc = unsafe { _rdtsc() };
     hasher.update(tsc.to_le_bytes());
 
-    hasher.update(crate::interrupts::ticks().to_le_bytes());
-    hasher.update((crate::rtc::unix_epoch_seconds() as u64).to_le_bytes());
+    hasher.update(crate::cpu::interrupts::ticks().to_le_bytes());
+    hasher.update((crate::cpu::rtc::unix_epoch_seconds() as u64).to_le_bytes());
     hasher.update(CALL_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
 
     // A stack address -- varies with call depth/whatever else has touched this kernel stack

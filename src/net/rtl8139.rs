@@ -130,7 +130,7 @@ fn probe_and_init(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     phys_mem_offset: VirtAddr,
 ) -> Option<Rtl8139> {
-    let candidate = crate::pci::find_by_class(0x02, 0x00)?;
+    let candidate = crate::drivers::pci::find_by_class(0x02, 0x00)?;
     if candidate.vendor_id != RTL8139_VENDOR || candidate.device_id != RTL8139_DEVICE {
         serial_println!(
             "[net] found a class-0x02 device ({:#06x}:{:#06x}) that isn't an rtl8139 -- skipping",
@@ -216,9 +216,9 @@ fn probe_and_init(
     RX_IRQ_FIRED.store(false, Ordering::Relaxed);
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        crate::interrupts::register_irq_handler(candidate.interrupt_line, rtl8139_irq_handler);
+        crate::cpu::interrupts::register_irq_handler(candidate.interrupt_line, rtl8139_irq_handler);
         unsafe {
-            crate::pic::unmask_irq(candidate.interrupt_line);
+            crate::cpu::pic::unmask_irq(candidate.interrupt_line);
         }
     });
 

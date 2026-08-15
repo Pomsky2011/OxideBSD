@@ -35,9 +35,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
 
-use crate::context_switch::switch_context;
+use crate::process::context_switch::switch_context;
 use crate::process::{self, Pid, ProcState};
-use crate::{gdt, serial_println};
+use crate::cpu::gdt;
+use crate::serial_println;
 
 /// `0` is never a valid `Pid` (`process::alloc_pid` starts at 1) — used as "no current process,"
 /// true only before the very first `scheduler::start`.
@@ -132,7 +133,7 @@ fn wait_for_ready() -> Pid {
         x86_64::instructions::interrupts::disable();
         // Scoped so the READY_QUEUE guard is dropped before enable_and_hlt() below -- holding it
         // across that would let the keyboard IRQ handler's own wake-up (which needs this same
-        // lock, see crate::stdin::push_byte) deadlock against itself on this single core.
+        // lock, see crate::console::stdin::push_byte) deadlock against itself on this single core.
         let popped = { READY_QUEUE.lock().pop_front() };
         if let Some(pid) = popped {
             return pid;

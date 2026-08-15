@@ -15,7 +15,7 @@
 use core::panic::PanicInfo;
 
 use bootloader::{BootInfo, entry_point};
-use oxidebsd::fd::oxidebsd_close_fd;
+use oxidebsd::fs::fd::oxidebsd_close_fd;
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 use oxidebsd::syscall::oxidebsd_register_syscall;
@@ -79,7 +79,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
 
     oxidebsd::memory::install_global_memory_state(frame_allocator, physical_memory_offset);
-    oxidebsd::fd::init();
+    oxidebsd::fs::fd::init();
 
     assert_eq!(
         oxidebsd_register_syscall(SYS_TEST_EXIT, test_exit_handler),
@@ -101,7 +101,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     let pid1 = oxidebsd::process::spawn(PIPE_BACKPRESSURE_SYSCALL_SMOKE_ELF, None)
         .unwrap_or_else(|e| panic!("failed to spawn pipe-backpressure-syscall-smoke: {e:?}"));
 
-    oxidebsd::scheduler::start(pid1)
+    oxidebsd::process::scheduler::start(pid1)
 }
 
 #[panic_handler]

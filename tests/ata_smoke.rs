@@ -18,7 +18,7 @@
 use core::panic::PanicInfo;
 
 use bootloader::{BootInfo, entry_point};
-use oxidebsd::ata::{self, Channel, Drive};
+use oxidebsd::drivers::ata::{self, Channel, Drive};
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 

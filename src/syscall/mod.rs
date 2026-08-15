@@ -1,0 +1,588 @@
+//! OxideBSD's native syscall ABI: `SYSCALL`/`SYSRETQ`, syscall number in `RAX`, up to four
+//! arguments in `RDI`/`RSI`/`RDX`/`R10`, success/failure signaled via the **carry flag** — the
+//! traditional BSD (and general historical x86 Unix) convention, layered on top of the modern
+//! fast-syscall instruction pair instead of the legacy `int 0x80` software-interrupt gate this
+//! kernel used up through its first process/scheduler milestone. On success, `CF = 0` and `RAX`
+//! holds the return value; on failure, `CF = 1` and `RAX` holds the *positive* `errno`. Register
+//! placement (`RDI`/`RSI`/`RDX`/`R10`, avoiding `RCX`/`R11` since `SYSCALL` itself clobbers them
+//! to save `RIP`/`RFLAGS`) mirrors real BSD's own `SYSCALL`-based convention.
+//!
+//! **`R10` used to be reserved but unread** — the entry stub always pushed it (uniform GPR
+//! save/restore, see `SyscallFrame`'s own doc comment), but `syscall_dispatch`/`dispatch` only
+//! ever forwarded `RDI`/`RSI`/`RDX` to a handler. Wired up for real once `SYS_EXECVE` needed a 4th
+//! argument (`envp_ptr`, alongside the existing `path_ptr`/`path_len`/`argv_ptr`) to support real
+//! `envp` passthrough — see `CLAUDE.md`'s BusyBox section. `SyscallHandler` is now a 4-argument
+//! function pointer; every registered handler across every module gained a 4th parameter (ignored
+//! by every syscall except `execve`), not just `execve`'s own — a real 4th argument is now a
+//! permanent part of this ABI, available to any future syscall that needs one, not a one-off
+//! special case threaded through only where `execve` needed it.
+//!
+//! **This mechanism used to be split across two files**: this module's own `int 0x80` gate, and a
+//! separate `src/linux_syscall.rs` that proved the `SYSCALL`/`SYSRETQ` mechanism in isolation
+//! (Linux's numbering, negative-`RAX` error convention — deliberately different from this ABI, as
+//! a stepping stone toward eventually running unmodified Linux binaries). That plan changed: this
+//! kernel is instead porting musl to speak *this* ABI directly (see `CLAUDE.md`'s "musl" section),
+//! so there was no longer a reason to keep two different syscall-numbering/error conventions each
+//! tied to a different trap instruction. `IA32_LSTAR` can only point at one entry stub, so this
+//! ABI now **owns** the `SYSCALL`/`SYSRETQ` mechanism outright — `src/linux_syscall.rs` and its
+//! dedicated `userland/linux-syscall-smoke/` test are gone, having already served their purpose of
+//! proving the mechanism (`IA32_STAR`/`LSTAR`/`SFMASK` setup, the GDT segment-ordering
+//! requirement, the stack-switch-on-entry problem) works at all.
+//!
+//! Syscall numbers match real FreeBSD's long-stable values for the calls implemented so far, as a
+//! deliberate nod to authenticity — not a claim of binary compatibility with real BSD userland
+//! (newer syscalls this ABI invents for itself, e.g. `mmap`/`brk`/TLS-base-set, don't extend that
+//! convention — see `modules/native_abi/`). errno values are *mostly* shared across Linux and the
+//! BSDs (`EBADF`, `EINVAL` are identical), but not universally — `ENOSYS` is `38` on Linux, `78` on
+//! FreeBSD. **`ENOSYS` itself uses the Linux/musl value (`38`), not the FreeBSD one** — the one
+//! deliberate exception to this file's own "FreeBSD authenticity" framing, fixed after it was found
+//! live blocking real functionality: whatever this file returns via the carry-flag ABI becomes
+//! musl's raw `errno` directly (see `EPROTONOSUPPORT`'s own doc comment below for the full
+//! mechanism), so a FreeBSD-authentic-but-musl-wrong value here isn't just cosmetic — BusyBox's own
+//! `libbb/change_identity.c` has a real upstream fallback (`errno == ENOSYS && target_uid ==
+//! getuid()` → treat a failed `initgroups()` as a harmless no-op, the correct behavior on a kernel
+//! with no supplementary-group concept, real Linux's own convention for `CONFIG_MULTIUSER=n`) that
+//! silently never fired while this returned FreeBSD's `78` instead of musl's real `38`, making `su`
+//! die outright instead of degrading gracefully. Was previously deliberately left unfixed pending a
+//! wider scope discussion (this constant is referenced far more broadly than the group below) —
+//! fixed once a live test demonstrated a concrete functional blocker, not as a preemptive sweep.
+//!
+//! **The number → handler mapping (`dispatch`'s table) is populated by a dynamically loaded
+//! kernel module, not hardcoded here.** `modules/native_abi/` registers `SYS_EXIT`/`SYS_READ`/
+//! `SYS_WRITE`/etc. via `oxidebsd_register_syscall` from its own `module_init` — see `CLAUDE.md`'s
+//! module-loading section. What stays kernel-resident, deliberately *not* moved into that module,
+//! is the actual `sys_exit`/`sys_read`/`sys_write` *behavior*, in `ffi.rs` alongside this file's
+//! other syscall-handler implementations. `oxidebsd_sys_exit`/`oxidebsd_sys_read`/
+//! `oxidebsd_sys_write` in that same file are the thin FFI adapters the module actually calls
+//! through.
+//!
+//! This file itself (`mod.rs`) is just the real ABI mechanism: `SyscallFrame`, the `SYSCALL`/
+//! `SYSRETQ` entry stub and its dispatch table, `redirect_frame`/signal delivery, and errno
+//! constants — see `ffi.rs` for every actual syscall handler this kernel implements directly
+//! (rather than delegating straight to `process::do_*`).
+
+pub mod ffi;
+
+pub use ffi::*;
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::arch::global_asm;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+use spin::Mutex;
+use x86_64::VirtAddr;
+use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
+use x86_64::registers::rflags::RFlags;
+
+use crate::cpu::gdt;
+use crate::serial_println;
+
+/// Standard, POSIX-heritage errno values. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC`/`EPIPE` happen to be
+/// identical on Linux and the BSDs; `ENOSYS` is not (see module doc comment) — unlike this group's
+/// other members, it uses musl's real Linux value (`38`), not FreeBSD's (`78`).
+pub(crate) const EBADF: u64 = 9;
+pub(crate) const EINVAL: u64 = 22;
+pub(crate) const ENOSYS: u64 = 38;
+pub(crate) const ECHILD: u64 = 10;
+pub(crate) const ENOEXEC: u64 = 8;
+pub(crate) const ENOMEM: u64 = 12;
+/// Returned by `crate::fs::pipe`'s `pipe_write` once a pipe's read end has been closed.
+pub(crate) const EPIPE: u64 = 32;
+/// Returned by `sys_kill` when the target pid doesn't exist -- "no such process," identical on
+/// Linux and the BSDs.
+pub(crate) const ESRCH: u64 = 3;
+/// Returned by `sys_ioctl` for a tty-specific request issued against a non-console fd -- identical
+/// on Linux and the BSDs, same as most of this group.
+pub(crate) const ENOTTY: u64 = 25;
+/// Returned by `sys_socketpair` for any domain/type other than `AF_UNIX`/`SOCK_STREAM`. `93`, not
+/// FreeBSD's `43` (unlike this group's other members, Linux and the BSDs actually diverge here) --
+/// matches the value musl's own compiled-in `bits/errno.h` (`third_party/musl/arch/generic/bits/
+/// errno.h`, since no x86_64-specific override exists) will compare `errno` against, which is what
+/// actually matters: whatever this file returns via the carry-flag ABI becomes musl's raw `errno`
+/// value directly (see `third_party/musl/arch/x86_64/syscall_arch.h`'s `jnc`/`neg` conversion), so
+/// it must match musl's *own* macro value, not a real-BSD-authenticity nod like `ENOSYS` below is.
+/// `src/net/udp.rs`'s own local copy of this constant (previously `43`, following this file's now-
+/// corrected mistake) needs the same fix.
+pub(crate) const EPROTONOSUPPORT: u64 = 93;
+/// Returned by `crate::fs::pipe`'s `blocking_read` for a real `O_NONBLOCK` fd (`sys_fcntl`) with
+/// nothing to read yet. `11`, matching musl's own compiled-in value (`EWOULDBLOCK` is the same
+/// value there too) -- same "must match musl's macro, not real-BSD numbering" reasoning as
+/// `EPROTONOSUPPORT` above.
+pub(crate) const EAGAIN: u64 = 11;
+/// Returned by `sys_shutdown` for any fd that isn't one of `crate::fs::pipe`'s `AF_UNIX` socketpair
+/// endpoints (a TCP/UDP socket, a plain pipe end, a regular oxfs file, ...) -- this pass only
+/// implements real half-close semantics for the socketpair shape `wget`'s HTTPS path actually
+/// needs, not real sockets. `88`, matching musl's own compiled-in value, same reasoning as
+/// `EPROTONOSUPPORT`/`EAGAIN` above.
+pub(crate) const ENOTSOCK: u64 = 88;
+/// Returned by `process::do_setuid`/`do_setgid` when a non-root caller tries to become a uid/gid
+/// other than its own -- identical value on Linux/BSD/musl, no divergence to worry about, unlike
+/// most of this group's other members.
+pub(crate) const EPERM: u64 = 1;
+/// Returned by `process::do_execve` when a `#!`-line interpreter chain (a script whose own
+/// interpreter is itself another `#!`-line script) nests deeper than `do_execve`'s own
+/// `MAX_SHEBANG_DEPTH` -- matches real Linux's own `ELOOP` for excessive `binfmt_script`
+/// recursion. `40`, musl's real compiled value (identical to `modules/oxfs`'s own local copy of
+/// this constant for symlink-depth overflow, same reasoning as `EPROTONOSUPPORT`/`EAGAIN` above:
+/// must match musl's macro, not a real-BSD nod).
+pub(crate) const ELOOP: u64 = 40;
+
+/// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
+/// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
+/// convention (see this file's module doc comment) — it's purely this internal module↔kernel
+/// registration boundary's own shape, chosen because it's representable in a plain scalar FFI
+/// return without a `#[repr(C)]` result struct.
+pub type SyscallHandler = extern "C" fn(u64, u64, u64, u64) -> i64;
+
+static SYSCALL_TABLE: Mutex<BTreeMap<u64, SyscallHandler>> = Mutex::new(BTreeMap::new());
+
+/// Registers `handler` for `number` in the table `dispatch` consults. `pub`, not `pub(crate)`:
+/// the primary caller is a loaded module's `module_init` (currently `modules/native_abi/`,
+/// crossing the module-relocation FFI boundary) populating what used to be `dispatch`'s own
+/// hardcoded `match`, but integration tests under `tests/` (a separate crate linking against this
+/// one) also need to register test-only syscall numbers directly — see `tests/fork_wait.rs`'s
+/// `SYS_TEST_EXIT` handler, which sidesteps the fact that `scheduler::start`/`process::do_exit`
+/// never return control to a test's own `main` the way a normal QEMU-exit-based test does.
+/// Returns `0` on success, `-1` if `number` is already registered: nothing registers the same
+/// number twice today, but silently overwriting a handler would be a far more confusing failure
+/// mode than refusing outright.
+pub extern "C" fn oxidebsd_register_syscall(number: u64, handler: SyscallHandler) -> i32 {
+    let mut table = SYSCALL_TABLE.lock();
+    if table.contains_key(&number) {
+        return -1;
+    }
+    table.insert(number, handler);
+    0
+}
+
+/// RFLAGS bit 0.
+const CARRY_FLAG: u64 = 1;
+
+/// Configures `SYSCALL`/`SYSRETQ`: `IA32_STAR` (from the real GDT selectors — `src/cpu/gdt.rs`'s
+/// segment ordering exists specifically to satisfy `SYSRETQ`'s fixed-offset selector-reconstruction
+/// scheme; `Star::write` validates this and fails loudly rather than silently misprogramming it),
+/// `IA32_LSTAR` (this file's own `syscall_entry`), `IA32_SFMASK` (clears `RFLAGS::INTERRUPT_FLAG`
+/// on entry, same as the old `int 0x80` gate did), and `EFER.SCE` — without which `SYSCALL` raises
+/// `#UD` (handled, fatally, by `invalid_opcode_handler`), so forgetting this step fails loudly.
+pub fn init() {
+    serial_println!("[boot] configuring SYSCALL/SYSRETQ (native ABI)");
+
+    // SAFETY: kernel_code_selector/kernel_data_selector are DPL 0, user_code_selector/
+    // user_data_selector are DPL 3, and src/cpu/gdt.rs lays the GDT out specifically so their
+    // offsets satisfy Star::write's own validation -- an error here means the GDT layout regressed.
+    Star::write(
+        gdt::user_code_selector(),
+        gdt::user_data_selector(),
+        gdt::kernel_code_selector(),
+        gdt::kernel_data_selector(),
+    )
+    .expect("IA32_STAR: GDT layout doesn't satisfy SYSCALL/SYSRETQ's fixed offset scheme");
+
+    let entry_addr = VirtAddr::new(syscall_entry as *const () as u64);
+    LStar::write(entry_addr);
+    SFMask::write(RFlags::INTERRUPT_FLAG);
+
+    // SAFETY: STAR/LSTAR/SFMASK are all configured above; enabling SCE now is what actually makes
+    // SYSCALL start dispatching to syscall_entry instead of raising #UD.
+    unsafe { Efer::update(|flags| flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS)) };
+
+    serial_println!("[boot] SYSCALL/SYSRETQ ready");
+}
+
+unsafe extern "C" {
+    /// Defined in the `global_asm!` block below: switches onto the current process's own kernel
+    /// stack (`SYSCALL` doesn't do this automatically the way an interrupt gate + TSS `RSP0`
+    /// does), saves every general-purpose register plus the user's own `RSP`, calls
+    /// `syscall_dispatch` with a pointer to them, restores everything, and `SYSRETQ`s back to
+    /// whatever issued `SYSCALL`.
+    pub fn syscall_entry();
+}
+
+/// The saved register state `syscall_entry` hands to `syscall_dispatch`, as a single pointer
+/// (`RDI`, System V's first argument register) rather than loose arguments — `RAX`-for-number and
+/// `RDI`/`RSI`/`RDX`-for-args don't line up with System V's own `call` convention closely enough
+/// to just pass straight through, and this shape doubles as the mechanism for the carry-flag
+/// trick below. Field order matches the entry stub's push order exactly (last pushed = lowest
+/// address = first field). Two fields do double duty, both forced by `SYSCALL`'s own hardware
+/// contract rather than a choice made here: `rcx` holds the user `RIP` to resume at (`SYSCALL`
+/// clobbers real `RCX` with it on entry, so whatever the user program's actual `RCX` held before
+/// the call is unrecoverable — the same reason every userland syscall stub declares `RCX`
+/// clobbered), and `r11` holds the user `RFLAGS` (same story) — `SYSRETQ` reads both back
+/// directly from registers, not from memory, so `syscall_dispatch` flips bit 0 of the saved `r11`
+/// value to signal `CF` exactly the way it used to flip a dedicated `rflags` field for `iretq`.
+/// `user_rsp` is the one genuinely new field: `SYSCALL` doesn't switch stacks the way an
+/// interrupt gate does, so the entry stub has to save/restore the user's `RSP` itself (see
+/// `gdt::CURRENT_RSP0`), and unlike `RCX`/`R11` there's no GPR slot already carrying it.
+// pub(crate), not private: src/process/context_switch.rs needs to name this type (to size a fork
+// child's seeded stack region and to type its `parent_frame`/`dst` pointers) without being able to
+// touch its fields directly -- field access stays private to this module; only
+// `copy_frame_for_fork`/`redirect_frame`/`current_frame` below cross that boundary, deliberately
+// narrow.
+//
+// `Clone`/`Copy`: lets `process::Process` hold a `signal_saved_frame: Option<SyscallFrame>`
+// snapshot (moved/copied by value, never needing field access outside this module) for signal
+// delivery/`sigreturn` -- see `deliver_pending_signal`/`do_sigreturn` below.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct SyscallFrame {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    user_rsp: u64,
+}
+
+/// The in-flight syscall's own `SyscallFrame`, valid only between `syscall_dispatch` storing it
+/// and returning. `SyscallHandler`'s `(u64, u64, u64) -> i64` signature can't carry a frame
+/// pointer, but `sys_fork`/`sys_execve` (`src/process.rs`) both need raw access to the live frame
+/// (fork copies it into the child's own kernel stack; execve overwrites `rip`/`rsp` in place) —
+/// this is a narrow, explicit exception for those two, not a signature change for every syscall.
+/// Plain `AtomicPtr`, not a lock: this is single-core and `SYSFMASK` clears `RFLAGS::INTERRUPT_FLAG`
+/// on every `SYSCALL` entry, so nothing can preempt a syscall in progress to observe a
+/// half-updated value (same reasoning `src/console/stdin.rs`'s ring buffer doc comment already
+/// relies on).
+static CURRENT_FRAME: AtomicPtr<SyscallFrame> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The currently in-flight syscall's frame — only valid to call from within a syscall handler
+/// (i.e. from code reachable through `dispatch`), and only for as long as that handler is still
+/// running.
+pub(crate) fn current_frame() -> *mut SyscallFrame {
+    CURRENT_FRAME.load(Ordering::Relaxed)
+}
+
+/// Copies `*src` into `*dst` (byte-for-byte, all 16 fields), then forces the copy's `rax` to `0`
+/// *and* clears its `CARRY_FLAG` bit (in the copy's `r11` field, which doubles as the saved
+/// `RFLAGS` — see `SyscallFrame`'s own doc comment) — used by `sys_fork` to seed a forked child's
+/// kernel stack so its first-ever "return" looks exactly like returning from the same `fork()`
+/// call the parent made, but with a clean success return (child pid `0`) of its own. Clearing
+/// `CARRY_FLAG` explicitly matters, not just zeroing `rax`: at the moment this runs, `*src`'s
+/// `r11` still holds whatever `CF` happened to be *before* the parent ever executed `SYSCALL` for
+/// this `fork()` call (ordinary instructions like `mov` don't touch `EFLAGS`, so that bit is
+/// really just leftover state from earlier in the parent's execution, not anything this syscall
+/// itself set yet — `syscall_dispatch`'s own CF-clearing/setting for the *parent's* return happens
+/// later, after `dispatch()`/`do_fork_from_current` returns, and only touches the parent's live
+/// frame, never this copy). Without this, the child could spuriously see `Err` from a stale `CF`
+/// bit that predates the call entirely. `dst` is raw, uninitialized stack memory (not yet a live
+/// `SyscallFrame` reference), so this writes through pointers rather than going through `&mut`.
+///
+/// # Safety
+///
+/// `dst` must point at `size_of::<SyscallFrame>()` writable bytes; `src` must point at a valid,
+/// fully-initialized `SyscallFrame`.
+pub(crate) unsafe fn copy_frame_for_fork(dst: *mut SyscallFrame, src: *const SyscallFrame) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, 1);
+        (*dst).rax = 0;
+        (*dst).r11 &= !CARRY_FLAG;
+    }
+}
+
+/// Redirects the live syscall frame at `frame` to resume execution at `rip` on `rsp` instead of
+/// returning normally to the caller — used by `sys_execve` on success to hand the calling process
+/// a whole new program image. Resets every GPR to `0` and the saved `RFLAGS` (`r11`) to
+/// `usermode::USER_RFLAGS` (hygiene: a freshly exec'd program shouldn't see the old program's
+/// register/flag state); doesn't touch `CS`/`SS` at all (there's no per-frame field for them any
+/// more — `SYSRETQ` always reconstructs both from `IA32_STAR`), which is fine since `execve`
+/// doesn't change privilege level anyway.
+///
+/// # Safety
+///
+/// `frame` must point at the currently in-flight syscall's live frame (i.e. `current_frame()`'s
+/// return value, called from within that same syscall's handling).
+pub(crate) unsafe fn redirect_frame(frame: *mut SyscallFrame, rip: VirtAddr, rsp: VirtAddr) {
+    unsafe {
+        let frame = &mut *frame;
+        frame.r15 = 0;
+        frame.r14 = 0;
+        frame.r13 = 0;
+        frame.r12 = 0;
+        frame.r11 = 0;
+        frame.r10 = 0;
+        frame.r9 = 0;
+        frame.r8 = 0;
+        frame.rbp = 0;
+        frame.rdi = 0;
+        frame.rsi = 0;
+        frame.rdx = 0;
+        frame.rcx = 0;
+        frame.rbx = 0;
+        frame.rax = 0;
+        frame.rcx = rip.as_u64();
+        frame.r11 = crate::process::usermode::USER_RFLAGS;
+        frame.user_rsp = rsp.as_u64();
+    }
+}
+
+/// OxideBSD's own invention -- see `bits/syscall.h.in`'s own comment on the musl fork for why
+/// this bypasses `SYSCALL_TABLE`/`dispatch` entirely (`do_sigreturn` below) rather than being
+/// registered like every other syscall.
+const SYS_SIGRETURN: u64 = 119;
+
+#[unsafe(no_mangle)]
+extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
+    // SAFETY: frame points at syscall_entry's just-pushed register block, on the current
+    // process's own kernel stack, valid and exclusively ours for the duration of this call.
+    let frame = unsafe { &mut *frame };
+
+    // A real, narrow exception, not routed through the normal table/Ok-Err machinery below:
+    // sigreturn must restore the interrupted context's own saved carry flag (in `r11`) bit for
+    // bit, but the normal `Ok(value)`/`Err(errno)` convention can only ever force that bit to one
+    // fixed polarity (clear on `Ok`, set on `Err`) -- neither can reproduce an arbitrary restored
+    // value. See `do_sigreturn`'s own doc comment.
+    if frame.rax == SYS_SIGRETURN {
+        do_sigreturn(frame);
+        return;
+    }
+
+    CURRENT_FRAME.store(frame as *mut SyscallFrame, Ordering::Relaxed);
+    let result = dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx, frame.r10);
+    match result {
+        Ok(value) => {
+            frame.rax = value;
+            frame.r11 &= !CARRY_FLAG;
+        }
+        Err(errno) => {
+            frame.rax = errno;
+            frame.r11 |= CARRY_FLAG;
+        }
+    }
+    CURRENT_FRAME.store(core::ptr::null_mut(), Ordering::Relaxed);
+
+    // Every path back to userspace this kernel has funnels through here (a blocked-then-woken
+    // process resumes by finishing the very syscall it blocked inside, same as any other) except
+    // a never-run process's very first launch (`spawn_trampoline_inner`, which can't have a signal
+    // pending before it's even executed once) -- so checking here, once, covers every real case.
+    // See `deliver_pending_signal`'s own doc comment.
+    deliver_pending_signal(frame);
+}
+
+/// Restores `*frame` from this process's own `Process::signal_saved_frame` (see
+/// `deliver_pending_signal` below), byte for byte -- including `rax`/`r11`'s carry-flag bit, which
+/// is exactly why this bypasses `syscall_dispatch`'s normal `Ok`/`Err` rewrite instead of being a
+/// registered handler returning a plain `Result` like every other syscall. If nothing is actually
+/// stashed (a spurious/duplicate call -- the trampoline this codebase installs only ever calls
+/// this once, right after a real handler returns, so this should never happen in practice, but
+/// nothing about a syscall number is trustworthy input), fails the call directly here (the normal
+/// error-signaling convention, just applied by hand since the usual `dispatch()`/`Result` path
+/// isn't reached for this number at all).
+fn do_sigreturn(frame: &mut SyscallFrame) {
+    let pid = crate::process::scheduler::current_pid();
+    match crate::process::take_signal_saved_frame(pid) {
+        Some(saved) => *frame = saved,
+        None => {
+            frame.rax = EINVAL;
+            frame.r11 |= CARRY_FLAG;
+        }
+    }
+}
+
+/// Checked once, at the tail of every completed syscall (see `syscall_dispatch` above): if the
+/// current process has a pending, unblocked signal, act on it now, right before control actually
+/// returns to userspace. Real Unix semantics for the same reason: a signal only ever "arrives"
+/// (steps a handler, or ends the process) between one instruction and the next of the process's
+/// own userspace execution, never mid-syscall.
+///
+/// `SigDisposition::Terminate` calls `process::do_exit`, which never returns -- this function
+/// itself can too, for that one case (it just never reaches its own tail).
+/// `SigDisposition::Handler` rewrites `*frame` in place so the *next* thing this process's own
+/// `sysretq` resumes into is the handler, not whatever userspace code the syscall originally
+/// interrupted -- the interrupted state is snapshotted into `Process::signal_saved_frame` first
+/// (see `process::stash_signal_context`), restored later by `do_sigreturn` once the handler
+/// itself returns (via the trampoline `sa_restorer` names -- musl's own `__restore_rt`, patched to
+/// call `SYS_SIGRETURN` -- see `bits/syscall.h.in`'s own comment on the musl fork).
+///
+/// Two known, deliberate simplifications:
+/// - **No `SA_SIGINFO` support.** A handler is always invoked as `void (*)(int)` (`rdi = signum`
+///   only, `rsi`/`rdx` zeroed) even if `SA_SIGINFO` was set and a real 3-argument
+///   `void (*)(int, siginfo_t *, void *)` handler was installed -- there's no `siginfo_t`/
+///   `ucontext_t` construction anywhere in this file. A real `SA_SIGINFO` handler that
+///   dereferences its `info`/`ucontext` arguments would fault on the `NULL` this hands it.
+/// - **`Process::signal_saved_frame` holds exactly one snapshot, not a real signal stack.** If a
+///   *second*, different (unblocked) signal becomes deliverable while already inside a handler --
+///   e.g. the handler itself issues a syscall, and that syscall's own tail finds another pending
+///   signal -- this overwrites the first snapshot rather than nesting it, so the eventual
+///   `sigreturn` from the *inner* handler restores into the *outer* handler's own interrupted
+///   state, not back to the original pre-signal program -- a real correctness gap for nested
+///   delivery specifically (single, non-nested signal handling was the only case exercised so
+///   far: `kill.elf $$`-style default-terminate delivery, not a live handler-invocation round
+///   trip -- see CLAUDE.md's own note on what was and wasn't boot-verified for this feature).
+fn deliver_pending_signal(frame: &mut SyscallFrame) {
+    let pid = crate::process::scheduler::current_pid();
+    if pid == 0 {
+        // Boot time (module_init self-checks, etc.) -- no real Process to carry signal state.
+        return;
+    }
+    let Some(delivery) = crate::process::take_deliverable_signal(pid) else {
+        return;
+    };
+    match delivery {
+        crate::process::SignalDelivery::Terminate(code) => {
+            crate::process::do_exit(pid, code);
+        }
+        crate::process::SignalDelivery::Handler {
+            signum,
+            handler,
+            restorer,
+            mask_to_add,
+        } => {
+            // Snapshotted *before* frame is mutated below -- this is the exact state the
+            // interrupted syscall was about to resume into.
+            crate::process::stash_signal_context(pid, *frame, mask_to_add);
+
+            // 128 bytes of red-zone headroom (the interrupted code may have live data there,
+            // System V's own red-zone convention this ABI otherwise never has to think about),
+            // then 16-byte-align down, then back off 8 more bytes so the slot this writes to
+            // lands exactly where an ordinary `call`'s own implicit return-address push would --
+            // i.e. RSP%16==8 at the handler's own entry, matching System V's calling convention.
+            let mut sp = frame.user_rsp.wrapping_sub(128);
+            sp &= !0xF;
+            sp = sp.wrapping_sub(8);
+            // SAFETY: same known pointer-validation gap every other user-memory write in this
+            // file already has -- sp is derived from this process's own live user_rsp, and this
+            // process's own address space is the one currently active (signals are only ever
+            // delivered to the process that's actually running right now).
+            unsafe { (sp as *mut u64).write(restorer) };
+
+            frame.rdi = signum;
+            frame.rsi = 0;
+            frame.rdx = 0;
+            frame.rcx = handler; // resume RIP
+            frame.r11 = crate::process::usermode::USER_RFLAGS; // resume RFLAGS
+            frame.user_rsp = sp;
+        }
+    }
+}
+
+/// Numbers `dispatch` has already logged an "unrecognized syscall" line for — see `dispatch`'s own
+/// doc comment for why this exists: a real interactive session (`sh.elf` with no `-c`, run for
+/// real rather than as a single smoke-tested command) calls the *same* missing syscall repeatedly
+/// (concretely, `hush` re-issues `rt_sigaction`/`rt_sigprocmask` around every command it runs), and
+/// logging it every single time drowns out the actual command output on the same serial console —
+/// discovered by actually using this interactively, not by inspection.
+static LOGGED_UNRECOGNIZED: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+/// The actual dispatch logic, kept separate from `syscall_dispatch`'s raw pointer/frame handling
+/// so it's directly unit-testable (see the `test_syscall_dispatch_*` tests in `src/lib.rs`). A
+/// pure lookup into `SYSCALL_TABLE` — no number is special-cased here anymore, they're all
+/// registered externally by whatever module chose to claim them.
+pub(crate) fn dispatch(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> Result<u64, u64> {
+    let handler = SYSCALL_TABLE.lock().get(&number).copied();
+    match handler {
+        Some(handler) => {
+            // Tells module_panic_trampoline whether a panic inside this specific call should
+            // reboot the system or just halt -- see CURRENT_MODULE_FATAL's own doc comment in
+            // src/module.rs. Must happen right before the call: this flag has no meaning except
+            // for whatever module code is currently executing.
+            crate::module::mark_active_module_by_address(handler as usize as u64);
+            ffi_result_to_result(handler(arg0, arg1, arg2, arg3))
+        }
+        None => {
+            // Only the first occurrence of a given number is logged -- see LOGGED_UNRECOGNIZED's
+            // own doc comment. Still the intended tool for discovering what a program's startup
+            // needs (every *distinct* unimplemented number still gets one line), just no longer at
+            // the cost of spamming every repeat once real interactive use started producing many.
+            if LOGGED_UNRECOGNIZED.lock().insert(number) {
+                serial_println!("[boot] unrecognized syscall number {}", number);
+            }
+            Err(ENOSYS)
+        }
+    }
+}
+
+/// Converts a registered handler's own `SyscallHandler` FFI return (negative = `-errno`) into a
+/// plain `Result` — used by `dispatch()` above, and by `ffi.rs`'s own `sys_read`/`sys_write` (both
+/// delegate straight to `crate::fs::fd::read`/`write`, which share this same negative-errno FFI
+/// shape). Private to this module (`syscall`), not `pub(crate)` — Rust's own ancestor-visibility
+/// rule already lets `ffi.rs` (a child module of this one) call it as `super::ffi_result_to_result`
+/// without any explicit re-export.
+fn ffi_result_to_result(raw: i64) -> Result<u64, u64> {
+    if raw < 0 {
+        Err((-raw) as u64)
+    } else {
+        Ok(raw as u64)
+    }
+}
+
+// `static mut`, not `static`: only ever written/read by this file's own raw asm (`mov [X], rsp`,
+// never through a Rust `&`/`&mut`), invisible to the optimizer either way -- same defensive
+// treatment as `gdt::CURRENT_RSP0`. Transiently holds the user's `RSP` for the handful of
+// instructions between "SYSCALL just landed, RSP is still the user's" and "pushed as the first
+// field of this process's own SyscallFrame, on this process's own kernel stack" -- genuinely a
+// single global for that brief window (this kernel is single-core and SFMASK keeps interrupts off
+// for the whole entry sequence, so at most one syscall can be *entering* at once), but safe past
+// that window regardless, since by the time any Rust code able to call scheduler::schedule() runs,
+// the saved RSP already lives in the (per-process) SyscallFrame instead of here. A single global
+// scratch slot living for the *entire* syscall the way src/linux_syscall.rs's old
+// USER_RSP_SCRATCH did would not have been safe here: do_wait4 already blocks and reschedules
+// mid-syscall, so a second process could enter its own syscall before the first one returns.
+#[unsafe(no_mangle)]
+static mut SYSCALL_RSP_SCRATCH: u64 = 0;
+
+global_asm!(
+    ".global syscall_entry",
+    "syscall_entry:",
+    // SYSCALL leaves RSP on the user's own stack (unlike an interrupt gate + TSS RSP0, there's no
+    // automatic switch) -- stash it, then move onto *this process's own* kernel stack (mirrored
+    // into CURRENT_RSP0 by gdt::set_kernel_stack on every context switch) before pushing anything.
+    "mov [SYSCALL_RSP_SCRATCH], rsp",
+    "mov rsp, [CURRENT_RSP0]",
+    "push qword ptr [SYSCALL_RSP_SCRATCH]", // user_rsp -- see SyscallFrame's doc comment
+    "push rax",
+    "push rbx",
+    "push rcx", // = user RIP (SYSCALL saved it here)
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11", // = user RFLAGS (SYSCALL saved it here)
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rdi, rsp", // &mut SyscallFrame, System V's first argument register
+    "call syscall_dispatch",
+    // Labeled separately (not just a fallthrough) so src/process/context_switch.rs's fork
+    // trampoline can jump straight here: a freshly forked child's kernel stack is seeded with a
+    // copy of its parent's SyscallFrame (rax forced to 0), placed at exactly the stack offset this
+    // tail expects, so "return from fork() with 0" and "return from any other syscall" are the
+    // same code path. See CLAUDE.md's process/scheduler section.
+    ".global syscall_return_tail",
+    "syscall_return_tail:",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax", // dispatcher's return value or errno, written directly into this stack slot
+    "pop rsp", // user_rsp -- must be the very last pop, right before sysretq
+    "sysretq",
+);

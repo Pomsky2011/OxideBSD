@@ -606,7 +606,7 @@ impl Writer {
     /// CPR: report the cursor's 1-based `row;col` position by writing `ESC[row;colR` straight
     /// into the stdin ring buffer, exactly as if it had been typed -- the real mechanism every
     /// terminal uses to answer this query (the reply travels back over the *input* side, not
-    /// this writer's own output). `crate::stdin::push_byte` is already `pub` and already the sole
+    /// this writer's own output). `crate::console::stdin::push_byte` is already `pub` and already the sole
     /// producer the keyboard IRQ handler uses, so this is just a second, synthetic producer of
     /// the same stream.
     fn device_status_report(&self, mode: u16) {
@@ -615,7 +615,7 @@ impl Writer {
         }
         let reply = alloc::format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
         for byte in reply.bytes() {
-            crate::stdin::push_byte(byte);
+            crate::console::stdin::push_byte(byte);
         }
     }
 

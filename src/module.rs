@@ -11,7 +11,7 @@
 //! always 0) -- what it has instead is potentially hundreds of small linker sections (one per
 //! function/global, before any `--gc-sections` pruning -- not attempted here, see `CLAUDE.md`),
 //! a symbol table, and relocation entries that must be resolved and applied by hand. Only the
-//! low-level "read an ELF64 field" helpers are shared with `elf.rs` (`crate::elf::read_u{16,32,
+//! low-level "read an ELF64 field" helpers are shared with `elf.rs` (`crate::process::elf::read_u{16,32,
 //! 64}`); the loading logic below is independent.
 //!
 //! Module code never runs in ring 3 and is mapped without `USER_ACCESSIBLE` -- it's invoked only
@@ -28,7 +28,7 @@ use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 
-use crate::elf::{read_u16, read_u32, read_u64};
+use crate::process::elf::{read_u16, read_u32, read_u64};
 use crate::{serial_print, serial_println};
 
 const MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -714,9 +714,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_readv" => Some(crate::syscall::oxidebsd_sys_readv as *const () as u64),
         "oxidebsd_sys_pipe" => Some(crate::syscall::oxidebsd_sys_pipe as *const () as u64),
         "oxidebsd_sys_dup2" => Some(crate::syscall::oxidebsd_sys_dup2 as *const () as u64),
-        "oxidebsd_alloc_fd" => Some(crate::fd::oxidebsd_alloc_fd as *const () as u64),
-        "oxidebsd_register_fd_ops" => Some(crate::fd::oxidebsd_register_fd_ops as *const () as u64),
-        "oxidebsd_close_fd" => Some(crate::fd::oxidebsd_close_fd as *const () as u64),
+        "oxidebsd_alloc_fd" => Some(crate::fs::fd::oxidebsd_alloc_fd as *const () as u64),
+        "oxidebsd_register_fd_ops" => Some(crate::fs::fd::oxidebsd_register_fd_ops as *const () as u64),
+        "oxidebsd_close_fd" => Some(crate::fs::fd::oxidebsd_close_fd as *const () as u64),
         "oxidebsd_get_cwd" => Some(crate::process::oxidebsd_get_cwd as *const () as u64),
         "oxidebsd_set_cwd" => Some(crate::process::oxidebsd_set_cwd as *const () as u64),
         "oxidebsd_get_root" => Some(crate::process::oxidebsd_get_root as *const () as u64),
@@ -756,7 +756,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_getitimer" => {
             Some(crate::syscall::oxidebsd_sys_getitimer as *const () as u64)
         }
-        "oxidebsd_real_fd_of" => Some(crate::fd::oxidebsd_real_fd_of as *const () as u64),
+        "oxidebsd_real_fd_of" => Some(crate::fs::fd::oxidebsd_real_fd_of as *const () as u64),
         "oxidebsd_proc_exists" => Some(crate::process::oxidebsd_proc_exists as *const () as u64),
         "oxidebsd_proc_pid_at" => Some(crate::process::oxidebsd_proc_pid_at as *const () as u64),
         "oxidebsd_proc_stat_line" => {
@@ -770,7 +770,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::process::oxidebsd_proc_stat_global as *const () as u64)
         }
         "oxidebsd_proc_modules" => Some(oxidebsd_proc_modules as *const () as u64),
-        "oxidebsd_fd_at" => Some(crate::fd::oxidebsd_fd_at as *const () as u64),
+        "oxidebsd_fd_at" => Some(crate::fs::fd::oxidebsd_fd_at as *const () as u64),
         "oxidebsd_sys_socket" => Some(crate::net::udp::oxidebsd_sys_socket as *const () as u64),
         "oxidebsd_sys_bind" => Some(crate::net::udp::oxidebsd_sys_bind as *const () as u64),
         "oxidebsd_sys_sendto" => Some(crate::net::udp::oxidebsd_sys_sendto as *const () as u64),
@@ -829,10 +829,10 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {
-            Some(crate::ata::oxidebsd_block_device_present as *const () as u64)
+            Some(crate::drivers::ata::oxidebsd_block_device_present as *const () as u64)
         }
-        "oxidebsd_block_read" => Some(crate::ata::oxidebsd_block_read as *const () as u64),
-        "oxidebsd_block_write" => Some(crate::ata::oxidebsd_block_write as *const () as u64),
+        "oxidebsd_block_read" => Some(crate::drivers::ata::oxidebsd_block_read as *const () as u64),
+        "oxidebsd_block_write" => Some(crate::drivers::ata::oxidebsd_block_write as *const () as u64),
         _ => None,
     }
 }

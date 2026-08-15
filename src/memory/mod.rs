@@ -1,3 +1,10 @@
+//! Physical/virtual memory management: this file is the frame allocator and phys-mem mapping
+//! init (formerly `memory.rs`, top-level); `allocator` is the kernel heap allocator, `address_space`
+//! is per-process page-table management (`AddressSpace::new`/`fork`/`new_excluding_user`).
+
+pub mod address_space;
+pub mod allocator;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};

@@ -115,14 +115,14 @@ extern "C" fn raw_close(real_fd: u64) -> i64 {
 /// Called from `udp::oxidebsd_sys_socket`'s `SOCK_RAW`/`IPPROTO_ICMP` case -- socket dispatch for
 /// every protocol lives there, not per-module, same as `tcp::create_socket`.
 pub fn create_socket() -> u64 {
-    let fd = crate::fd::oxidebsd_alloc_fd();
+    let fd = crate::fs::fd::oxidebsd_alloc_fd();
     RAW_SOCKETS.lock().insert(
         fd,
         RawSocket {
             recv_queue: VecDeque::new(),
         },
     );
-    crate::fd::oxidebsd_register_fd_ops(fd, raw_read, raw_write, raw_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(fd, raw_read, raw_write, raw_close);
     fd
 }
 

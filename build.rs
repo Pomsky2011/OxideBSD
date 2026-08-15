@@ -86,7 +86,7 @@ fn main() {
     // `build_musl_sysroot_shared`'s own doc comment for why it can't reuse the static sysroot
     // above, and why it's linked at its own natural base rather than a fixed one) producing
     // `libc.so` (which doubles as `ld-musl-x86_64.so.1`, musl's own convention) -- the kernel
-    // itself picks its real runtime placement (`src/process.rs`'s `INTERP_LOAD_BASE`, `0xc000000`)
+    // itself picks its real runtime placement (`src/process/lifecycle.rs`'s `INTERP_LOAD_BASE`, `0xc000000`)
     // at `execve` time, not this build. The fixture binary
     // (`userland/dynlink-smoke/main.c`) is fixed at `0x4d00000` -- an ordinary `ET_EXEC` main
     // binary, same fixed-link-time-base treatment every other userland crate here gets, distinct
@@ -120,8 +120,8 @@ fn main() {
     // `CONFIG_HUSH_INTERACTIVE` is left off (`allnoconfig`'s own default), so hush just reads and
     // executes commands from stdin like a script, no prompt/readline/job-control machinery that
     // would need real termios/ioctl support this kernel doesn't have. See CLAUDE.md's BusyBox
-    // section for what this needed: real pipe(2)/dup2(2) (modules/posix_compat, src/pipe.rs,
-    // src/fd.rs), discovered the same iterative "boot and see what's unrecognized" way musl/cat's
+    // section for what this needed: real pipe(2)/dup2(2) (modules/posix_compat, src/fs/pipe.rs,
+    // src/fs/fd.rs), discovered the same iterative "boot and see what's unrecognized" way musl/cat's
     // own new syscalls were.
     // "FALSE"/"YES"/"MORE" continue the same load-address sequence right past HUSH's own
     // 0xe00000. `more`'s own isatty()/TIOCGWINSZ probe hits the same already-documented,
@@ -542,7 +542,7 @@ fn main() {
     );
     build_module_crate("oxfs", "OXFS", &oxfs_extra_env);
 
-    // Real disk persistence (see src/ata.rs and modules/oxfs's own "Real disk persistence"
+    // Real disk persistence (see src/drivers/ata.rs and modules/oxfs's own "Real disk persistence"
     // section): the two raw disk image *files* QEMU's `-drive` attaches, as opposed to everything
     // above, which gets embedded into the kernel/module binaries themselves via `include_bytes!`.
     write_data_disk_images();
@@ -710,8 +710,8 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
 /// `.rela.dyn`/`DT_RELA` table (confirmed via `readelf -r`), and real musl's own self-relocation
 /// bootstrap (`ldso/dlstart.c`) always computes `real_addr = AT_BASE + stored_value`, expecting
 /// `stored_value` to be zero-based -- a fixed-base link double-counts the base and produces a wild
-/// pointer. `src/elf.rs`'s `elf::load` now applies a real, kernel-chosen runtime bias instead (see
-/// its own doc comment and `src/process.rs`'s `INTERP_LOAD_BASE`) -- this build only needs to
+/// pointer. `src/process/elf.rs`'s `elf::load` now applies a real, kernel-chosen runtime bias instead (see
+/// its own doc comment and `src/process/lifecycle.rs`'s `INTERP_LOAD_BASE`) -- this build only needs to
 /// produce a normally-linked, real `-fPIC` shared object, the same shape any real musl
 /// distro ships.
 ///
@@ -821,8 +821,8 @@ fn build_musl_sysroot_shared() -> PathBuf {
 /// Cross-builds `userland/dynlink-smoke/main.c` (one `write()` call) against `sysroot` (see
 /// `build_musl_sysroot_shared` above) as a real, dynamically-linked `ET_EXEC` binary: `-no-pie`
 /// (matching `build_musl_smoke`'s own reasoning -- keeps this the *main binary*, not itself an
-/// `ET_DYN` image, so only the interpreter needs `src/elf.rs`'s new `ET_DYN` handling), fixed at
-/// `fixture_base` (must stay clear of `src/process.rs`'s `INTERP_LOAD_BASE` -- both images load
+/// `ET_DYN` image, so only the interpreter needs `src/process/elf.rs`'s new `ET_DYN` handling), fixed at
+/// `fixture_base` (must stay clear of `src/process/lifecycle.rs`'s `INTERP_LOAD_BASE` -- both images load
 /// into the *same* address space for a real `PT_INTERP` exec, unlike every other fixed-base
 /// userland binary in this codebase, which never coexists with another image), and an explicit
 /// `-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1` overriding the sysroot's own host-path default
@@ -1266,7 +1266,7 @@ fn configure_busybox_single_applet(out_dir: &Path, applet_symbol: &str) {
         // this is off -- `allnoconfig` disables both despite their own `default y`, the same way
         // it disables everything else this function already has to flip back on. Discovered as a
         // real gap, not preemptively enabled: `cat.elf --help` printed nothing at all until
-        // src/syscall.rs's stderr fix (fd 2) landed, and even with that fix would have only shown
+        // src/syscall/'s stderr fix (fd 2) landed, and even with that fix would have only shown
         // the generic fallback without this -- see CLAUDE.md's BusyBox section.
         (
             "# CONFIG_SHOW_USAGE is not set".to_string(),
@@ -2206,7 +2206,7 @@ const OXFS_METADATA_BLOCKS: u64 =
 const OXFS_DISK_IMAGE_BYTES: u64 = (OXFS_METADATA_BLOCKS + OXFS_NUM_BLOCKS) * OXFS_BLOCK_SIZE;
 
 /// Writes the two raw disk images `Cargo.toml`'s `run-args`/`test-args` attach to QEMU as
-/// `src/ata.rs`'s fixed data-disk target (see that module's own doc comment for why secondary
+/// `src/drivers/ata.rs`'s fixed data-disk target (see that module's own doc comment for why secondary
 /// channel/master specifically).
 ///
 /// `oxfs_disk.img` is the real, persistent dev disk `cargo run` uses -- created **only if it

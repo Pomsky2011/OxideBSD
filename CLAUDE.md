@@ -11,7 +11,7 @@ Current state:
   stack, PIC-driven interrupts (timer + PS/2 keyboard), a VGA console mirroring serial, a heap
   allocator over bootloader-provided paging.
 - Separate per-process address spaces, ELF64 loading, ring-3 execution, and a native BSD-style
-  syscall ABI over `SYSCALL`/`SYSRETQ` (`src/syscall.rs`) with carry-flag error signaling.
+  syscall ABI over `SYSCALL`/`SYSRETQ` (`src/syscall/mod.rs`) with carry-flag error signaling.
 - A dynamic kernel module loader (`src/module.rs`) relocates `#![no_std]` code into the kernel at
   boot and resolves symbol references against a hand-curated kernel API. Syscall handlers are
   registered by modules, not hardcoded: `modules/native_abi/` (core syscalls), `modules/
@@ -21,16 +21,16 @@ Current state:
   multi-component paths, per-process cwd, no fixed file-size cap) — replaced `modules/fat32/`
   (8.3 names, one path component per call, fixed file cap), which still builds/self-checks via
   `cargo build` but is no longer loaded at boot.
-- A real process table + cooperative round-robin scheduler (`src/process.rs`, `src/scheduler.rs`,
-  `src/context_switch.rs`) with `fork`/`execve`/`wait4`/`getpid`, real `argv`/`envp` passthrough,
-  blocking pipes, and per-process signal delivery.
+- A real process table + cooperative round-robin scheduler (`src/process/`) with
+  `fork`/`execve`/`wait4`/`getpid`, real `argv`/`envp` passthrough, blocking pipes, and per-process
+  signal delivery.
 - pid 1 is BusyBox's `hush`, built against a patched musl fork — not the original hand-written
   `userland/stsh/` shell (still buildable, no longer wired up). 256 BusyBox applets run as
   standalone static binaries (curated down from 314 before v0.1 — see the BusyBox port section's
   own "Removed before v0.1" reference), `execve`'d individually (not a multi-call `busybox` binary
   dispatching on `argv[0]` — that passthrough exists now, but the roster hasn't been rebuilt to
   use it).
-- A real networking stack (`src/pci.rs`, `src/net/*`, `modules/net/`): PCI + an rtl8139 driver,
+- A real networking stack (`src/drivers/pci.rs`, `src/net/*`, `modules/net/`): PCI + an rtl8139 driver,
   Ethernet/ARP/IPv4/ICMP, UDP/TCP/raw-ICMP sockets, `poll(2)`, and real hostname resolution over
   musl's own DNS stub resolver (no DNS protocol code of its own) — see "Real networking" below.
 - A real, on-target C compiler (`third_party/tinycc`, vendored TinyCC) — `tcc` runs as an ordinary
@@ -76,7 +76,7 @@ this way (normally supplied by the root `build.rs`).
 
 No libtest — `no_std`, tests boot in QEMU and self-report via `src/qemu.rs` (writes to the
 `isa-debug-exit` port; `test-success-exit-code` in `Cargo.toml` must stay in sync with
-`QemuExitCode::Success`) and `src/serial.rs` (hand-rolled 16550 UART, read via `-serial stdio`).
+`QemuExitCode::Success`) and `src/console/serial.rs` (hand-rolled 16550 UART, read via `-serial stdio`).
 
 - `src/lib.rs` defines `no_std` test scaffolding (`custom_test_frameworks`, `#[test_case]`) and
   boots itself under `#[cfg(test)]`.
@@ -107,7 +107,7 @@ No libtest — `no_std`, tests boot in QEMU and self-report via `src/qemu.rs` (w
   ABI-incompatible `core`).
 - SSE/MMX disabled, `disable-redzone: true` (interrupt handlers can't safely use either).
 
-## Memory management (`src/memory.rs`, `src/allocator.rs`)
+## Memory management (`src/memory/mod.rs`, `src/memory/allocator.rs`)
 
 - `memory::init` walks `CR3` and adds `BootInfo::physical_memory_offset` to get a virtual pointer
   to the level-4 table (relies on the bootloader's `map_physical_memory` feature). Call at most
@@ -131,7 +131,7 @@ No libtest — `no_std`, tests boot in QEMU and self-report via `src/qemu.rs` (w
 - The global allocator is `linked_list_allocator`'s `Heap` wrapped in a local `Locked<T>`
   (`spin::Mutex`), not the crate's own `LockedHeap` — avoids a second spinlock crate in the graph.
 
-## User-mode execution (`src/address_space.rs`, `src/elf.rs`, `src/usermode.rs`)
+## User-mode execution (`src/memory/address_space.rs`, `src/process/elf.rs`, `src/process/usermode.rs`)
 
 `process::spawn` builds the first process this way at boot; `process::do_execve` builds every
 later one the same way, mid-syscall.
@@ -167,7 +167,7 @@ later one the same way, mid-syscall.
   sharing a page.
 - Known simplification: no `NO_EXECUTE` on any ELF segment (would also need `EFER.NXE`).
 
-## Syscall ABI (`src/syscall.rs`)
+## Syscall ABI (`src/syscall/`)
 
 OxideBSD's own native, BSD-flavored ABI over `SYSCALL`/`SYSRETQ` — not Linux-compatible. Syscall
 number in `RAX`, up to 4 args in `RDI`/`RSI`/`RDX`/`R10` (not `RCX`/`R11`, clobbered by `SYSCALL`
@@ -191,7 +191,7 @@ authenticity nod. Everything since (`SYS_MMAP=100`, `SYS_MUNMAP=101`, `SYS_BRK=1
 `SYS_MOUNT_TMPFS=175`, `SYS_UMOUNT2=176`, `SYS_FSYNC=471`...`SYS_FSTATFS=477`,
 `SYS_PRLIMIT64=478`...`SYS_REBOOT=486`, `SYS_UMASK=487`, `SYS_LINK=488`, `SYS_MKNOD=489`,
 `SYS_CHROOT=490`, `SYS_GETRUSAGE=491`) is OxideBSD's own invention — numbers/shapes picked for
-what porting musl/BusyBox actually needed, not copied from FreeBSD/Linux. **Check `src/syscall.rs`
+what porting musl/BusyBox actually needed, not copied from FreeBSD/Linux. **Check `src/syscall/`
 and module sources for the current highest number before assigning a new one.**
 
 **Before picking a new syscall number**: grep every still-inert real-Linux value in
@@ -216,7 +216,7 @@ with the user before a sweeping renumbering): `src/net/udp.rs`'s `ENOTSOCK=38` (
 `EDESTADDRREQ=39` (musl: `89`), `EADDRINUSE=48` (musl: `98`), `EHOSTUNREACH=65` (musl: `113`);
 `src/net/tcp.rs`'s `EISCONN`/`ENOTCONN`/`ECONNREFUSED`/`ETIMEDOUT`/`EOPNOTSUPP`/`EADDRINUSE`/
 `EHOSTUNREACH`. **Already fixed** (confirmed load-bearing by a live test, not preemptively):
-`src/syscall.rs`'s `EPROTONOSUPPORT=93`/`EAGAIN=11`/`ENOTSOCK=88`/`ENOSYS=38` (was FreeBSD's `78`;
+`src/syscall/mod.rs`'s `EPROTONOSUPPORT=93`/`EAGAIN=11`/`ENOTSOCK=88`/`ENOSYS=38` (was FreeBSD's `78`;
 blocked `su`'s real `ENOSYS`-fallback path), `tcp.rs`'s own `EAGAIN=11` (was `35`).
 
 The number→handler mapping is a runtime registry (`SYSCALL_TABLE`, `Mutex<BTreeMap>`) populated by
@@ -225,7 +225,7 @@ unregistered number logs `[boot] unrecognized syscall number N` and returns `ENO
 tool for discovering what a ported program's startup still needs.
 
 - **`SYSRETQ`'s selector scheme forces GDT order.** `SYSRETQ` derives `SS`/`CS` from
-  `IA32_STAR[63:48]` as `+8`/`+16` — user data must sit immediately before user code. `src/gdt.rs`
+  `IA32_STAR[63:48]` as `+8`/`+16` — user data must sit immediately before user code. `src/cpu/gdt.rs`
   order: kernel code, kernel data, unused placeholder (offset spacing), user data, user code, TSS.
   Don't reorder without redoing the `STAR` arithmetic; `x86_64::registers::model_specific::
   Star::write` validates this and panics loudly if the GDT regresses.
@@ -248,7 +248,7 @@ tool for discovering what a ported program's startup still needs.
   userland. Any other fd delegates to `crate::fd`'s per-process `(Pid, fd)` registry.
 - `sys_write`'s `fd == 2` (stderr) is an alias for `fd == 1` — no real second sink exists.
 
-## musl port (`third_party/musl`, `userland/musl-smoke/`, `src/user_stack.rs`, `src/fpu.rs`)
+## musl port (`third_party/musl`, `userland/musl-smoke/`, `src/process/user_stack.rs`, `src/cpu/fpu.rs`)
 
 musl is patched (not the kernel made Linux-compatible) to speak this native ABI directly.
 `third_party/musl` is a submodule of a personal fork (`ifduyue/musl`), patches on its own
@@ -277,7 +277,7 @@ future syscall port, so re-check these when adding one:
 - SSE was never enabled at the hardware level (`CR0.EM`/`CR4.OSFXSR`/`OSXMMEXCPT`); `src/fpu.rs::
   init()` enables it once at boot. No save/restore across context switches — fine only while at
   most one SSE-using process is ever mid-computation (true today, no preemption).
-- `src/user_stack.rs` builds a real System V argc/argv/envp/auxv initial stack. `AT_PHDR` is
+- `src/process/user_stack.rs` builds a real System V argc/argv/envp/auxv initial stack. `AT_PHDR` is
   derived from whichever `PT_LOAD` segment has the smallest `p_offset` (this project's own linker
   scripts don't map the ELF header into any segment). `AT_RANDOM` is a fixed placeholder.
 - **`open`/`execve` argument-convention mismatches are fixed on the musl side**, not by remapping
@@ -351,14 +351,14 @@ the tool that found the
   `PATH=/bin`, so `/bin/<name>` resolves from any cwd. `modules/oxfs`'s `module_init` seeds every
   applet under its bare name in `/bin`; data fixtures (`hello.txt`, ...) stay at root.
 - New kernel-resident pieces `sh` required: the real 4th syscall arg (`R10`, for `envp`), real
-  blocking `pipe(2)`/`dup2(2)` (`src/pipe.rs` — bounded at `PIPE_CAPACITY` (64 KiB, matching real
+  blocking `pipe(2)`/`dup2(2)` (`src/fs/pipe.rs` — bounded at `PIPE_CAPACITY` (64 KiB, matching real
   Linux's own default) with a real blocking writer, blocks via `BlockReason::WaitingForPipeData`/
   `WaitingForPipeSpace` + `scheduler::schedule()`), and a **per-process** `(Pid, fd)` fd table
-  (`src/fd.rs`) — a flat table broke real pipelines the moment a parent closed its own copy of a
+  (`src/fs/fd.rs`) — a flat table broke real pipelines the moment a parent closed its own copy of a
   pipe fd out from under still-using children.
 - **Fixed: a producer whose own `write()` calls never block used to be able to OOM the kernel
   heap.** `yes | head -n 3` used to reliably panic (`memory allocation of 67239936 bytes failed`),
-  found by `modules/oxfs/src/test_busybox.sh`. Root cause: `src/pipe.rs`'s buffer used to be an
+  found by `modules/oxfs/src/test_busybox.sh`. Root cause: `src/fs/pipe.rs`'s buffer used to be an
   unbounded `VecDeque<u8>` — `yes` never yields (no blocking syscall in its write loop), so with no
   preemption `head` never got scheduled to read three lines and close its end, and the buffer grew
   without limit. Not specific to `yes`/`head` — any pipeline where a non-blocking producer outpaces
@@ -379,28 +379,28 @@ the tool that found the
   `scheduler::wait_for_ready`).
 - musl's stdio calls `write(fd, buf, 0)`/`read(fd, buf, 0)` with a null/garbage `buf` (POSIX-legal
   at length 0) — crashed every fd callback's unconditional `slice::from_raw_parts`; fixed centrally
-  in `src/fd.rs`'s `read`/`write` funnel functions.
+  in `src/fs/fd.rs`'s `read`/`write` funnel functions.
 - New syscalls always go in a dedicated module (`modules/posix_compat/`, `modules/signal/`, ...),
   not `modules/native_abi/` — keeps the core ABI module small.
 
-## Interactive shell (`src/stdin.rs`, `userland/stsh/`)
+## Interactive shell (`src/console/stdin.rs`, `userland/stsh/`)
 
 `stsh` ("stupidshell") is the original hand-written interactive userland program — still
 buildable, no longer pid 1 (superseded by `hush`). Its design remains the reference for stdin:
 
-- Keyboard IRQ (`src/interrupts.rs`) decodes scancodes into a fixed 256-byte ring buffer
-  (`src/stdin.rs`) — non-ASCII dropped, no allocation in the interrupt handler. `sys_read` drains
+- Keyboard IRQ (`src/cpu/interrupts.rs`) decodes scancodes into a fixed 256-byte ring buffer
+  (`src/console/stdin.rs`) — non-ASCII dropped, no allocation in the interrupt handler. `sys_read` drains
   it. Auto-echo only when `TERMIOS.ECHO` is set.
 - The `spin::Mutex` around the ring buffer can't deadlock between IRQ and syscall context
   specifically because `SFMASK` clears `IF` for a `SYSCALL`'s entire duration on this single core —
   breaks if SMP is ever added.
 - `sys_read` is non-blocking; `stsh` busy-polls a byte at a time (`do_wait4`/pipe reads already
   block, `sys_read` itself hasn't been converted).
-- `src/vga.rs`'s `Writer` is a true 2D-addressable console with a minimal ANSI/VT100 CSI escape
+- `src/console/vga.rs`'s `Writer` is a true 2D-addressable console with a minimal ANSI/VT100 CSI escape
   parser (cursor moves, erase display/line, SGR colors) so full-screen applets (`vi`, `clear`,
   `reset`) render correctly; unrecognized sequences are parsed just enough to find the final byte
   then dropped.
-- Real `SYS_IOCTL=124` (`src/stdin.rs`'s `RawTermios`, a single **global**, not per-session,
+- Real `SYS_IOCTL=124` (`src/console/stdin.rs`'s `RawTermios`, a single **global**, not per-session,
   `TERMIOS`) implements `TCGETS`/`TCSETS*`/`TIOCGWINSZ` (fixed `24x80`)/`TIOCSWINSZ`
   (accepted/discarded); else `ENOTTY`. Only succeeds against the real console (`crate::
   fd::real_fd_of`, so a `dup2`'d pipe end still reports non-tty — load-bearing for `isatty()`).
@@ -409,7 +409,7 @@ buildable, no longer pid 1 (superseded by `hush`). Its design remains the refere
   unimplemented here (a real session/controlling-tty model exists at the process level — see
   "Session, controlling-tty, and login authentication" below).
 
-## Process abstraction, scheduler, and fork/exec/wait (`src/process.rs`, `src/scheduler.rs`, `src/context_switch.rs`)
+## Process abstraction, scheduler, and fork/exec/wait (`src/process/`)
 
 Dynamically allocated process table, cooperative round-robin scheduler, kernel-thread-style
 context switch between per-process kernel stacks. No preemption, no copy-on-write fork (full eager
@@ -512,7 +512,7 @@ kernel.
 - `serial_println!` can't take implicit `{name}`-style captures (its `concat!`-based expansion
   blocks it) — always use explicit positional args; `serial_print!` has no such restriction.
 - Known limits: no module unload/reload, no versioning, no inter-module direct calls (only
-  module→kernel, via each module's own resolved symbol table — why `src/fd.rs`'s registry exists
+  module→kernel, via each module's own resolved symbol table — why `src/fs/fd.rs`'s registry exists
   at all, as the only coordination point between e.g. `oxfs` and `native_abi`).
 
 ## Filesystem: oxfs (live) and FAT32 (superseded)
@@ -548,16 +548,16 @@ kernel). Root is fixed inode `0`, self-referencing `.`/`..`.
 cluster, one **kernel-wide** cwd, whole-file-buffered reads capped at `MAX_FILE_BUFFER=131072`, no
 `unlink`/`rmdir`/`rename`. Superseded once these limits started actively blocking BusyBox work.
 
-**`src/fd.rs`** (shared by both): a per-process `(Pid, fd)` scoped registry — the only
+**`src/fs/fd.rs`** (shared by both): a per-process `(Pid, fd)` scoped registry — the only
 coordination channel between independently-loaded modules. Bump-allocated fd numbers, never reused
 even after close.
 
-## Real disk persistence (`src/ata.rs`, `modules/oxfs`)
+## Real disk persistence (`src/drivers/ata.rs`, `modules/oxfs`)
 
 OxideBSD's first real block device driver, and what lets oxfs survive a reboot. Scoped
 deliberately: real disk I/O and oxfs mount/format persistence, not a general VFS/mount-table layer.
 
-- **`src/ata.rs`**: a hand-rolled ATA PIO driver, kernel-resident (boot-wired from `main.rs`) —
+- **`src/drivers/ata.rs`**: a hand-rolled ATA PIO driver, kernel-resident (boot-wired from `main.rs`) —
   classic legacy IDE, LBA28, **polling only, no IRQ**. Fixed legacy ports (0x1F0/0x3F6 primary,
   0x170/0x376 secondary — QEMU's default `i440fx` PIIX3 IDE controller). Every BSY/DRQ wait is
   bounded by a real `crate::tsc`-based deadline (never `hlt()`, never unbounded) — load-bearing
@@ -652,7 +652,7 @@ plug in).
 - **Not covered**: a real block-device-agnostic mount table (`pivot_root`/`switch_root`), anything
   needing a real partition table or multiple on-disk formats (`blkid`/`fdisk`/`fsck`/`mkswap`/...).
 
-## Permission model (`src/process.rs`, `modules/oxfs/`, `modules/posix_compat/`)
+## Permission model (`src/process/`, `modules/oxfs/`, `modules/posix_compat/`)
 
 Real uid/gid, real per-inode `mode`/`uid`/`gid`, real `chmod`/`chown`, real `open()` permission
 enforcement. Scoped deliberately: only one uid has ever existed (root, `0`) until "Session,
@@ -710,7 +710,7 @@ controlling-tty, and login authentication" below adds a real second user.
   `__NR_fchmod = 91` — found live post-v0.1: `uudecode` restores a decoded file's mode via a real
   `fchmod(fd, mode)` call on its still-open output fd, not a path-based `chmod()`).
 
-## Session, controlling-tty, and login authentication (`src/process.rs`, `src/stdin.rs`, `src/interrupts.rs`, `modules/posix_compat/`, `modules/oxfs/`)
+## Session, controlling-tty, and login authentication (`src/process/`, `src/console/stdin.rs`, `src/cpu/interrupts.rs`, `modules/posix_compat/`, `modules/oxfs/`)
 
 Closes `su`/`login`/`sulogin`/`getty`. Split: `su`/`login` needed only a real second user + real
 password verification; `sulogin`/`getty` additionally needed a real session/controlling-tty/
@@ -725,7 +725,7 @@ foreground-process-group model.
   it.
 - **A real session model**: `Process` gains `sid: Pid` (same shape as `pgid`) — a spawned process
   becomes its own session leader; forked child inherits parent's `sid`; execve leaves it untouched.
-  Two new **single, not per-session**, globals in `src/stdin.rs`: `CONTROLLING_SESSION:
+  Two new **single, not per-session**, globals in `src/console/stdin.rs`: `CONTROLLING_SESSION:
   Option<Pid>`, `FOREGROUND_PGID: Option<Pid>` — this kernel has exactly one real console.
   - **`SYS_SETSID=112`** (real x86_64 Linux's own value). `process::do_setsid` enforces `EPERM` if
     the caller is already a process-group leader; on success makes it leader of a fresh
@@ -772,7 +772,7 @@ future syscall-number choice**:
    constant — deliberately scoped to just this one, not a preemptive sweep of the other still-
    flagged errno mismatches.
 
-## Signal handling module (`modules/signal/`, `src/process.rs`, `src/syscall.rs`)
+## Signal handling module (`modules/signal/`, `src/process/signals.rs`, `src/syscall/mod.rs`)
 
 Real `kill(2)`/`sigaction(2)`/`sigprocmask(2)` + delivery (handler invocation + `sigreturn`).
 `SYS_KILL=116`/`SYS_SIGACTION=117`/`SYS_SIGPROCMASK=118`/`SYS_SIGRETURN=119` — all four happen to
@@ -791,16 +791,16 @@ hardcoded restorer-stub literal, `src/signal/x86_64/restore.s`). Real signal num
   No process-group targeting, no permission checks.
 - Only 1-argument `void (*)(int)` handlers — no `SA_SIGINFO`.
 
-## Real-time clock (`modules/clock/`, `src/pit.rs`, `src/rtc.rs`, `src/syscall.rs`)
+## Real-time clock (`modules/clock/`, `src/cpu/pit.rs`, `src/cpu/rtc.rs`, `src/syscall/`)
 
 `SYS_CLOCK_GETTIME=138` — real `clock_gettime(2)`'s exact wire format, only the number needed
 remapping. `time()`/`gettimeofday()` are plain musl wrappers around it, so one remap unlocks both.
 
-- **`src/pit.rs`** reprograms the 8253/8254 PIT channel 0 to a fixed `TIMER_HZ=100` at boot —
+- **`src/cpu/pit.rs`** reprograms the 8253/8254 PIT channel 0 to a fixed `TIMER_HZ=100` at boot —
   before this, `TICKS` incremented at the BIOS power-on default (~18.2 Hz), never a rate this
   kernel actually configured. 100 Hz, not 1000, deliberately (every extra IRQ has real overhead
   under QEMU's software TCG).
-- **`src/rtc.rs`** reads the CMOS/MC146818 RTC fresh on every `CLOCK_REALTIME` request. Doesn't
+- **`src/cpu/rtc.rs`** reads the CMOS/MC146818 RTC fresh on every `CLOCK_REALTIME` request. Doesn't
   wait out an in-progress RTC update (rare, self-correcting) and assumes the 21st century. `tv_nsec`
   is always `0`.
 - `CLOCK_MONOTONIC` converts `ticks()` against `TIMER_HZ`. Any other `clockid` is `EINVAL`.
@@ -811,14 +811,14 @@ remapping. `time()`/`gettimeofday()` are plain musl wrappers around it, so one r
   whole tick; `{0,0}` returns immediately. `rem_ptr` always zeroed (no signal-interrupts-sleep path
   exists). Doesn't implement `clock_nanosleep(2)`'s absolute-deadline/other-clock cases.
 
-## Real networking (`src/pci.rs`, `src/net/*`, `modules/net/`)
+## Real networking (`src/drivers/pci.rs`, `src/net/*`, `modules/net/`)
 
 A real, phased networking stack: PCI enumeration, an IRQ-driven rtl8139 driver, Ethernet/ARP/
 IPv4/ICMP, UDP/TCP sockets, raw ICMP sockets, `poll(2)`, and no DNS protocol code of its own — real
 hostname resolution works by making musl's own stub resolver (`third_party/musl/src/network/`)
 function correctly over this ABI.
 
-- **`src/pci.rs`**: legacy I/O-port config-space access, flat scan of all 256 buses (QEMU puts
+- **`src/drivers/pci.rs`**: legacy I/O-port config-space access, flat scan of all 256 buses (QEMU puts
   everything on bus 0).
 - **`src/net/rtl8139.rs`**: brought up unconditionally at boot, absence logged not fatal. `src/
   interrupts.rs`'s generic `IRQ_HANDLERS` table (IRQ2-15) lets a driver whose IRQ isn't known until
@@ -851,7 +851,7 @@ function correctly over this ABI.
    `RFLAGS::INTERRUPT_FLAG` for a syscall's *entire* duration — `hlt()` only wakes on an unmasked
    interrupt/NMI, and no timer tick can fire to advance `ticks()` either, so a tick-bounded deadline
    can never even be re-evaluated. Any syscall-reachable retry loop must use
-   `core::hint::spin_loop()`, never `hlt()`, and must gate its deadline on **`src/tsc.rs`**
+   `core::hint::spin_loop()`, never `hlt()`, and must gate its deadline on **`src/cpu/tsc.rs`**
    (`RDTSC`-based, calibrated once at boot against `TIMER_HZ`, immune to `IF`) — **never
    `crate::interrupts::ticks()`**, which is frozen for a syscall's whole duration and can never
    elapse a deadline checked from inside one (found live: `poll()` hung solid on what should have
@@ -883,14 +883,14 @@ triggers without the functions under test ever running outside a real syscall.
   process path uses) — the timer IRQ already holds `process::table()`'s lock, re-locking would
   deadlock. Not inherited by fork; preserved across execve.
 - `socketpair(AF_UNIX, SOCK_STREAM, ...)` — `SYS_SOCKETPAIR=149` (`posix_compat`), built on
-  `src/pipe.rs`'s existing blocking-buffer machinery (two cross-wired buffers, not a real `AF_UNIX`
+  `src/fs/pipe.rs`'s existing blocking-buffer machinery (two cross-wired buffers, not a real `AF_UNIX`
   abstraction). Getting `wget` HTTPS working end-to-end through this needed five real fixes in
   sequence, each found only after live-retesting the previous one: `SYS_SET_TID_ADDRESS=150`
   (every musl program calls this at startup/after fork — was silently `ENOSYS`); `SYS_FCNTL=151`
   (`F_GETFL`/`F_SETFL`(`O_NONBLOCK` only)/`F_SETFD`(no-op)/`F_DUPFD`/`F_DUPFD_CLOEXEC` — only
   `crate::pipe::blocking_read` honors `O_NONBLOCK`, tracked per-`real_fd` via `crate::
   fd::is_nonblocking`); `SYS_SHUTDOWN=152` (real half-close for a `crate::pipe`-backed socketpair
-  endpoint only, `ENOTSOCK` otherwise — forced `src/pipe.rs`'s `close_direction` to stop
+  endpoint only, `ENOTSOCK` otherwise — forced `src/fs/pipe.rs`'s `close_direction` to stop
   `.expect()`-panicking on an already-removed buffer); a synthetic `/dev/{u}random,null,zero`
   path (`modules/oxfs`'s `dev_open`) backed by **`src/random.rs`** — a real SHA-256(RustCrypto
   `sha2`)-seeded ChaCha20(RustCrypto `chacha20`) generator, not a throwaway PRNG (deliberate: gathers
@@ -961,7 +961,7 @@ space model at all.
 - Verified via `tests/needs_syscall_smoke.rs` + `userland/needs-syscall-smoke/` (except
   `reboot`/`umask`, manual-only).
 
-## Real hard links, device nodes, per-process chroot, and getrusage/wait4 rusage (`modules/oxfs`, `modules/posix_compat`, `src/process.rs`, `src/syscall.rs`)
+## Real hard links, device nodes, per-process chroot, and getrusage/wait4 rusage (`modules/oxfs`, `modules/posix_compat`, `src/process/`, `src/syscall/ffi.rs`)
 
 Closes most of the rest of `NEEDS_SYSCALL`: `link`/`ln`, `mknod`/`makedevs`, `chroot`, `time`'s
 `getrusage`/`wait4`-rusage dependency. SysV IPC and real namespaces stay out of scope.
@@ -1003,7 +1003,7 @@ Closes most of the rest of `NEEDS_SYSCALL`: `link`/`ln`, `mknod`/`makedevs`, `ch
 - Verified via `modules/oxfs`'s own boot self-check and `tests/needs_syscall2_smoke.rs` +
   `userland/needs-syscall2-smoke/`.
 
-## Two syscalls found live by the expanded `test_busybox.sh` post-v0.1, both real Linux numbers used directly (`modules/oxfs`, `src/process.rs`)
+## Two syscalls found live by the expanded `test_busybox.sh` post-v0.1, both real Linux numbers used directly (`modules/oxfs`, `src/process/limits.rs`)
 
 Running the pre-v0.1-expanded `sh /test_busybox.sh` against a real boot for the first time (the
 script's own comment had flagged it as never yet run live) surfaced two `[boot] unrecognized
@@ -1022,7 +1022,7 @@ reverse).
   wrong. Resolves the fd the same way `oxfs_fstat`/`oxfs_ftruncate` already do (`resolve_write_fd_
   inode`, covering a pre-existing or freshly-`O_CREAT`'d write fd, not just a plain read fd), then
   the same owner-or-root check and `0o777` mask as `oxfs_chmod`.
-- **`sched_getaffinity` (`src/process.rs`'s `do_sched_getaffinity`, real `__NR_sched_getaffinity =
+- **`sched_getaffinity` (`src/process/limits.rs`'s `do_sched_getaffinity`, real `__NR_sched_getaffinity =
   204`)**: found via `nproc`, which calls this to count set bits in the affinity mask — but silently
   falls back to `count = 1` on any failure, so `nproc` printed the right answer by coincidence even
   while this was a flat `ENOSYS`; the gap only showed up as a logged unrecognized-syscall line, not
@@ -1141,7 +1141,7 @@ broke in three separately-real ways:
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
 cluster of applets at once. New syscall numbers should continue from the highest currently
-assigned (check `src/syscall.rs`/module sources rather than trusting stale numbers here).
+assigned (check `src/syscall/`/module sources rather than trusting stale numbers here).
 
 **`docs/BUSYBOX_APPLETS.md` is the authoritative, per-applet detail behind every row below** — the
 counts here (out of the 287 applets that built at all) are a summary, not the full picture. A
@@ -1166,7 +1166,7 @@ hw-profile support) rather than continuing to carry them as dead weight; see tha
 | `fsync`/`sync`/`ftruncate`/`fallocate`/`flock`/`statfs`/`setrlimit`/sched-priority/`reboot` | done | was subset of 33 (`NEEDS_SYSCALL`) | `SYS_FSYNC=471` through `SYS_REBOOT=486` |
 | `link`/`ln`, `mknod`/`makedevs`, `chroot`, `getrusage`/`time` | done | was subset of `NEEDS_SYSCALL` | `SYS_LINK=488`/`SYS_MKNOD=489`/`SYS_CHROOT=490`/`SYS_GETRUSAGE=491` |
 | SysV IPC, namespaces (`unshare`/`nsenter`/`setarch`/`setpriv`), `inotify`, ext2 `ioctl`s/`xattr` | not started, and no longer blocking anything — the applets that needed these (`ipcrm`/`ipcs`, `linux32`/`linux64`/`nsenter`/`setarch`/`setpriv`/`unshare`, `inotifyd`, `chattr`/`fatattr`/`lsattr`/`setfattr`) were removed from the roster before v0.1 | 0 remaining (`NEEDS_SYSCALL` fully resolved: done or removed) | namespaces don't fit this kernel's single-address-space model at all |
-| `/proc` — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`) | done | — | special-cased path prefix in `modules/oxfs` (no VFS layer to plug a separate module into), synthesized from `src/process.rs` accessors. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
+| `/proc` — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`) | done | — | special-cased path prefix in `modules/oxfs` (no VFS layer to plug a separate module into), synthesized from `src/process/procfs.rs` accessors. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
 | `/proc` — system-wide (`meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | `MemFree`/`MemAvailable` == `MemTotal` (no dealloc tracking); `/proc/stat`'s `cpu` line all-zero except `idle`. `free`/`uptime` call `sysinfo(2)` for their primary numbers — a distinct, unimplemented gap these don't unblock |
 | `/proc` — per-fd (`/proc/<pid>/fd/`) | done (enumeration only, not real symlinks) | subset of the above | needs a cross-module "describe this fd" mechanism to go further (oxfs doesn't know what a pipe/socket fd is) |
 | Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` | new `InodeKind::Symlink`; `resolve_path_impl` follows for every intermediate component always, final component only when `follow_last` — `MAX_SYMLINK_DEPTH=8`, `ELOOP=40` (musl's real value) |
@@ -1200,8 +1200,8 @@ docs/example files mismatched by candidate-extraction, 1 (`lzopcat`) is a genuin
   the pre-0.9 name). Decoding is two calls through the *same* locked guard: `add_byte` →
   `KeyEvent`, then `process_keyevent` → `DecodedKey`.
 - `pic8259`/`uart_16550` are deliberately **not** dependencies — both wrap a handful of
-  `outb`/`inb` calls against a stable protocol, small enough that owning the code (`src/pic.rs`,
-  `src/serial.rs`) outweighs the dependency. Different call than `pc-keyboard` (hundreds of lines
+  `outb`/`inb` calls against a stable protocol, small enough that owning the code (`src/cpu/pic.rs`,
+  `src/console/serial.rs`) outweighs the dependency. Different call than `pc-keyboard` (hundreds of lines
   of scancode tables) or `linked_list_allocator` (safety-critical free-list logic), which stay
   external.
 - `sha2`/`chacha20` (`src/random.rs`, backing `/dev/random`/`/dev/urandom`): `default-features =

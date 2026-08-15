@@ -21,7 +21,7 @@
 use core::panic::PanicInfo;
 
 use bootloader::{BootInfo, entry_point};
-use oxidebsd::fd::oxidebsd_close_fd;
+use oxidebsd::fs::fd::oxidebsd_close_fd;
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 use oxidebsd::syscall::{
@@ -153,7 +153,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     let tid = oxidebsd_sys_set_tid_address(0);
     assert_eq!(
         tid,
-        oxidebsd::scheduler::current_pid() as i64,
+        oxidebsd::process::scheduler::current_pid() as i64,
         "set_tid_address() should report the caller's own pid as tid: {tid}"
     );
     serial_println!(

@@ -47,7 +47,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 
 use spin::Mutex;
 
-use crate::scheduler;
+use crate::process::scheduler;
 use crate::syscall::EBADF;
 
 /// Matches `syscall::SyscallHandler`'s own FFI convention (negative = `-errno`, non-negative =
@@ -356,7 +356,7 @@ extern "C" fn stdin_read(_real_fd: u64, ptr: u64, len: u64) -> i64 {
     // already has -- [ptr, ptr+len) isn't checked against the caller's actual mappings first.
     // len == 0 is already handled by this file's own read() above, never reaching here.
     let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
-    crate::stdin::read(buf) as i64
+    crate::console::stdin::read(buf) as i64
 }
 
 extern "C" fn write_not_permitted(_real_fd: u64, _ptr: u64, _len: u64) -> i64 {

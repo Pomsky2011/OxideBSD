@@ -157,7 +157,7 @@ static STATE: Mutex<TcpState> = Mutex::new(TcpState::new());
 static ISN_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn resolve(fd: u64) -> Option<u64> {
-    crate::fd::real_fd_of(fd)
+    crate::fs::fd::real_fd_of(fd)
 }
 
 /// Not RFC 6528 hash-based/random -- ticks mixed with a plain counter is non-repeating in
@@ -165,7 +165,7 @@ fn resolve(fd: u64) -> Option<u64> {
 /// "no entropy source" simplification `AT_RANDOM` already documents elsewhere).
 fn isn() -> u32 {
     let counter = ISN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    (crate::interrupts::ticks() as u32) ^ counter.wrapping_mul(0x9E37_79B1)
+    (crate::cpu::interrupts::ticks() as u32) ^ counter.wrapping_mul(0x9E37_79B1)
 }
 
 fn window_for(recv_buf_len: usize) -> u16 {
@@ -266,7 +266,7 @@ fn send_and_track(real_fd: u64, seq: u32, ack: u32, flags: u8, data: &[u8]) -> O
         let mut state = STATE.lock();
         if let Some(TcpSocket::Connection(conn)) = state.sockets.get_mut(&real_fd) {
             conn.unacked_segment = Some(segment);
-            conn.retransmit_deadline = Some(crate::interrupts::ticks() + RETRANSMIT_TICKS);
+            conn.retransmit_deadline = Some(crate::cpu::interrupts::ticks() + RETRANSMIT_TICKS);
         }
     }
     Some(())
@@ -345,7 +345,7 @@ fn send_fin_and_transition(real_fd: u64, next_state: ConnState) {
 /// from `net::poll()` -- the same self-driving mechanism every socket syscall already funnels
 /// through, so this runs whenever anything touches the network, not on a dedicated timer.
 pub fn check_retransmits() {
-    let now = crate::interrupts::ticks();
+    let now = crate::cpu::interrupts::ticks();
     let due: Vec<u64> = {
         let state = STATE.lock();
         state
@@ -376,7 +376,7 @@ fn retransmit_or_give_up(real_fd: u64) {
         if conn.retransmit_count > MAX_RETRANSMITS {
             None
         } else {
-            conn.retransmit_deadline = Some(crate::interrupts::ticks() + RETRANSMIT_TICKS);
+            conn.retransmit_deadline = Some(crate::cpu::interrupts::ticks() + RETRANSMIT_TICKS);
             Some((conn.unacked_segment.clone(), conn.remote_ip))
         }
     };
@@ -467,7 +467,7 @@ fn handle_new_syn(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, their_
     }
 
     let seq = isn();
-    let conn_fd = crate::fd::oxidebsd_alloc_fd();
+    let conn_fd = crate::fs::fd::oxidebsd_alloc_fd();
     let conn = Connection {
         state: ConnState::SynReceived,
         local_port,
@@ -676,12 +676,12 @@ pub fn has_data_ready(real_fd: u64) -> Option<bool> {
 }
 
 pub fn create_socket() -> u64 {
-    let fd = crate::fd::oxidebsd_alloc_fd();
+    let fd = crate::fs::fd::oxidebsd_alloc_fd();
     STATE
         .lock()
         .sockets
         .insert(fd, TcpSocket::Unbound { local_port: None });
-    crate::fd::oxidebsd_register_fd_ops(fd, tcp_read, tcp_write, tcp_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(fd, tcp_read, tcp_write, tcp_close);
     fd
 }
 
@@ -770,14 +770,14 @@ pub extern "C" fn oxidebsd_sys_connect(fd: u64, addr_ptr: u64, len: u64) -> i64 
         return -EHOSTUNREACH;
     }
 
-    // `crate::tsc`, not `crate::interrupts::ticks()`: `ticks()` is driven entirely by the timer
+    // `crate::tsc`, not `crate::cpu::interrupts::ticks()`: `ticks()` is driven entirely by the timer
     // IRQ, which can't fire while this syscall has interrupts masked (`src/syscall.rs`'s SFMASK
     // setup) -- a tick-based deadline here would be frozen at whatever value it had when the
     // syscall began and could never actually elapse, turning "give up after N ticks" into "never
     // gives up" for a peer that never completes the handshake. Confirmed live by the identical
     // bug in `net::oxidebsd_sys_poll` (see `crate::tsc`'s own doc comment) -- fixed here for the
     // same reason. `CONNECT_TIMEOUT_TICKS` is still the budget, just converted to `tsc` cycles.
-    let deadline = crate::tsc::now() + crate::tsc::ms_to_cycles(CONNECT_TIMEOUT_TICKS * 10);
+    let deadline = crate::cpu::tsc::now() + crate::cpu::tsc::ms_to_cycles(CONNECT_TIMEOUT_TICKS * 10);
     loop {
         super::poll();
         let outcome = {
@@ -794,7 +794,7 @@ pub extern "C" fn oxidebsd_sys_connect(fd: u64, addr_ptr: u64, len: u64) -> i64 
         if let Some(result) = outcome {
             return result;
         }
-        if crate::tsc::now() >= deadline {
+        if crate::cpu::tsc::now() >= deadline {
             let mut state = STATE.lock();
             teardown(&mut state, real_fd);
             return -ETIMEDOUT;
@@ -871,7 +871,7 @@ pub extern "C" fn oxidebsd_sys_accept(fd: u64, addr_out_ptr: u64, addrlen_ptr: u
         return -ECONNREFUSED;
     };
 
-    crate::fd::oxidebsd_register_fd_ops(conn_fd, tcp_read, tcp_write, tcp_close);
+    crate::fs::fd::oxidebsd_register_fd_ops(conn_fd, tcp_read, tcp_write, tcp_close);
     super::udp::write_sockaddr(addr_out_ptr, remote_ip, remote_port);
     if addrlen_ptr != 0 {
         unsafe {
@@ -881,7 +881,7 @@ pub extern "C" fn oxidebsd_sys_accept(fd: u64, addr_out_ptr: u64, addrlen_ptr: u
     conn_fd as i64
 }
 
-/// Genuinely blocks (unless `O_NONBLOCK` is set -- `crate::fd::is_nonblocking`, `syscall::
+/// Genuinely blocks (unless `O_NONBLOCK` is set -- `crate::fs::fd::is_nonblocking`, `syscall::
 /// sys_fcntl`) while the connection is still open and simply has nothing buffered *yet* -- only
 /// returns `0` (real EOF) once the peer has actually signaled closure (`CloseWait`/`FinWait2`/
 /// `Closed`, reached via a real FIN, not just an empty buffer). Previously returned `0` the
@@ -927,7 +927,7 @@ extern "C" fn tcp_read(real_fd: u64, ptr: u64, len: u64) -> i64 {
                 ConnState::CloseWait | ConnState::FinWait2 | ConnState::Closed
             ) {
                 return 0; // real EOF: the peer has actually signaled closure
-            } else if crate::fd::is_nonblocking(real_fd) {
+            } else if crate::fs::fd::is_nonblocking(real_fd) {
                 return -EAGAIN;
             } else {
                 None

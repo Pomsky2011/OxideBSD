@@ -7,8 +7,8 @@ use x86_64::instructions::port::Port;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
-use crate::gdt::DOUBLE_FAULT_IST_INDEX;
-use crate::pic::{self, PIC_1_OFFSET, PIC_2_OFFSET};
+use crate::cpu::gdt::DOUBLE_FAULT_IST_INDEX;
+use crate::cpu::pic::{self, PIC_1_OFFSET, PIC_2_OFFSET};
 use crate::reboot::reboot;
 use crate::{serial_print, serial_println};
 
@@ -211,7 +211,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 
     // Wake any process blocked in `process::do_nanosleep` (`BlockReason::Sleeping`) whose deadline
     // has now passed -- same "IRQ handler reaches directly into `process::table()`" shape
-    // `crate::stdin::push_byte`'s own `wake_blocked_readers` already established for
+    // `crate::console::stdin::push_byte`'s own `wake_blocked_readers` already established for
     // `WaitingForStdin`, just driven by this timer IRQ instead of the keyboard one. Safe for the
     // same reason that one is: every other place `process::table()` is locked either runs inside a
     // `SYSCALL` (where `SFMASK` clears `IF` for the syscall's entire duration) or inside
@@ -226,7 +226,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
                 && now >= deadline
             {
                 proc.state = crate::process::ProcState::Ready;
-                crate::scheduler::enqueue_ready(pid);
+                crate::process::scheduler::enqueue_ready(pid);
             }
 
             // `SYS_SETITIMER`'s `ITIMER_REAL` expiry (also backs real `alarm()`, a thin musl-side
@@ -306,8 +306,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                     // pushed to stdin and a userland reader (`stsh`'s own `read_line`, BusyBox
                     // `hush`'s line editor) handles it itself, unchanged from before this existed.
                     if byte == 0x03
-                        && crate::stdin::get_termios().c_lflag & crate::stdin::ISIG != 0
-                        && let Some(pgid) = crate::stdin::foreground_pgid()
+                        && crate::console::stdin::get_termios().c_lflag & crate::console::stdin::ISIG != 0
+                        && let Some(pgid) = crate::console::stdin::foreground_pgid()
                     {
                         serial_print!("^C\n");
                         crate::process::signal_foreground_group(pgid, crate::process::SIGINT);
@@ -316,12 +316,12 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                         }
                         return;
                     }
-                    if crate::stdin::echo_enabled()
+                    if crate::console::stdin::echo_enabled()
                         && (byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte))
                     {
                         serial_print!("{character}");
                     }
-                    crate::stdin::push_byte(byte);
+                    crate::console::stdin::push_byte(byte);
                 }
             }
             // Modifier/lock keys (Shift, Ctrl, CapsLock, ...) and any other non-Unicode key --

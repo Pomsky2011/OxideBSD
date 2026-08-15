@@ -46,7 +46,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     // Must run before oxfs loads, below -- its module_init decides mount-vs-format based on
     // whether this probe found a data disk. See src/ata.rs's own doc comment for why the disk is
     // pinned to the secondary channel/master specifically.
-    oxidebsd::ata::init();
+    oxidebsd::drivers::ata::init();
 
     // Populates SYS_EXIT/SYS_READ/SYS_WRITE/SYS_FORK/SYS_WAIT4/SYS_EXECVE/SYS_GETPID -- must load
     // before oxfs-persistence-syscall-smoke, below, is spawned.
@@ -78,7 +78,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     .unwrap_or_else(|e| panic!("failed to load the oxfs module: {e:?}"));
 
     oxidebsd::memory::install_global_memory_state(frame_allocator, physical_memory_offset);
-    oxidebsd::fd::init();
+    oxidebsd::fs::fd::init();
 
     assert_eq!(
         oxidebsd_register_syscall(SYS_TEST_EXIT, test_exit_handler),
@@ -95,7 +95,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     let pid1 = oxidebsd::process::spawn(OXFS_PERSISTENCE_SYSCALL_SMOKE_ELF, None)
         .unwrap_or_else(|e| panic!("failed to spawn oxfs-persistence-syscall-smoke: {e:?}"));
 
-    oxidebsd::scheduler::start(pid1)
+    oxidebsd::process::scheduler::start(pid1)
 }
 
 #[panic_handler]

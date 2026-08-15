@@ -114,7 +114,7 @@ fn read_status(io_base: u16) -> u8 {
 /// discarded by every caller here, but returning it costs nothing and matches the shape a future
 /// caller checking `DF`/`ERR` after a command completes might want.
 fn wait_while_busy(io_base: u16) -> Result<u8, AtaError> {
-    let deadline = crate::tsc::now() + crate::tsc::ms_to_cycles(TIMEOUT_MS);
+    let deadline = crate::cpu::tsc::now() + crate::cpu::tsc::ms_to_cycles(TIMEOUT_MS);
     loop {
         let status = read_status(io_base);
         if status == 0xFF {
@@ -123,7 +123,7 @@ fn wait_while_busy(io_base: u16) -> Result<u8, AtaError> {
         if status & STATUS_BSY == 0 {
             return Ok(status);
         }
-        if crate::tsc::now() >= deadline {
+        if crate::cpu::tsc::now() >= deadline {
             return Err(AtaError::Timeout);
         }
         core::hint::spin_loop();
@@ -134,7 +134,7 @@ fn wait_while_busy(io_base: u16) -> Result<u8, AtaError> {
 /// `TIMEOUT_MS`. Distinct from `wait_while_busy`: a command that doesn't move data (e.g. `CACHE
 /// FLUSH`) only ever needs the latter.
 fn wait_for_data(io_base: u16) -> Result<(), AtaError> {
-    let deadline = crate::tsc::now() + crate::tsc::ms_to_cycles(TIMEOUT_MS);
+    let deadline = crate::cpu::tsc::now() + crate::cpu::tsc::ms_to_cycles(TIMEOUT_MS);
     loop {
         let status = read_status(io_base);
         if status == 0xFF {
@@ -146,7 +146,7 @@ fn wait_for_data(io_base: u16) -> Result<(), AtaError> {
         if status & STATUS_BSY == 0 && status & STATUS_DRQ != 0 {
             return Ok(());
         }
-        if crate::tsc::now() >= deadline {
+        if crate::cpu::tsc::now() >= deadline {
             return Err(AtaError::Timeout);
         }
         core::hint::spin_loop();

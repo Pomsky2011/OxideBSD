@@ -67,7 +67,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     .unwrap_or_else(|e| panic!("failed to load the oxfs module: {e:?}"));
 
     oxidebsd::memory::install_global_memory_state(frame_allocator, physical_memory_offset);
-    oxidebsd::fd::init();
+    oxidebsd::fs::fd::init();
 
     assert_eq!(
         oxidebsd_register_syscall(SYS_TEST_EXIT, test_exit_handler),
@@ -83,7 +83,7 @@ fn main(boot_info: &'static BootInfo) -> ! {
     let pid1 = oxidebsd::process::spawn(PROC_SMOKE_ELF, None)
         .unwrap_or_else(|e| panic!("failed to spawn proc-smoke: {e:?}"));
 
-    oxidebsd::scheduler::start(pid1)
+    oxidebsd::process::scheduler::start(pid1)
 }
 
 #[panic_handler]

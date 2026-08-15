@@ -92,13 +92,13 @@ pub fn _print(args: fmt::Arguments) {
             .write_fmt(args)
             .expect("printing to serial port failed");
     });
-    crate::vga::_print(args);
+    crate::console::vga::_print(args);
 }
 
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
-        $crate::serial::_print(format_args!($($arg)*));
+        $crate::console::serial::_print(format_args!($($arg)*));
     };
 }
 

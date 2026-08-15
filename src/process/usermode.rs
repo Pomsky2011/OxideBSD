@@ -4,7 +4,7 @@ use core::arch::asm;
 
 use x86_64::VirtAddr;
 
-use crate::gdt::{user_code_selector, user_data_selector};
+use crate::cpu::gdt::{user_code_selector, user_data_selector};
 
 /// RFLAGS value used for the jump: bit 1 is a reserved bit that must always read as 1, and
 /// `INTERRUPT_FLAG` (bit 9) keeps interrupts enabled in user mode — otherwise the timer could

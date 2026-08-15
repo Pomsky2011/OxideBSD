@@ -130,7 +130,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // oxfs's module_init needs to know whether a data disk is attached to decide between its
     // mount-existing-disk and format-fresh-disk/pure-in-memory paths. Never fatal: absence just
     // means oxfs falls back to its original 100%-in-memory behavior for this boot.
-    oxidebsd::ata::init();
+    oxidebsd::drivers::ata::init();
 
     // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
     // (still built and self-checked by build.rs on every `cargo build`) but deliberately not
@@ -183,7 +183,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Registers fd 0/1/2 as real crate::fd entries (see that module's own doc comment for why
     // stdin/stdout/stderr moved out of being special-cased directly in sys_read/sys_write) --
     // must happen before any process (starting with pid 1 below) can issue its first read/write.
-    oxidebsd::fd::init();
+    oxidebsd::fs::fd::init();
 
     // BusyBox's `hush` (see CLAUDE.md's BusyBox/oxfs sections) replaces `stsh` as pid 1 -- a real
     // shell over a real filesystem, not a purpose-built demo. `stsh` (`userland/stsh/`) stays in
@@ -201,7 +201,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let pid1 = oxidebsd::process::spawn(HUSH_ELF, None)
         .unwrap_or_else(|e| panic!("failed to spawn hush: {e:?}"));
 
-    oxidebsd::scheduler::start(pid1)
+    oxidebsd::process::scheduler::start(pid1)
 }
 
 #[cfg(not(test))]

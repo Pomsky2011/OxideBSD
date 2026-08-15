@@ -73,7 +73,7 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
     let timeout_ms = timeout_ms as i32 as i64;
     let entries = unsafe { core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds as usize) };
 
-    // `crate::tsc`, not `crate::interrupts::ticks()`: this is a real syscall handler, and
+    // `crate::tsc`, not `crate::cpu::interrupts::ticks()`: this is a real syscall handler, and
     // `ticks()` is driven entirely by the timer IRQ, which can't fire for the syscall's *entire*
     // duration (`src/syscall.rs`'s SFMASK clears `RFLAGS::INTERRUPT_FLAG` at entry) -- a
     // tick-based deadline here would be frozen at the value it had when the syscall began and
@@ -81,7 +81,7 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
     // path hung solid on exactly this before `crate::tsc` existed -- see that module's own doc
     // comment. RDTSC keeps advancing regardless of the interrupt-enable state.
     let deadline =
-        (timeout_ms >= 0).then(|| crate::tsc::now() + crate::tsc::ms_to_cycles(timeout_ms as u64));
+        (timeout_ms >= 0).then(|| crate::cpu::tsc::now() + crate::cpu::tsc::ms_to_cycles(timeout_ms as u64));
 
     loop {
         poll(); // drain the NIC / run the protocol stack once per pass, same as recvfrom's self-poll
@@ -91,7 +91,7 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
             if entry.fd < 0 {
                 continue; // negative fd: real poll() skips these entirely, not an error
             }
-            let Some(real_fd) = crate::fd::real_fd_of(entry.fd as u64) else {
+            let Some(real_fd) = crate::fs::fd::real_fd_of(entry.fd as u64) else {
                 entry.revents = POLLNVAL;
                 ready_count += 1;
                 continue;
@@ -108,7 +108,7 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
         if ready_count > 0 {
             return ready_count;
         }
-        if deadline.is_some_and(|d| crate::tsc::now() >= d) {
+        if deadline.is_some_and(|d| crate::cpu::tsc::now() >= d) {
             return 0;
         }
         // `hint::spin_loop()`, not `hlt()`: this is a real syscall handler, and

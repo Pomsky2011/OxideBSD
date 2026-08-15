@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
 
-use crate::elf::Elf;
+use crate::process::elf::Elf;
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;

@@ -1,0 +1,480 @@
+//! Process abstraction: PID allocation, the process control block (PCB), and the global process
+//! table. Companion to `crate::process::scheduler` (which owns *when* a process runs) and
+//! `crate::process::context_switch` (which owns *how* control moves from one kernel stack to
+//! another) -- this file owns process *state* itself (the `Process` struct, `ProcState`,
+//! `PROCESS_TABLE`). The real syscall logic that mutates that state is split across this
+//! directory's other files: `lifecycle` (spawn/fork/execve/wait/exit/reboot), `signals`
+//! (kill/sigaction/sigprocmask/delivery), `identity` (uid/gid/pgid/sid), `limits`
+//! (rlimit/priority/sched), `timers` (nanosleep/itimer), `mm` (mmap/munmap/mprotect/brk), `procfs`
+//! (`/proc` formatting). All re-exported here so `crate::process::X` keeps resolving exactly where
+//! it always has.
+//!
+//! See CLAUDE.md's process/scheduler section for the full design rationale.
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use spin::{Lazy, Mutex};
+use x86_64::VirtAddr;
+
+use crate::memory::address_space::AddressSpace;
+use crate::memory::{self};
+use crate::syscall::SyscallFrame;
+
+pub type Pid = u64;
+/// Floor: 128 KiB -- much larger than the 20 KiB the single, old, static RSP0 stack (`gdt.rs`'s
+/// original fixed stack, before every process got its own) used to be. Found empirically, the hard
+/// way: 16 KiB overflowed on `ls` (`SYS_OPEN` on a directory -> `modules/fat32`'s
+/// `open_directory_listing`, deeper than plain `SYS_READ`/`SYS_WRITE`); 32 KiB then overflowed on
+/// `fork()` (`do_fork_from_current` -> `AddressSpace::fork`'s 4-level page-table walk ->
+/// `AddressSpace::new` -> `PageTable::clone()` -- in an unoptimized debug build, cloning a
+/// 512-entry array through the generic `try_from_fn` machinery has a surprisingly large unoptimized
+/// stack frame). There's no guard page (heap-allocated, not a dedicated mapped-with-a-gap region
+/// like `gdt.rs`'s stacks), so a stack overflow here corrupts silently or double-faults rather than
+/// failing cleanly -- this needs real margin for debug builds specifically, not just "enough for
+/// the common case observed once," which is why RAM-constrained boots keep exactly this floor
+/// rather than shrinking further (see `kernel_stack_size` below).
+const KERNEL_STACK_SIZE_FLOOR: usize = 128 * 1024;
+/// Ceiling: purely a bound on how much a RAM-rich boot hands each process for free (more headroom
+/// against deeper call chains, at essentially no cost against a multi-GiB usable-RAM pool) -- not
+/// something any code path has been observed to need.
+const KERNEL_STACK_SIZE_CEILING: usize = 512 * 1024;
+
+/// Scales the per-process kernel stack size to `memory::usable_ram_bytes()`, clamped to
+/// `[KERNEL_STACK_SIZE_FLOOR, KERNEL_STACK_SIZE_CEILING]`. `spin::Lazy` (not a plain `const`)
+/// because the real value depends on the memory map read at boot; safe to compute lazily since
+/// every caller (`KernelStack::new`) only ever runs after `memory::BootInfoFrameAllocator::init`
+/// has already populated `usable_ram_bytes` (process creation happens well after boot's memory
+/// setup completes).
+static KERNEL_STACK_SIZE: Lazy<usize> = Lazy::new(|| {
+    let scaled = (memory::usable_ram_bytes() / 256) as usize; // 1/256th of usable RAM
+    scaled.clamp(KERNEL_STACK_SIZE_FLOOR, KERNEL_STACK_SIZE_CEILING)
+});
+
+fn kernel_stack_size() -> usize {
+    *KERNEL_STACK_SIZE
+}
+
+/// Fixed for every process, same constant `src/main.rs`'s old one-shot demo path used. `execve`
+/// reuses it too — a fresh program image gets a fresh stack at the same fixed top — which is fine
+/// since this only needs to be unique *within* one process's own address space, not across the
+/// whole system; different address spaces don't share user-space mappings the way they share the
+/// kernel half.
+pub const USER_STACK_TOP: u64 = 0x_5000_0000_0000;
+
+/// Floor: 4 pages (16 KiB) -- the fixed size this kernel always mapped, proven sufficient for
+/// `stsh` and every program it execs so far.
+const USER_STACK_PAGES_FLOOR: u64 = 4;
+/// Ceiling: 64 pages (256 KiB) -- bounds how much a RAM-rich boot maps per process; nothing today
+/// needs more.
+const USER_STACK_PAGES_CEILING: u64 = 64;
+
+/// Scales the per-process user stack size the same way `kernel_stack_size` scales the kernel-side
+/// one, off the same `memory::usable_ram_bytes()` reading.
+static USER_STACK_PAGES: Lazy<u64> = Lazy::new(|| {
+    let scaled = memory::usable_ram_bytes() / (256 * 4096); // 1/256th of usable RAM, in pages
+    scaled.clamp(USER_STACK_PAGES_FLOOR, USER_STACK_PAGES_CEILING)
+});
+
+fn user_stack_pages() -> u64 {
+    *USER_STACK_PAGES
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcState {
+    Ready,
+    Running,
+    Blocked(BlockReason),
+    Zombie(i32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockReason {
+    /// `None` = waiting for any child (`wait4(-1, ...)`); `Some(pid)` = waiting for one specific
+    /// child.
+    WaitingForChild(Option<Pid>),
+    /// Blocked in a `crate::pipe` read on an empty, still-open pipe (identified by that pipe's own
+    /// id, not by fd — a pipe's read end can be `dup2`'d to other fds, but there's still only one
+    /// underlying pipe). See `crate::pipe`'s module doc comment for why a pipe read has to
+    /// genuinely block (not just return `Ok(0)`/`EAGAIN`) for a pipeline to work at all on this
+    /// single-core, cooperatively-scheduled kernel.
+    WaitingForPipeData(u64),
+    /// Blocked in a `crate::pipe` write on a full, still-open pipe (identified by pipe id, same
+    /// convention as `WaitingForPipeData`) — the write-side counterpart, now that
+    /// `crate::fs::pipe::PipeBuffer` is bounded rather than an unboundedly-growable `VecDeque`. Woken
+    /// by a reader draining space or by the read side closing (`EPIPE` once woken, if so).
+    WaitingForPipeSpace(u64),
+    /// Blocked in `crate::console::stdin::read` on an empty keyboard ring buffer. Unlike every other
+    /// `BlockReason`, nothing *schedulable* ever wakes this one — the only thing that ever will is
+    /// the keyboard IRQ handler itself, which is why `scheduler::schedule()`'s own "nothing
+    /// runnable" fallback had to grow a real interrupts-enabled idle wait (`wait_for_ready`)
+    /// instead of spinning forever with interrupts masked. See `crate::stdin`'s module doc comment
+    /// for the full story — this is what makes `sh.elf` (BusyBox's `hush`), run with no `-c`
+    /// argument, able to actually block reading a line from the keyboard instead of seeing an
+    /// instant EOF.
+    WaitingForStdin,
+    /// Blocked in `do_nanosleep` until `interrupts::ticks()` reaches this absolute deadline (not a
+    /// duration). Unlike `WaitingForPipeData`/`WaitingForChild` (woken by another schedulable
+    /// process's own syscall), the only thing that ever wakes this one is
+    /// `interrupts::timer_interrupt_handler` itself — the same "IRQ handler reaches directly into
+    /// `process::table()`" shape `crate::console::stdin::push_byte`'s own `wake_blocked_readers` already
+    /// established for `WaitingForStdin`, just driven by the timer IRQ instead of the keyboard one.
+    Sleeping(u64),
+}
+/// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
+/// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own
+/// doc comment. Using real numbers here (rather than inventing OxideBSD-own ones, unlike most of
+/// this ABI's own syscalls) is deliberate: a signal *number* is just a plain argument value, not a
+/// syscall number, so there's no ABI collision risk the way `open`/`execve` had -- and using the
+/// real values is what let `bits/syscall.h.in`'s own remap of `SYS_kill`/`SYS_rt_sigaction`/
+/// `SYS_rt_sigprocmask` be the *only* musl-side patch this feature needed (see that file's own
+/// comment on the musl fork): musl's `kill.c`/`sigaction.c`/`sigprocmask.c`/`pthread_sigmask.c`
+/// already build exactly the wire format `do_kill`/`do_sigaction`/`do_sigprocmask` below expect,
+/// unmodified.
+pub const SIGHUP: u64 = 1;
+pub const SIGINT: u64 = 2;
+pub const SIGQUIT: u64 = 3;
+pub const SIGILL: u64 = 4;
+pub const SIGTRAP: u64 = 5;
+pub const SIGABRT: u64 = 6;
+pub const SIGBUS: u64 = 7;
+pub const SIGFPE: u64 = 8;
+pub const SIGKILL: u64 = 9;
+pub const SIGUSR1: u64 = 10;
+pub const SIGSEGV: u64 = 11;
+pub const SIGUSR2: u64 = 12;
+pub const SIGPIPE: u64 = 13;
+pub const SIGALRM: u64 = 14;
+pub const SIGTERM: u64 = 15;
+pub const SIGCHLD: u64 = 17;
+pub const SIGCONT: u64 = 18;
+pub const SIGSTOP: u64 = 19;
+pub const SIGTSTP: u64 = 20;
+pub const SIGTTIN: u64 = 21;
+pub const SIGTTOU: u64 = 22;
+pub const SIGURG: u64 = 23;
+pub const SIGXCPU: u64 = 24;
+pub const SIGXFSZ: u64 = 25;
+pub const SIGVTALRM: u64 = 26;
+pub const SIGPROF: u64 = 27;
+pub const SIGWINCH: u64 = 28;
+pub const SIGIO: u64 = 29;
+pub const SIGSYS: u64 = 31;
+/// One process's disposition for one signal, indexed `1..=31` into `Process::sigactions`
+/// (index `0` is unused). Mirrors real POSIX `sigaction`'s own `handler` sentinel convention
+/// directly -- `0` = `SIG_DFL`, `1` = `SIG_IGN`, anything else is a real handler address -- which
+/// is why `do_sigaction`'s own wire-format read/write needs no translation: musl's real `SIG_DFL`/
+/// `SIG_IGN` macros already expand to these exact values.
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    pub handler: u64,
+    pub flags: u64,
+    pub restorer: u64,
+    pub mask: u64,
+}
+
+impl SigAction {
+    const DEFAULT: SigAction = SigAction {
+        handler: 0,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+}
+/// `SA_NODEFER` -- the one `sa_flags` bit `deliver_pending_signal`'s own mask computation
+/// consults (real Linux/x86_64 value; every other flag, `SA_RESTART` included, is accepted but has
+/// no observable effect on this kernel -- there's no blocking-syscall-restart machinery to hook it
+/// into).
+const SA_NODEFER: u64 = 0x40000000;
+/// What `default_disposition` says happens to a signal nothing has installed a handler for (or
+/// that's been explicitly reset to `SIG_DFL`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultDisposition {
+    Terminate,
+    Ignore,
+}
+
+/// Real POSIX default dispositions for the signals this ABI recognizes (`1..=31`), collapsed to
+/// just two outcomes -- this kernel has no core-dump concept (`Terminate` covers both "term" and
+/// "core" defaults identically) and no real job control (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`
+/// default to `Ignore` here rather than a real "stopped" process state -- a deliberate, documented
+/// simplification; see CLAUDE.md's BusyBox gap-analysis section on signals: stop/continue is only
+/// valuable bundled with real job control, not attempted standalone in this pass). A signal number
+/// outside `1..=31` (real-time signals, or garbage) isn't reachable here at all -- every caller
+/// (`sys_kill`/`sys_sigaction`, `take_deliverable_signal`'s own pending-bit scan) is already
+/// bounded to that range before this is consulted.
+fn default_disposition(sig: u64) -> DefaultDisposition {
+    match sig {
+        SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGIO | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => {
+            DefaultDisposition::Ignore
+        }
+        _ => DefaultDisposition::Terminate,
+    }
+}
+/// `take_deliverable_signal`'s own result -- what `deliver_pending_signal`
+/// (`src/syscall.rs`) should actually do about the signal it picked.
+pub(crate) enum SignalDelivery {
+    /// Terminate the process with this exit code (`128 + signum`, the real shell/POSIX
+    /// convention for "died from a signal").
+    Terminate(i32),
+    /// Redirect the live frame into this handler.
+    Handler {
+        signum: u64,
+        handler: u64,
+        restorer: u64,
+        /// The blocked-signal mask to install (on top of whatever's already blocked) for the
+        /// duration of the handler -- `action.mask` plus the signal's own bit, unless
+        /// `SA_NODEFER` was set.
+        mask_to_add: u64,
+    },
+}
+/// A process's own kernel stack: heap-allocated (not a fixed-size `static`/`static mut` array like
+/// `gdt.rs`'s single RSP0 stack, since the number of processes isn't fixed) via a raw
+/// `alloc`/`dealloc` pair rather than `Vec<u8>`/`Box<[u8]>`, neither of which guarantees the
+/// 16-byte alignment `context_switch::SwitchFrame` needs.
+struct KernelStack {
+    base: *mut u8,
+    layout: core::alloc::Layout,
+}
+
+impl KernelStack {
+    fn new() -> Self {
+        let stack_size = kernel_stack_size();
+        let layout =
+            core::alloc::Layout::from_size_align(stack_size, 16).expect("bad kernel stack layout");
+        // SAFETY: layout has non-zero size (stack_size >= KERNEL_STACK_SIZE_FLOOR > 0).
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null(), "out of memory allocating a kernel stack");
+        KernelStack { base, layout }
+    }
+
+    fn top(&self) -> VirtAddr {
+        VirtAddr::from_ptr(self.base) + self.layout.size() as u64
+    }
+}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        // SAFETY: base/layout are exactly what alloc_zeroed returned in `new`; KernelStack is
+        // never cloned or shared, so this is the sole owner.
+        unsafe { alloc::alloc::dealloc(self.base, self.layout) };
+    }
+}
+
+// SAFETY: KernelStack owns its allocation exclusively -- conceptually equivalent to `Box<[u8]>`'s
+// own `Unique<u8>`, which is `Send` for the same reason. Needed because `PROCESS_TABLE` (below) is
+// a `Mutex<BTreeMap<Pid, Box<Process>>>` static, which requires `Process` (and transitively this
+// raw-pointer-holding field) to be `Send` for `Mutex<..>` to be `Sync`.
+unsafe impl Send for KernelStack {}
+pub struct Process {
+    pub pid: Pid,
+    pub parent: Option<Pid>,
+    pub children: Vec<Pid>,
+    pub state: ProcState,
+    pub address_space: AddressSpace,
+    #[allow(dead_code)] // kept alive for its Drop impl; never read after construction
+    kernel_stack: KernelStack,
+    pub kernel_stack_top: VirtAddr,
+    /// Saved outgoing RSP for `context_switch::switch_context`, valid only while
+    /// `state != Running` (i.e. only while this process isn't the one currently executing).
+    pub rsp: u64,
+    /// Consulted only by `spawn_trampoline_inner`, the first time a never-run process starts.
+    pub entry_point: VirtAddr,
+    /// Despite the name, this is the *initial `RSP`* the process starts running with — the
+    /// `user_stack::build`-computed address of the argc/argv/envp/auxv image's own start, not the
+    /// bare top of the mapped stack region (`process::USER_STACK_TOP`). Handed straight to
+    /// `usermode::jump_to_usermode`/`syscall::redirect_frame` as the stack pointer.
+    pub user_stack_top: VirtAddr,
+    /// The current top of this process's `SYS_BRK`-managed heap region — see `do_brk`. Starts at
+    /// the loaded ELF's `Elf::highest_loaded_address()` (page-aligned), grows/shrinks from there.
+    pub brk: VirtAddr,
+    /// This process's own `IA32_FS_BASE` value (see `SYS_SET_FS_BASE`), restored into the real MSR
+    /// on every context switch into this process (`scheduler::activate_and_prepare`) — `IA32_FS_BASE`
+    /// is a single global MSR, not something `context_switch::switch_context` saves/restores the
+    /// way it does `RSP`/callee-saved GPRs, so without this every musl-linked process (which uses
+    /// `%fs`-relative TLS, including the stack-protector canary check at `%fs:0x28`) would silently
+    /// clobber every *other* process's TLS base the instant it set its own. A real, previously-
+    /// latent bug: never surfaced by `true`/`echo`/`cat`/`musl-smoke` (each run directly by `stsh`,
+    /// which isn't musl-linked and never touches `%fs` itself, and none of them survives long enough
+    /// for a *different* still-running musl-linked process to resume and read a stale value) --
+    /// only found once `sh` (BusyBox's `hush`, itself musl-linked) forked and `execve`'d another
+    /// musl-linked child and then kept running *after* that child exited: `hush`'s own next
+    /// stack-protector check read through the dead child's own leftover `FS_BASE`, page-faulting on
+    /// whatever happened to be at that address in `hush`'s own (unrelated) address space. Starts at
+    /// `0` for a freshly spawned/`execve`'d process (no TLS set up yet); a forked child inherits the
+    /// parent's live value (real `fork()` semantics — TLS state is copied, not reset).
+    pub fs_base: u64,
+    /// This process's current-working-directory, as an opaque inode number `modules/oxfs` (not the
+    /// kernel) assigns meaning to — the kernel never interprets it, just persists/restores it per
+    /// process on `fork`/`spawn` exactly like `brk`/`fs_base` already do. `0` is oxfs's own root
+    /// inode number, which conveniently doubles as "unset" for a freshly spawned process. Fixes the
+    /// "one, kernel-wide current directory" limitation `modules/fat32` had (see CLAUDE.md) — now
+    /// that real processes exist, cwd is genuinely per-process. `do_execve` deliberately leaves
+    /// this untouched (real `execve()` preserves the caller's cwd, unlike `fs_base`, which an
+    /// exec'd program's own TLS layout makes meaningless to keep).
+    pub cwd: u64,
+    /// This process's own root directory (`SYS_CHROOT`) -- same "opaque inode number `modules/oxfs`
+    /// assigns meaning to, kernel just persists/restores it" shape as `cwd` immediately above,
+    /// right down to `0` doubling as both oxfs's real root inode number *and* "never chrooted".
+    /// Copied by `fork` (real `chroot(2)` semantics: a forked child stays confined to whatever root
+    /// its parent already had); left untouched by `execve` (real `chroot(2)` persists across
+    /// `exec` too -- unlike `fs_base`, there's no reason a new program's own layout would make this
+    /// meaningless to keep).
+    pub root_inode: u64,
+    /// Bitmask, bit `N-1` = signal `N` is pending delivery. Set by `do_kill`; drained by
+    /// `take_deliverable_signal` (called once, at the tail of every completed syscall — see
+    /// `src/syscall.rs`'s `deliver_pending_signal`).
+    pub pending_signals: u64,
+    /// Bitmask, bit `N-1` = signal `N` is currently blocked (won't be delivered even if pending,
+    /// until unblocked) — set by `SYS_SIGPROCMASK`, and temporarily grown by
+    /// `stash_signal_context` for the duration of a handler's own execution (restored by
+    /// `take_signal_saved_frame` on `sigreturn`).
+    pub blocked_signals: u64,
+    /// Indexed `1..=31` (index `0` unused) — see `SigAction`'s own doc comment.
+    pub sigactions: [SigAction; 32],
+    /// The interrupted context a `Handler`-disposition delivery snapshotted, restored verbatim by
+    /// `sigreturn` (`take_signal_saved_frame`) once the handler itself returns. `None` whenever
+    /// this process isn't currently inside a signal handler.
+    pub(crate) signal_saved_frame: Option<SyscallFrame>,
+    /// `blocked_signals`'s value from just before the handler above was entered — restored
+    /// alongside `signal_saved_frame` on `sigreturn`. Meaningless while `signal_saved_frame` is
+    /// `None`.
+    pub signal_saved_blocked: u64,
+    /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
+    #[allow(dead_code)]
+    pub priority: u8,
+    /// This process's process-group ID — an ordinary `Pid`, not a distinct namespace (real POSIX
+    /// process groups are just pids reinterpreted). Persisted/restored per process on
+    /// `fork`/`spawn` exactly like `cwd`/`fs_base`/`brk` already are. A freshly `spawn`ed process
+    /// (pid 1 today — no parent to inherit a group from) becomes its own group leader
+    /// (`pgid == pid`), matching real init/session-leader convention; a forked child inherits the
+    /// parent's live `pgid` (real `fork()` semantics — a child stays in its parent's group until it
+    /// calls `setpgid` itself). `do_execve` deliberately leaves this untouched, same reasoning as
+    /// `cwd` — real `execve()` preserves the caller's process group.
+    pub pgid: Pid,
+    /// This process's session ID — same "ordinary `Pid`, not a distinct namespace" shape as `pgid`.
+    /// A freshly `spawn`ed process becomes its own session leader (`sid == pid`), same as `pgid`;
+    /// a forked child inherits the parent's live `sid` unchanged (real `fork()` semantics — a child
+    /// stays in its parent's session until it calls `setsid` itself, and `setsid` itself refuses a
+    /// caller that's already a process-group leader — see `do_setsid`). `do_execve` leaves this
+    /// untouched, same reasoning as `cwd`/`pgid`. Paired with `stdin::CONTROLLING_SESSION` (a
+    /// single global, not a per-session table — this kernel has exactly one real console/tty, so
+    /// "which session owns the controlling tty" only ever needs one slot, the same simplification
+    /// already accepted for `stdin::TERMIOS`).
+    pub sid: Pid,
+    /// Executable basename (no path, no parens) — populated by `do_execve`/`spawn`, copied
+    /// verbatim by `fork` (real `fork()` semantics: a child keeps its parent's `comm`/`cmdline`
+    /// until it execs its own). Backs `/proc/[pid]/stat`'s `(comm)` field and `status`'s `Name:`.
+    pub comm: Vec<u8>,
+    /// Real `/proc/[pid]/cmdline` wire format: each `argv` entry followed by one NUL byte, no
+    /// trailing separator beyond that. Same copy-on-fork/reset-on-exec semantics as `comm`.
+    pub cmdline: Vec<u8>,
+    /// `SYS_SETITIMER`'s `ITIMER_REAL` state (`do_setitimer`/`do_getitimer`) — the absolute
+    /// `interrupts::ticks()` deadline this process's next `SIGALRM` fires at, `None` while
+    /// disarmed. Checked by `interrupts::timer_interrupt_handler` alongside its existing
+    /// `BlockReason::Sleeping` scan. Real `alarm(2)` is musl's own `setitimer()` wrapper (see
+    /// `third_party/musl/src/unistd/alarm.c`) — no separate kernel mechanism needed for it.
+    /// **Not inherited by `fork`** (`None`/`0` in a freshly forked child) — matches real POSIX
+    /// itimer semantics (a child starts with its own disarmed timer, unlike `cwd`/`brk`/`fs_base`,
+    /// which *are* copied). `do_execve` leaves both fields untouched (preserved, like `cwd`/`pgid`
+    /// — real `execve()` doesn't reset a pending itimer).
+    pub real_timer_deadline: Option<u64>,
+    /// Reload value in ticks for a periodic (`it_interval != 0`) real-timer; `0` means one-shot —
+    /// the expiry handler clears `real_timer_deadline` instead of rearming it. Meaningless while
+    /// `real_timer_deadline` is `None`.
+    pub real_timer_interval_ticks: u64,
+    /// Real uid/gid — no distinct saved/effective pair, since this kernel has no setuid-bit
+    /// `execve` support to ever make them diverge (see `do_execve`'s own doc comment: it never
+    /// touches these fields at all, matching real `execve()`'s "preserved unless the setuid/setgid
+    /// bit is set" semantics collapsing to plain preservation when that bit can never be set).
+    /// `SYS_GETEUID`/`SYS_GETEGID` just echo these same fields back. `0` (root) at `spawn` — this
+    /// kernel has no login mechanism, so pid 1 (and everything downstream) starts as root, matching
+    /// a real single-user embedded/init system more than a real multi-user boot. Copied by `fork`
+    /// (real `fork()` semantics, same as `cwd`/`pgid`/`brk`).
+    pub uid: u32,
+    pub gid: u32,
+    /// `SYS_PRLIMIT64`'s backing store -- one `(rlim_cur, rlim_max)` pair per real `RLIMIT_*`
+    /// resource (`RLIM_NLIMITS = 16` on real Linux), `u64::MAX` (`RLIM_INFINITY`) in every slot by
+    /// default. Copied by `fork` (real POSIX rlimit/fork semantics, same as `uid`/`gid`/`pgid`);
+    /// preserved by `execve` (untouched, same as `cwd`/`pgid`). **Stored, never enforced** — an
+    /// honest, documented gap, the same tier as several other accepted-but-unenforced fields
+    /// already in this codebase (e.g. `O_NONBLOCK` on a TCP socket, see `src/net/tcp.rs`).
+    pub rlimits: [(u64, u64); 16],
+    /// `SYS_SETPRIORITY`/`SYS_GETPRIORITY`'s backing store — real `nice` range is `-20..=19`, `0`
+    /// by default. Stored and echoed back honestly; this kernel's cooperative round-robin
+    /// scheduler has no priority concept at all, so it has no real scheduling effect. Copied by
+    /// `fork`; preserved by `execve` (same reasoning as `rlimits` above).
+    pub nice: i32,
+    /// `SYS_SCHED_SETSCHEDULER`/`SYS_SCHED_GETSCHEDULER`'s backing store — real Linux
+    /// `SCHED_RR = 2` by default (matching BusyBox `chrt`'s own default when no `-r`/`-f`/`-o`/
+    /// `-b`/`-i` flag is given). No real RT scheduling class exists here — stored and echoed back
+    /// honestly, same tier as `nice` above. Copied by `fork`; preserved by `execve`.
+    pub sched_policy: i32,
+    /// `SYS_SCHED_SETSCHEDULER`/`SYS_SCHED_GETPARAM`'s backing store — the `sched_priority` field
+    /// of a real `struct sched_param`, `0` by default. Same "stored, not enforced" tier as
+    /// `sched_policy` above. Copied by `fork`; preserved by `execve`.
+    pub sched_priority: i32,
+    /// `SYS_UMASK`'s backing store — real POSIX `umask()` always succeeds and returns the
+    /// *previous* mask, so this has to be real per-process state, not a pure function. `0o022`
+    /// (the standard real Unix default) rather than `0`, since a plausible ambient value matters
+    /// here in a way it doesn't for `nice`/`sched_policy`: BusyBox's `libbb/parse_mode.c` reads it
+    /// back via `umask(0)`/`umask(old)` to compute symbolic mode changes (`chmod +x`, ...) — found
+    /// live testing `chmod +x` on a real script, before this field existed, computing garbage from
+    /// the `ENOSYS` this ABI used to return for the then-unmapped `umask(2)` syscall (see
+    /// `third_party/musl/arch/x86_64/bits/syscall.h.in`'s own `__NR_umask` comment). Same
+    /// "stored, not enforced" tier as `rlimits`/`nice`/`sched_policy` otherwise — oxfs doesn't
+    /// consult this anywhere it creates a new inode. Copied by `fork`; preserved by `execve`.
+    pub umask: u32,
+}
+static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());
+
+fn alloc_pid() -> Pid {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// `Box<Process>` (not `Process` by value) is load-bearing, not stylistic: it lets callers pull a
+/// raw `*mut Process`/copy out needed fields from under a short-held lock and drop that lock
+/// *before* doing anything that might call `scheduler::schedule()` — the `BTreeMap`'s internal
+/// tree nodes can move on insert/remove, but a `Box`'s own heap allocation never does. Holding this
+/// lock across a context switch would only be released whenever that exact stack next resumes —
+/// a real deadlock risk if the switched-to process needs this same lock, which it always will.
+pub(crate) fn table() -> &'static Mutex<BTreeMap<Pid, Box<Process>>> {
+    &PROCESS_TABLE
+}
+#[derive(Debug)]
+pub enum SpawnError {
+    Elf(elf::ElfError),
+}
+
+pub use lifecycle::*;
+pub use signals::*;
+pub use identity::*;
+pub use limits::*;
+pub use timers::*;
+pub use mm::*;
+// `pub(crate) use`, not `pub use`: every item in `procfs` is itself `pub(crate)` (its
+// `oxidebsd_proc_*` functions are resolved as `crate::process::oxidebsd_proc_*` by
+// `src/module.rs`'s FFI table, which is in-crate but not `procfs`'s own module) -- matching that
+// exact visibility avoids both a hollow `pub` claim (nothing outside the crate can see these
+// anyway) and a plain private `use`, which wouldn't re-export far enough for `module.rs` to see.
+pub(crate) use procfs::*;
+
+pub mod identity;
+pub mod lifecycle;
+pub mod limits;
+pub mod mm;
+pub mod procfs;
+pub mod signals;
+pub mod timers;
+
+// Pre-existing, already-standalone modules moved into this directory unsplit (see the reorg plan)
+// -- unlike the seven above, these were never part of process.rs's own namespace, so they keep
+// their own explicit submodule path (`crate::process::scheduler::X`, not flattened into
+// `crate::process::X`) rather than being re-exported.
+pub mod context_switch;
+pub mod elf;
+pub mod scheduler;
+pub mod user_stack;
+pub mod usermode;

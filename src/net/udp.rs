@@ -131,7 +131,7 @@ impl UdpState {
 static STATE: Mutex<UdpState> = Mutex::new(UdpState::new());
 
 fn resolve(fd: u64) -> Option<u64> {
-    crate::fd::real_fd_of(fd)
+    crate::fs::fd::real_fd_of(fd)
 }
 
 /// Reads a `struct sockaddr_in` at `ptr` (2 bytes family, ignored -- AF_INET is the only family
@@ -231,9 +231,9 @@ pub extern "C" fn oxidebsd_sys_socket(domain: u64, ty: u64, protocol: u64) -> i6
     let base_ty = (ty as i64) & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     match base_ty {
         SOCK_DGRAM => {
-            let fd = crate::fd::oxidebsd_alloc_fd();
+            let fd = crate::fs::fd::oxidebsd_alloc_fd();
             STATE.lock().sockets.insert(fd, UdpSocket::new());
-            crate::fd::oxidebsd_register_fd_ops(fd, udp_read, udp_write, udp_close);
+            crate::fs::fd::oxidebsd_register_fd_ops(fd, udp_read, udp_write, udp_close);
             fd as i64
         }
         SOCK_STREAM => super::tcp::create_socket() as i64,
