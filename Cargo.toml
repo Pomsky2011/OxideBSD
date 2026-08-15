@@ -20,6 +20,7 @@ members = [
   "userland/access-syscall-smoke",
   "userland/pipe-backpressure-syscall-smoke",
   "userland/dynlink-syscall-smoke",
+  "userland/sa-siginfo-syscall-smoke",
   "userland/lsoxmod",
   "modules/hello",
   "modules/native_abi",
@@ -152,6 +153,10 @@ harness = false
 
 [[test]]
 name = "dynlink_syscall_smoke"
+harness = false
+
+[[test]]
+name = "sa_siginfo_syscall_smoke"
 harness = false
 
 [[test]]

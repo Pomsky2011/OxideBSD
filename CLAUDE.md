@@ -164,7 +164,16 @@ later one the same way, mid-syscall.
 - **`elf::load` tracks already-mapped pages in a `BTreeMap<Page, PhysFrame>` for one call** —
   `PT_LOAD` segments align to `p_align`, not to each other, so small binaries routinely share a
   page across segments; mapping/zeroing it twice is a bug. Flags aren't unioned across segments
-  sharing a page.
+  sharing a page — **found live**, not just theoretical: `userland/sa-siginfo-syscall-smoke`
+  (the SA_SIGINFO handler-invocation smoke test) was the first userland crate with real writable
+  globals (every earlier `*-syscall-smoke` crate kept mutable state on the stack instead), and its
+  small total size let the RW `.got`/`.data`/`.bss` segment share a page with the RX `.text`/
+  `.rodata` segment — the shared page kept only the first segment's R/E flags, so the very first
+  static write page-faulted (`PROTECTION_VIOLATION | CAUSED_BY_WRITE | USER_MODE`). Worked around
+  at the linker-script level for that one crate (`. = ALIGN(0x1000);` before the writable
+  sections — see that crate's own `linker.ld` comment), not fixed in `elf.rs` itself — a real
+  flag-union fix would benefit every future small binary with writable globals, not just this one,
+  but was out of scope for the pass that found it.
 - Known simplification: no `NO_EXECUTE` on any ELF segment (would also need `EFER.NXE`).
 
 ## Syscall ABI (`src/syscall/`)

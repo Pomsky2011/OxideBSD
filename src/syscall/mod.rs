@@ -387,6 +387,121 @@ fn do_sigreturn(frame: &mut SyscallFrame) {
     }
 }
 
+/// musl's own `siginfo_t` on x86_64 (`third_party/musl/include/signal.h`): three `int`s
+/// (`si_signo`/`si_code`/`si_errno`, no `__SI_SWAP_ERRNO_CODE` on this arch), padded to 8-byte
+/// alignment, then the `__si_common` union's two sub-unions -- `si_pid`/`si_uid` (the
+/// `__piduid`/user-signal-generated shape, the only one this kernel ever actually fills; the
+/// `si_timerid`/`si_overrun` alternative in the same union slot is never populated, no real
+/// per-process timer identity exists to report) followed by `si_value`/`si_status`+`si_utime`+
+/// `si_stime` (also never populated -- see this struct's own field doc below), then padding out to
+/// the real, fixed 128-byte `siginfo_t` size shared across every real Linux architecture.
+#[repr(C)]
+struct RawSiginfo {
+    si_signo: i32,
+    si_code: i32,
+    si_errno: i32,
+    _pad0: i32,
+    /// `__si_fields.__si_common.__first.__piduid.si_pid` -- always `0` today. This kernel's
+    /// `pending_signals` is a plain per-signal-number bitmask with no sender identity attached
+    /// (`do_kill` never records *who* sent a signal), so there is no real value to report here --
+    /// `0` is an honest "unknown," not a fabricated pid, matching this codebase's usual
+    /// all-zero-placeholder tier (`RawRusage`, `RawTms`) rather than inventing a plausible-looking
+    /// number.
+    si_pid: i32,
+    /// `__si_fields.__si_common.__first.__piduid.si_uid` -- same "no sender identity tracked"
+    /// story as `si_pid` above.
+    si_uid: i32,
+    /// `__si_fields.__si_common.__second.si_value` (`union sigval`, `sival_ptr`-sized) --
+    /// `sigqueue(2)`'s own payload would land here once that syscall gets a real handler (tracked
+    /// in `docs/MISSING_POSIX_SYSCALLS.md`); every signal delivered through the existing
+    /// `kill`/`tkill` path has no payload to carry, so this is always `0`.
+    si_value: u64,
+    _tail: [u8; 128 - 4 * 4 - 2 * 4 - 8],
+}
+
+const _: () = assert!(core::mem::size_of::<RawSiginfo>() == 128);
+
+/// Real Linux `SI_USER` (`0`) -- every signal this kernel delivers arrives via `kill`/`tkill`
+/// (never a real hardware fault turned into `SIGSEGV`/`SIGBUS`/... -- `page_fault_handler` just
+/// logs and reboots, see CLAUDE.md's memory-management section), so `SI_USER` is always the
+/// correct `si_code` regardless of which specific signal number it is. Real Linux would report
+/// `SI_TKILL` (`-6`) specifically for the `tkill`-delivered case, but `do_kill`/`take_deliverable_
+/// signal` don't distinguish how a signal was raised (self, `kill`, or `tkill` all funnel through
+/// the same `pending_signals` bitmask) -- a real, documented simplification, not an oversight.
+const SI_USER: i32 = 0;
+
+/// musl's own `mcontext_t` on x86_64 under `_GNU_SOURCE` (`third_party/musl/arch/x86_64/bits/
+/// signal.h`) -- the layout this kernel's actual userland (BusyBox, built with `-D_GNU_SOURCE`)
+/// compiles against. `gregs` is real -- populated from the interrupted syscall's own saved
+/// `SyscallFrame` below, the actual pre-signal machine state, not a placeholder. `fpregs`/
+/// `reserved1` are always `0`/`null` -- this kernel never saves FPU state anywhere (`src/cpu/
+/// fpu.rs`'s own documented gap), so there is no real value to point at.
+#[repr(C)]
+struct RawMcontext {
+    gregs: [i64; 23],
+    fpregs: u64,
+    reserved1: [u64; 8],
+}
+
+const _: () = assert!(core::mem::size_of::<RawMcontext>() == 256);
+
+/// Real Linux/x86_64 `REG_*` indices into `RawMcontext::gregs` (`third_party/musl/arch/x86_64/
+/// bits/signal.h`'s own `_GNU_SOURCE` enum).
+const REG_R8: usize = 0;
+const REG_R9: usize = 1;
+const REG_R10: usize = 2;
+const REG_R11: usize = 3;
+const REG_R12: usize = 4;
+const REG_R13: usize = 5;
+const REG_R14: usize = 6;
+const REG_R15: usize = 7;
+const REG_RDI: usize = 8;
+const REG_RSI: usize = 9;
+const REG_RBP: usize = 10;
+const REG_RBX: usize = 11;
+const REG_RDX: usize = 12;
+const REG_RAX: usize = 13;
+const REG_RCX: usize = 14;
+const REG_RSP: usize = 15;
+const REG_RIP: usize = 16;
+const REG_EFL: usize = 17;
+
+/// musl's own `stack_t`/`struct sigaltstack` on x86_64 -- `ss_sp` + `ss_flags` (padded to 8 bytes)
+/// + `ss_size`. Always zeroed: `sigaltstack(2)` itself isn't implemented yet (tracked in
+/// `docs/MISSING_POSIX_SYSCALLS.md`), so there is never a real alternate stack to report.
+#[repr(C)]
+struct RawStackT {
+    ss_sp: u64,
+    ss_flags: i32,
+    _pad: u32,
+    ss_size: u64,
+}
+
+/// musl's own `ucontext_t` on x86_64 under `_GNU_SOURCE` -- `uc_flags`/`uc_link`/`uc_stack`/
+/// `uc_mcontext`/`uc_sigmask`/`__fpregs_mem` in that order, 936 bytes total. Exists so a real
+/// `SA_SIGINFO` handler that dereferences its third argument gets a correctly-sized, correctly-
+/// shaped structure with real general-purpose-register values (see `RawMcontext` above) instead of
+/// faulting on `NULL` -- the gap this whole function used to document as unfixed.
+#[repr(C)]
+struct RawUcontext {
+    uc_flags: u64,
+    uc_link: u64,
+    uc_stack: RawStackT,
+    uc_mcontext: RawMcontext,
+    /// The real `blocked_signals` mask in effect *before* this handler's own extra `mask_to_add`
+    /// was applied (`stash_signal_context`'s own return value) -- matches real Linux's "the mask
+    /// the interrupted program was actually running under" semantics for `uc_sigmask`. Only the
+    /// first `u64` of the real 128-byte `sigset_t` is ever meaningful on this ABI (see
+    /// `do_sigprocmask`'s own doc comment for why) -- the rest is real zero padding, not truncated
+    /// data.
+    uc_sigmask: [u64; 16],
+    /// No real FPU state exists anywhere on this kernel to report -- always zeroed, same story as
+    /// `RawMcontext::fpregs` above.
+    fpregs_mem: [u64; 64],
+}
+
+const _: () = assert!(core::mem::size_of::<RawUcontext>() == 936);
+
 /// Checked once, at the tail of every completed syscall (see `syscall_dispatch` above): if the
 /// current process has a pending, unblocked signal, act on it now, right before control actually
 /// returns to userspace. Real Unix semantics for the same reason: a signal only ever "arrives"
@@ -402,12 +517,17 @@ fn do_sigreturn(frame: &mut SyscallFrame) {
 /// itself returns (via the trampoline `sa_restorer` names -- musl's own `__restore_rt`, patched to
 /// call `SYS_SIGRETURN` -- see `bits/syscall.h.in`'s own comment on the musl fork).
 ///
-/// Two known, deliberate simplifications:
-/// - **No `SA_SIGINFO` support.** A handler is always invoked as `void (*)(int)` (`rdi = signum`
-///   only, `rsi`/`rdx` zeroed) even if `SA_SIGINFO` was set and a real 3-argument
-///   `void (*)(int, siginfo_t *, void *)` handler was installed -- there's no `siginfo_t`/
-///   `ucontext_t` construction anywhere in this file. A real `SA_SIGINFO` handler that
-///   dereferences its `info`/`ucontext` arguments would fault on the `NULL` this hands it.
+/// **`SA_SIGINFO` is supported**: when the installed action has that flag set, the handler is
+/// invoked as a real 3-argument `void (*)(int, siginfo_t *, void *)` -- `rsi`/`rdx` point at a
+/// real, correctly-sized `RawSiginfo`/`RawUcontext` constructed on the handler's own stack frame
+/// (see those structs' own doc comments for exactly what is and isn't faithfully populated: real
+/// general-purpose registers and the real pre-handler `blocked_signals` mask, but no sender
+/// identity for `si_pid`/`si_uid` -- `pending_signals` is a plain bitmask with no sender attached)
+/// rather than the `NULL` this used to hand every such handler. Without `SA_SIGINFO`, the handler
+/// is still invoked the plain 1-argument way (`rdi = signum` only, `rsi`/`rdx` zeroed), matching
+/// real Unix's own distinction between the two handler shapes.
+///
+/// One known, deliberate simplification remains:
 /// - **`Process::signal_saved_frame` holds exactly one snapshot, not a real signal stack.** If a
 ///   *second*, different (unblocked) signal becomes deliverable while already inside a handler --
 ///   e.g. the handler itself issues a syscall, and that syscall's own tail finds another pending
@@ -435,17 +555,92 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
             handler,
             restorer,
             mask_to_add,
+            flags,
         } => {
             // Snapshotted *before* frame is mutated below -- this is the exact state the
-            // interrupted syscall was about to resume into.
-            crate::process::stash_signal_context(pid, *frame, mask_to_add);
+            // interrupted syscall was about to resume into. `old_mask` is what that state was
+            // actually running under -- what `uc_sigmask` reports below, for the SA_SIGINFO case.
+            let saved = *frame;
+            let old_mask = crate::process::stash_signal_context(pid, saved, mask_to_add);
 
             // 128 bytes of red-zone headroom (the interrupted code may have live data there,
-            // System V's own red-zone convention this ABI otherwise never has to think about),
-            // then 16-byte-align down, then back off 8 more bytes so the slot this writes to
-            // lands exactly where an ordinary `call`'s own implicit return-address push would --
-            // i.e. RSP%16==8 at the handler's own entry, matching System V's calling convention.
+            // System V's own red-zone convention this ABI otherwise never has to think about).
             let mut sp = frame.user_rsp.wrapping_sub(128);
+
+            let (siginfo_addr, ucontext_addr) = if flags & crate::process::SA_SIGINFO != 0 {
+                sp = sp.wrapping_sub(core::mem::size_of::<RawUcontext>() as u64);
+                sp &= !0xF;
+                let ucontext_addr = sp;
+
+                sp = sp.wrapping_sub(core::mem::size_of::<RawSiginfo>() as u64);
+                sp &= !0xF;
+                let siginfo_addr = sp;
+
+                let mut gregs = [0i64; 23];
+                gregs[REG_R8] = saved.r8 as i64;
+                gregs[REG_R9] = saved.r9 as i64;
+                gregs[REG_R10] = saved.r10 as i64;
+                gregs[REG_R11] = saved.r11 as i64;
+                gregs[REG_R12] = saved.r12 as i64;
+                gregs[REG_R13] = saved.r13 as i64;
+                gregs[REG_R14] = saved.r14 as i64;
+                gregs[REG_R15] = saved.r15 as i64;
+                gregs[REG_RDI] = saved.rdi as i64;
+                gregs[REG_RSI] = saved.rsi as i64;
+                gregs[REG_RBP] = saved.rbp as i64;
+                gregs[REG_RBX] = saved.rbx as i64;
+                gregs[REG_RDX] = saved.rdx as i64;
+                gregs[REG_RAX] = saved.rax as i64;
+                gregs[REG_RCX] = saved.rcx as i64;
+                gregs[REG_RSP] = saved.user_rsp as i64;
+                gregs[REG_RIP] = saved.rcx as i64; // rcx doubles as resume RIP, see SyscallFrame's own doc comment
+                gregs[REG_EFL] = saved.r11 as i64; // r11 doubles as resume RFLAGS, same story
+
+                let mut uc_sigmask = [0u64; 16];
+                uc_sigmask[0] = old_mask;
+
+                let ucontext = RawUcontext {
+                    uc_flags: 0,
+                    uc_link: 0,
+                    uc_stack: RawStackT {
+                        ss_sp: 0,
+                        ss_flags: 0,
+                        _pad: 0,
+                        ss_size: 0,
+                    },
+                    uc_mcontext: RawMcontext {
+                        gregs,
+                        fpregs: 0,
+                        reserved1: [0; 8],
+                    },
+                    uc_sigmask,
+                    fpregs_mem: [0; 64],
+                };
+                let siginfo = RawSiginfo {
+                    si_signo: signum as i32,
+                    si_code: SI_USER,
+                    si_errno: 0,
+                    _pad0: 0,
+                    si_pid: 0,
+                    si_uid: 0,
+                    si_value: 0,
+                    _tail: [0; 128 - 4 * 4 - 2 * 4 - 8],
+                };
+                // SAFETY: same known pointer-validation gap every other user-memory write in this
+                // file already has -- both addresses are derived from this process's own live
+                // user_rsp, and this process's own address space is the one currently active.
+                unsafe {
+                    (ucontext_addr as *mut RawUcontext).write_unaligned(ucontext);
+                    (siginfo_addr as *mut RawSiginfo).write_unaligned(siginfo);
+                }
+                (siginfo_addr, ucontext_addr)
+            } else {
+                (0, 0)
+            };
+
+            // 16-byte-align down, then back off 8 more bytes so the slot this writes to lands
+            // exactly where an ordinary `call`'s own implicit return-address push would -- i.e.
+            // RSP%16==8 at the handler's own entry, matching System V's calling convention.
             sp &= !0xF;
             sp = sp.wrapping_sub(8);
             // SAFETY: same known pointer-validation gap every other user-memory write in this
@@ -455,8 +650,8 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
             unsafe { (sp as *mut u64).write(restorer) };
 
             frame.rdi = signum;
-            frame.rsi = 0;
-            frame.rdx = 0;
+            frame.rsi = siginfo_addr;
+            frame.rdx = ucontext_addr;
             frame.rcx = handler; // resume RIP
             frame.r11 = crate::process::usermode::USER_RFLAGS; // resume RFLAGS
             frame.user_rsp = sp;

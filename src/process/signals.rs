@@ -284,6 +284,7 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
                     handler: handler_addr,
                     restorer: action.restorer,
                     mask_to_add,
+                    flags: action.flags,
                 });
             }
         }
@@ -293,14 +294,21 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
 /// Snapshots `saved` (the frame the interrupted syscall was about to resume into) and grows
 /// `blocked_signals` by `mask_to_add` for the handler's own duration — called by
 /// `deliver_pending_signal` right before it redirects the live frame into the handler itself.
-/// `take_signal_saved_frame` (below) is this operation's inverse, run by `sigreturn`.
-pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u64) {
+/// `take_signal_saved_frame` (below) is this operation's inverse, run by `sigreturn`. Returns the
+/// *pre*-mutation `blocked_signals` (the mask the interrupted program was actually running under)
+/// — `deliver_pending_signal`'s own `SA_SIGINFO` path uses this for the constructed `ucontext_t`'s
+/// `uc_sigmask`, matching real Linux's own "the mask in effect just before the handler was
+/// entered" semantics.
+pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u64) -> u64 {
     let mut table = PROCESS_TABLE.lock();
-    if let Some(proc) = table.get_mut(&pid) {
-        proc.signal_saved_blocked = proc.blocked_signals;
-        proc.blocked_signals |= mask_to_add;
-        proc.signal_saved_frame = Some(saved);
-    }
+    let Some(proc) = table.get_mut(&pid) else {
+        return 0;
+    };
+    let old_mask = proc.blocked_signals;
+    proc.signal_saved_blocked = old_mask;
+    proc.blocked_signals |= mask_to_add;
+    proc.signal_saved_frame = Some(saved);
+    old_mask
 }
 
 /// `sigreturn`'s real logic (`src/syscall.rs`'s `do_sigreturn` — kept here, not there, since it

@@ -187,6 +187,12 @@ impl SigAction {
 /// no observable effect on this kernel -- there's no blocking-syscall-restart machinery to hook it
 /// into).
 const SA_NODEFER: u64 = 0x40000000;
+/// `SA_SIGINFO` (real Linux/x86_64 value) -- consulted by `deliver_pending_signal`
+/// (`src/syscall/mod.rs`) to decide whether to invoke the handler as a real 3-argument
+/// `void (*)(int, siginfo_t *, void *)` (constructing a real `siginfo_t`/`ucontext_t` on the
+/// handler's own stack frame) or the plain 1-argument `void (*)(int)` form. See that function's
+/// own doc comment for what is and isn't faithfully populated.
+pub(crate) const SA_SIGINFO: u64 = 0x00000004;
 /// What `default_disposition` says happens to a signal nothing has installed a handler for (or
 /// that's been explicitly reset to `SIG_DFL`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,6 +233,9 @@ pub(crate) enum SignalDelivery {
         /// duration of the handler -- `action.mask` plus the signal's own bit, unless
         /// `SA_NODEFER` was set.
         mask_to_add: u64,
+        /// The installed `sa_flags`, forwarded so `deliver_pending_signal` can check
+        /// `SA_SIGINFO` without a second table lookup.
+        flags: u64,
     },
 }
 /// A process's own kernel stack: heap-allocated (not a fixed-size `static`/`static mut` array like

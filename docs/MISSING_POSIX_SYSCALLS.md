@@ -99,10 +99,38 @@ Four of the cheap, no-new-primitive entries from the table below now have real h
 | `sigpending` | `SYS_SIGPENDING = 494` | `modules/signal` → `sys_sigpending` → `process::do_sigpending` | Direct readback of the existing `pending_signals` bitmask. |
 | `fchdir` | `SYS_FCHDIR = 81` (real, unclaimed) | `modules/oxfs`'s `oxfs_fchdir` | Resolves the fd via the existing `resolve_write_fd_inode`, rejects non-directories with `ENOTDIR`, reuses `oxfs_chdir`'s own `set_current_cwd_real` tail. |
 
-Not yet built and verified end-to-end through a real `SYSCALL` (see this doc's own testing-discipline
-note below) — only fast, scoped `cargo check` on the individual module crates so far, plus a full
-`cargo build` kicked off separately. Update this note once a real syscall-smoke test exists per
-this codebase's own established pattern (`tests/*_syscall_smoke.rs` + `userland/*-syscall-smoke/`).
+`SYS_TKILL`/`SYS_TIMES`/`SYS_SIGPENDING`/`SYS_FCHDIR` were verified with a fast, scoped `cargo check`
+on the individual module crates plus a full `cargo build` (0 warnings, 0 errors, 27m01s — the musl
+header sweep's own rebuild cascade). `SYS_TKILL`/`SYS_SIGPENDING` additionally now have a real
+end-to-end `SYSCALL` smoke test (`tests/sa_siginfo_syscall_smoke.rs` +
+`userland/sa-siginfo-syscall-smoke/`, see immediately below — it exercises both directly). `SYS_TIMES`/
+`SYS_FCHDIR` still don't have a dedicated test of their own.
+
+**`SA_SIGINFO` handler invocation** (`src/syscall/mod.rs`'s `deliver_pending_signal`,
+`RawSiginfo`/`RawUcontext`/`RawMcontext`) is also now real, closing the "No `SA_SIGINFO` support"
+gap that function's own doc comment used to list. A handler installed with `SA_SIGINFO` is invoked
+as a genuine 3-argument `void (*)(int, siginfo_t *, void *)` — `rsi`/`rdx` point at a correctly
+sized/shaped `siginfo_t`/`ucontext_t` built on the handler's own stack frame, not `NULL`.
+Faithfully populated: `si_signo`, `si_code` (always `SI_USER` — every signal here arrives via
+`kill`/`tkill`, never a real hardware fault), the real general-purpose registers in
+`uc_mcontext.gregs` (from the interrupted syscall's own saved frame), and `uc_sigmask` (the real
+pre-handler `blocked_signals`). Honestly zeroed, not fabricated: `si_pid`/`si_uid` (no sender
+identity is tracked anywhere in `pending_signals`), `si_value` (nothing populates it until
+`sigqueue` itself has a handler — see below), FPU state (never saved anywhere on this kernel),
+`uc_stack` (`sigaltstack` isn't implemented). This needed **zero module-side changes** — `sigaction`
+already threaded `flags` through to `Process::sigactions`; only the kernel-resident delivery path
+needed to consult it.
+
+**Verified end-to-end**: `tests/sa_siginfo_syscall_smoke.rs` + `userland/sa-siginfo-syscall-smoke/`
+installs a real `SA_SIGINFO` handler for `SIGUSR1`, `tkill`s itself, and confirms — from inside the
+handler, into global statics — that `signum`/`si_signo`/`si_code`/a non-`NULL` `ucontext`/
+`uc_sigmask` all arrived correctly, then confirms (after the `tkill` syscall itself returns, proving
+a real `sigreturn` round trip actually resumed the interrupted instruction stream) that
+`sigpending()` no longer reports the signal. **Passes.** This also incidentally found a real,
+previously-only-theoretical bug: `elf.rs`'s "flags aren't unioned across `PT_LOAD` segments sharing
+a page" gap (already documented in CLAUDE.md) page-faulted this crate's very first static write,
+since it's the first userland crate with real writable globals — worked around at the linker-script
+level for this one crate, not fixed in `elf.rs` itself; see CLAUDE.md's own updated note on that gap.
 
 ## Missing, live caller confirmed
 
@@ -112,7 +140,7 @@ OxideBSD handler.
 | POSIX interface(s) | Backing syscall | Live caller | Suggested number | Notes |
 |---|---|---|---|---|
 | `sigtimedwait`, `sigwaitinfo` | `rt_sigtimedwait(2)` | `src/signal/sigtimedwait.c:19,22` | `495` (already remapped, see sweep above — no handler registered yet) | No blocking-on-signal primitive exists yet; would need a new `BlockReason` variant, more than a number remap. |
-| `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496` (already remapped, see sweep above — no handler registered yet) | Only 1-arg `void(*)(int)` handlers exist (per `modules/signal/`'s own scope note) — `sigqueue`'s payload (`union sigval`) has nowhere to go without `SA_SIGINFO` support first. |
+| `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496` (already remapped, see sweep above — no handler registered yet) | `SA_SIGINFO` handler invocation is now real (see "Implemented this session" above) — `RawSiginfo::si_value` already exists as a landing spot. Still needs: a real `SYS_SIGQUEUE` handler (currently unregistered), and `pending_signals` would need to grow from a plain bitmask into something that can carry one queued `union sigval` per signal number, since today's bitmask has nowhere to stash a payload between `do_kill`-style setting and `take_deliverable_signal`-style draining. |
 | `sigsuspend` | `rt_sigsuspend(2)` | `src/signal/sigsuspend.c:6` | real `130` (`__NR_rt_sigsuspend`, confirmed unclaimed) | Needs a real block/wake primitive tied to signal delivery, not just a number. |
 | `sigaltstack` | `sigaltstack(2)` | `src/signal/sigaltstack.c:19` | real `131` (`__NR_sigaltstack`, confirmed unclaimed) | Lower priority — `modules/signal/`'s own scope note already documents "no real signal stack" as a known gap (a second signal during handler execution overwrites `signal_saved_frame` rather than nesting); a real `sigaltstack` doesn't fix that by itself. |
 | `pause` | `pause(2)` | no direct `.c` call site found (likely inlined/aliased) | real `34` (`__NR_pause`, confirmed unclaimed) | Low priority — no confirmed live path in the current roster. |
