@@ -15,10 +15,21 @@ belong in this doc.
 before assigning any new number, grep `third_party/musl/arch/x86_64/bits/syscall.h.in` for a live
 `__NR_*` caller in `third_party/musl/src/`. If musl already calls a real, unremapped Linux number
 directly, use that number — don't invent one. Otherwise continue OxideBSD's own invented sequence
-from the current highest, **526** (see the full sweep below — this range moved twice in one session).
-This project has been bitten by number collisions twice before (`SYS_KILL`/real `setgroups`,
+from the current highest, **554** (see the full sweep below, then the planned-implementation-order
+pre-reservation batch further down — this range moved three times across two sessions). This
+project has been bitten by number collisions twice before (`SYS_KILL`/real `setgroups`,
 `__NR_getdents64` sibling) — and a great many more times, found and **fixed** by a full sweep of
 the header, documented below.
+
+**Deliberate exception to the discipline above, as of the batch in "Pre-reserved ahead of
+implementation" further down**: this project has since decided it doesn't want its own planned
+future syscalls sitting at borrowed real Linux numbers even when they're safely unclaimed today —
+OxideBSD is its own ABI, not obligated to reuse real Linux's numbering just because a slot happens
+to be free. So for syscalls with a **planned** implementation (not just a theoretical future one),
+claim a permanent OxideBSD-invented number now, ahead of writing the handler, rather than waiting
+until implementation time. This is a one-time cost (one musl-submodule bump, one full BusyBox
+relink) paid once for a whole batch, instead of once per syscall spread across future sessions —
+see that section for the full reasoning.
 
 ## Fixed: a full sweep of every real/invented numeric collision in the header
 
@@ -141,9 +152,9 @@ OxideBSD handler.
 |---|---|---|---|---|
 | `sigtimedwait`, `sigwaitinfo` | `rt_sigtimedwait(2)` | `src/signal/sigtimedwait.c:19,22` | `495` (already remapped, see sweep above — no handler registered yet) | No blocking-on-signal primitive exists yet; would need a new `BlockReason` variant, more than a number remap. |
 | `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496` (already remapped, see sweep above — no handler registered yet) | `SA_SIGINFO` handler invocation is now real (see "Implemented this session" above) — `RawSiginfo::si_value` already exists as a landing spot. Still needs: a real `SYS_SIGQUEUE` handler (currently unregistered), and `pending_signals` would need to grow from a plain bitmask into something that can carry one queued `union sigval` per signal number, since today's bitmask has nowhere to stash a payload between `do_kill`-style setting and `take_deliverable_signal`-style draining. |
-| `sigsuspend` | `rt_sigsuspend(2)` | `src/signal/sigsuspend.c:6` | real `130` (`__NR_rt_sigsuspend`, confirmed unclaimed) | Needs a real block/wake primitive tied to signal delivery, not just a number. |
-| `sigaltstack` | `sigaltstack(2)` | `src/signal/sigaltstack.c:19` | real `131` (`__NR_sigaltstack`, confirmed unclaimed) | Lower priority — `modules/signal/`'s own scope note already documents "no real signal stack" as a known gap (a second signal during handler execution overwrites `signal_saved_frame` rather than nesting); a real `sigaltstack` doesn't fix that by itself. |
-| `pause` | `pause(2)` | no direct `.c` call site found (likely inlined/aliased) | real `34` (`__NR_pause`, confirmed unclaimed) | Low priority — no confirmed live path in the current roster. |
+| `sigsuspend` | `rt_sigsuspend(2)` | `src/signal/sigsuspend.c:6` | `530` (pre-reserved, see "Pre-reserved ahead of implementation" below — no handler registered yet) | Needs a real block/wake primitive tied to signal delivery, not just a number. |
+| `sigaltstack` | `sigaltstack(2)` | `src/signal/sigaltstack.c:19` | `528` (pre-reserved, see below — no handler registered yet) | Lower priority — `modules/signal/`'s own scope note already documents "no real signal stack" as a known gap (a second signal during handler execution overwrites `signal_saved_frame` rather than nesting); a real `sigaltstack` doesn't fix that by itself. |
+| `pause` | `pause(2)` | no direct `.c` call site found (likely inlined/aliased) | `529` (pre-reserved, see below — no handler registered yet) | Low priority — no confirmed live path in the current roster. |
 
 ## Missing, POSIX-mandated, no live caller yet in ported userland
 
@@ -154,15 +165,15 @@ elsewhere.
 
 | POSIX interface(s) | Backing concept | Notes |
 |---|---|---|
-| `mq_open`, `mq_close`, `mq_unlink`, `mq_send`, `mq_receive`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getattr`, `mq_setattr` | POSIX message queues | Real Linux numbers `240-245`, confirmed unremapped/unclaimed. No seeded applet uses these; `src/fs/pipe.rs`'s existing blocking-buffer machinery (already reused for `socketpair`) is the natural backing if ever needed. |
-| `sem_init`, `sem_destroy`, `sem_wait`, `sem_trywait`, `sem_timedwait`, `sem_post`, `sem_getvalue` (unnamed semaphores) | futex-backed | Needs a real `futex(2)` first (see "structurally inapplicable" below for why that's currently out of scope) — blocked on the same prerequisite as thread sync primitives generally. |
-| `sem_open`, `sem_close`, `sem_unlink` (named semaphores) | `/dev/shm`-backed `open`+`mmap` | No live caller; would also want the `shm_open` path below first. |
-| `shm_open`, `shm_unlink` | POSIX shared memory | No live caller in roster. |
-| `shmget`, `shmat`, `shmctl`, `shmdt`, `msgget`, `msgctl`, `msgrcv`, `msgsnd`, `semget`, `semctl`, `semop` | SysV IPC | Real Linux numbers `29-31`/`64-68`, confirmed unremapped/unclaimed. `ipcrm`/`ipcs` were already cut from the BusyBox roster before v0.1 specifically because this doesn't exist — see CLAUDE.md's own gap-analysis table. |
-| `aio_read`, `aio_write`, `aio_fsync`, `aio_error`, `aio_return`, `aio_cancel`, `aio_suspend`, `lio_listio` | POSIX async I/O | On real Linux, musl implements these via a userspace thread pool (`src/aio/aio.c`), not a true async-I/O syscall — not meaningfully "missing" at the kernel level at all; would only become relevant once real threading exists. |
-| `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | POSIX per-process timers | Distinct from the already-implemented `setitimer`/`getitimer` (`ITIMER_REAL` only). No live caller confirmed; `timer_delete.c` does call `tkill` internally (see Priority 1 above) but only after a real `timer_create` has ever succeeded, which can't happen yet. |
-| `select`, `pselect` | fd readiness | `poll(2)` already exists and covers every confirmed live caller (musl's DNS resolver). `src/select/poll.c` doesn't route through `pselect6` on this build (confirmed: `SYS_poll` is used directly). The only BusyBox callers of raw `select` (`inetd`, `telnetd`, `dhcprelay`, `fdisk`, ...) are already cut from the roster. |
-| `getrandom` | `getrandom(2)` | Real Linux number `318`, confirmed unremapped/unclaimed. Only reachable via `getentropy()`, only reachable via BusyBox's `seedrng` applet — which doesn't even build here (missing `linux/random.h`). The synthetic `/dev/urandom` path already covers every currently-live need (see CLAUDE.md's "Real networking" gaps section). |
+| `mq_open`, `mq_close`, `mq_unlink`, `mq_send`, `mq_receive`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getattr`, `mq_setattr` | POSIX message queues | Pre-reserved at `536-541` (see "Pre-reserved ahead of implementation" below — no handler registered yet). No seeded applet uses these; `src/fs/pipe.rs`'s existing blocking-buffer machinery (already reused for `socketpair`) is the natural backing if ever needed. |
+| `sem_init`, `sem_destroy`, `sem_wait`, `sem_trywait`, `sem_timedwait`, `sem_post`, `sem_getvalue` (unnamed semaphores) | futex-backed | Needs a real `futex(2)` first (see "structurally inapplicable" below for why that's currently out of scope) — blocked on the same prerequisite as thread sync primitives generally. No distinct syscall of its own to reserve a number for — not part of the pre-reservation batch below. |
+| `sem_open`, `sem_close`, `sem_unlink` (named semaphores) | `/dev/shm`-backed `open`+`mmap` | No live caller; would also want the `shm_open` path below first. Not a distinct syscall either — not part of the pre-reservation batch below. |
+| `shm_open`, `shm_unlink` | POSIX shared memory | No live caller in roster. Implemented via plain `open`/`mkdir` on real Linux, not a distinct syscall — not part of the pre-reservation batch below. |
+| `shmget`, `shmat`, `shmctl`, `shmdt`, `msgget`, `msgctl`, `msgrcv`, `msgsnd`, `semget`, `semctl`, `semop`, `semtimedop` | SysV IPC | Pre-reserved at `542-553` (see "Pre-reserved ahead of implementation" below — no handler registered yet). `ipcrm`/`ipcs` were already cut from the BusyBox roster before v0.1 specifically because this doesn't exist — see CLAUDE.md's own gap-analysis table. |
+| `aio_read`, `aio_write`, `aio_fsync`, `aio_error`, `aio_return`, `aio_cancel`, `aio_suspend`, `lio_listio` | POSIX async I/O | On real Linux, musl implements these via a userspace thread pool (`src/aio/aio.c`), not a true async-I/O syscall — not meaningfully "missing" at the kernel level at all; would only become relevant once real threading exists. Not part of the pre-reservation batch below. |
+| `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | POSIX per-process timers | Pre-reserved at `531-535` (see "Pre-reserved ahead of implementation" below — no handler registered yet). Distinct from the already-implemented `setitimer`/`getitimer` (`ITIMER_REAL` only). No live caller confirmed; `timer_delete.c` does call `tkill` internally (see Priority 1 above) but only after a real `timer_create` has ever succeeded, which can't happen yet. |
+| `select`, `pselect` | fd readiness | `poll(2)` already exists and covers every confirmed live caller (musl's DNS resolver). `src/select/poll.c` doesn't route through `pselect6` on this build (confirmed: `SYS_poll` is used directly). The only BusyBox callers of raw `select` (`inetd`, `telnetd`, `dhcprelay`, `fdisk`, ...) are already cut from the roster. Not part of the pre-reservation batch below — genuinely not needed. |
+| `getrandom` | `getrandom(2)` | Pre-reserved at `526` (see "Pre-reserved ahead of implementation" below — no handler registered yet). Only reachable via `getentropy()`, only reachable via BusyBox's `seedrng` applet — which doesn't even build here (missing `linux/random.h`). The synthetic `/dev/urandom` path already covers every currently-live need (see CLAUDE.md's "Real networking" gaps section). |
 | `posix_spawn`, `posix_spawnp` + the `posix_spawnattr_*`/`posix_spawn_file_actions_*` family | process creation | musl implements `posix_spawn` entirely in userspace on top of `vfork`/`execve` (`src/process/posix_spawn.c`) — both of those already exist here (see CLAUDE.md's `vfork.s` note). Not a missing syscall at all, just unexercised library code. |
 | `fexecve` | `execveat`-style exec by fd | musl's `fexecve` falls back to `/proc/self/fd/<n>` + `execve` when `execveat` is unavailable — would work today given real per-fd `/proc` entries exist, modulo the "not a real symlink" limitation already documented in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_PROC` section. |
 
@@ -182,11 +193,45 @@ deferred exists.
 | `getlogin`, `getlogin_r`, `ttyname`, `ttyname_r`, `tcgetsid` | Real Linux backs these via `/proc/self/fd/N` symlink resolution + `ioctl(TIOCGSID)`-adjacent lookups against `utmp`, not a single dedicated syscall — `tcgetsid` specifically has no distinct number on this ABI at all (would fold into the existing `TIOCGPGRP`-style `SYS_IOCTL` gate, not a new registration). No live caller in the current roster. |
 | `pathconf`, `fpathconf`, `sysconf` (the syscall-shaped subset) | On real Linux these are pure libc constant tables, not syscalls at all — musl's own implementation never issues one. Not a gap; correctly out of scope for this doc. |
 
+## Pre-reserved ahead of implementation: a planned-implementation-order batch
+
+Distinct from the collision sweep above (that batch fixed real bugs — a still-real macro silently
+misrouting into an OxideBSD handler with mismatched arguments). **Nothing in this batch was
+colliding with anything** — every one of these 28 syscalls was already confirmed sitting at a
+safe, unclaimed real Linux value, and would have `ENOSYS`'d cleanly forever if left alone. This
+batch exists purely because of a deliberate architectural choice (see the numbering-discipline
+note at the top of this doc): OxideBSD is its own ABI, and syscalls it actually plans to implement
+shouldn't sit at borrowed real-Linux numbers just because the slot happened to be free — they get
+a permanent OxideBSD-invented number instead, claimed now, so the eventual implementation pass is
+a pure kernel-side change (register a handler at the already-claimed number) with **zero further
+musl-submodule edits**. Landed in one commit
+(`third_party/musl`'s `oxidebsd` branch, `bd7f66d3`) covering the whole batch at once — one
+submodule bump, one full BusyBox relink, instead of paying that cost once per syscall spread
+across future sessions.
+
+Numbers assigned in the batch's own planned implementation order (cheapest / most build on
+existing primitives first, most architecturally novel last):
+
+| Order | Number | Syscall | Old (real, unclaimed) value | Why this position |
+|---|---|---|---|---|
+| 1 | `526` | `getrandom` | `318` | Near-direct backing already exists (`src/random.rs`'s real ChaCha20 generator, already serving `/dev/urandom`). |
+| 2 | `527` | `sysinfo` | `99` | Non-POSIX footnote (see below) but same tier — honest all-zero-except-real-fields struct, same pattern as `getrusage`/`times`. |
+| 3 | `528` | `sigaltstack` | `131` | One small `Process` state addition. |
+| 4 | `529` | `pause` | `34` | Thin wrapper, reuses whatever primitive `sigsuspend` ends up needing. |
+| 5 | `530` | `sigsuspend` | `130` (`rt_sigsuspend`) | Needs a genuinely new block/wake-on-signal primitive, not just a state field. |
+| 6-10 | `531-535` | `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` | `222-226` | Natural extension of the already-implemented `setitimer`/`getitimer` infrastructure once per-timer-id tracking exists. |
+| 11-16 | `536-541` | `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/`mq_getsetattr` | `240-245` | Needs a new blocking primitive, but `src/fs/pipe.rs`'s existing blocking-buffer machinery (already reused for `socketpair`) is the natural backing. |
+| 17-28 | `542-553` | SysV IPC: `shmget`/`shmat`/`shmctl`/`shmdt`, `semget`/`semop`/`semctl`/`semtimedop`, `msgget`/`msgsnd`/`msgrcv`/`msgctl` | `29-31`/`64-71`/`220` | Biggest, most novel subsystem, no live caller today, and `ipcrm`/`ipcs` are already cut from the BusyBox roster — lowest priority of the batch. |
+
+No kernel-side handler exists for any of these 28 yet — this batch is purely the number
+reservation, matching the collision-sweep's own "safety fix, not a functional regression" framing
+above. Implementing any of them is separate future work.
+
 ## Non-POSIX interfaces worth a footnote
 
 `sysinfo(2)` isn't a POSIX interface at all (Linux-specific), but it's the confirmed live blocker
 for `free`/`uptime`'s primary numbers (`procps/{free,uptime}.c`) per prior research and
-`docs/BUSYBOX_APPLETS.md`'s own `NEEDS_PROC` section — real Linux number `99`, confirmed unclaimed
-by anything in this ABI today (double-checked directly above the `times`/`ptrace` collision this
-doc found). Tracked here for completeness since it'll come up in the same implementation pass as
-several POSIX entries above, not because it belongs in a POSIX-conformance doc on its own merits.
+`docs/BUSYBOX_APPLETS.md`'s own `NEEDS_PROC` section. Pre-reserved at `527` (see "Pre-reserved
+ahead of implementation" above) — previously sat at its real, unclaimed Linux number `99`. Tracked
+here for completeness since it'll come up in the same implementation pass as several POSIX entries
+above, not because it belongs in a POSIX-conformance doc on its own merits.
