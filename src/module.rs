@@ -831,6 +831,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::syscall::oxidebsd_sys_getrusage as *const () as u64)
         }
         "oxidebsd_sys_times" => Some(crate::syscall::oxidebsd_sys_times as *const () as u64),
+        "oxidebsd_sys_getrandom" => {
+            Some(crate::syscall::oxidebsd_sys_getrandom as *const () as u64)
+        }
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {

@@ -1280,6 +1280,36 @@ broke in three separately-real ways:
    bug 3's check ever got the chance to decide mount-vs-format. Fixed: an existing dev disk smaller
    than the current expected size gets grown in place (zeros appended, real bytes untouched).
 
+## Real `getrandom(2)`: first of the pre-reserved batch (`modules/posix_compat`, `src/syscall/ffi.rs`)
+
+`docs/MISSING_POSIX_SYSCALLS.md` tracks POSIX conformance beyond musl's live call graph, including
+a 28-syscall batch (`526`-`553`) pre-reserved with permanent OxideBSD-invented numbers ahead of
+having real handlers — see that doc's own "Pre-reserved ahead of implementation" section for why
+(this ABI doesn't want its own planned syscalls sitting at borrowed real-Linux numbers just because
+the slot happens to be free today). `getrandom` (`SYS_GETRANDOM = 526`) is item 1 of that batch and
+the first to get a real handler.
+
+- **Thin plumbing, no new primitive**: `modules/posix_compat`'s `handle_getrandom` →
+  `src/syscall/ffi.rs`'s `sys_getrandom` → `src/random.rs`'s `oxidebsd_random_bytes` — the same
+  generator already backing `/dev/random`/`/dev/urandom` (see that module's own doc comment for
+  the persistent entropy pool and the `RDRAND`/`RDSEED` hypervisor-distrust gate). Real
+  `(buf_ptr, buflen, flags)` wire format, no musl call-site patch needed beyond the number remap
+  already sitting in `bits/syscall.h.in`.
+- **Only reachable via `getentropy()`** in this port's roster (BusyBox's `seedrng` applet doesn't
+  build here — missing `linux/random.h`), which caps `len` at `256` and loops calling `getrandom()`
+  itself until satisfied — this handler can safely always fill the whole request in one shot
+  (never partial, never blocking; the generator itself never fails or waits on an entropy
+  threshold), so that loop always exits after its first iteration.
+- **`flags`** (`GRND_NONBLOCK`/`GRND_RANDOM`) are accepted but make no behavioral difference — no
+  blocking-on-low-entropy distinction exists to honor either against, matching `/dev/random`/
+  `/dev/urandom` already sharing one source. Any other bit is a real `EINVAL`.
+- Verified via `tests/getrandom_syscall_smoke.rs` + `userland/getrandom-syscall-smoke/` — a real
+  spawned ELF through genuine `SYSCALL`/`SYSRETQ` (`tests/random_smoke.rs` already covers the
+  generator's own cryptographic logic directly; this test's job is narrower — proving the syscall
+  plumbing and argument convention, the class of bug this codebase's musl-port section documents
+  catching repeatedly). Four parts: a real 32-byte request succeeds and isn't degenerate, two
+  consecutive requests differ, `len == 0` is a harmless no-op, and flag handling is correct.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a

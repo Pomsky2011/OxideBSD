@@ -143,6 +143,22 @@ a page" gap (already documented in CLAUDE.md) page-faulted this crate's very fir
 since it's the first userland crate with real writable globals — worked around at the linker-script
 level for this one crate, not fixed in `elf.rs` itself; see CLAUDE.md's own updated note on that gap.
 
+## Pre-reserved batch: first implementation
+
+Item 1 of the 28-syscall "pre-reserved ahead of implementation" batch further below now has a real
+handler:
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `getrandom` (only reachable via `getentropy()`) | `SYS_GETRANDOM = 526` | `modules/posix_compat` → `sys_getrandom` → `src/random.rs`'s existing generator | Real `(buf_ptr, buflen, flags)` wire format, no musl call-site patch needed. Delegates straight to the generator already backing `/dev/random`/`/dev/urandom` — inherits its persistent entropy pool and `RDRAND`/`RDSEED` hypervisor-distrust gate for free. `flags` outside real `GRND_NONBLOCK`/`GRND_RANDOM` is `EINVAL`; both accepted bits make no behavioral difference since this generator has no blocking-on-low-entropy distinction to honor them against. |
+
+**Verified end-to-end**: `tests/getrandom_syscall_smoke.rs` + `userland/getrandom-syscall-smoke/` —
+a real spawned ELF through genuine `SYSCALL`/`SYSRETQ` (not a plain Rust function call --
+`tests/random_smoke.rs` already covers the generator's own cryptographic logic directly, this test's
+job is proving the syscall plumbing itself). Four parts: a real 32-byte request succeeds and isn't
+degenerate, two consecutive requests differ, `len == 0` is a harmless no-op, and flag handling
+(`GRND_NONBLOCK`/`GRND_RANDOM` accepted, any other bit `EINVAL`) is correct. **Passes.**
+
 ## Missing, live caller confirmed
 
 Interfaces musl's own C source calls directly (grepped, not inferred) that have no registered
@@ -173,7 +189,6 @@ elsewhere.
 | `aio_read`, `aio_write`, `aio_fsync`, `aio_error`, `aio_return`, `aio_cancel`, `aio_suspend`, `lio_listio` | POSIX async I/O | On real Linux, musl implements these via a userspace thread pool (`src/aio/aio.c`), not a true async-I/O syscall — not meaningfully "missing" at the kernel level at all; would only become relevant once real threading exists. Not part of the pre-reservation batch below. |
 | `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | POSIX per-process timers | Pre-reserved at `531-535` (see "Pre-reserved ahead of implementation" below — no handler registered yet). Distinct from the already-implemented `setitimer`/`getitimer` (`ITIMER_REAL` only). No live caller confirmed; `timer_delete.c` does call `tkill` internally (see Priority 1 above) but only after a real `timer_create` has ever succeeded, which can't happen yet. |
 | `select`, `pselect` | fd readiness | `poll(2)` already exists and covers every confirmed live caller (musl's DNS resolver). `src/select/poll.c` doesn't route through `pselect6` on this build (confirmed: `SYS_poll` is used directly). The only BusyBox callers of raw `select` (`inetd`, `telnetd`, `dhcprelay`, `fdisk`, ...) are already cut from the roster. Not part of the pre-reservation batch below — genuinely not needed. |
-| `getrandom` | `getrandom(2)` | Pre-reserved at `526` (see "Pre-reserved ahead of implementation" below — no handler registered yet). Only reachable via `getentropy()`, only reachable via BusyBox's `seedrng` applet — which doesn't even build here (missing `linux/random.h`). The synthetic `/dev/urandom` path already covers every currently-live need (see CLAUDE.md's "Real networking" gaps section). |
 | `posix_spawn`, `posix_spawnp` + the `posix_spawnattr_*`/`posix_spawn_file_actions_*` family | process creation | musl implements `posix_spawn` entirely in userspace on top of `vfork`/`execve` (`src/process/posix_spawn.c`) — both of those already exist here (see CLAUDE.md's `vfork.s` note). Not a missing syscall at all, just unexercised library code. |
 | `fexecve` | `execveat`-style exec by fd | musl's `fexecve` falls back to `/proc/self/fd/<n>` + `execve` when `execveat` is unavailable — would work today given real per-fd `/proc` entries exist, modulo the "not a real symlink" limitation already documented in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_PROC` section. |
 
@@ -212,7 +227,9 @@ across future sessions.
 **Implementation order** (update the checkbox when a syscall in this batch gets a real kernel-side
 handler — this is the tracking list for the batch, not just historical numbering rationale):
 
-- [ ] 1. `getrandom` (`526`)
+- [x] 1. `getrandom` (`526`) — `modules/posix_compat`'s `handle_getrandom` -> `src/syscall/ffi.rs`'s
+      `sys_getrandom`, delegating to `src/random.rs`'s existing generator. Verified via
+      `tests/getrandom_syscall_smoke.rs` + `userland/getrandom-syscall-smoke/`.
 - [ ] 2. `sysinfo` (`527`)
 - [ ] 3. `sigaltstack` (`528`)
 - [ ] 4. `pause` (`529`)

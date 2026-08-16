@@ -96,6 +96,15 @@
 //! `setgroups(2)`'s unconditional `CAP_SYS_ADMIN` requirement, unlike `setuid`/`setgid`'s narrower
 //! "become yourself" allowance for non-root), doesn't touch the actual list at all since there's
 //! still no supplementary-group concept to store it in.
+//!
+//! `SYS_GETRANDOM = 526` is item 1 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
+//! "pre-reserved ahead of implementation" batch — the first one actually implemented. Matches real
+//! `getrandom(2)`'s exact `(buf_ptr, buflen, flags)` wire format, no argument-convention patch
+//! needed beyond the number remap already in `bits/syscall.h.in`. Real logic (`src/syscall/
+//! ffi.rs`'s `sys_getrandom`) is kernel-resident and delegates straight to `src/random.rs`'s
+//! existing SHA-256/ChaCha20 generator (the same one already backing `/dev/random`/`/dev/
+//! urandom`) — see that module's own doc comment for the persistent entropy pool and the
+//! hypervisor-distrust gate on `RDRAND`/`RDSEED` this syscall inherits for free.
 #![no_std]
 
 unsafe extern "C" {
@@ -137,6 +146,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_umask(new_mask: u64) -> i64;
     fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64;
     fn oxidebsd_sys_times(tms_ptr: u64) -> i64;
+    fn oxidebsd_sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -222,6 +232,14 @@ const SYS_GETRUSAGE: u64 = 491;
 /// process-resource-adjacent placement as `SYS_GETRUSAGE` just above (`src/syscall/ffi.rs`'s
 /// `sys_times`/`RawTms` for the real, honestly all-zero logic).
 const SYS_TIMES: u64 = 493;
+/// Item 1 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall "pre-reserved ahead of
+/// implementation" batch -- a permanent OxideBSD-invented number claimed before this handler
+/// existed (see that doc's own numbering-discipline note for why: this ABI doesn't want its own
+/// planned syscalls sitting at borrowed real-Linux numbers just because the slot happened to be
+/// free). Real logic (`src/syscall/ffi.rs`'s `sys_getrandom`, delegating to `src/random.rs`'s
+/// existing generator) is kernel-resident, same reasoning as everything else this module only
+/// ever calls through to.
+const SYS_GETRANDOM: u64 = 526;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -364,6 +382,10 @@ extern "C" fn handle_times(tms_ptr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_times(tms_ptr) }
 }
 
+extern "C" fn handle_getrandom(buf_ptr: u64, buflen: u64, flags: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_getrandom(buf_ptr, buflen, flags) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -400,9 +422,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_UMASK, handle_umask);
         oxidebsd_register_syscall(SYS_GETRUSAGE, handle_getrusage);
         oxidebsd_register_syscall(SYS_TIMES, handle_times);
+        oxidebsd_register_syscall(SYS_GETRANDOM, handle_getrandom);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM)\n",
     );
     0
 }

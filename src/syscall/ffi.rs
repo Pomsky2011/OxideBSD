@@ -804,6 +804,36 @@ pub(crate) fn sys_times(tms_ptr: u64) -> Result<u64, u64> {
     Ok(crate::cpu::interrupts::ticks())
 }
 
+/// Real `getrandom(2)`'s `GRND_NONBLOCK`/`GRND_RANDOM` flag bits -- not syscall numbers, no
+/// remapping needed.
+const GRND_NONBLOCK: u64 = 0x0001;
+const GRND_RANDOM: u64 = 0x0002;
+
+/// `SYS_GETRANDOM` (`526`, pre-reserved ahead of implementation in
+/// `docs/MISSING_POSIX_SYSCALLS.md` -- item 1 of that doc's own 28-syscall planned-
+/// implementation-order batch) -- real `getrandom(2)`'s exact `(buf_ptr, buflen, flags)` wire
+/// format (`third_party/musl/src/linux/getrandom.c` is a bare 3-argument `syscall_cp`, no
+/// call-site patch needed beyond the number remap already in `bits/syscall.h.in`). Only reachable
+/// via `getentropy()` in this port's own roster (BusyBox's `seedrng` applet doesn't build here --
+/// missing `linux/random.h`) -- and `third_party/musl/src/misc/getentropy.c` caps `len` at `256`
+/// itself and loops calling `getrandom()` until satisfied, so this handler can safely always fill
+/// the whole request in one shot: never partial, never blocking. `src/random.rs`'s own generator
+/// never fails or waits on an entropy-availability threshold (see that module's own doc comment
+/// on why `/dev/random`/`/dev/urandom` already share one source), so that loop always exits after
+/// its first iteration here -- matching real `getrandom(2)`'s contract in the only case that
+/// actually matters to any live caller.
+///
+/// `flags` are accepted but make no difference to the output for the same reason -- no
+/// blocking-on-low-entropy distinction exists to honor `GRND_NONBLOCK` against, and `GRND_RANDOM`
+/// (draw from `/dev/random`'s pool specifically) is moot when both device nodes are already the
+/// same source. Any bit outside that pair is a real `EINVAL`, matching real Linux.
+pub(crate) fn sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> Result<u64, u64> {
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM) != 0 {
+        return Err(EINVAL);
+    }
+    Ok(crate::random::oxidebsd_random_bytes(buf_ptr, buflen) as u64)
+}
+
 /// musl's own `struct timespec` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
 /// timespec` template, `time_t`/`long` both 8 bytes on this arch): two `i64`s, no padding.
 #[repr(C)]
@@ -1160,6 +1190,10 @@ pub(crate) extern "C" fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i6
 
 pub(crate) extern "C" fn oxidebsd_sys_times(tms_ptr: u64) -> i64 {
     result_to_ffi(sys_times(tms_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> i64 {
+    result_to_ffi(sys_getrandom(buf_ptr, buflen, flags))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_execve(
