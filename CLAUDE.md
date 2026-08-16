@@ -1015,9 +1015,31 @@ triggers without the functions under test ever running outside a real syscall.
   `.expect()`-panicking on an already-removed buffer); a synthetic `/dev/{u}random,null,zero`
   path (`modules/oxfs`'s `dev_open`) backed by **`src/random.rs`** — a real SHA-256(RustCrypto
   `sha2`)-seeded ChaCha20(RustCrypto `chacha20`) generator, not a throwaway PRNG (deliberate: gathers
-  `RDTSC`/PIT/RTC/a call counter/a stack address/`RDRAND` when available, hashes into a 32-byte
-  key, generates output as a ChaCha20 keystream under an all-zero nonce — safe since a key is never
-  reused). Both crates need `default-features = false` + soft-float-equivalent backend flags for
+  `RDTSC`/PIT/RTC/a call counter/a stack address/`RDRAND`+`RDSEED` when available, hashes into a
+  32-byte key, generates output as a ChaCha20 keystream under an all-zero nonce — safe since a key
+  is never reused, guaranteed by a strictly-monotonic call counter folded into every seed). **Also
+  gains a real, persistent `ENTROPY_POOL`** (`spin::Mutex<[u8;32]>`, `without_interrupts`-guarded
+  against the single-core IRQ-vs-syscall-context deadlock the same way `scheduler.rs`/`vga.rs`
+  already are) — the original per-call-only design left the generator with almost nothing
+  genuinely hard to predict under QEMU/TCG without `RDRAND` (RTC has 1s granularity, PIT ticks are
+  a fixed 100 Hz, the stack-address sample is near-constant call to call). `mix_entropy` folds real
+  externally-triggered IRQ timing jitter (the exact `RDTSC` value a keyboard or rtl8139 IRQ
+  happened to land at) into the pool from those two handlers' own call sites — deliberately not the
+  periodic timer IRQ, too predictable and too hot to be worth the lock traffic. `gather_seed` folds
+  the pool into every output and re-mixes it with a fresh `RDTSC` sample in the same critical
+  section, so it keeps evolving even across calls with no intervening IRQ activity. Still an honest
+  gap: a pool starts all-zero, so the very first read at boot (before any keystroke/packet) still
+  leans on the original weak per-call sources — this raises the floor for sustained use, not that
+  first call. **`RDRAND`/`RDSEED` are only trusted on real bare metal** — both VT-x and SVM let a
+  hypervisor trap either instruction and substitute any value it wants while the guest still sees
+  a clean success, undetectable from inside the guest; `CPUID` reporting the instruction supported
+  only proves the physical CPU has it, not that the specific hypervisor is passing it through
+  honestly. `running_under_hypervisor()` checks the standard "hypervisor present" bit (`CPUID`
+  leaf `1`, `ECX` bit `31`) and both `rdrand_available`/`rdseed_available` treat the instruction as
+  unavailable whenever it's set — under any detected hypervisor, including this project's own QEMU
+  dev/test loop (QEMU sets this bit regardless of the `-accel kvm`/`-accel tcg` backend), the
+  `ENTROPY_POOL` IRQ-jitter accumulation is the real floor instead, never a possibly-fabricated
+  hardware DRNG value. Both crates need `default-features = false` + soft-float-equivalent backend flags for
   this SSE-disabled target (`sha2`'s `force-soft` feature, `chacha20`'s `--cfg
   chacha20_backend="soft"` via `.cargo/config.toml` rustflags). Finally, a real `tcp_read` EOF-vs-
   empty bug (see gotcha 3 above). `SYS_READV=153` (`native_abi`, mirrors `SYS_WRITEV` for the

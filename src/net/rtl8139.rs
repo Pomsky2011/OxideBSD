@@ -77,14 +77,19 @@ fn rtl8139_irq_handler() {
     if io_base == 0 {
         return;
     }
+    let isr: u16;
     unsafe {
-        let isr = Port::<u16>::new(io_base + REG_ISR).read();
+        isr = Port::<u16>::new(io_base + REG_ISR).read();
         // Write-1-to-clear, and must happen before this handler returns: EOI to the PIC only
         // tells the *controller* the CPU is ready for another interrupt, it doesn't touch the
         // NIC's own cause bits -- leaving them set means the NIC re-fires the same cause
         // immediately once EOI reopens the line, an interrupt storm.
         Port::<u16>::new(io_base + REG_ISR).write(isr);
     }
+    // Real, externally-triggered timing jitter (a network frame's arrival, at whatever exact
+    // cycle count it happened to land) -- feeds `src/random.rs`'s persistent entropy pool. No
+    // heap allocation, matching this handler's own existing constraint.
+    crate::random::mix_entropy(isr as u64);
     RX_IRQ_FIRED.store(true, Ordering::Relaxed);
 }
 

@@ -269,6 +269,11 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // acknowledged at the hardware level, and it's only ever read here.
     let scancode: u8 = unsafe { port.read() };
 
+    // Real, externally-triggered timing jitter (a human keystroke, at whatever exact cycle count
+    // it happened to land) -- feeds `src/random.rs`'s persistent entropy pool. Unconditional, not
+    // gated on how the scancode later decodes, so every keyboard IRQ contributes.
+    crate::random::mix_entropy(scancode as u64);
+
     let mut keyboard = KEYBOARD.lock();
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode)
         && let Some(key) = keyboard.process_keyevent(key_event)
