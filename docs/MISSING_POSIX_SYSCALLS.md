@@ -209,6 +209,38 @@ musl-submodule edits**. Landed in one commit
 submodule bump, one full BusyBox relink, instead of paying that cost once per syscall spread
 across future sessions.
 
+**Implementation order** (update the checkbox when a syscall in this batch gets a real kernel-side
+handler — this is the tracking list for the batch, not just historical numbering rationale):
+
+- [ ] 1. `getrandom` (`526`)
+- [ ] 2. `sysinfo` (`527`)
+- [ ] 3. `sigaltstack` (`528`)
+- [ ] 4. `pause` (`529`)
+- [ ] 5. `sigsuspend` (`530`)
+- [ ] 6. `timer_create` (`531`)
+- [ ] 7. `timer_settime` (`532`)
+- [ ] 8. `timer_gettime` (`533`)
+- [ ] 9. `timer_getoverrun` (`534`)
+- [ ] 10. `timer_delete` (`535`)
+- [ ] 11. `mq_open` (`536`)
+- [ ] 12. `mq_unlink` (`537`)
+- [ ] 13. `mq_timedsend` (`538`)
+- [ ] 14. `mq_timedreceive` (`539`)
+- [ ] 15. `mq_notify` (`540`)
+- [ ] 16. `mq_getsetattr` (`541`)
+- [ ] 17. `shmget` (`542`)
+- [ ] 18. `shmat` (`543`)
+- [ ] 19. `shmctl` (`544`)
+- [ ] 20. `shmdt` (`545`)
+- [ ] 21. `semget` (`546`)
+- [ ] 22. `semop` (`547`)
+- [ ] 23. `semctl` (`548`)
+- [ ] 24. `semtimedop` (`549`)
+- [ ] 25. `msgget` (`550`)
+- [ ] 26. `msgsnd` (`551`)
+- [ ] 27. `msgrcv` (`552`)
+- [ ] 28. `msgctl` (`553`)
+
 Numbers assigned in the batch's own planned implementation order (cheapest / most build on
 existing primitives first, most architecturally novel last):
 
