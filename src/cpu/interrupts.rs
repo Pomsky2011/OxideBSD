@@ -229,6 +229,22 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
                 crate::process::scheduler::enqueue_ready(pid);
             }
 
+            // Real `mq_timedsend`/`mq_timedreceive` deadline expiry (`crate::fs::mqueue`) -- same
+            // "IRQ handler reaches directly into `process::table()`" shape `Sleeping` just above
+            // already established; `u64::MAX` (the plain `mq_send`/`mq_receive` wrapper's "no
+            // timeout" case) never realistically matches `now` within this kernel's lifetime, so
+            // no separate `Option`-typed deadline is needed. `do_mq_timedsend`/`do_mq_timedreceive`
+            // re-check the real condition after waking, same discipline `Sleeping` establishes.
+            if let crate::process::ProcState::Blocked(
+                crate::process::BlockReason::WaitingForMqData(_, deadline)
+                | crate::process::BlockReason::WaitingForMqSpace(_, deadline),
+            ) = proc.state
+                && now >= deadline
+            {
+                proc.state = crate::process::ProcState::Ready;
+                crate::process::scheduler::enqueue_ready(pid);
+            }
+
             // `SYS_SETITIMER`'s `ITIMER_REAL` expiry (also backs real `alarm()`, a thin musl-side
             // wrapper around it -- see `process::do_setitimer`'s own doc comment). Just sets the
             // pending bit, the same simple, already-established pattern `process::do_kill`'s own

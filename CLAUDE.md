@@ -1280,15 +1280,47 @@ broke in three separately-real ways:
    bug 3's check ever got the chance to decide mount-vs-format. Fixed: an existing dev disk smaller
    than the current expected size gets grown in place (zeros appended, real bytes untouched).
 
-## Real `getrandom(2)`/`sysinfo(2)`/`sigaltstack(2)`/`pause(2)`: first four of the pre-reserved batch (`modules/posix_compat`, `modules/signal`, `src/syscall/ffi.rs`, `src/process/signals.rs`)
+## Real `getrandom(2)`/`sysinfo(2)`/`sigaltstack(2)`/`pause(2)`/`sigsuspend(2)`/POSIX timers/POSIX message queues: items 1-16 of the pre-reserved batch (`modules/posix_compat`, `modules/signal`, `modules/clock`, `src/syscall/ffi.rs`, `src/process/signals.rs`, `src/process/timers.rs`, `src/fs/mqueue.rs`)
 
 `docs/MISSING_POSIX_SYSCALLS.md` tracks POSIX conformance beyond musl's live call graph, including
 a 28-syscall batch (`526`-`553`) pre-reserved with permanent OxideBSD-invented numbers ahead of
 having real handlers — see that doc's own "Pre-reserved ahead of implementation" section for why
 (this ABI doesn't want its own planned syscalls sitting at borrowed real-Linux numbers just because
-the slot happens to be free today). `getrandom` (`SYS_GETRANDOM = 526`), `sysinfo`
-(`SYS_SYSINFO = 527`), `sigaltstack` (`SYS_SIGALTSTACK = 528`), and `pause` (`SYS_PAUSE = 529`) are
-items 1-4 of that batch, all now with real handlers.
+the slot happens to be free today, and for the full per-item implementation write-up/test list this
+section only summarizes). Items 1-16 of 28 now have real handlers, in real POSIX implementation
+order:
+
+- **1-4**: `getrandom` (`526`), `sysinfo` (`527`), `sigaltstack` (`528`), `pause` (`529`) — thin
+  plumbing (`getrandom`/`sysinfo`/`sigaltstack`) plus `pause`'s own new block/wake-on-signal
+  primitive (`BlockReason::WaitingForSignal`).
+- **5**: `sigsuspend` (`530`) — reuses `pause`'s primitive plus a temporary `blocked_signals` swap,
+  restored via `Process::sigsuspend_restore_mask` once `deliver_pending_signal` knows how the woken
+  signal resolved.
+- **6-10**: `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`
+  (`531`-`535`, `src/process/timers.rs`) — real per-process POSIX timers (`Process::posix_timers`,
+  up to `MAX_POSIX_TIMERS = 8`), relative and `TIMER_ABSTIME` arming against
+  `CLOCK_MONOTONIC`/`CLOCK_REALTIME`, real overrun accounting, delivered from
+  `interrupts::timer_interrupt_handler` alongside the existing `ITIMER_REAL` scan. Not inherited by
+  `fork`; disarmed and deleted by `execve`.
+- **11-16**: `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/`mq_getsetattr`
+  (`536`-`541`, `src/fs/mqueue.rs`) — real POSIX message queues, a separate name→queue namespace
+  (not backed by `oxfs`), real priority-ordered delivery, real bounded blocking send/receive with a
+  real `TIMER_ABSTIME`-shaped deadline (`BlockReason::WaitingForMqData`/`WaitingForMqSpace`, woken
+  either by the matching send/receive or by the same timer-IRQ deadline scan the POSIX-timer batch
+  added), and real `mq_notify`/`SIGEV_SIGNAL` delivery via `process::do_kill` directly (no bespoke
+  delivery path — `do_kill` already performs no permission check for any signal). `mq_close` isn't
+  its own syscall: real `mq_close(3)` is a bare `syscall(SYS_close, mqd)`, so an mqd rides the
+  ordinary `crate::fs::fd` registry exactly like a pipe/socketpair end.
+  `third_party/musl/src/mq/mq_timedsend.c`/`mq_timedreceive.c` needed a real call-site patch (
+  `oxidebsd` branch) — real Linux needs 5 syscall args and this ABI only carries 4, so `mqd`/`len`
+  are packed into one register (high 32 bits = `len`, low 32 bits = `mqd`) rather than the usual
+  "drop a redundant argument" trick, since nothing here is redundant to drop.
+
+Items 17-28 (SysV IPC: `shmget`/`shmat`/`shmctl`/`shmdt`, `semget`/`semop`/`semctl`/`semtimedop`,
+`msgget`/`msgsnd`/`msgrcv`/`msgctl`, `542`-`553`) remain unimplemented — the biggest, most novel
+remaining subsystem, no live caller today, lowest priority of the batch. See
+`docs/MISSING_POSIX_SYSCALLS.md`'s own "Pre-reserved ahead of implementation" section for the
+tracking checklist.
 
 - **`getrandom`, thin plumbing, no new primitive**: `modules/posix_compat`'s `handle_getrandom` →
   `src/syscall/ffi.rs`'s `sys_getrandom` → `src/random.rs`'s `oxidebsd_random_bytes` — the same

@@ -287,7 +287,7 @@ fn ticks_to_timespec(ticks: u64) -> (i64, i64) {
 /// count. A target already in the past (delta `<= 0`) collapses to "fire on the very next timer
 /// IRQ" (`now_ticks`) rather than underflowing, matching real semantics for an already-elapsed
 /// absolute deadline.
-fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
+pub(crate) fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
     let hz = crate::cpu::pit::TIMER_HZ as u64;
     let frac_ticks = (nsec as u64 * hz).div_ceil(1_000_000_000);
     let now_ticks = crate::cpu::interrupts::ticks();

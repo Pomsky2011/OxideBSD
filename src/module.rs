@@ -857,6 +857,22 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_timer_delete" => {
             Some(crate::syscall::oxidebsd_sys_timer_delete as *const () as u64)
         }
+        "oxidebsd_sys_mq_open" => Some(crate::syscall::oxidebsd_sys_mq_open as *const () as u64),
+        "oxidebsd_sys_mq_unlink" => {
+            Some(crate::syscall::oxidebsd_sys_mq_unlink as *const () as u64)
+        }
+        "oxidebsd_sys_mq_timedsend" => {
+            Some(crate::syscall::oxidebsd_sys_mq_timedsend as *const () as u64)
+        }
+        "oxidebsd_sys_mq_timedreceive" => {
+            Some(crate::syscall::oxidebsd_sys_mq_timedreceive as *const () as u64)
+        }
+        "oxidebsd_sys_mq_notify" => {
+            Some(crate::syscall::oxidebsd_sys_mq_notify as *const () as u64)
+        }
+        "oxidebsd_sys_mq_getsetattr" => {
+            Some(crate::syscall::oxidebsd_sys_mq_getsetattr as *const () as u64)
+        }
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {

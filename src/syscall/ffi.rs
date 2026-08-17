@@ -1336,6 +1336,83 @@ pub(crate) extern "C" fn oxidebsd_sys_timer_delete(timerid: u64) -> i64 {
     ))
 }
 
+/// `SYS_MQ_OPEN = 536` through `SYS_MQ_GETSETATTR = 541` (registered by `modules/posix_compat`,
+/// items 11-16 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved batch) -- real
+/// POSIX message queues, built on `crate::fs::mqueue`. See that module's own doc comment for the
+/// full wire-format/blocking/notify design.
+pub(crate) fn sys_mq_open(name_ptr: u64, flags: u64, mode: u64, attr_ptr: u64) -> Result<u64, u64> {
+    crate::fs::mqueue::do_mq_open(name_ptr, flags, mode, attr_ptr)
+}
+
+pub(crate) fn sys_mq_unlink(name_ptr: u64) -> Result<u64, u64> {
+    crate::fs::mqueue::do_mq_unlink(name_ptr)
+}
+
+pub(crate) fn sys_mq_timedsend(
+    mqd_and_len: u64,
+    msg_ptr: u64,
+    prio: u64,
+    at_ptr: u64,
+) -> Result<u64, u64> {
+    crate::fs::mqueue::do_mq_timedsend(mqd_and_len, msg_ptr, prio, at_ptr)
+}
+
+pub(crate) fn sys_mq_timedreceive(
+    mqd_and_len: u64,
+    msg_ptr: u64,
+    prio_ptr: u64,
+    at_ptr: u64,
+) -> Result<u64, u64> {
+    crate::fs::mqueue::do_mq_timedreceive(mqd_and_len, msg_ptr, prio_ptr, at_ptr)
+}
+
+pub(crate) fn sys_mq_notify(mqd: u64, sev_ptr: u64) -> Result<u64, u64> {
+    crate::fs::mqueue::do_mq_notify(mqd, sev_ptr)
+}
+
+pub(crate) fn sys_mq_getsetattr(mqd: u64, new_ptr: u64, old_ptr: u64) -> Result<u64, u64> {
+    crate::fs::mqueue::do_mq_getsetattr(mqd, new_ptr, old_ptr)
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mq_open(
+    name_ptr: u64,
+    flags: u64,
+    mode: u64,
+    attr_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_mq_open(name_ptr, flags, mode, attr_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mq_unlink(name_ptr: u64) -> i64 {
+    result_to_ffi(sys_mq_unlink(name_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mq_timedsend(
+    mqd_and_len: u64,
+    msg_ptr: u64,
+    prio: u64,
+    at_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_mq_timedsend(mqd_and_len, msg_ptr, prio, at_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mq_timedreceive(
+    mqd_and_len: u64,
+    msg_ptr: u64,
+    prio_ptr: u64,
+    at_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_mq_timedreceive(mqd_and_len, msg_ptr, prio_ptr, at_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mq_notify(mqd: u64, sev_ptr: u64) -> i64 {
+    result_to_ffi(sys_mq_notify(mqd, sev_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mq_getsetattr(mqd: u64, new_ptr: u64, old_ptr: u64) -> i64 {
+    result_to_ffi(sys_mq_getsetattr(mqd, new_ptr, old_ptr))
+}
+
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/
 /// `do_getpid`/`do_mmap`/`do_munmap`/`do_brk` for `modules/native_abi/` to call — same pattern as
 /// the exit/read/write adapters above, real logic kept kernel-side since module code can't use

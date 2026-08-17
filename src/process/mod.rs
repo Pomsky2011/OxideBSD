@@ -140,6 +140,22 @@ pub enum BlockReason {
     /// reaches directly into `process::table()`" shape `WaitingForChild`/`WaitingForPipeData`
     /// already established.
     WaitingForSignal,
+    /// Blocked in `crate::fs::mqueue`'s `do_mq_timedreceive` on an empty queue, still bounded by a
+    /// real deadline (identified by mq id, same convention `WaitingForPipeData`'s pipe id already
+    /// establishes) -- `u64::MAX` means "no timeout" (the plain `mq_receive()` wrapper, which
+    /// always passes a null `at`). Woken either by `do_mq_timedsend` inserting into a
+    /// previously-empty queue, or by `interrupts::timer_interrupt_handler`'s own deadline scan
+    /// once `now >= deadline` -- the same dual "another schedulable process's syscall" /
+    /// "timer IRQ reaches directly into `process::table()`" shape `Sleeping` already established,
+    /// just combined into one wait instead of split across two distinct primitives. A wake from
+    /// either source just flips this back to `Ready`; `do_mq_timedreceive`'s own loop re-checks
+    /// the real condition (message available, or deadline passed) from scratch either way, same
+    /// "never trust state==Ready alone" discipline every other blocking primitive here follows.
+    WaitingForMqData(u64, u64),
+    /// The write-side counterpart to `WaitingForMqData` -- blocked in `do_mq_timedsend` on a full
+    /// queue. Same id/deadline convention, woken by `do_mq_timedreceive` draining a message or by
+    /// the same timer-IRQ deadline scan.
+    WaitingForMqSpace(u64, u64),
 }
 /// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
 /// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own

@@ -236,6 +236,49 @@ slots are in use plus slot reuse after `timer_delete`; and `EINVAL` for an out-o
 already-deleted `timerid` across all four of `timer_settime`/`timer_gettime`/`timer_getoverrun`/
 `timer_delete`. **Passes.**
 
+## Pre-reserved batch: third implementation
+
+Items 11-16 of the 28-syscall "pre-reserved ahead of implementation" batch above -- the real POSIX
+message-queue sub-batch -- now have real handlers too, closing out the whole batch's first three
+sub-batches (SysV IPC, items 17-28, remains unimplemented).
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `mq_open` (also backs `mq_send`/`mq_receive`/`mq_getattr`'s own `mqd_t`) | `SYS_MQ_OPEN = 536` | `modules/posix_compat` -> `src/syscall/ffi.rs`'s `sys_mq_open` -> `src/fs/mqueue.rs`'s `do_mq_open` | Real `(name, flags, mode, attr)` wire format, no musl call-site patch needed -- `name` is a raw NUL-terminated pointer (not this codebase's usual length-prefixed convention: real `mq_open(2)` already fills all 4 register slots, leaving no room for a `path_len`, and real Linux doesn't length-prefix it either). A real, separate name -> queue namespace (`NAMES`/`QUEUES`), not backed by `oxfs`. Returns a real fd from `crate::fs::fd` -- an mqd rides the ordinary fd registry exactly like a pipe/socketpair end, since real `mq_close(3)` is a bare `syscall(SYS_close, mqd)` (no distinct `mq_close` number exists in this batch). |
+| `mq_unlink` | `SYS_MQ_UNLINK = 537` | `do_mq_unlink` | Real `(name)` wire format, no patch needed. Removes the name immediately; the queue itself survives until every open descriptor closes, matching real POSIX. |
+| `mq_timedsend` (also backs `mq_send`) | `SYS_MQ_TIMEDSEND = 538` | `do_mq_timedsend` | Real Linux needs 5 syscall args (`mqd, msg, len, prio, at`); this ABI only carries 4. `third_party/musl/src/mq/mq_timedsend.c` is patched (`oxidebsd` branch) to pack `mqd`/`len` into one register (high 32 = len, low 32 = mqd) rather than dropping an argument the way `utimensat` drops its always-`AT_FDCWD` `fd` -- nothing here is redundant to drop. Real priority-ordered insertion (highest priority first, FIFO among ties), a real bounded block (`BlockReason::WaitingForMqSpace`) once `mq_maxmsg` is reached, real `EMSGSIZE` past `mq_msgsize`, and real `mq_notify` delivery on an empty-to-non-empty transition with no receiver already waiting. |
+| `mq_timedreceive` (also backs `mq_receive`) | `SYS_MQ_TIMEDRECEIVE = 539` | `do_mq_timedreceive` | Same 4-register packing as `mq_timedsend`. Real blocking (`BlockReason::WaitingForMqData`) on an empty queue, real `EMSGSIZE` if the caller's buffer is smaller than the queue's own `mq_msgsize`, real priority readback via the (optional) `prio_ptr` out-argument. |
+| `mq_notify` | `SYS_MQ_NOTIFY = 540` | `do_mq_notify` | Real `(mqd, sev_ptr)` wire format, no patch needed (`third_party/musl/src/mq/mq_notify.c` issues this raw syscall directly for every notify kind except `SIGEV_THREAD`, which never reaches the syscall boundary at all -- handled entirely in userspace over a real `AF_NETLINK` socket this port doesn't have). `SIGEV_SIGNAL` delivery reuses `process::do_kill` directly (no permission check to bypass, real disposition-respecting delivery) rather than a bespoke path. `SIGEV_THREAD`/`SIGEV_THREAD_ID` are real `EINVAL`. `si_value` is read but never delivered -- same already-documented gap `sigqueue`'s own "Missing, live caller confirmed" entry below has (`pending_signals` has nowhere to carry a payload). |
+| `mq_getsetattr` (also backs `mq_getattr`/`mq_setattr`) | `SYS_MQ_GETSETATTR = 541` | `do_mq_getsetattr` | Real `(mqd, new, old)` wire format, no patch needed. Only `mq_flags`'s `O_NONBLOCK` bit is actually settable (`mq_maxmsg`/`mq_msgsize` are fixed at creation and silently ignored if passed in `new`, matching real Linux); `old` is always filled with the queue's real current state (`mq_curmsgs` included). |
+
+Real timeout support falls out of a genuine new dual-wake shape: `BlockReason::WaitingForMqData`/
+`WaitingForMqSpace` carry a deadline (`u64::MAX` for the plain, non-timed `mq_send`/`mq_receive`
+wrapper's null-`at` case -- never realistically reached within this kernel's lifetime, so no
+`Option` wrapper is needed), woken either by the matching send/receive draining the condition or by
+`interrupts::timer_interrupt_handler`'s own deadline scan (extended alongside its existing
+`Sleeping`/`real_timer_deadline`/`posix_timers` checks). `resolve_deadline` converts the `at`
+`timespec` via `process::abstime_to_ticks` (now `pub(crate)`, reused from the per-process-timer
+batch above), always against `CLOCK_REALTIME` -- real POSIX `mq_timedsend`/`mq_timedreceive`'s own
+timeout is never configurable the way `timer_settime`'s `clockid` is.
+
+Two hard caps this port enforces that real Linux doesn't (no privileged-override/`rlimit`-driven
+ceiling exists here): `mq_maxmsg <= 256`, `mq_msgsize <= 65536` -- `EINVAL` past either. Each queue
+is a plain heap-backed `Vec`, not block-allocator-bounded the way `oxfs` is; an unbounded
+`maxmsg * msgsize` would be the same "unbounded heap growth reachable from userspace" bug
+`fs/pipe.rs`'s own `PIPE_CAPACITY` was already added to close for pipes.
+
+**Verified end-to-end**: `tests/mq_syscall_smoke.rs` + `userland/mq-syscall-smoke/` -- same real-
+`SYSCALL` pattern. Eight parts: `O_CREAT | O_EXCL` open then a real `EEXIST`/`ENOENT`; priority-
+ordered delivery (three sends at priorities `1, 5, 1` come back `5, 1, 1`); `EMSGSIZE` both
+directions; filling to `mq_maxmsg` then a real `O_NONBLOCK` `EAGAIN`, confirmed by an
+`mq_getsetattr` readback of `mq_curmsgs`/`mq_maxmsg`/`mq_msgsize`/`mq_flags`; a real
+`TIMER_ABSTIME`-shaped deadline actually expiring `ETIMEDOUT`; a real block/wake pair across
+`fork()` (the parent genuinely blocks in `mq_timedreceive` on an empty queue, forcing the freshly
+forked child to run, which sends the message that wakes it); `mq_notify`/`SIGEV_SIGNAL` firing
+exactly once on an empty-to-non-empty transition with nothing already blocked, then *not* firing
+again on a second send (one-shot, nothing re-registered); and `mq_unlink` removing the name while
+the already-open descriptor keeps working, torn down via a real `close()`. **Passes.**
+
 ## Missing, live caller confirmed
 
 Interfaces musl's own C source calls directly (grepped, not inferred) that have no registered
@@ -331,12 +374,12 @@ handler — this is the tracking list for the batch, not just historical numberi
 - [x] 8. `timer_gettime` (`533`)
 - [x] 9. `timer_getoverrun` (`534`)
 - [x] 10. `timer_delete` (`535`)
-- [ ] 11. `mq_open` (`536`)
-- [ ] 12. `mq_unlink` (`537`)
-- [ ] 13. `mq_timedsend` (`538`)
-- [ ] 14. `mq_timedreceive` (`539`)
-- [ ] 15. `mq_notify` (`540`)
-- [ ] 16. `mq_getsetattr` (`541`)
+- [x] 11. `mq_open` (`536`)
+- [x] 12. `mq_unlink` (`537`)
+- [x] 13. `mq_timedsend` (`538`)
+- [x] 14. `mq_timedreceive` (`539`)
+- [x] 15. `mq_notify` (`540`)
+- [x] 16. `mq_getsetattr` (`541`)
 - [ ] 17. `shmget` (`542`)
 - [ ] 18. `shmat` (`543`)
 - [ ] 19. `shmctl` (`544`)

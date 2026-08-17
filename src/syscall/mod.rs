@@ -129,6 +129,25 @@ pub(crate) const ELOOP: u64 = 40;
 /// Returned by `process::do_pause` once a deliverable signal wakes it -- real `pause(2)`'s only
 /// possible return value. `4`, identical on Linux/BSD/musl, no divergence to worry about.
 pub(crate) const EINTR: u64 = 4;
+/// Returned by `crate::fs::mqueue`'s `do_mq_open` (no `O_CREAT`, name not found) / `do_mq_unlink`
+/// (name not found). `2`, identical on Linux/BSD/musl.
+pub(crate) const ENOENT: u64 = 2;
+/// Returned by `crate::fs::mqueue`'s `do_mq_open` (`O_CREAT | O_EXCL` against an already-existing
+/// name). `17`, identical on Linux/BSD/musl.
+pub(crate) const EEXIST: u64 = 17;
+/// Returned by `crate::fs::mqueue`'s `do_mq_notify` when a second process tries to register a
+/// notification while one is already live -- real POSIX `mq_notify(3)`'s own documented error for
+/// this case. `16`, identical on Linux/BSD/musl.
+pub(crate) const EBUSY: u64 = 16;
+/// Returned by `crate::fs::mqueue`'s `do_mq_timedsend` (message longer than the queue's own
+/// `mq_msgsize`) / `do_mq_timedreceive` (caller's buffer shorter than it). `90`, matching musl's
+/// own compiled-in value -- same "must match musl's macro, not a real-BSD nod" reasoning
+/// `EPROTONOSUPPORT`/`EAGAIN` above already establish.
+pub(crate) const EMSGSIZE: u64 = 90;
+/// Returned by `crate::fs::mqueue`'s `do_mq_timedsend`/`do_mq_timedreceive` once a real
+/// `TIMER_ABSTIME`-style deadline (the `at` argument) passes while still blocked. `110`, matching
+/// musl's own compiled-in value, same reasoning as `EMSGSIZE` just above.
+pub(crate) const ETIMEDOUT: u64 = 110;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
