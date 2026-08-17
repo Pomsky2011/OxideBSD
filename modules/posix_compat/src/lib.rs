@@ -167,6 +167,10 @@ unsafe extern "C" {
     ) -> i64;
     fn oxidebsd_sys_mq_notify(mqd: u64, sev_ptr: u64) -> i64;
     fn oxidebsd_sys_mq_getsetattr(mqd: u64, new_ptr: u64, old_ptr: u64) -> i64;
+    fn oxidebsd_sys_msgget(key: u64, flag: u64) -> i64;
+    fn oxidebsd_sys_msgsnd(q: u64, m: u64, len: u64, flag: u64) -> i64;
+    fn oxidebsd_sys_msgrcv(q_and_flag: u64, m: u64, len: u64, msgtyp: u64) -> i64;
+    fn oxidebsd_sys_msgctl(q: u64, cmd: u64, buf_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -275,6 +279,14 @@ const SYS_MQ_TIMEDSEND: u64 = 538;
 const SYS_MQ_TIMEDRECEIVE: u64 = 539;
 const SYS_MQ_NOTIFY: u64 = 540;
 const SYS_MQ_GETSETATTR: u64 = 541;
+/// Items 25-28, last sub-batch of the same 28-syscall pre-reserved batch -- real SysV message
+/// queues, see `src/fs/sysv_msg.rs`'s own doc comment (`crate::fs::sysv_msg`, kernel-resident
+/// since this module can't use `alloc`) for the real logic and how it differs from the POSIX
+/// `mq_*` family just above.
+const SYS_MSGGET: u64 = 550;
+const SYS_MSGSND: u64 = 551;
+const SYS_MSGRCV: u64 = 552;
+const SYS_MSGCTL: u64 = 553;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -454,6 +466,22 @@ extern "C" fn handle_mq_getsetattr(mqd: u64, new_ptr: u64, old_ptr: u64, _a3: u6
     unsafe { oxidebsd_sys_mq_getsetattr(mqd, new_ptr, old_ptr) }
 }
 
+extern "C" fn handle_msgget(key: u64, flag: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_msgget(key, flag) }
+}
+
+extern "C" fn handle_msgsnd(q: u64, m: u64, len: u64, flag: u64) -> i64 {
+    unsafe { oxidebsd_sys_msgsnd(q, m, len, flag) }
+}
+
+extern "C" fn handle_msgrcv(q_and_flag: u64, m: u64, len: u64, msgtyp: u64) -> i64 {
+    unsafe { oxidebsd_sys_msgrcv(q_and_flag, m, len, msgtyp) }
+}
+
+extern "C" fn handle_msgctl(q: u64, cmd: u64, buf_ptr: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_msgctl(q, cmd, buf_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -498,9 +526,13 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MQ_TIMEDRECEIVE, handle_mq_timedreceive);
         oxidebsd_register_syscall(SYS_MQ_NOTIFY, handle_mq_notify);
         oxidebsd_register_syscall(SYS_MQ_GETSETATTR, handle_mq_getsetattr);
+        oxidebsd_register_syscall(SYS_MSGGET, handle_msgget);
+        oxidebsd_register_syscall(SYS_MSGSND, handle_msgsnd);
+        oxidebsd_register_syscall(SYS_MSGRCV, handle_msgrcv);
+        oxidebsd_register_syscall(SYS_MSGCTL, handle_msgctl);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL)\n",
     );
     0
 }

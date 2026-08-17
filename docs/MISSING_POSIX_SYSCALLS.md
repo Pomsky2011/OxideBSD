@@ -279,6 +279,50 @@ exactly once on an empty-to-non-empty transition with nothing already blocked, t
 again on a second send (one-shot, nothing re-registered); and `mq_unlink` removing the name while
 the already-open descriptor keeps working, torn down via a real `close()`. **Passes.**
 
+## Pre-reserved batch: fourth implementation
+
+Items 25-28 of the 28-syscall "pre-reserved ahead of implementation" batch above -- the real SysV
+message-queue sub-batch -- now have real handlers too. Implemented out of the batch's own planned
+order (ahead of items 17-24, the shm/sem sub-batches) since it's the more directly useful half of
+SysV IPC and shares no code with the shm/sem work.
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `msgget` | `SYS_MSGGET = 550` | `modules/posix_compat` -> `src/syscall/ffi.rs`'s `sys_msgget` -> `src/fs/sysv_msg.rs`'s `do_msgget` | Real `(key, flag)` wire format, no musl call-site patch needed. A fundamentally different lifecycle from `crate::fs::mqueue`'s POSIX message queues (see that module's own doc comment for the contrast): identified by an integer `key_t` via a separate `KEYS`/`QUEUES` namespace, `IPC_PRIVATE` always allocates a fresh unfindable-by-key queue, real `IPC_CREAT`/`IPC_EXCL` semantics. Returns a bare integer id, not a real fd -- no `crate::fs::fd` involvement at all (a SysV queue has no "open"/"close" step; it lives from `msgget` until an explicit `msgctl(IPC_RMID)`). |
+| `msgsnd` | `SYS_MSGSND = 551` | `do_msgsnd` | Real `(q, m, len, flag)` wire format, already fits this ABI's 4 real register args, no patch needed. `m` points at a real `{long mtype; char mtext[len];}` buffer; `mtype < 1` is `EINVAL`. Real bounded blocking (`BlockReason::WaitingForSysvMsgSend`) once the queue's own `qbytes` cap is reached, `IPC_NOWAIT` `EAGAIN` otherwise; `len` alone exceeding `qbytes` is `EINVAL` (can never fit regardless of occupancy). Real `ipc_perm` rwx-style permission check (`check_access`), same shape a file's own mode bits use. |
+| `msgrcv` | `SYS_MSGRCV = 552` | `do_msgrcv` | Real Linux needs 5 syscall args (`q, m, len, type, flag`); this ABI only carries 4. `third_party/musl/src/ipc/msgrcv.c` is patched (`oxidebsd` branch) to pack `q`/`flag` into one register (high 32 = flag, low 32 = q), same shape `mq_timedsend`/`mq_timedreceive`'s own patches already established. Real `msgtyp` selection matching `msgrcv(2)`'s exact documented semantics -- `0` = oldest message any type, `> 0` = oldest message of that exact type (or, with `MSG_EXCEPT`, oldest message of any *other* type), `< 0` = among messages with `mtype <= |msgtyp|`, the oldest message of the *smallest* such type (`find_matching_index`). Real `E2BIG`/`MSG_NOERROR`: a message peeked (not yet removed) that's too big for the caller's buffer without `MSG_NOERROR` returns `E2BIG` **without consuming the message** -- found live during this session's own testing, not preemptively: an earlier draft removed the message before checking size, silently destroying it on a failed receive. Real bounded blocking (`BlockReason::WaitingForSysvMsgRecv`), `IPC_NOWAIT` `ENOMSG` otherwise. |
+| `msgctl` | `SYS_MSGCTL = 553`, last of the batch | `do_msgctl` | Real `(q, cmd, buf)` wire format, no patch needed. `cmd` always arrives with real glibc/musl's `IPC_64` bit (`0x100`) OR'd in (`third_party/musl/src/ipc/msgctl.c`'s own `IPC_CMD()` macro) -- masked off before matching. `IPC_STAT` (real permission-checked readback, including live `cbytes`/`qnum` computed fresh), `IPC_SET` (owner/creator/root only -- a stricter check than plain write permission, real SysV distinction from `msgsnd`/`msgrcv`'s rwx check), `IPC_RMID` (owner/creator/root only; removes the queue and wakes every blocked sender/receiver, which each re-check `QUEUES` from scratch and find the id gone -- real `EIDRM`, no distinct wake signal needed). `MSG_STAT`/`MSG_STAT_ANY`/`IPC_INFO`/`MSG_INFO` (real `/proc`-introspection-shaped commands) are honest `EINVAL` -- no live caller, not silently no-op'd. |
+
+**Real, not honest-zero, timestamps**: `stime`/`rtime`/`ctime` are real `crate::cpu::rtc::
+unix_epoch_seconds()` reads at creation and every successful `msgsnd`/`msgrcv`/`msgctl(IPC_SET)` --
+cheap (the same CMOS read `CLOCK_REALTIME` already uses) and meaningfully more useful than a
+placeholder for a struct whose whole job is reporting these three timestamps, a deliberate
+departure from the "honest zero" tier `RawRusage`/`RawTms`/`RawSysinfo` use for concepts this
+kernel genuinely doesn't track at all.
+
+**No timeout concept, unlike the POSIX `mq_*` batch**: real `msgsnd`/`msgrcv` only ever block
+indefinitely or (`IPC_NOWAIT`) fail immediately -- no `semtimedop`-style deadline argument exists
+to plumb through, so no timer-IRQ deadline scan was needed here the way the POSIX-timer/`mq_*`
+batches needed one.
+
+`RawIpcPerm`/`RawMsqidDs` (48/120 bytes) were verified via a direct `musl-gcc`/`sizeof`/`offsetof`
+probe against musl's real `struct ipc_perm`/`struct msqid_ds` on this arch, same rigor
+`RawSysinfo` already established, rather than assumed from Rust `repr(C)` layout rules alone.
+
+**Verified end-to-end**: `tests/sysv_msg_syscall_smoke.rs` + `userland/sysv-msg-syscall-smoke/` --
+same real-`SYSCALL` pattern. Seven parts: `IPC_CREAT | IPC_EXCL` then a real `EEXIST`/`ENOENT`; a
+plain send/receive round trip preserving `mtype`; real `msgtyp` selection (positive exact match out
+of FIFO order, negative smallest-type-within-bound, zero FIFO-any, plus `MSG_EXCEPT`); real
+`E2BIG` that doesn't consume the message, then a `MSG_NOERROR` receive that does (truncated);
+`msgctl(IPC_SET)` shrinking `qbytes` then a real `EINVAL`/`IPC_NOWAIT` `EAGAIN`/`IPC_NOWAIT`
+`ENOMSG`; a real block/wake pair across `fork()` (the parent genuinely blocks in `msgrcv` on an
+empty queue, forcing the freshly forked child to run, which sends the message that wakes it); and
+`msgctl(IPC_STAT)` reporting real state followed by `IPC_RMID` and confirmation that
+`msgsnd`/`msgrcv`/`msgctl` against the removed `msqid` are all real `EIDRM`. **Passes.**
+
+This brings the batch to 20 of 28 items done (1-16, 25-28) -- only the shm/sem sub-batches (items
+17-24, `542-549`) remain, the biggest and most novel remaining subsystem with no live caller today.
+
 ## Missing, live caller confirmed
 
 Interfaces musl's own C source calls directly (grepped, not inferred) that have no registered
@@ -388,10 +432,10 @@ handler — this is the tracking list for the batch, not just historical numberi
 - [ ] 22. `semop` (`547`)
 - [ ] 23. `semctl` (`548`)
 - [ ] 24. `semtimedop` (`549`)
-- [ ] 25. `msgget` (`550`)
-- [ ] 26. `msgsnd` (`551`)
-- [ ] 27. `msgrcv` (`552`)
-- [ ] 28. `msgctl` (`553`)
+- [x] 25. `msgget` (`550`)
+- [x] 26. `msgsnd` (`551`)
+- [x] 27. `msgrcv` (`552`)
+- [x] 28. `msgctl` (`553`)
 
 Numbers assigned in the batch's own planned implementation order (cheapest / most build on
 existing primitives first, most architecturally novel last):

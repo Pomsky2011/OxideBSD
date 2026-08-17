@@ -1280,15 +1280,16 @@ broke in three separately-real ways:
    bug 3's check ever got the chance to decide mount-vs-format. Fixed: an existing dev disk smaller
    than the current expected size gets grown in place (zeros appended, real bytes untouched).
 
-## Real `getrandom(2)`/`sysinfo(2)`/`sigaltstack(2)`/`pause(2)`/`sigsuspend(2)`/POSIX timers/POSIX message queues: items 1-16 of the pre-reserved batch (`modules/posix_compat`, `modules/signal`, `modules/clock`, `src/syscall/ffi.rs`, `src/process/signals.rs`, `src/process/timers.rs`, `src/fs/mqueue.rs`)
+## Real `getrandom(2)`/`sysinfo(2)`/`sigaltstack(2)`/`pause(2)`/`sigsuspend(2)`/POSIX timers/POSIX message queues/SysV message queues: items 1-16 and 25-28 of the pre-reserved batch (`modules/posix_compat`, `modules/signal`, `modules/clock`, `src/syscall/ffi.rs`, `src/process/signals.rs`, `src/process/timers.rs`, `src/fs/mqueue.rs`, `src/fs/sysv_msg.rs`)
 
 `docs/MISSING_POSIX_SYSCALLS.md` tracks POSIX conformance beyond musl's live call graph, including
 a 28-syscall batch (`526`-`553`) pre-reserved with permanent OxideBSD-invented numbers ahead of
 having real handlers — see that doc's own "Pre-reserved ahead of implementation" section for why
 (this ABI doesn't want its own planned syscalls sitting at borrowed real-Linux numbers just because
 the slot happens to be free today, and for the full per-item implementation write-up/test list this
-section only summarizes). Items 1-16 of 28 now have real handlers, in real POSIX implementation
-order:
+section only summarizes). Items 1-16 and 25-28 of 28 now have real handlers (25-28 implemented
+ahead of 17-24's own planned order — the more directly useful, code-independent half of SysV IPC),
+in real POSIX/SysV implementation order:
 
 - **1-4**: `getrandom` (`526`), `sysinfo` (`527`), `sigaltstack` (`528`), `pause` (`529`) — thin
   plumbing (`getrandom`/`sysinfo`/`sigaltstack`) plus `pause`'s own new block/wake-on-signal
@@ -1315,11 +1316,27 @@ order:
   `oxidebsd` branch) — real Linux needs 5 syscall args and this ABI only carries 4, so `mqd`/`len`
   are packed into one register (high 32 bits = `len`, low 32 bits = `mqd`) rather than the usual
   "drop a redundant argument" trick, since nothing here is redundant to drop.
+- **25-28**: `msgget`/`msgsnd`/`msgrcv`/`msgctl` (`550`-`553`, `src/fs/sysv_msg.rs`) — real SysV
+  message queues, a genuinely different subsystem from `mq_*` above despite the similar name: an
+  integer-`key_t`-addressed, fd-less namespace (`msgget` returns a bare id, not a real fd — no
+  `crate::fs::fd` involvement at all; a queue lives from `msgget` until an explicit
+  `msgctl(IPC_RMID)`, not tied to any process closing anything), real `ipc_perm` rwx-style
+  permission checks on `msgsnd`/`msgrcv` plus a stricter owner/creator/root check on
+  `msgctl(IPC_SET/IPC_RMID)`, real `msgtyp` selection semantics (positive exact match, negative
+  smallest-type-within-bound, zero FIFO-any, `MSG_EXCEPT`), and real (not honest-zero) `stime`/
+  `rtime`/`ctime` off `crate::cpu::rtc::unix_epoch_seconds()`. No timeout concept exists in real
+  `msgsnd`/`msgrcv` at all (unlike `mq_timedsend`), so no timer-IRQ deadline scan was needed here.
+  `third_party/musl/src/ipc/msgrcv.c` needed the same kind of call-site patch as `mq_timedreceive`
+  (5 real args, packs `q`/`flag` into one register). **A real bug found and fixed during this
+  session's own testing**: an early draft removed a matched message from the queue *before*
+  checking whether the caller's buffer was big enough, silently destroying it on a real `E2BIG` —
+  fixed by peeking the message's length first and only removing it once actually returning
+  successfully, matching real Linux's "a too-big message stays queued for a retry" semantics.
 
-Items 17-28 (SysV IPC: `shmget`/`shmat`/`shmctl`/`shmdt`, `semget`/`semop`/`semctl`/`semtimedop`,
-`msgget`/`msgsnd`/`msgrcv`/`msgctl`, `542`-`553`) remain unimplemented — the biggest, most novel
-remaining subsystem, no live caller today, lowest priority of the batch. See
-`docs/MISSING_POSIX_SYSCALLS.md`'s own "Pre-reserved ahead of implementation" section for the
+Items 17-24 (SysV shm/sem: `shmget`/`shmat`/`shmctl`/`shmdt`, `semget`/`semop`/`semctl`/
+`semtimedop`, `542`-`549`) remain unimplemented — the biggest, most novel remaining subsystem, no
+live caller today, lowest priority of the batch. See `docs/MISSING_POSIX_SYSCALLS.md`'s own
+"Pre-reserved ahead of implementation" section for the
 tracking checklist.
 
 - **`getrandom`, thin plumbing, no new primitive**: `modules/posix_compat`'s `handle_getrandom` →

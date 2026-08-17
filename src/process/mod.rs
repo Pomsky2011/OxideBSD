@@ -156,6 +156,16 @@ pub enum BlockReason {
     /// queue. Same id/deadline convention, woken by `do_mq_timedreceive` draining a message or by
     /// the same timer-IRQ deadline scan.
     WaitingForMqSpace(u64, u64),
+    /// Blocked in `crate::fs::sysv_msg`'s `do_msgsnd` on a real SysV message queue (`msgget`/
+    /// `msgctl`, not `crate::fs::mqueue`'s POSIX one) that's currently at its own `qbytes` limit
+    /// -- identified by `msqid`, real Linux's own SysV IPC id, not a `crate::fs::fd` real_fd (a
+    /// SysV queue has no fd at all, see that module's own doc comment). No deadline -- real
+    /// `msgsnd`/`msgrcv` only ever block indefinitely or fail immediately (`IPC_NOWAIT`), unlike
+    /// `mq_timedsend`'s real timeout.
+    WaitingForSysvMsgSend(u64),
+    /// The read-side counterpart to `WaitingForSysvMsgSend` -- blocked in `do_msgrcv` with no
+    /// message matching its own real `msgtyp` selection available yet.
+    WaitingForSysvMsgRecv(u64),
 }
 /// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
 /// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own

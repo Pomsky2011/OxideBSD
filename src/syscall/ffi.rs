@@ -1413,6 +1413,48 @@ pub(crate) extern "C" fn oxidebsd_sys_mq_getsetattr(mqd: u64, new_ptr: u64, old_
     result_to_ffi(sys_mq_getsetattr(mqd, new_ptr, old_ptr))
 }
 
+/// `SYS_MSGGET = 550` through `SYS_MSGCTL = 553` (registered by `modules/posix_compat`, items
+/// 25-28 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved batch -- the last
+/// sub-batch) -- real SysV message queues, built on `crate::fs::sysv_msg`. See that module's own
+/// doc comment for the full wire-format/permission/blocking design, and how it differs from
+/// `crate::fs::mqueue`'s POSIX message queues.
+pub(crate) fn sys_msgget(key: u64, flag: u64) -> Result<u64, u64> {
+    crate::fs::sysv_msg::do_msgget(key, flag)
+}
+
+pub(crate) fn sys_msgsnd(q: u64, m: u64, len: u64, flag: u64) -> Result<u64, u64> {
+    crate::fs::sysv_msg::do_msgsnd(q, m, len, flag)
+}
+
+pub(crate) fn sys_msgrcv(q_and_flag: u64, m: u64, len: u64, msgtyp: u64) -> Result<u64, u64> {
+    crate::fs::sysv_msg::do_msgrcv(q_and_flag, m, len, msgtyp)
+}
+
+pub(crate) fn sys_msgctl(q: u64, cmd: u64, buf_ptr: u64) -> Result<u64, u64> {
+    crate::fs::sysv_msg::do_msgctl(q, cmd, buf_ptr)
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_msgget(key: u64, flag: u64, _a2: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_msgget(key, flag))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_msgsnd(q: u64, m: u64, len: u64, flag: u64) -> i64 {
+    result_to_ffi(sys_msgsnd(q, m, len, flag))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_msgrcv(
+    q_and_flag: u64,
+    m: u64,
+    len: u64,
+    msgtyp: u64,
+) -> i64 {
+    result_to_ffi(sys_msgrcv(q_and_flag, m, len, msgtyp))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_msgctl(q: u64, cmd: u64, buf_ptr: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_msgctl(q, cmd, buf_ptr))
+}
+
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/
 /// `do_getpid`/`do_mmap`/`do_munmap`/`do_brk` for `modules/native_abi/` to call — same pattern as
 /// the exit/read/write adapters above, real logic kept kernel-side since module code can't use

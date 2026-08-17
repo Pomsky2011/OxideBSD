@@ -148,6 +148,23 @@ pub(crate) const EMSGSIZE: u64 = 90;
 /// `TIMER_ABSTIME`-style deadline (the `at` argument) passes while still blocked. `110`, matching
 /// musl's own compiled-in value, same reasoning as `EMSGSIZE` just above.
 pub(crate) const ETIMEDOUT: u64 = 110;
+/// Returned by `crate::fs::sysv_msg`'s permission checks (`msgsnd`/`msgrcv` against the real
+/// `ipc_perm` rwx-style bits, `msgctl`'s `IPC_SET`/`IPC_RMID` against owner/creator/root). `13`,
+/// identical on Linux/BSD/musl.
+pub(crate) const EACCES: u64 = 13;
+/// Returned by `crate::fs::sysv_msg`'s `msgsnd` (a message longer than the queue's own hard
+/// `msgmax` cap -- a single message can never fit regardless of queue occupancy) / `msgrcv` (the
+/// received message is longer than the caller's buffer and `MSG_NOERROR` wasn't set). `7`,
+/// matching musl's own compiled-in value, same "must match musl's macro, not a real-BSD nod"
+/// reasoning `EPROTONOSUPPORT`/`EAGAIN` above already establish.
+pub(crate) const E2BIG: u64 = 7;
+/// Returned by `crate::fs::sysv_msg`'s `msgrcv` for a real `IPC_NOWAIT` call with no matching
+/// message available. `42`, matching musl's own compiled-in value, same reasoning as `E2BIG`.
+pub(crate) const ENOMSG: u64 = 42;
+/// Returned by `crate::fs::sysv_msg`'s `msgsnd`/`msgrcv` once a real `msgctl(IPC_RMID)` removes
+/// the queue out from under a still-blocked caller -- real SysV IPC semantics. `43`, matching
+/// musl's own compiled-in value, same reasoning as `E2BIG`.
+pub(crate) const EIDRM: u64 = 43;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
