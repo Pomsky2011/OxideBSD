@@ -732,6 +732,13 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::syscall::oxidebsd_sys_sigpending as *const () as u64)
         }
         "oxidebsd_sys_tkill" => Some(crate::syscall::oxidebsd_sys_tkill as *const () as u64),
+        "oxidebsd_sys_sigaltstack" => {
+            Some(crate::syscall::oxidebsd_sys_sigaltstack as *const () as u64)
+        }
+        "oxidebsd_sys_pause" => Some(crate::syscall::oxidebsd_sys_pause as *const () as u64),
+        "oxidebsd_sys_sigsuspend" => {
+            Some(crate::syscall::oxidebsd_sys_sigsuspend as *const () as u64)
+        }
         "oxidebsd_sys_setpgid" => Some(crate::syscall::oxidebsd_sys_setpgid as *const () as u64),
         "oxidebsd_sys_getpgid" => Some(crate::syscall::oxidebsd_sys_getpgid as *const () as u64),
         "oxidebsd_sys_setsid" => Some(crate::syscall::oxidebsd_sys_setsid as *const () as u64),
@@ -833,6 +840,22 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_times" => Some(crate::syscall::oxidebsd_sys_times as *const () as u64),
         "oxidebsd_sys_getrandom" => {
             Some(crate::syscall::oxidebsd_sys_getrandom as *const () as u64)
+        }
+        "oxidebsd_sys_sysinfo" => Some(crate::syscall::oxidebsd_sys_sysinfo as *const () as u64),
+        "oxidebsd_sys_timer_create" => {
+            Some(crate::syscall::oxidebsd_sys_timer_create as *const () as u64)
+        }
+        "oxidebsd_sys_timer_settime" => {
+            Some(crate::syscall::oxidebsd_sys_timer_settime as *const () as u64)
+        }
+        "oxidebsd_sys_timer_gettime" => {
+            Some(crate::syscall::oxidebsd_sys_timer_gettime as *const () as u64)
+        }
+        "oxidebsd_sys_timer_getoverrun" => {
+            Some(crate::syscall::oxidebsd_sys_timer_getoverrun as *const () as u64)
+        }
+        "oxidebsd_sys_timer_delete" => {
+            Some(crate::syscall::oxidebsd_sys_timer_delete as *const () as u64)
         }
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),

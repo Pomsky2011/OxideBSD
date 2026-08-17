@@ -14,6 +14,13 @@
 //! `setitimer`, see `third_party/musl/src/unistd/alarm.c`) — the same class of timer-machinery
 //! addition this module already owns, backed by `process::do_setitimer`/`do_getitimer` and
 //! `interrupts::timer_interrupt_handler`'s own `ITIMER_REAL` expiry check.
+//!
+//! `SYS_TIMER_CREATE = 531`/`SYS_TIMER_SETTIME = 532`/`SYS_TIMER_GETTIME = 533`/
+//! `SYS_TIMER_GETOVERRUN = 534`/`SYS_TIMER_DELETE = 535` (`docs/MISSING_POSIX_SYSCALLS.md`'s own
+//! 28-syscall pre-reserved batch, items 6-10): real POSIX per-process timers, a natural extension
+//! of the `setitimer`/`getitimer` machinery just above now that per-timer-id tracking exists
+//! (`process::PosixTimer`/`Process::posix_timers`) — see `process::do_timer_create`'s own doc
+//! comment for the real wire format/semantics of the whole sub-batch.
 #![no_std]
 
 unsafe extern "C" {
@@ -26,6 +33,11 @@ unsafe extern "C" {
     fn oxidebsd_sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i64;
     fn oxidebsd_sys_setitimer(which: u64, new_ptr: u64, old_ptr: u64) -> i64;
     fn oxidebsd_sys_getitimer(which: u64, old_ptr: u64) -> i64;
+    fn oxidebsd_sys_timer_create(clockid: u64, evp_ptr: u64, timerid_ptr: u64) -> i64;
+    fn oxidebsd_sys_timer_settime(timerid: u64, flags: u64, new_ptr: u64, old_ptr: u64) -> i64;
+    fn oxidebsd_sys_timer_gettime(timerid: u64, val_ptr: u64) -> i64;
+    fn oxidebsd_sys_timer_getoverrun(timerid: u64) -> i64;
+    fn oxidebsd_sys_timer_delete(timerid: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -36,6 +48,11 @@ const SYS_CLOCK_GETTIME: u64 = 138;
 const SYS_NANOSLEEP: u64 = 139;
 const SYS_SETITIMER: u64 = 156;
 const SYS_GETITIMER: u64 = 157;
+const SYS_TIMER_CREATE: u64 = 531;
+const SYS_TIMER_SETTIME: u64 = 532;
+const SYS_TIMER_GETTIME: u64 = 533;
+const SYS_TIMER_GETOVERRUN: u64 = 534;
+const SYS_TIMER_DELETE: u64 = 535;
 
 extern "C" fn handle_clock_gettime(clockid: u64, ts_ptr: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_clock_gettime(clockid, ts_ptr) }
@@ -53,6 +70,26 @@ extern "C" fn handle_getitimer(which: u64, old_ptr: u64, _arg2: u64, _arg3: u64)
     unsafe { oxidebsd_sys_getitimer(which, old_ptr) }
 }
 
+extern "C" fn handle_timer_create(clockid: u64, evp_ptr: u64, timerid_ptr: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_timer_create(clockid, evp_ptr, timerid_ptr) }
+}
+
+extern "C" fn handle_timer_settime(timerid: u64, flags: u64, new_ptr: u64, old_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_timer_settime(timerid, flags, new_ptr, old_ptr) }
+}
+
+extern "C" fn handle_timer_gettime(timerid: u64, val_ptr: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_timer_gettime(timerid, val_ptr) }
+}
+
+extern "C" fn handle_timer_getoverrun(timerid: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_timer_getoverrun(timerid) }
+}
+
+extern "C" fn handle_timer_delete(timerid: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_timer_delete(timerid) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -60,9 +97,14 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_NANOSLEEP, handle_nanosleep);
         oxidebsd_register_syscall(SYS_SETITIMER, handle_setitimer);
         oxidebsd_register_syscall(SYS_GETITIMER, handle_getitimer);
+        oxidebsd_register_syscall(SYS_TIMER_CREATE, handle_timer_create);
+        oxidebsd_register_syscall(SYS_TIMER_SETTIME, handle_timer_settime);
+        oxidebsd_register_syscall(SYS_TIMER_GETTIME, handle_timer_gettime);
+        oxidebsd_register_syscall(SYS_TIMER_GETOVERRUN, handle_timer_getoverrun);
+        oxidebsd_register_syscall(SYS_TIMER_DELETE, handle_timer_delete);
     }
     log(
-        "[module] clock: module_init running (registered SYS_CLOCK_GETTIME/SYS_NANOSLEEP/SYS_SETITIMER/SYS_GETITIMER)\n",
+        "[module] clock: module_init running (registered SYS_CLOCK_GETTIME/SYS_NANOSLEEP/SYS_SETITIMER/SYS_GETITIMER/SYS_TIMER_CREATE/SYS_TIMER_SETTIME/SYS_TIMER_GETTIME/SYS_TIMER_GETOVERRUN/SYS_TIMER_DELETE)\n",
     );
     0
 }

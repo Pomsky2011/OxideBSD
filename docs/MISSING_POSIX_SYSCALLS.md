@@ -145,12 +145,16 @@ level for this one crate, not fixed in `elf.rs` itself; see CLAUDE.md's own upda
 
 ## Pre-reserved batch: first implementation
 
-Item 1 of the 28-syscall "pre-reserved ahead of implementation" batch further below now has a real
-handler:
+Items 1-5 of the 28-syscall "pre-reserved ahead of implementation" batch further below now have
+real handlers:
 
 | POSIX interface(s) | Number | Handler | Notes |
 |---|---|---|---|
 | `getrandom` (only reachable via `getentropy()`) | `SYS_GETRANDOM = 526` | `modules/posix_compat` → `sys_getrandom` → `src/random.rs`'s existing generator | Real `(buf_ptr, buflen, flags)` wire format, no musl call-site patch needed. Delegates straight to the generator already backing `/dev/random`/`/dev/urandom` — inherits its persistent entropy pool and `RDRAND`/`RDSEED` hypervisor-distrust gate for free. `flags` outside real `GRND_NONBLOCK`/`GRND_RANDOM` is `EINVAL`; both accepted bits make no behavioral difference since this generator has no blocking-on-low-entropy distinction to honor them against. |
+| `sysinfo` (non-POSIX, see footnote below) | `SYS_SYSINFO = 527` | `modules/posix_compat` → `sys_sysinfo`/`RawSysinfo` | Real `(info_ptr)` wire format, no musl call-site patch needed. `RawSysinfo` is 368 bytes, verified via a direct C `offsetof`/`sizeof` probe against musl's real `struct sysinfo` rather than assumed from Rust `repr(C)` layout rules alone. Real `uptime`/`totalram`/`procs`; `freeram == totalram` (same tier `/proc/meminfo`'s own `MemFree` placeholder already uses — no deallocation tracking exists anywhere in this kernel); `loads`/`sharedram`/`bufferram`/`totalswap`/`freeswap`/`totalhigh`/`freehigh` honestly zero (no load-average/page-cache/swap tracking exists). |
+| `sigaltstack` | `SYS_SIGALTSTACK = 528` | `modules/signal` → `sys_sigaltstack` → `process::do_sigaltstack`/`AltStack` | Real `(ss_ptr, old_ptr)` wire format, no musl call-site patch needed (musl's own wrapper filters `SS_ONSTACK`/an undersized `ss_size` client-side). Bookkeeping only — no signal is ever actually delivered on the alt stack, `SA_ONSTACK` still isn't honored by `deliver_pending_signal`, matching `modules/signal`'s already-documented "no real signal stack" gap. `SS_ONSTACK` is always reported unset on read-back, an honest reflection of that. Copied by `fork` (the duplicated address space keeps the alt stack's address valid); reset to disabled by `execve` (the old address is meaningless in the new image). |
+| `pause` | `SYS_PAUSE = 529` | `modules/signal` → `sys_pause` → `process::do_pause` | Real zero-argument wire format, no musl call-site patch needed. The first item in the batch to need a genuine new block/wake primitive (`BlockReason::WaitingForSignal`), not just a state field — see `do_pause`'s own doc comment for the full real-POSIX-ordering reasoning (a caught handler runs before the caller ever observes `pause()` "returning"). Woken by `do_kill`/`signal_foreground_group`'s own `Action::SetPending` arm via a new `wake_if_paused` helper; an ignored or blocked signal correctly leaves it parked. |
+| `sigsuspend` | `SYS_SIGSUSPEND = 530` | `modules/signal` → `sys_sigsuspend` → `process::do_sigsuspend` | Real `(mask_ptr, sigsetsize)` wire format, no musl call-site patch needed. Reuses `do_pause`'s own `BlockReason::WaitingForSignal`/`wake_if_paused` primitive unchanged, adding a temporary, atomic swap of `blocked_signals` around the same wait (atomicity falls out for free from this kernel's single-core, no-preemption design). The one real new wrinkle: the temporary mask must **not** be restored as soon as a deliverable signal is found (the woken signal is very often blocked under the *original* mask — the canonical `sigsuspend` use case — so restoring early would hide it from `take_deliverable_signal`), but real POSIX semantics also require the *original* mask back once the wait is over, not the temporary one. Solved with a new `Process::sigsuspend_restore_mask` handoff: `do_sigsuspend` records the mask to restore instead of applying it, and `deliver_pending_signal` (`src/syscall.rs`) consumes it once it knows how the woken signal actually resolved — immediately, if no handler runs (`Terminate`/`Stop`/nothing left deliverable); deferred until `sigreturn`, if one does (via a new `set_signal_saved_blocked_override`, so the *original* mask is what `sigreturn` restores, not the temporary one `stash_signal_context` would otherwise have captured). |
 
 **Verified end-to-end**: `tests/getrandom_syscall_smoke.rs` + `userland/getrandom-syscall-smoke/` —
 a real spawned ELF through genuine `SYSCALL`/`SYSRETQ` (not a plain Rust function call --
@@ -158,6 +162,79 @@ a real spawned ELF through genuine `SYSCALL`/`SYSRETQ` (not a plain Rust functio
 job is proving the syscall plumbing itself). Four parts: a real 32-byte request succeeds and isn't
 degenerate, two consecutive requests differ, `len == 0` is a harmless no-op, and flag handling
 (`GRND_NONBLOCK`/`GRND_RANDOM` accepted, any other bit `EINVAL`) is correct. **Passes.**
+
+**Verified end-to-end**: `tests/sysinfo_syscall_smoke.rs` + `userland/sysinfo-syscall-smoke/` — same
+real-`SYSCALL` pattern. Three parts: a real call's fields (`mem_unit == 1`, `totalram > 0`,
+`freeram == totalram`, `procs >= 1`, every untracked field honestly zero), `uptime` non-decreasing
+across two calls, and `totalram` stable across two calls. **Passes.**
+
+**Verified end-to-end**: `tests/sigaltstack_syscall_smoke.rs` + `userland/sigaltstack-syscall-smoke/`
+— same real-`SYSCALL` pattern, deliberately bypassing musl's own `sigaltstack()` wrapper (a raw
+`syscall()` call) to exercise the kernel's own `EINVAL` path directly. Five parts: the real POSIX
+startup state is disabled, installing a real alt stack succeeds, reading it back matches
+(`flags == 0`, not `SS_DISABLE`/`SS_ONSTACK`), a combined set+read-old call reports the state from
+just before, and an invalid flag bit is `EINVAL` while disabling correctly zeroes `sp`/`size`.
+**Passes.**
+
+**Verified end-to-end**: `tests/pause_syscall_smoke.rs` + `userland/pause-syscall-smoke/` — same
+real-`SYSCALL` pattern. Forks; the parent immediately calls `pause()` (genuinely blocks, forcing
+the scheduler to run the freshly forked child); the child sends the parent a caught-disposition
+`SIGUSR1` (the wake hook fires against a process actually sitting in
+`Blocked(WaitingForSignal)`), then exits; the parent's `pause()` returns `EINTR` only after the
+handler has already run, and it reaps the child's clean `exit(0)` via `wait4`. **Passes.** (Found
+and fixed live along the way: this crate's own real writable static — `HANDLER_RAN: AtomicBool`,
+set from inside the signal handler — hit the exact same `elf.rs` PT_LOAD-segment-sharing-a-page
+issue `sa-siginfo-syscall-smoke` first found; same linker-script `ALIGN(0x1000)` workaround
+applied, see this crate's own `linker.ld`.)
+
+**Verified end-to-end**: `tests/sigsuspend_syscall_smoke.rs` + `userland/sigsuspend-syscall-smoke/`
+— same real-`SYSCALL` pattern (same `ALIGN(0x1000)` writable-global workaround, this time a real
+`AtomicU32` handler counter). Blocks `SIGUSR1` via `sigprocmask`, forks; the parent immediately
+calls `sigsuspend(&empty_mask)` (genuinely blocks, forcing the scheduler to run the freshly forked
+child); the child sends the parent `SIGUSR1` — blocked under the parent's *original* mask, but not
+under `sigsuspend`'s temporary empty one — then exits; the parent's `sigsuspend()` returns `EINTR`
+only after the caught handler has already run once. Then, the specific correctness property
+`do_sigsuspend`'s own doc comment exists for: a `sigprocmask` readback confirms `SIGUSR1` is
+blocked *again* (the original mask, not left at the temporary empty one); a self-`kill(pid,
+SIGUSR1)` while blocked again is held pending (`sigpending()`) without invoking the handler a
+second time; unblocking it and issuing one more ordinary syscall then delivers it for real (handler
+count reaches `2`) via the normal `deliver_pending_signal` tail. Finally reaps the child's clean
+`exit(0)` via `wait4`. **Passes.**
+
+## Pre-reserved batch: second implementation
+
+Items 6-10 of the 28-syscall "pre-reserved ahead of implementation" batch above -- the real POSIX
+per-process timer sub-batch -- now have real handlers too:
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `timer_create` | `SYS_TIMER_CREATE = 531` | `modules/clock` -> `src/syscall/ffi.rs`'s `oxidebsd_sys_timer_create` -> `process::do_timer_create`/`process::PosixTimer` | Real `(clockid, evp_ptr, timerid_ptr)` wire format. `evp_ptr == 0` matches real POSIX's own default (`SIGEV_SIGNAL`/`SIGALRM`); an explicit `evp` supports `SIGEV_SIGNAL`/`SIGEV_NONE` only -- `SIGEV_THREAD`/`SIGEV_THREAD_ID` are real `EINVAL` (this kernel has no `clone(2)`, so musl's own `SIGEV_THREAD` path never reaches the syscall in the first place). A caller's own opaque `timer_t` is just an index into a new fixed `Process::posix_timers: [Option<PosixTimer>; MAX_POSIX_TIMERS]` array (`MAX_POSIX_TIMERS = 8`, no live caller to size this against) -- `EAGAIN` once every slot is in use, matching real Linux. |
+| `timer_settime` | `SYS_TIMER_SETTIME = 532` | `process::do_timer_settime` | Real `(timerid, flags, new_ptr, old_ptr)` wire format (a bare 4-argument syscall on this LP64 target -- no `*64`-suffixed sibling exists, see `bits/syscall.h.in`'s own comment on the batch). Supports both relative (`flags == 0`) and `TIMER_ABSTIME` arming; `TIMER_ABSTIME` resolves the absolute target against whichever `clockid` the timer was created with (`CLOCK_MONOTONIC` converts directly since `ticks()` already *is* that domain; `CLOCK_REALTIME` anchors off `src/cpu/rtc.rs`'s live CMOS read). An all-zero `it_value` disarms regardless of `TIMER_ABSTIME`, matching real semantics. |
+| `timer_gettime` | `SYS_TIMER_GETTIME = 533` | `process::do_timer_gettime` | Real `(timerid, val_ptr)` wire format, same remaining-time/floored-readback shape `getitimer`'s own `RawItimerval` handling already established, just nanosecond- (`RawItimerspec`) instead of microsecond-precision. |
+| `timer_getoverrun` | `SYS_TIMER_GETOVERRUN = 534` | `process::do_timer_getoverrun` | Real single-argument `(timerid)` wire format -- unlike the other three, the overrun count itself *is* the syscall's return value, no output pointer. A real, if simplified, count: an expiry whose signal is still pending (undelivered) from a previous expiry increments it instead of being silently lost; resets to `0` on a fresh (non-overlapping) expiry or on rearming. **Known, accepted gap**: two timers sharing one `signo` can't be told apart by this bookkeeping (both observe the same process-wide `pending_signals` bit) -- no live caller to exercise this. |
+| `timer_delete` | `SYS_TIMER_DELETE = 535` | `process::do_timer_delete` | Real single-argument `(timerid)` wire format. Just frees the slot -- no dealloc beyond that, consistent with this kernel's "no deallocation anywhere" stance. |
+
+Delivery is a new scan inside `interrupts::timer_interrupt_handler`, alongside the existing
+`ITIMER_REAL`/`real_timer_deadline` check: same simple "just set the pending bit" design (no
+forced cross-process wake), now also computing the overrun count above. **Real, not just planned,
+`fork`/`execve` semantics**: `Process::posix_timers` is *not* inherited by `fork` (matching real
+`timer_create(2)`'s own NOTES section) and, unlike `real_timer_deadline`/`ITIMER_REAL`, *is* reset
+(disarmed and deleted) by `execve` too -- a POSIX timer's whole purpose (notifying the program that
+created it) means nothing to a new program image, the same reasoning `AltStack`'s own `execve`
+reset already established.
+
+**Verified end-to-end**: `tests/posix_timer_syscall_smoke.rs` + `userland/posix-timer-syscall-
+smoke/` -- same real-`SYSCALL` pattern (same `ALIGN(0x1000)` writable-global workaround as
+`pause-syscall-smoke`, this time two `AtomicU32` handler-run counters). Eight parts: an invalid
+`clockid` is `EINVAL`; a default-`evp` (`SIGALRM`) relative one-shot timer fires exactly once and
+reads back disarmed; an explicit `SIGEV_SIGNAL`/`SIGUSR1` periodic timer fires repeatedly and
+`timer_delete` genuinely stops it; `TIMER_ABSTIME` against both `CLOCK_MONOTONIC` and
+`CLOCK_REALTIME` (the latter specifically exercising the CMOS-RTC-anchored branch); overrun
+accounting (block the signal, let a periodic timer expire several times undelivered, confirm a
+nonzero overrun, unblock and confirm exactly one delivery); `EAGAIN` once all `MAX_POSIX_TIMERS`
+slots are in use plus slot reuse after `timer_delete`; and `EINVAL` for an out-of-range or
+already-deleted `timerid` across all four of `timer_settime`/`timer_gettime`/`timer_getoverrun`/
+`timer_delete`. **Passes.**
 
 ## Missing, live caller confirmed
 
@@ -168,9 +245,6 @@ OxideBSD handler.
 |---|---|---|---|---|
 | `sigtimedwait`, `sigwaitinfo` | `rt_sigtimedwait(2)` | `src/signal/sigtimedwait.c:19,22` | `495` (already remapped, see sweep above — no handler registered yet) | No blocking-on-signal primitive exists yet; would need a new `BlockReason` variant, more than a number remap. |
 | `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496` (already remapped, see sweep above — no handler registered yet) | `SA_SIGINFO` handler invocation is now real (see "Implemented this session" above) — `RawSiginfo::si_value` already exists as a landing spot. Still needs: a real `SYS_SIGQUEUE` handler (currently unregistered), and `pending_signals` would need to grow from a plain bitmask into something that can carry one queued `union sigval` per signal number, since today's bitmask has nowhere to stash a payload between `do_kill`-style setting and `take_deliverable_signal`-style draining. |
-| `sigsuspend` | `rt_sigsuspend(2)` | `src/signal/sigsuspend.c:6` | `530` (pre-reserved, see "Pre-reserved ahead of implementation" below — no handler registered yet) | Needs a real block/wake primitive tied to signal delivery, not just a number. |
-| `sigaltstack` | `sigaltstack(2)` | `src/signal/sigaltstack.c:19` | `528` (pre-reserved, see below — no handler registered yet) | Lower priority — `modules/signal/`'s own scope note already documents "no real signal stack" as a known gap (a second signal during handler execution overwrites `signal_saved_frame` rather than nesting); a real `sigaltstack` doesn't fix that by itself. |
-| `pause` | `pause(2)` | no direct `.c` call site found (likely inlined/aliased) | `529` (pre-reserved, see below — no handler registered yet) | Low priority — no confirmed live path in the current roster. |
 
 ## Missing, POSIX-mandated, no live caller yet in ported userland
 
@@ -230,15 +304,33 @@ handler — this is the tracking list for the batch, not just historical numberi
 - [x] 1. `getrandom` (`526`) — `modules/posix_compat`'s `handle_getrandom` -> `src/syscall/ffi.rs`'s
       `sys_getrandom`, delegating to `src/random.rs`'s existing generator. Verified via
       `tests/getrandom_syscall_smoke.rs` + `userland/getrandom-syscall-smoke/`.
-- [ ] 2. `sysinfo` (`527`)
-- [ ] 3. `sigaltstack` (`528`)
-- [ ] 4. `pause` (`529`)
-- [ ] 5. `sigsuspend` (`530`)
-- [ ] 6. `timer_create` (`531`)
-- [ ] 7. `timer_settime` (`532`)
-- [ ] 8. `timer_gettime` (`533`)
-- [ ] 9. `timer_getoverrun` (`534`)
-- [ ] 10. `timer_delete` (`535`)
+- [x] 2. `sysinfo` (`527`) — `modules/posix_compat`'s `handle_sysinfo` -> `src/syscall/ffi.rs`'s
+      `sys_sysinfo`/`RawSysinfo` (368 bytes, verified via a direct C `offsetof`/`sizeof` probe
+      against musl's real `struct sysinfo`). Real `uptime`/`totalram`/`procs`; `freeram ==
+      totalram` (same "no deallocation tracking" tier `/proc/meminfo`'s `MemFree` already uses);
+      `loads`/`sharedram`/`bufferram`/`totalswap`/`freeswap`/`totalhigh`/`freehigh` honestly zero
+      (no load-average/page-cache/swap tracking exists). Verified via
+      `tests/sysinfo_syscall_smoke.rs` + `userland/sysinfo-syscall-smoke/`.
+- [x] 3. `sigaltstack` (`528`) — `modules/signal`'s `handle_sigaltstack` -> `src/syscall/ffi.rs`'s
+      `sys_sigaltstack` -> `src/process/signals.rs`'s `do_sigaltstack`/`AltStack`. Real
+      `(ss_ptr, old_ptr)` wire format; bookkeeping only (`SA_ONSTACK` still isn't honored by
+      signal delivery, matching the still-open "no real signal stack" gap) -- `SS_ONSTACK` is
+      always reported unset on read-back. Copied by `fork`, reset to disabled by `execve`.
+      Verified via `tests/sigaltstack_syscall_smoke.rs` + `userland/sigaltstack-syscall-smoke/`.
+- [x] 4. `pause` (`529`) — `modules/signal`'s `handle_pause` -> `src/syscall/ffi.rs`'s `sys_pause`
+      -> `src/process/signals.rs`'s `do_pause`. A genuine new block/wake-on-signal primitive
+      (`ProcState::Blocked(BlockReason::WaitingForSignal)`), not just a state field — woken by
+      `do_kill`/`signal_foreground_group`'s own `Action::SetPending` arm via a new shared
+      `wake_if_paused` helper. Always returns `EINTR`; real POSIX ordering (a caught handler runs
+      before the caller ever observes `pause()` "returning") falls out for free from this
+      codebase's existing "deliver pending signals at the tail of every completed syscall" design.
+      Verified via `tests/pause_syscall_smoke.rs` + `userland/pause-syscall-smoke/`.
+- [x] 5. `sigsuspend` (`530`)
+- [x] 6. `timer_create` (`531`)
+- [x] 7. `timer_settime` (`532`)
+- [x] 8. `timer_gettime` (`533`)
+- [x] 9. `timer_getoverrun` (`534`)
+- [x] 10. `timer_delete` (`535`)
 - [ ] 11. `mq_open` (`536`)
 - [ ] 12. `mq_unlink` (`537`)
 - [ ] 13. `mq_timedsend` (`538`)

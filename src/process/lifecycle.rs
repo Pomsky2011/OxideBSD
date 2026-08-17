@@ -116,6 +116,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sigactions: [SigAction::DEFAULT; 32],
         signal_saved_frame: None,
         signal_saved_blocked: 0,
+        altstack: AltStack::default(),
         priority: 0,
         pgid,
         sid: pid,
@@ -123,6 +124,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         cmdline,
         real_timer_deadline: None,
         real_timer_interval_ticks: 0,
+        posix_timers: [None; MAX_POSIX_TIMERS],
         // No login mechanism exists -- pid 1 (and every process descending from it) starts as
         // root, same reasoning as Process::uid's own doc comment.
         uid: 0,
@@ -134,6 +136,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         umask: 0o022,
         stop_notify_pending: false,
         cont_notify_pending: false,
+        sigsuspend_restore_mask: None,
     };
 
     {
@@ -232,6 +235,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_sigactions,
         parent_signal_saved_frame,
         parent_signal_saved_blocked,
+        parent_altstack,
         parent_comm,
         parent_cmdline,
         parent_uid,
@@ -268,6 +272,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             parent.sigactions,
             parent.signal_saved_frame,
             parent.signal_saved_blocked,
+            // Real fork() semantics: the alt stack's own address stays valid in the child (the
+            // whole address space is duplicated) -- see AltStack's own doc comment.
+            parent.altstack,
             // Real fork() semantics: the child keeps the parent's comm/cmdline until it execs its
             // own -- same reasoning as brk/fs_base/cwd above.
             parent.comm.clone(),
@@ -312,6 +319,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         sigactions: parent_sigactions,
         signal_saved_frame: parent_signal_saved_frame,
         signal_saved_blocked: parent_signal_saved_blocked,
+        altstack: parent_altstack,
         priority: 0,
         pgid: parent_pgid,
         sid: parent_sid,
@@ -321,6 +329,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // semantics: a forked child starts with its own disarmed timer).
         real_timer_deadline: None,
         real_timer_interval_ticks: 0,
+        // Not inherited either -- see `Process::posix_timers`'s own doc comment (real
+        // `timer_create(2)` semantics: not inherited across `fork`).
+        posix_timers: [None; MAX_POSIX_TIMERS],
         uid: parent_uid,
         gid: parent_gid,
         rlimits: parent_rlimits,
@@ -332,6 +343,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // POSIX fork() semantics, same "starts fresh" story as real_timer_deadline above.
         stop_notify_pending: false,
         cont_notify_pending: false,
+        // Never straddles a fork boundary -- see this field's own doc comment on Process.
+        sigsuspend_restore_mask: None,
     };
 
     {
@@ -692,6 +705,13 @@ pub fn do_execve(
                 *action = SigAction::DEFAULT;
             }
         }
+        // Real execve() semantics: an established alt stack's address belongs to the old program
+        // image and means nothing in the new one -- reset to disabled, same reasoning fs_base
+        // above already uses.
+        me.altstack = AltStack::default();
+        // Real `timer_create(2)` semantics: POSIX per-process timers are disarmed and deleted
+        // across execve -- see `Process::posix_timers`'s own doc comment.
+        me.posix_timers = [None; MAX_POSIX_TIMERS];
     }
 
     let frame = syscall::current_frame();

@@ -55,6 +55,26 @@ fn main() {
         "getrandom-syscall-smoke",
         "GETRANDOM_SYSCALL_SMOKE_ELF_PATH",
     );
+    build_userland_crate(
+        "sysinfo-syscall-smoke",
+        "SYSINFO_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
+        "sigaltstack-syscall-smoke",
+        "SIGALTSTACK_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
+        "pause-syscall-smoke",
+        "PAUSE_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
+        "sigsuspend-syscall-smoke",
+        "SIGSUSPEND_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
+        "posix-timer-syscall-smoke",
+        "POSIX_TIMER_SYSCALL_SMOKE_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.

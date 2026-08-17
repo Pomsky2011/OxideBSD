@@ -130,6 +130,16 @@ pub enum BlockReason {
     /// `process::table()`" shape `crate::console::stdin::push_byte`'s own `wake_blocked_readers` already
     /// established for `WaitingForStdin`, just driven by the timer IRQ instead of the keyboard one.
     Sleeping(u64),
+    /// Blocked in `do_pause` (`SYS_PAUSE`) until a deliverable signal (pending and not blocked)
+    /// exists — real POSIX `pause(2)` semantics: waits for a signal that either terminates the
+    /// process or invokes a caught handler. Woken by `do_kill`/`signal_foreground_group`'s own
+    /// `Action::SetPending` arm (the only action shape that corresponds to "a caught handler will
+    /// run" — `Action::Discard` is an ignored signal, which must *not* wake a pause; `Action::
+    /// Terminate` doesn't need a wake hook at all, since `terminate_process` transitions straight
+    /// to `Zombie` regardless of prior state, same "another schedulable process's own syscall
+    /// reaches directly into `process::table()`" shape `WaitingForChild`/`WaitingForPipeData`
+    /// already established.
+    WaitingForSignal,
 }
 /// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
 /// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own
@@ -191,6 +201,89 @@ impl SigAction {
         mask: 0,
     };
 }
+
+/// Real `sigaltstack(2)` flag bits (`third_party/musl/include/signal.h`). `SS_ONSTACK` is a
+/// read-only status bit a caller can observe but never set (musl's own `sigaltstack()` wrapper
+/// already rejects `ss_flags & SS_ONSTACK` client-side before ever issuing the syscall — see
+/// `docs/MISSING_POSIX_SYSCALLS.md`'s own note on this being "only reachable via `sigaltstack()`"
+/// the same way `getrandom` is only reachable via `getentropy()`).
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
+
+/// Backing store for `SYS_SIGALTSTACK` (`do_sigaltstack`, `src/process/signals.rs`) — real POSIX
+/// per-process alternate-signal-stack bookkeeping. **Bookkeeping only**: no signal is ever
+/// actually delivered on this stack — `SA_ONSTACK` isn't honored by `deliver_pending_signal`
+/// (`src/syscall/mod.rs`), matching `modules/signal`'s own already-documented "no real signal
+/// stack" gap (a second signal during handler execution still overwrites `signal_saved_frame`
+/// rather than nesting; a real `sigaltstack` doesn't fix that by itself, see
+/// `docs/MISSING_POSIX_SYSCALLS.md`). Since this kernel never actually executes a handler on the
+/// alt stack, `SS_ONSTACK` is always reported as unset on read-back — an honest reflection of
+/// what actually happens, not a fabricated "yes, active" answer. `Default` is the real POSIX
+/// startup state: no alternate stack established (`flags = SS_DISABLE`).
+///
+/// Copied by `fork` (a real `fork()` duplicates the whole address space, so the alt stack's own
+/// address stays valid in the child, same reasoning `cwd`/`brk`/`fs_base` already document); reset
+/// to `Default` by `execve` (the old program's address is meaningless in the new image, same
+/// reasoning `Process::fs_base` already uses for the identical situation).
+#[derive(Clone, Copy)]
+pub struct AltStack {
+    pub sp: u64,
+    pub flags: i32,
+    pub size: u64,
+}
+
+impl Default for AltStack {
+    fn default() -> Self {
+        AltStack {
+            sp: 0,
+            flags: SS_DISABLE,
+            size: 0,
+        }
+    }
+}
+
+/// `SYS_TIMER_CREATE`'s max concurrently-armed timers per process (`docs/
+/// MISSING_POSIX_SYSCALLS.md`'s pre-reserved batch, items 6-10) -- no live caller in the current
+/// roster to size this against (see that doc's own note on the whole POSIX-timer sub-batch), so a
+/// small, plausible number rather than real Linux's much larger practical limit. Bumping it later
+/// is a pure array-size change with no wire-format implications -- a caller's own opaque `timer_t`
+/// is just this array's index.
+pub const MAX_POSIX_TIMERS: usize = 8;
+
+/// One `timer_create(2)`-allocated POSIX per-process timer slot -- distinct from the single
+/// `ITIMER_REAL`-only `real_timer_deadline`/`real_timer_interval_ticks` pair `do_setitimer` above
+/// already owns: a process can hold several of these at once, each independently armed and each
+/// free to target any deliverable signal (not just `SIGALRM`). A caller's own opaque `timer_t` is
+/// just this slot's index into `Process::posix_timers` -- stable for the timer's whole lifetime,
+/// close enough to real Linux's own "small per-process integer" `timer_t` representation that no
+/// translation layer is needed.
+#[derive(Clone, Copy)]
+pub struct PosixTimer {
+    /// The `clockid_t` given to `timer_create` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC` only, same
+    /// restriction `sys_clock_gettime` already enforces) -- remembered so a later `TIMER_ABSTIME`
+    /// `timer_settime` call knows which clock domain its absolute timestamp is expressed in.
+    pub clockid: u64,
+    /// Real signal number (`1..=31`) to raise on expiry, or `0` for `SIGEV_NONE` (armed, but no
+    /// notification is ever delivered -- still real POSIX semantics, just polled via
+    /// `timer_gettime`/`timer_getoverrun` instead).
+    pub signo: u64,
+    /// Absolute `interrupts::ticks()` deadline, `None` while disarmed -- same shape as
+    /// `real_timer_deadline` above, just one of several rather than the process's only one.
+    pub deadline: Option<u64>,
+    /// Reload value in ticks for a periodic timer; `0` means one-shot -- same convention
+    /// `real_timer_interval_ticks` above already uses.
+    pub interval_ticks: u64,
+    /// `timer_getoverrun`'s backing store: how many additional expirations this timer has hit
+    /// while its previous expiry's signal was still pending (undelivered) -- resets to `0` the
+    /// moment a fresh (not-already-pending) expiry sets the pending bit again. A real, if
+    /// simplified, overrun count matching this kernel's already-simple `SIGALRM`-via-
+    /// `pending_signals` delivery model, not real Linux's own siginfo-attached per-expiry
+    /// accounting. **Known, accepted gap**: two timers sharing the same `signo` can't be told
+    /// apart by this bookkeeping, since both would observe the same process-wide pending bit --
+    /// no live caller to exercise this today (see `docs/MISSING_POSIX_SYSCALLS.md`).
+    pub overrun: u32,
+}
+
 /// `SA_NODEFER` -- the one `sa_flags` bit `deliver_pending_signal`'s own mask computation
 /// consults (real Linux/x86_64 value; every other flag, `SA_RESTART` included, is accepted but has
 /// no observable effect on this kernel -- there's no blocking-syscall-restart machinery to hook it
@@ -373,6 +466,9 @@ pub struct Process {
     /// alongside `signal_saved_frame` on `sigreturn`. Meaningless while `signal_saved_frame` is
     /// `None`.
     pub signal_saved_blocked: u64,
+    /// `SYS_SIGALTSTACK`'s backing store — see `AltStack`'s own doc comment for the real
+    /// bookkeeping-only semantics and fork/execve treatment.
+    pub altstack: AltStack,
     /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
     #[allow(dead_code)]
     pub priority: u8,
@@ -416,6 +512,16 @@ pub struct Process {
     /// the expiry handler clears `real_timer_deadline` instead of rearming it. Meaningless while
     /// `real_timer_deadline` is `None`.
     pub real_timer_interval_ticks: u64,
+    /// `SYS_TIMER_CREATE`-allocated slots (batch items 6-10, `docs/MISSING_POSIX_SYSCALLS.md`) —
+    /// `None` = free slot; see `PosixTimer`'s own doc comment. Checked by
+    /// `interrupts::timer_interrupt_handler` alongside the `real_timer_deadline` scan just above.
+    /// **Not inherited by `fork`, disarmed and deleted by `execve`** — real POSIX semantics
+    /// (`timer_create(2)`'s own NOTES section: "not inherited... disarmed and deleted during
+    /// execve(2)"), the same "starts fresh" story `real_timer_deadline` already tells for `fork`
+    /// — though unlike that field, `execve` resets this one too (matching `altstack`'s own reset):
+    /// a POSIX timer's whole purpose, notifying the very program that created it, means nothing to
+    /// the new image.
+    pub posix_timers: [Option<PosixTimer>; MAX_POSIX_TIMERS],
     /// Real uid/gid — no distinct saved/effective pair, since this kernel has no setuid-bit
     /// `execve` support to ever make them diverge (see `do_execve`'s own doc comment: it never
     /// touches these fields at all, matching real `execve()`'s "preserved unless the setuid/setgid
@@ -474,6 +580,15 @@ pub struct Process {
     /// cleared by a matching `wait4(WCONTINUED)`" shape as `stop_notify_pending` above. Not copied
     /// by `fork`; not touched by `execve`.
     pub cont_notify_pending: bool,
+    /// `SYS_SIGSUSPEND`'s own transient handoff -- the mask to restore once `do_sigsuspend`'s
+    /// temporarily-swapped-in mask has done its job (see that function's own doc comment for why
+    /// the restore can't happen inside `do_sigsuspend` itself). `Some` only for the brief window
+    /// between `do_sigsuspend` returning `Err(EINTR)` and `deliver_pending_signal` consuming it,
+    /// both within the same `syscall_dispatch` call -- never observable at a `fork`/`execve`
+    /// boundary (no other syscall can be issued by this process in between), so both just start a
+    /// fresh child/keep it `None` rather than threading it through either constructor's own
+    /// parent-state tuple.
+    pub sigsuspend_restore_mask: Option<u64>,
 }
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());

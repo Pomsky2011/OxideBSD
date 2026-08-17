@@ -21,6 +21,22 @@
 //! `SYS_SIGRETURN = 119` (real `rt_sigreturn`'s own wire slot) is deliberately **not** registered
 //! here at all — see `src/syscall.rs`'s `syscall_dispatch`, which intercepts that number directly,
 //! before ever reaching this module's table.
+//!
+//! `SYS_SIGALTSTACK = 528` is item 3 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
+//! "pre-reserved ahead of implementation" batch. Real logic (`src/process/signals.rs`'s
+//! `do_sigaltstack`/`AltStack`) is kernel-resident, same pattern as everything else this module
+//! only ever calls through to — bookkeeping only, no signal is ever actually delivered on the alt
+//! stack (see that type's own doc comment).
+//!
+//! `SYS_PAUSE = 529` is item 4 of the same batch. Real logic (`src/process/signals.rs`'s
+//! `do_pause`) is kernel-resident and introduces a genuine new block/wake-on-signal primitive
+//! (`BlockReason::WaitingForSignal`) — this module's own `handle_pause` is, same as everything
+//! else here, a thin zero-argument wrapper.
+//!
+//! `SYS_SIGSUSPEND = 530` is item 5 of the same batch. Real logic (`src/process/signals.rs`'s
+//! `do_sigsuspend`) is kernel-resident and reuses `do_pause`'s own `BlockReason::WaitingForSignal`
+//! primitive, adding a temporary, atomic swap of `blocked_signals` around the same wait — this
+//! module's own `handle_sigsuspend` is, same as everything else here, a thin wrapper.
 #![no_std]
 
 unsafe extern "C" {
@@ -33,6 +49,9 @@ unsafe extern "C" {
     fn oxidebsd_sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) -> i64;
     fn oxidebsd_sys_sigpending(set_ptr: u64, sigsetsize: u64) -> i64;
     fn oxidebsd_sys_tkill(tid: u64, sig: u64) -> i64;
+    fn oxidebsd_sys_sigaltstack(ss_ptr: u64, old_ptr: u64) -> i64;
+    fn oxidebsd_sys_pause() -> i64;
+    fn oxidebsd_sys_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64;
 }
 
 const SYS_KILL: u64 = 116;
@@ -46,6 +65,16 @@ const SYS_SIGPENDING: u64 = 494;
 /// `src/syscall/ffi.rs`'s `sys_tkill` doc comment for why this is just `kill` under another name
 /// on a single-threaded kernel.
 const SYS_TKILL: u64 = 200;
+/// Item 3 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall "pre-reserved ahead of
+/// implementation" batch -- a permanent OxideBSD-invented number claimed before this handler
+/// existed, same reasoning `modules/posix_compat`'s `SYS_GETRANDOM`/`SYS_SYSINFO` already have.
+const SYS_SIGALTSTACK: u64 = 528;
+/// Item 4 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall "pre-reserved ahead of
+/// implementation" batch -- same reasoning `SYS_SIGALTSTACK` just above already has.
+const SYS_PAUSE: u64 = 529;
+/// Item 5 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall "pre-reserved ahead of
+/// implementation" batch -- same reasoning `SYS_PAUSE` just above already has.
+const SYS_SIGSUSPEND: u64 = 530;
 
 extern "C" fn handle_kill(pid: u64, sig: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_kill(pid, sig) }
@@ -67,6 +96,18 @@ extern "C" fn handle_tkill(tid: u64, sig: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_tkill(tid, sig) }
 }
 
+extern "C" fn handle_sigaltstack(ss_ptr: u64, old_ptr: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sigaltstack(ss_ptr, old_ptr) }
+}
+
+extern "C" fn handle_pause(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_pause() }
+}
+
+extern "C" fn handle_sigsuspend(mask_ptr: u64, sigsetsize: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sigsuspend(mask_ptr, sigsetsize) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -75,6 +116,9 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SIGPROCMASK, handle_sigprocmask);
         oxidebsd_register_syscall(SYS_SIGPENDING, handle_sigpending);
         oxidebsd_register_syscall(SYS_TKILL, handle_tkill);
+        oxidebsd_register_syscall(SYS_SIGALTSTACK, handle_sigaltstack);
+        oxidebsd_register_syscall(SYS_PAUSE, handle_pause);
+        oxidebsd_register_syscall(SYS_SIGSUSPEND, handle_sigsuspend);
     }
     0
 }

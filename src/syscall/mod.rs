@@ -126,6 +126,9 @@ pub(crate) const EPERM: u64 = 1;
 /// this constant for symlink-depth overflow, same reasoning as `EPROTONOSUPPORT`/`EAGAIN` above:
 /// must match musl's macro, not a real-BSD nod).
 pub(crate) const ELOOP: u64 = 40;
+/// Returned by `process::do_pause` once a deliverable signal wakes it -- real `pause(2)`'s only
+/// possible return value. `4`, identical on Linux/BSD/musl, no divergence to worry about.
+pub(crate) const EINTR: u64 = 4;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -543,7 +546,16 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
         // Boot time (module_init self-checks, etc.) -- no real Process to carry signal state.
         return;
     }
+    // Set only by a `do_sigsuspend` (`src/process/signals.rs`) that just woke up -- see that
+    // function's own doc comment for why the mask restore has to happen here, not there, split
+    // three ways below by how the woken signal actually resolves.
+    let sigsuspend_restore = crate::process::take_sigsuspend_restore_mask(pid);
     let Some(delivery) = crate::process::take_deliverable_signal(pid) else {
+        // Every pending-but-unblocked bit that woke sigsuspend turned out to be SIG_IGN/default-
+        // Ignore -- no handler will ever run to restore the mask via sigreturn, so do it now.
+        if let Some(orig) = sigsuspend_restore {
+            crate::process::restore_blocked_signals(pid, orig);
+        }
         return;
     };
     match delivery {
@@ -552,6 +564,11 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
         }
         crate::process::SignalDelivery::Stop(signum) => {
             crate::process::do_stop_self(pid, signum);
+            // The process doesn't die and no handler is going to run -- restore now, same
+            // reasoning as the no-more-deliverable-signal branch above.
+            if let Some(orig) = sigsuspend_restore {
+                crate::process::restore_blocked_signals(pid, orig);
+            }
         }
         crate::process::SignalDelivery::Handler {
             signum,
@@ -565,6 +582,12 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
             // actually running under -- what `uc_sigmask` reports below, for the SA_SIGINFO case.
             let saved = *frame;
             let old_mask = crate::process::stash_signal_context(pid, saved, mask_to_add);
+            // A real handler is about to run -- defer the sigsuspend mask restore until it
+            // returns (`sigreturn`/`take_signal_saved_frame`) rather than doing it now, real
+            // POSIX semantics (see `do_sigsuspend`'s own doc comment).
+            if let Some(orig) = sigsuspend_restore {
+                crate::process::set_signal_saved_blocked_override(pid, orig);
+            }
 
             // 128 bytes of red-zone headroom (the interrupted code may have live data there,
             // System V's own red-zone convention this ABI otherwise never has to think about).

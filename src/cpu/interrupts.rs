@@ -255,6 +255,33 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
                     None
                 };
             }
+
+            // `SYS_TIMER_CREATE`'s own per-timer expiry (`Process::posix_timers`, batch items
+            // 6-10 of `docs/MISSING_POSIX_SYSCALLS.md`) -- same simple pending-bit-only delivery
+            // as `real_timer_deadline` just above (no forced cross-process wake here either, same
+            // reasoning), plus a real `timer_getoverrun` count: an expiry whose signal is *still*
+            // pending from a previous, undelivered expiry increments `overrun` instead of getting
+            // lost silently.
+            for slot in proc.posix_timers.iter_mut().flatten() {
+                if let Some(deadline) = slot.deadline
+                    && now >= deadline
+                {
+                    if slot.signo != 0 {
+                        let bit = 1 << (slot.signo - 1);
+                        if proc.pending_signals & bit != 0 {
+                            slot.overrun = slot.overrun.saturating_add(1);
+                        } else {
+                            slot.overrun = 0;
+                            proc.pending_signals |= bit;
+                        }
+                    }
+                    slot.deadline = if slot.interval_ticks > 0 {
+                        Some(now + slot.interval_ticks)
+                    } else {
+                        None
+                    };
+                }
+            }
         }
     }
 

@@ -1280,16 +1280,17 @@ broke in three separately-real ways:
    bug 3's check ever got the chance to decide mount-vs-format. Fixed: an existing dev disk smaller
    than the current expected size gets grown in place (zeros appended, real bytes untouched).
 
-## Real `getrandom(2)`: first of the pre-reserved batch (`modules/posix_compat`, `src/syscall/ffi.rs`)
+## Real `getrandom(2)`/`sysinfo(2)`/`sigaltstack(2)`/`pause(2)`: first four of the pre-reserved batch (`modules/posix_compat`, `modules/signal`, `src/syscall/ffi.rs`, `src/process/signals.rs`)
 
 `docs/MISSING_POSIX_SYSCALLS.md` tracks POSIX conformance beyond musl's live call graph, including
 a 28-syscall batch (`526`-`553`) pre-reserved with permanent OxideBSD-invented numbers ahead of
 having real handlers — see that doc's own "Pre-reserved ahead of implementation" section for why
 (this ABI doesn't want its own planned syscalls sitting at borrowed real-Linux numbers just because
-the slot happens to be free today). `getrandom` (`SYS_GETRANDOM = 526`) is item 1 of that batch and
-the first to get a real handler.
+the slot happens to be free today). `getrandom` (`SYS_GETRANDOM = 526`), `sysinfo`
+(`SYS_SYSINFO = 527`), `sigaltstack` (`SYS_SIGALTSTACK = 528`), and `pause` (`SYS_PAUSE = 529`) are
+items 1-4 of that batch, all now with real handlers.
 
-- **Thin plumbing, no new primitive**: `modules/posix_compat`'s `handle_getrandom` →
+- **`getrandom`, thin plumbing, no new primitive**: `modules/posix_compat`'s `handle_getrandom` →
   `src/syscall/ffi.rs`'s `sys_getrandom` → `src/random.rs`'s `oxidebsd_random_bytes` — the same
   generator already backing `/dev/random`/`/dev/urandom` (see that module's own doc comment for
   the persistent entropy pool and the `RDRAND`/`RDSEED` hypervisor-distrust gate). Real
@@ -1309,6 +1310,80 @@ the first to get a real handler.
   plumbing and argument convention, the class of bug this codebase's musl-port section documents
   catching repeatedly). Four parts: a real 32-byte request succeeds and isn't degenerate, two
   consecutive requests differ, `len == 0` is a harmless no-op, and flag handling is correct.
+- **`sysinfo`, the confirmed live blocker for `free`/`uptime`'s primary numbers**
+  (`procps/{free,uptime}.c`, per `docs/BUSYBOX_APPLETS.md`'s own `NEEDS_PROC` section) — not a
+  POSIX interface at all (Linux-specific), but tracked in the same doc/batch for completeness.
+  `modules/posix_compat`'s `handle_sysinfo` → `src/syscall/ffi.rs`'s `sys_sysinfo`/`RawSysinfo`.
+  Real `(info_ptr)` wire format, no musl call-site patch needed.
+- **`RawSysinfo` is 368 bytes** — confirmed via a direct C `offsetof`/`sizeof` probe against
+  musl's real `struct sysinfo` rather than assumed from Rust `repr(C)` layout rules alone (an
+  8-byte gap after `procs`/`pad` before `totalhigh` is real `unsigned long` alignment padding, not
+  a missing field). `[u8; 256]` doesn't implement `Default` in this toolchain (only small arrays
+  do), so the struct is built as a full field-literal rather than `#[derive(Default)]` +
+  struct-update syntax.
+- **Same honesty tier as `RawRusage`/`RawTms`**: real `uptime` (`ticks() / TIMER_HZ`, the same
+  conversion `/proc/uptime`/`CLOCK_MONOTONIC` already use), real `totalram`
+  (`memory::usable_ram_bytes()`, with `mem_unit = 1` so no further scaling is needed), real
+  `procs` (the live process table's own length). `freeram` is set equal to `totalram` — same
+  "no deallocation tracking exists anywhere in this kernel" reasoning `/proc/meminfo`'s own
+  `MemFree == MemTotal` placeholder already documents. `loads`/`sharedram`/`bufferram`/
+  `totalswap`/`freeswap`/`totalhigh`/`freehigh` are honest `0` — no load-average/page-cache/swap
+  tracking exists, matching `/proc/meminfo`'s own `Buffers`/`Cached`/`SwapTotal`/`SwapFree`.
+- Verified via `tests/sysinfo_syscall_smoke.rs` + `userland/sysinfo-syscall-smoke/` — same real-
+  `SYSCALL` pattern. Three parts: a real call's fields, `uptime` non-decreasing across two calls,
+  `totalram` stable across two calls.
+- **`sigaltstack`, bookkeeping only, no new primitive**: `modules/signal`'s `handle_sigaltstack` →
+  `src/syscall/ffi.rs`'s `sys_sigaltstack` → `src/process/signals.rs`'s `do_sigaltstack`, backed
+  by a new `Process::altstack: AltStack` field (`src/process/mod.rs`). Real `(ss_ptr, old_ptr)`
+  wire format, no musl call-site patch needed — musl's own `sigaltstack()` wrapper already filters
+  a caller-supplied `SS_ONSTACK` bit and an undersized `ss_size` client-side before ever issuing
+  the syscall (same "only reachable via X" precedent `getrandom`/`getentropy()` already has).
+- **No signal is ever actually delivered on this stack** — `SA_ONSTACK` still isn't honored by
+  `deliver_pending_signal` (`src/syscall/mod.rs`), matching `modules/signal`'s own already-
+  documented "no real signal stack" gap (a second signal during handler execution still overwrites
+  `signal_saved_frame` rather than nesting — a real `sigaltstack` doesn't fix that by itself).
+  `SS_ONSTACK` is therefore always reported unset on read-back, an honest reflection of what this
+  kernel actually does rather than a fabricated "yes, active" answer.
+- **Copied by `fork`** (a real `fork()` duplicates the whole address space, so the alt stack's own
+  address stays valid in the child); **reset to disabled by `execve`** (the old program's address
+  is meaningless in the new image, same reasoning `Process::fs_base` already uses).
+- Verified via `tests/sigaltstack_syscall_smoke.rs` + `userland/sigaltstack-syscall-smoke/` — a
+  real raw `syscall()` call, deliberately bypassing musl's own wrapper to exercise the kernel's
+  `EINVAL` path directly. Five parts: the real POSIX startup state is disabled, installing a real
+  alt stack succeeds, reading it back matches, a combined set+read-old call reports the prior
+  state, and an invalid flag bit is `EINVAL` while disabling correctly zeroes `sp`/`size`.
+- **`pause`, the first item in the batch needing a genuine new primitive**: `modules/signal`'s
+  `handle_pause` → `src/syscall/ffi.rs`'s `sys_pause` → `src/process/signals.rs`'s `do_pause`.
+  Real zero-argument wire format, no musl call-site patch needed. Unlike `getrandom`/`sysinfo`/
+  `sigaltstack` (all thin plumbing over existing state), `pause(2)`'s real semantics — block until
+  a signal is delivered that either terminates the process or invokes a caught handler — needed an
+  actual new block/wake primitive: a new top-level `BlockReason::WaitingForSignal` variant, plus a
+  new `wake_if_paused` helper called from both `do_kill`'s and `signal_foreground_group`'s own
+  `Action::SetPending` arm (the only action shape that corresponds to "a caught handler will run"
+  — an ignored signal or one with default-`Terminate`/`Stop` disposition already has its own
+  existing immediate path, unaffected by the caller's `ProcState`).
+- **`do_pause` checks the real wake condition (`pending_signals & !blocked_signals != 0`) before
+  ever blocking** (avoiding a lost wakeup, same principle every other blocking primitive here
+  follows) and **loops and re-checks after every wake** — the same discipline this codebase
+  already audits for any cross-process force-wake mechanism (see the real Ctrl+Z/`nanosleep`
+  regression the "Real job control" section above documents catching from the identical gap).
+- **Real POSIX ordering falls out for free**: once `do_pause` finds a deliverable signal and
+  returns `Err(EINTR)`, this codebase's own existing "deliver pending signals at the tail of every
+  completed syscall" design (`deliver_pending_signal`) redirects the live frame into the caught
+  handler *before* the caller's own `pause()` call site is ever observed to "return" — the handler
+  runs, calls `sigreturn`, and only then does control resume at the original call site with
+  `EINTR` already in `RAX`/`CF` — exactly matching real POSIX's "the handler runs before pause()
+  returns" contract, using the exact same hijack mechanism `sa-siginfo-syscall-smoke` already
+  proved for `tkill`.
+- Verified via `tests/pause_syscall_smoke.rs` + `userland/pause-syscall-smoke/` — forks; the
+  parent immediately calls `pause()` (genuinely blocks, forcing the scheduler to run the freshly
+  forked child next); the child sends the parent a caught-disposition `SIGUSR1` (exercising the
+  wake hook against a process actually sitting `Blocked(WaitingForSignal)`), then exits; the
+  parent's `pause()` returns `EINTR` only after the handler has already run, and it reaps the
+  child's clean exit via `wait4`. **Found and fixed live along the way**: this crate's own real
+  writable static (`HANDLER_RAN: AtomicBool`) hit the exact same `elf.rs` PT_LOAD-segment-sharing-
+  a-page issue documented above for `sa-siginfo-syscall-smoke` — same linker-script
+  `ALIGN(0x1000)` workaround applied.
 
 ## BusyBox gap analysis: what's needed for more applets
 
@@ -1340,7 +1415,7 @@ hw-profile support) rather than continuing to carry them as dead weight; see tha
 | `link`/`ln`, `mknod`/`makedevs`, `chroot`, `getrusage`/`time` | done | was subset of `NEEDS_SYSCALL` | `SYS_LINK=488`/`SYS_MKNOD=489`/`SYS_CHROOT=490`/`SYS_GETRUSAGE=491` |
 | SysV IPC, namespaces (`unshare`/`nsenter`/`setarch`/`setpriv`), `inotify`, ext2 `ioctl`s/`xattr` | not started, and no longer blocking anything — the applets that needed these (`ipcrm`/`ipcs`, `linux32`/`linux64`/`nsenter`/`setarch`/`setpriv`/`unshare`, `inotifyd`, `chattr`/`fatattr`/`lsattr`/`setfattr`) were removed from the roster before v0.1 | 0 remaining (`NEEDS_SYSCALL` fully resolved: done or removed) | namespaces don't fit this kernel's single-address-space model at all |
 | `/proc` — per-process (`stat`/`cmdline`/`status`, dir listing, `stat(2)`) | done | — | special-cased path prefix in `modules/oxfs` (no VFS layer to plug a separate module into), synthesized from `src/process/procfs.rs` accessors. Unlocks `pidof`/`pgrep`/`pkill`/`pstree`/`minips` |
-| `/proc` — system-wide (`meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | `MemFree`/`MemAvailable` == `MemTotal` (no dealloc tracking); `/proc/stat`'s `cpu` line all-zero except `idle`. `free`/`uptime` call `sysinfo(2)` for their primary numbers — a distinct, unimplemented gap these don't unblock |
+| `/proc` — system-wide (`meminfo`/`uptime`/`stat`) + `chdir(2)` into `/proc` | done | — | `MemFree`/`MemAvailable` == `MemTotal` (no dealloc tracking); `/proc/stat`'s `cpu` line all-zero except `idle`. `free`/`uptime` also call `sysinfo(2)` for their primary numbers — see "Real `getrandom(2)`/`sysinfo(2)`" below, now implemented |
 | `/proc` — per-fd (`/proc/<pid>/fd/`) | done (enumeration only, not real symlinks) | subset of the above | needs a cross-module "describe this fd" mechanism to go further (oxfs doesn't know what a pipe/socket fd is) |
 | Real symlinks (`SYS_SYMLINK`/`SYS_READLINK`) | done | `ln -s`/`readlink` | new `InodeKind::Symlink`; `resolve_path_impl` follows for every intermediate component always, final component only when `follow_last` — `MAX_SYMLINK_DEPTH=8`, `ELOOP=40` (musl's real value) |
 | Console/VT ioctls, serial/tape/I2C hardware, syslog, real pty | not started, and no longer blocking anything in the kept roster — `cttyhack`/`setsid` turned out to already work (real session/tty syscalls exist) and moved to WORKS; the other 22 applets in this category were removed before v0.1 | 0 remaining (was 24, `NEEDS_HARDWARE`) | several unrelated small gaps, see `docs/BUSYBOX_APPLETS.md` |

@@ -246,6 +246,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pause-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "pc-keyboard"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -261,6 +265,10 @@ version = "0.1.0"
 
 [[package]]
 name = "poll-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "posix-timer-syscall-smoke"
 version = "0.1.0"
 
 [[package]]
@@ -307,7 +315,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sigaltstack-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "signal"
+version = "0.1.0"
+
+[[package]]
+name = "sigsuspend-syscall-smoke"
 version = "0.1.0"
 
 [[package]]
@@ -325,6 +341,10 @@ dependencies = [
 
 [[package]]
 name = "stsh"
+version = "0.1.0"
+
+[[package]]
+name = "sysinfo-syscall-smoke"
 version = "0.1.0"
 
 [[package]]

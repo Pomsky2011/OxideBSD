@@ -317,6 +317,39 @@ pub(crate) fn sys_sigpending(set_ptr: u64, sigsetsize: u64) -> Result<u64, u64> 
     crate::process::do_sigpending(crate::process::scheduler::current_pid(), set_ptr)
 }
 
+/// `SYS_SIGALTSTACK` (`528`, item 3 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
+/// pre-reserved batch) — matches real `sigaltstack(2)`'s exact `(ss_ptr, old_ptr)` wire format
+/// (`third_party/musl/src/signal/sigaltstack.c` is a bare 2-argument `syscall`, no call-site patch
+/// needed beyond the number remap already sitting in `bits/syscall.h.in`). Delegates straight to
+/// `process::do_sigaltstack` — see that function's and `AltStack`'s own doc comments for the real
+/// bookkeeping-only semantics.
+pub(crate) fn sys_sigaltstack(ss_ptr: u64, old_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sigaltstack(crate::process::scheduler::current_pid(), ss_ptr, old_ptr)
+}
+
+/// `SYS_PAUSE` (`529`, item 4 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved
+/// batch) — matches real `pause(2)`'s exact zero-argument wire format
+/// (`third_party/musl/src/internal/syscall.h`'s `__sys_pause_cp` is a bare `__syscall_cp(SYS_pause)`,
+/// no call-site patch needed beyond the number remap already sitting in `bits/syscall.h.in`).
+/// Delegates straight to `process::do_pause` — see that function's and `BlockReason::
+/// WaitingForSignal`'s own doc comments for the real block/wake primitive this needed.
+pub(crate) fn sys_pause() -> Result<u64, u64> {
+    crate::process::do_pause(crate::process::scheduler::current_pid())
+}
+
+/// `SYS_SIGSUSPEND` (`530`, item 5 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
+/// pre-reserved batch) — matches real `sigsuspend(2)`'s exact `(mask_ptr, sigsetsize)` wire format
+/// (`third_party/musl/src/signal/sigsuspend.c` is a bare `syscall_cp(SYS_rt_sigsuspend, mask,
+/// _NSIG/8)`, no call-site patch needed beyond the number remap already sitting in
+/// `bits/syscall.h.in`). `sigsetsize` is read but not otherwise validated, same story
+/// `sys_sigprocmask`/`sys_sigpending` already have. Delegates straight to `process::do_sigsuspend`
+/// — see that function's own doc comment for the real block/wake-with-temporary-mask primitive
+/// this needed.
+pub(crate) fn sys_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> Result<u64, u64> {
+    let _ = sigsetsize;
+    crate::process::do_sigsuspend(crate::process::scheduler::current_pid(), mask_ptr)
+}
+
 /// `SYS_TKILL` (real, unclaimed Linux number `200` — used directly, no invented number or musl-
 /// side remap needed, same "still completely unassigned in this ABI's own registry" story
 /// `SYS_FCHMOD`/`SYS_FCHDIR` already have). Matches real `tkill(2)`'s exact `(tid, sig)` wire
@@ -834,6 +867,83 @@ pub(crate) fn sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> Result<u64
     Ok(crate::random::oxidebsd_random_bytes(buf_ptr, buflen) as u64)
 }
 
+/// musl's own `struct sysinfo` on x86_64 (`third_party/musl/include/sys/sysinfo.h`) -- confirmed
+/// 368 bytes via a direct `offsetof`/`sizeof` probe against that exact field list (Rust's own
+/// `repr(C)` layout rules match a C compiler's here since every field is a plain scalar/array with
+/// no explicit alignment override, but the *value* was verified rather than assumed given how easy
+/// an off-by-a-few-bytes struct-layout bug is to get wrong silently). An 8-byte gap after
+/// `procs`/`pad` (offset 84) before `totalhigh` (offset 88) is real, natural `unsigned long`
+/// alignment padding, not a missing field.
+#[repr(C)]
+struct RawSysinfo {
+    uptime: u64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    reserved: [u8; 256],
+}
+
+const _: () = assert!(core::mem::size_of::<RawSysinfo>() == 368);
+
+/// `SYS_SYSINFO` (`527`, item 2 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved
+/// batch) -- real `sysinfo(2)`'s exact `(info_ptr)` wire format (`third_party/musl/src/linux/
+/// sysinfo.c` is a bare 1-argument `syscall(SYS_sysinfo, info)`, no call-site patch needed beyond
+/// the number remap already in `bits/syscall.h.in`). Not a POSIX interface at all (Linux-specific),
+/// but the confirmed live blocker for `free`/`uptime`'s primary numbers (`procps/{free,uptime}.c`)
+/// -- see `docs/BUSYBOX_APPLETS.md`'s own `NEEDS_PROC` entries for those two applets.
+///
+/// Same honesty tier as `RawRusage`/`RawTms` above: real fields where this kernel actually tracks
+/// the concept, an honest placeholder (not a fabricated number) everywhere it doesn't.
+/// - `uptime`: real, `ticks() / TIMER_HZ` -- the same conversion `/proc/uptime`
+///   (`oxidebsd_proc_uptime`) and `sys_clock_gettime`'s `CLOCK_MONOTONIC` arm already use.
+/// - `totalram`: real, `memory::usable_ram_bytes()`, with `mem_unit = 1` so the byte count needs
+///   no further scaling -- matches `/proc/meminfo`'s own `MemTotal` source exactly.
+/// - `freeram`: set equal to `totalram`, same reasoning `/proc/meminfo`'s own doc comment already
+///   gives for `MemFree == MemTotal` -- no free-memory/deallocation tracking exists anywhere in
+///   this kernel (the frame allocator never reclaims a frame), so "as much as there ever was" is
+///   genuinely the most honest answer available, not an invented one.
+/// - `procs`: real, the live process table's own length (`process::table().lock().len()`) --
+///   truncated to `u16` (real `sysinfo(2)`'s own field width; this table will never remotely
+///   approach 65536 entries on this kernel).
+/// - `sharedram`/`bufferram`/`totalswap`/`freeswap`/`totalhigh`/`freehigh`/`loads`: honest `0` --
+///   no page cache, no swap, and no load-average tracking exist, same tier as `/proc/meminfo`'s
+///   own `Buffers`/`Cached`/`SwapTotal`/`SwapFree` placeholders.
+pub(crate) fn sys_sysinfo(info_ptr: u64) -> Result<u64, u64> {
+    let ticks = crate::cpu::interrupts::ticks();
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    let total_ram = crate::memory::usable_ram_bytes();
+    let procs = crate::process::table().lock().len().min(u16::MAX as usize) as u16;
+    let info = RawSysinfo {
+        uptime: ticks / hz,
+        loads: [0; 3],
+        totalram: total_ram,
+        freeram: total_ram,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs,
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        reserved: [0; 256],
+    };
+    // SAFETY: same known pointer-validation gap every other user-memory write in this file already
+    // has -- info_ptr isn't checked against the caller's actual mappings first.
+    unsafe { (info_ptr as *mut RawSysinfo).write_unaligned(info) };
+    Ok(0)
+}
+
 /// musl's own `struct timespec` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
 /// timespec` template, `time_t`/`long` both 8 bytes on this arch): two `i64`s, no padding.
 #[repr(C)]
@@ -1011,6 +1121,18 @@ pub(crate) extern "C" fn oxidebsd_sys_sigpending(set_ptr: u64, sigsetsize: u64) 
     result_to_ffi(sys_sigpending(set_ptr, sigsetsize))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_sigaltstack(ss_ptr: u64, old_ptr: u64) -> i64 {
+    result_to_ffi(sys_sigaltstack(ss_ptr, old_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_pause() -> i64 {
+    result_to_ffi(sys_pause())
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
+    result_to_ffi(sys_sigsuspend(mask_ptr, sigsetsize))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_tkill(tid: u64, sig: u64) -> i64 {
     result_to_ffi(sys_tkill(tid, sig))
 }
@@ -1161,6 +1283,59 @@ pub(crate) extern "C" fn oxidebsd_sys_getitimer(which: u64, old_ptr: u64) -> i64
     ))
 }
 
+/// `SYS_TIMER_CREATE = 531`/`SYS_TIMER_SETTIME = 532`/`SYS_TIMER_GETTIME = 533`/
+/// `SYS_TIMER_GETOVERRUN = 534`/`SYS_TIMER_DELETE = 535` (registered by `modules/clock`, items
+/// 6-10 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved batch) -- real POSIX
+/// per-process timers, a natural extension of the already-implemented `setitimer`/`getitimer`
+/// (`ITIMER_REAL`-only) infrastructure just above, now that per-timer-id tracking exists
+/// (`process::PosixTimer`/`Process::posix_timers`). See `process::do_timer_create`'s own doc
+/// comment for the real wire format/semantics of the whole sub-batch.
+pub(crate) extern "C" fn oxidebsd_sys_timer_create(clockid: u64, evp_ptr: u64, timerid_ptr: u64) -> i64 {
+    result_to_ffi(crate::process::do_timer_create(
+        crate::process::scheduler::current_pid(),
+        clockid,
+        evp_ptr,
+        timerid_ptr,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_timer_settime(
+    timerid: u64,
+    flags: u64,
+    new_ptr: u64,
+    old_ptr: u64,
+) -> i64 {
+    result_to_ffi(crate::process::do_timer_settime(
+        crate::process::scheduler::current_pid(),
+        timerid,
+        flags,
+        new_ptr,
+        old_ptr,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_timer_gettime(timerid: u64, val_ptr: u64) -> i64 {
+    result_to_ffi(crate::process::do_timer_gettime(
+        crate::process::scheduler::current_pid(),
+        timerid,
+        val_ptr,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_timer_getoverrun(timerid: u64) -> i64 {
+    result_to_ffi(crate::process::do_timer_getoverrun(
+        crate::process::scheduler::current_pid(),
+        timerid,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_timer_delete(timerid: u64) -> i64 {
+    result_to_ffi(crate::process::do_timer_delete(
+        crate::process::scheduler::current_pid(),
+        timerid,
+    ))
+}
+
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/
 /// `do_getpid`/`do_mmap`/`do_munmap`/`do_brk` for `modules/native_abi/` to call — same pattern as
 /// the exit/read/write adapters above, real logic kept kernel-side since module code can't use
@@ -1194,6 +1369,10 @@ pub(crate) extern "C" fn oxidebsd_sys_times(tms_ptr: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> i64 {
     result_to_ffi(sys_getrandom(buf_ptr, buflen, flags))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sysinfo(info_ptr: u64) -> i64 {
+    result_to_ffi(sys_sysinfo(info_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_execve(

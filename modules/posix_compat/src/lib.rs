@@ -105,6 +105,14 @@
 //! existing SHA-256/ChaCha20 generator (the same one already backing `/dev/random`/`/dev/
 //! urandom`) — see that module's own doc comment for the persistent entropy pool and the
 //! hypervisor-distrust gate on `RDRAND`/`RDSEED` this syscall inherits for free.
+//!
+//! `SYS_SYSINFO = 527` is item 2 of the same batch. Matches real `sysinfo(2)`'s exact
+//! `(info_ptr)` wire format, no argument-convention patch needed. Real logic (`src/syscall/
+//! ffi.rs`'s `sys_sysinfo`/`RawSysinfo`) is kernel-resident and honest about what this kernel
+//! actually tracks — real `uptime`/`totalram`/`procs`, `freeram == totalram` (same "no
+//! deallocation tracking" reasoning `/proc/meminfo`'s `MemFree` already uses), zero everywhere
+//! else (no swap, no page cache, no load average). Not itself a POSIX interface, but the confirmed
+//! live blocker for `free`/`uptime`'s primary numbers.
 #![no_std]
 
 unsafe extern "C" {
@@ -147,6 +155,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64;
     fn oxidebsd_sys_times(tms_ptr: u64) -> i64;
     fn oxidebsd_sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> i64;
+    fn oxidebsd_sys_sysinfo(info_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -240,6 +249,11 @@ const SYS_TIMES: u64 = 493;
 /// existing generator) is kernel-resident, same reasoning as everything else this module only
 /// ever calls through to.
 const SYS_GETRANDOM: u64 = 526;
+/// Item 2 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall "pre-reserved ahead of
+/// implementation" batch -- same pre-claimed-before-the-handler-existed reasoning as
+/// `SYS_GETRANDOM` just above. Real logic (`src/syscall/ffi.rs`'s `sys_sysinfo`/`RawSysinfo`) is
+/// kernel-resident; this module only ever calls through to it.
+const SYS_SYSINFO: u64 = 527;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -386,6 +400,10 @@ extern "C" fn handle_getrandom(buf_ptr: u64, buflen: u64, flags: u64, _a3: u64) 
     unsafe { oxidebsd_sys_getrandom(buf_ptr, buflen, flags) }
 }
 
+extern "C" fn handle_sysinfo(info_ptr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sysinfo(info_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -423,9 +441,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_GETRUSAGE, handle_getrusage);
         oxidebsd_register_syscall(SYS_TIMES, handle_times);
         oxidebsd_register_syscall(SYS_GETRANDOM, handle_getrandom);
+        oxidebsd_register_syscall(SYS_SYSINFO, handle_sysinfo);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO)\n",
     );
     0
 }

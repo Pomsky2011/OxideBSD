@@ -2,7 +2,7 @@
 
 
 
-use crate::syscall::EINVAL;
+use crate::syscall::{EAGAIN, EINVAL};
 use super::*;
 
 /// musl's own `struct timespec` on x86_64 -- see `src/syscall.rs`'s `RawTimespec` (duplicated
@@ -210,5 +210,312 @@ pub fn do_getitimer(pid: Pid, which: u64, old_ptr: u64) -> Result<u64, u64> {
             it_value_usec: value_usec,
         })
     };
+    Ok(0)
+}
+
+/// Real, architecture-generic `clockid_t` values -- duplicated from `src/syscall/ffi.rs`'s own
+/// copy rather than shared across this internal module boundary, same "no shared crate across this
+/// internal ABI boundary" convention this file's own `RawTimespec`/`RawItimerval` already follow.
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// Real Linux `TIMER_ABSTIME` (`third_party/musl/include/time.h`) -- the one `timer_settime(2)`
+/// `flags` bit this ABI understands; any other bit is `EINVAL`.
+const TIMER_ABSTIME: u64 = 1;
+
+/// musl's own `struct ksigevent` (`third_party/musl/src/time/timer_create.c`) -- the real,
+/// kernel-facing shape `timer_create(2)`'s `evp` argument actually points at (musl's userspace
+/// `struct sigevent` is translated into this smaller struct before the syscall for every
+/// notification kind reachable here -- see `do_timer_create`'s own doc comment for why
+/// `SIGEV_THREAD`/`SIGEV_THREAD_ID` never really reach this kernel in practice). `union sigval` is
+/// 8 bytes on this LP64 target (its largest member is a pointer); `sigev_value`/`sigev_tid` are
+/// never read (only `sigev_notify`/`sigev_signo` matter here) but stay in the struct for correct
+/// field-offset layout matching the real one musl builds.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawKSigevent {
+    #[allow(dead_code)]
+    sigev_value: u64,
+    sigev_signo: i32,
+    sigev_notify: i32,
+    #[allow(dead_code)]
+    sigev_tid: i32,
+}
+
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+
+/// Real `struct itimerspec` layout (`{ struct timespec it_interval; struct timespec it_value; }`,
+/// nanosecond precision) -- distinct from `RawItimerval` above (`setitimer`'s own microsecond-
+/// precision `timeval` pair). What `timer_settime(2)`/`timer_gettime(2)` actually read/write.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawItimerspec {
+    it_interval_sec: i64,
+    it_interval_nsec: i64,
+    it_value_sec: i64,
+    it_value_nsec: i64,
+}
+
+/// `sec`/`nsec` -> ticks, rounded up (never fires *earlier* than requested) -- same rounding
+/// discipline `timeval_to_ticks` above already established, just nanosecond- instead of
+/// microsecond-precision.
+fn timespec_to_ticks(sec: i64, nsec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return None;
+    }
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    let whole = sec as u64 * hz;
+    let frac = (nsec as u64 * hz).div_ceil(1_000_000_000);
+    Some(whole + frac)
+}
+
+/// Inverse of `timespec_to_ticks` -- floored, same "never claim more time is left than actually
+/// is" reasoning `ticks_to_timeval` above already established.
+fn ticks_to_timespec(ticks: u64) -> (i64, i64) {
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    ((ticks / hz) as i64, ((ticks % hz) * 1_000_000_000 / hz) as i64)
+}
+
+/// Converts a `TIMER_ABSTIME` `timer_settime` target (a point in `clockid`'s own domain, not a
+/// duration) into an absolute `interrupts::ticks()` deadline. `CLOCK_MONOTONIC`'s domain already
+/// *is* "seconds since boot at `TIMER_HZ` resolution" -- exactly what `ticks()` counts -- so a
+/// requested absolute timestamp converts the same way a relative one would (`timespec_to_ticks`),
+/// just used directly as the deadline instead of added to `ticks()`. `CLOCK_REALTIME`'s domain is
+/// wall-clock time (`src/cpu/rtc.rs`'s live CMOS read, `tv_nsec` always `0`) -- converted via the
+/// delta between the requested wall-clock second and *now*, then applied against the current tick
+/// count. A target already in the past (delta `<= 0`) collapses to "fire on the very next timer
+/// IRQ" (`now_ticks`) rather than underflowing, matching real semantics for an already-elapsed
+/// absolute deadline.
+fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    let frac_ticks = (nsec as u64 * hz).div_ceil(1_000_000_000);
+    let now_ticks = crate::cpu::interrupts::ticks();
+    if clockid == CLOCK_MONOTONIC {
+        sec.max(0) as u64 * hz + frac_ticks
+    } else {
+        let now_wall = crate::cpu::rtc::unix_epoch_seconds();
+        let delta_secs = sec - now_wall;
+        if delta_secs <= 0 {
+            now_ticks
+        } else {
+            now_ticks + delta_secs as u64 * hz + frac_ticks
+        }
+    }
+}
+
+/// `SYS_TIMER_CREATE` (`531`, item 6 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
+/// pre-reserved batch) -- matches real `timer_create(2)`'s exact `(clockid, evp_ptr, timerid_ptr)`
+/// wire format (musl's own `timer_create()` translates its `struct sigevent` argument into the
+/// smaller `struct ksigevent` -- `RawKSigevent` above -- before issuing the raw syscall for every
+/// `SIGEV_SIGNAL`/`SIGEV_NONE`/`SIGEV_THREAD_ID` notification kind; `SIGEV_THREAD` is handled
+/// entirely in userspace via a real `pthread_create()` first, which always fails on this kernel
+/// -- no `clone(2)` -- before ever reaching this syscall, so only `SIGEV_SIGNAL`/`SIGEV_NONE` are
+/// real, reachable cases here; a caller bypassing musl's own wrapper to request `SIGEV_THREAD_ID`
+/// directly gets a real `EINVAL`, this kernel having no notion of a specific thread to target).
+///
+/// `evp_ptr == 0` matches real POSIX's own default: `SIGEV_SIGNAL` with `sigev_signo = SIGALRM`.
+/// Finds the first free `Process::posix_timers` slot (`EAGAIN` if all `MAX_POSIX_TIMERS` are
+/// already in use, matching real Linux's own resource-exhaustion errno for this call) and writes
+/// its index back as the real, opaque `timer_t` value.
+pub fn do_timer_create(pid: Pid, clockid: u64, evp_ptr: u64, timerid_ptr: u64) -> Result<u64, u64> {
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return Err(EINVAL);
+    }
+
+    let signo = if evp_ptr == 0 {
+        SIGALRM
+    } else {
+        // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+        // already has.
+        let evp = unsafe { *(evp_ptr as *const RawKSigevent) };
+        match evp.sigev_notify {
+            SIGEV_NONE => 0,
+            SIGEV_SIGNAL => {
+                let sig = evp.sigev_signo as u64;
+                if !(1..=31).contains(&sig) {
+                    return Err(EINVAL);
+                }
+                sig
+            }
+            _ => return Err(EINVAL),
+        }
+    };
+
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("timer_create: current process missing from table");
+
+    let Some(slot) = proc.posix_timers.iter().position(Option::is_none) else {
+        return Err(EAGAIN);
+    };
+    proc.posix_timers[slot] = Some(PosixTimer {
+        clockid,
+        signo,
+        deadline: None,
+        interval_ticks: 0,
+        overrun: 0,
+    });
+    drop(table);
+
+    // SAFETY: same known pointer-validation gap as above, for a write this time.
+    unsafe { (timerid_ptr as *mut i32).write(slot as i32) };
+    Ok(0)
+}
+
+/// `SYS_TIMER_SETTIME` (`532`, item 7 of the same batch) -- matches real `timer_settime(2)`'s
+/// exact `(timerid, flags, new_ptr, old_ptr)` wire format (musl's own `timer_settime()` reduces to
+/// a bare 4-argument `syscall` on this LP64 target -- no `*64`-suffixed sibling exists for
+/// `time_t` this size, see `third_party/musl/arch/x86_64/bits/syscall.h.in`'s own comment on the
+/// batch). `timerid` doubles as `Process::posix_timers`'s own index; an out-of-range or currently-
+/// unallocated one is `EINVAL`, matching real Linux.
+///
+/// Setting `it_value` to all-zero disarms the timer regardless of `TIMER_ABSTIME` -- real
+/// `timer_settime(2)` semantics, checked before either the relative or absolute interpretation
+/// below. Otherwise: relative mode (`flags == 0`) arms `ticks() + value_ticks`, same shape
+/// `do_setitimer` already uses; `TIMER_ABSTIME` mode resolves the absolute target via
+/// `abstime_to_ticks`, using the `clockid` this timer was created against. Rearming always clears
+/// `overrun` -- a stale overrun count from before this call has no real meaning against a freshly
+/// (re)armed timer.
+pub fn do_timer_settime(
+    pid: Pid,
+    timerid: u64,
+    flags: u64,
+    new_ptr: u64,
+    old_ptr: u64,
+) -> Result<u64, u64> {
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(EINVAL);
+    }
+    if new_ptr == 0 {
+        return Err(EINVAL);
+    }
+    let timerid = timerid as usize;
+
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let new = unsafe { *(new_ptr as *const RawItimerspec) };
+    let value_ticks = timespec_to_ticks(new.it_value_sec, new.it_value_nsec).ok_or(EINVAL)?;
+    let interval_ticks =
+        timespec_to_ticks(new.it_interval_sec, new.it_interval_nsec).ok_or(EINVAL)?;
+
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("timer_settime: current process missing from table");
+    let clockid = proc
+        .posix_timers
+        .get(timerid)
+        .and_then(|s| s.as_ref())
+        .ok_or(EINVAL)?
+        .clockid;
+
+    if old_ptr != 0 {
+        let slot = proc.posix_timers[timerid].as_ref().unwrap();
+        let (value_sec, value_nsec) = match slot.deadline {
+            Some(deadline) => {
+                ticks_to_timespec(deadline.saturating_sub(crate::cpu::interrupts::ticks()))
+            }
+            None => (0, 0),
+        };
+        let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);
+        // SAFETY: same known pointer-validation gap as above, for a write this time.
+        unsafe {
+            (old_ptr as *mut RawItimerspec).write(RawItimerspec {
+                it_interval_sec: interval_sec,
+                it_interval_nsec: interval_nsec,
+                it_value_sec: value_sec,
+                it_value_nsec: value_nsec,
+            })
+        };
+    }
+
+    let slot = proc.posix_timers[timerid].as_mut().unwrap();
+    if new.it_value_sec == 0 && new.it_value_nsec == 0 {
+        slot.deadline = None;
+        slot.interval_ticks = 0;
+    } else if flags & TIMER_ABSTIME != 0 {
+        slot.deadline = Some(abstime_to_ticks(clockid, new.it_value_sec, new.it_value_nsec));
+        slot.interval_ticks = interval_ticks;
+    } else {
+        slot.deadline = Some(crate::cpu::interrupts::ticks() + value_ticks);
+        slot.interval_ticks = interval_ticks;
+    }
+    slot.overrun = 0;
+    Ok(0)
+}
+
+/// `SYS_TIMER_GETTIME` (`533`, item 8) -- matches real `timer_gettime(2)`'s exact
+/// `(timerid, val_ptr)` wire format. Same `ok_or(EINVAL)` invalid-id handling as
+/// `do_timer_settime`.
+pub fn do_timer_gettime(pid: Pid, timerid: u64, val_ptr: u64) -> Result<u64, u64> {
+    if val_ptr == 0 {
+        return Err(EINVAL);
+    }
+    let timerid = timerid as usize;
+    let table = PROCESS_TABLE.lock();
+    let proc = table
+        .get(&pid)
+        .expect("timer_gettime: current process missing from table");
+    let slot = proc
+        .posix_timers
+        .get(timerid)
+        .and_then(|s| s.as_ref())
+        .ok_or(EINVAL)?;
+
+    let (value_sec, value_nsec) = match slot.deadline {
+        Some(deadline) => {
+            ticks_to_timespec(deadline.saturating_sub(crate::cpu::interrupts::ticks()))
+        }
+        None => (0, 0),
+    };
+    let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);
+    // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
+    // already has.
+    unsafe {
+        (val_ptr as *mut RawItimerspec).write(RawItimerspec {
+            it_interval_sec: interval_sec,
+            it_interval_nsec: interval_nsec,
+            it_value_sec: value_sec,
+            it_value_nsec: value_nsec,
+        })
+    };
+    Ok(0)
+}
+
+/// `SYS_TIMER_GETOVERRUN` (`534`, item 9) -- matches real `timer_getoverrun(2)`'s exact
+/// single-argument `(timerid)` wire format; unlike every other timer call here, the overrun count
+/// itself *is* the real return value (no output pointer) -- see `PosixTimer::overrun`'s own doc
+/// comment for what this counts and its one known, accepted simplification.
+pub fn do_timer_getoverrun(pid: Pid, timerid: u64) -> Result<u64, u64> {
+    let timerid = timerid as usize;
+    let table = PROCESS_TABLE.lock();
+    let proc = table
+        .get(&pid)
+        .expect("timer_getoverrun: current process missing from table");
+    let slot = proc
+        .posix_timers
+        .get(timerid)
+        .and_then(|s| s.as_ref())
+        .ok_or(EINVAL)?;
+    Ok(slot.overrun as u64)
+}
+
+/// `SYS_TIMER_DELETE` (`535`, item 10, the last of the POSIX-timer sub-batch) -- matches real
+/// `timer_delete(2)`'s exact single-argument `(timerid)` wire format. Just frees the slot (`None`)
+/// -- no dealloc beyond that to do, consistent with the rest of this kernel's "no deallocation
+/// anywhere" stance for every other resource.
+pub fn do_timer_delete(pid: Pid, timerid: u64) -> Result<u64, u64> {
+    let timerid = timerid as usize;
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("timer_delete: current process missing from table");
+    let slot = proc.posix_timers.get_mut(timerid).ok_or(EINVAL)?;
+    if slot.is_none() {
+        return Err(EINVAL);
+    }
+    *slot = None;
     Ok(0)
 }

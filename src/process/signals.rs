@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 
-use crate::syscall::{EINVAL, ESRCH, SyscallFrame};
+use crate::syscall::{EINTR, EINVAL, ESRCH, SyscallFrame};
 use super::*;
 
 /// `SYS_KILL`'s real logic. Signals `1..=31` only; anything else is `EINVAL`, matching real
@@ -171,6 +171,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {
                 proc.pending_signals |= 1 << (sig - 1);
+                wake_if_paused(target, proc, sig);
             }
         }
     }
@@ -261,9 +262,155 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                 let mut table = PROCESS_TABLE.lock();
                 if let Some(proc) = table.get_mut(&pid) {
                     proc.pending_signals |= 1 << (sig - 1);
+                    wake_if_paused(pid, proc, sig);
                 }
             }
         }
+    }
+}
+
+/// Wakes `pid` if it's blocked in `do_pause` and `sig` isn't currently blocked by it -- shared by
+/// `do_kill`/`signal_foreground_group`'s own `Action::SetPending` arms (the only action shape that
+/// corresponds to real POSIX `pause(2)`'s own wake condition: a signal that will invoke a caught
+/// handler; see `BlockReason::WaitingForSignal`'s own doc comment for why `Action::Discard`/
+/// `Action::Terminate`/`Action::Stop` don't need this hook at all). Spurious wakes aren't possible
+/// here (unlike `wake_parent_if_waiting`'s `WUNTRACED`/`WCONTINUED` case) since this is the exact
+/// condition `do_pause`'s own loop re-checks after waking anyway.
+fn wake_if_paused(pid: Pid, proc: &mut Process, sig: u64) {
+    if proc.state == ProcState::Blocked(BlockReason::WaitingForSignal)
+        && proc.blocked_signals & (1 << (sig - 1)) == 0
+    {
+        proc.state = ProcState::Ready;
+        scheduler::enqueue_ready(pid);
+    }
+}
+
+/// `SYS_PAUSE`'s real logic (`529`, item 4 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
+/// pre-reserved batch). Real POSIX semantics: blocks until a signal is delivered that either
+/// terminates the process (in which case this never returns at all) or invokes a caught handler
+/// -- always returns `EINTR` otherwise (`pause(2)` has no successful return). An ignored signal,
+/// a default-`Terminate`/`Stop` signal is handled by its own existing immediate path (`do_kill`'s
+/// `Action::Terminate`/`Action::Stop`, unaffected by this process's `ProcState`), and a signal
+/// blocked via `sigprocmask` don't wake this loop at all -- it just keeps blocking, matching real
+/// semantics.
+///
+/// Checks the real wake condition (`pending_signals & !blocked_signals != 0`) *before* ever
+/// blocking, same "avoid a lost wakeup" reasoning every other blocking primitive in this codebase
+/// already follows -- a signal could already be pending-but-deferred from before this call (e.g.
+/// delivery deferred while blocked, since unblocked). Loops and re-checks after every wake, same
+/// established pattern this codebase already audits for (`ScheduleWakeup`-worthy: any cross-
+/// process force-wake mechanism needs every `scheduler::schedule()` call site to loop-and-recheck,
+/// not trust "state == Ready now" to mean "my specific event happened" -- see
+/// `ProcState::Stopped`'s own doc comment for the identical reasoning).
+///
+/// Once a deliverable signal exists, this returns `Err(EINTR)` and control resumes normally at
+/// this exact syscall's own dispatch tail (`src/syscall/mod.rs`'s `deliver_pending_signal`, called
+/// once at the tail of every completed syscall) -- which is what actually invokes the handler
+/// (redirecting the live frame) before the caller ever observes `pause()` "returning" `-1`/`EINTR`
+/// at its own call site, matching real POSIX behavior where a caught signal's handler runs before
+/// the interrupted `pause()` call is ever seen to return.
+pub fn do_pause(pid: Pid) -> Result<u64, u64> {
+    loop {
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let proc = table
+                .get_mut(&pid)
+                .expect("pause: current process missing from table");
+            if proc.pending_signals & !proc.blocked_signals != 0 {
+                return Err(EINTR);
+            }
+            proc.state = ProcState::Blocked(BlockReason::WaitingForSignal);
+        }
+        scheduler::schedule();
+    }
+}
+
+/// `SYS_SIGSUSPEND`'s real logic (`530`, item 5 of `docs/MISSING_POSIX_SYSCALLS.md`'s own
+/// 28-syscall pre-reserved batch). Real POSIX semantics: atomically replaces `blocked_signals`
+/// with `*mask_ptr` for the duration of a single wait, blocks until a signal is delivered that
+/// either terminates the process (never returns) or invokes a caught handler, then restores the
+/// original mask once that's resolved -- always returns `EINTR` otherwise (`sigsuspend(2)` has no
+/// successful return). This is exactly `do_pause` above plus a temporary, atomic mask swap around
+/// the same loop (musl's own `pause()` is separate, unrelated code -- not implemented in terms of
+/// this syscall on this ABI, unlike on some real Unixes). The atomicity POSIX requires (no window
+/// where a signal sent between reading the old mask and blocking could be missed) falls out for
+/// free from this kernel's single-core, no-preemption design: nothing else can run between the
+/// mask swap below and the loop's first deliverability check.
+///
+/// `blocked_signals` is deliberately left at the *temporary* mask, not restored here, for as long
+/// as a deliverable signal has only just been detected -- restoring immediately, before
+/// `deliver_pending_signal` (`src/syscall.rs`, called right after this returns, still within the
+/// same `syscall_dispatch` invocation) gets to act on it, would be wrong: the very signal that
+/// just woke this call is very often blocked under the *original* mask (this is in fact the
+/// canonical `sigsuspend` use case -- temporarily unblocking a signal that's normally blocked, to
+/// atomically wait for it) and would become invisible to `take_deliverable_signal` right when
+/// it's needed. Instead, `Process::sigsuspend_restore_mask` records the mask to restore, consumed
+/// by `deliver_pending_signal` itself once it knows how the signal was actually resolved
+/// (immediately, if no handler runs; deferred until `sigreturn`, if one does) -- see that
+/// function's own doc comment for the three-way split.
+pub fn do_sigsuspend(pid: Pid, mask_ptr: u64) -> Result<u64, u64> {
+    // SIGKILL/SIGSTOP can never be blocked -- same masking sigprocmask's SIG_SETMASK already
+    // applies.
+    let unblockable = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+    // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+    let requested = unsafe { (mask_ptr as *const u64).read() };
+
+    let original_mask = {
+        let mut table = PROCESS_TABLE.lock();
+        let proc = table
+            .get_mut(&pid)
+            .expect("sigsuspend: current process missing from table");
+        let original = proc.blocked_signals;
+        proc.blocked_signals = requested & !unblockable;
+        original
+    };
+
+    loop {
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let proc = table
+                .get_mut(&pid)
+                .expect("sigsuspend: current process missing from table");
+            if proc.pending_signals & !proc.blocked_signals != 0 {
+                proc.sigsuspend_restore_mask = Some(original_mask);
+                return Err(EINTR);
+            }
+            proc.state = ProcState::Blocked(BlockReason::WaitingForSignal);
+        }
+        scheduler::schedule();
+    }
+}
+
+/// Consumes `Process::sigsuspend_restore_mask` -- `None` unless the process currently finishing a
+/// syscall is doing so via a freshly-woken `do_sigsuspend` above. Called once, by
+/// `deliver_pending_signal` (`src/syscall.rs`), immediately after `take_deliverable_signal`.
+pub(crate) fn take_sigsuspend_restore_mask(pid: Pid) -> Option<u64> {
+    let mut table = PROCESS_TABLE.lock();
+    table.get_mut(&pid)?.sigsuspend_restore_mask.take()
+}
+
+/// Restores `blocked_signals` directly -- used by `deliver_pending_signal` for every
+/// `do_sigsuspend` wakeup outcome that *won't* pass through `sigreturn` (no handler ran, or the
+/// process terminated/stopped instead of catching it) -- the `Handler` case instead defers via
+/// `set_signal_saved_blocked_override` below, since a real handler is about to run under the
+/// temporary mask and must not have it restored out from under it.
+pub(crate) fn restore_blocked_signals(pid: Pid, mask: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(proc) = table.get_mut(&pid) {
+        proc.blocked_signals = mask;
+    }
+}
+
+/// Overrides the mask `sigreturn` (`take_signal_saved_frame`) will restore once the handler
+/// `deliver_pending_signal` just redirected into finishes -- used only for a `do_sigsuspend`
+/// wakeup that resolved to a real caught handler. Real POSIX semantics restore `sigsuspend`'s
+/// *original* pre-call mask once the handler returns, not the temporary one `do_sigsuspend`
+/// swapped in for the wait itself (already folded into the handler's own `mask_to_add` via
+/// `stash_signal_context`'s normal path, which this call runs immediately after).
+pub(crate) fn set_signal_saved_blocked_override(pid: Pid, mask: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(proc) = table.get_mut(&pid) {
+        proc.signal_saved_blocked = mask;
     }
 }
 
@@ -306,6 +453,65 @@ pub fn do_sigaction(pid: Pid, sig: u64, act_ptr: u64, oldact_ptr: u64) -> Result
             flags: raw.flags,
             restorer: raw.restorer,
             mask: raw.mask,
+        };
+    }
+    Ok(0)
+}
+
+/// `SYS_SIGALTSTACK`'s real logic (`528`, item 3 of `docs/MISSING_POSIX_SYSCALLS.md`'s own
+/// 28-syscall pre-reserved batch). Reads/writes a real musl `struct sigaltstack`/`stack_t`
+/// (`ss_sp`, `ss_flags`, `ss_size` — see `AltStack`'s own doc comment for the "bookkeeping only,
+/// never actually switched to" scope). Both `ss_ptr`/`old_ptr` are optional (either may be `0`),
+/// matching real `sigaltstack(2)`'s own semantics — a call can read the current state, set a new
+/// one, or both in one shot.
+///
+/// `ss_ptr != 0`: real Linux rejects any `ss_flags` bit outside `SS_DISABLE` with `EINVAL` — a
+/// caller can never *set* `SS_ONSTACK` (it's a read-only status bit, see `AltStack`'s own doc
+/// comment), and musl's own `sigaltstack()` wrapper already filters that client-side before ever
+/// reaching this syscall. `SS_DISABLE` set discards `ss_sp`/`ss_size` (matches real Linux: a
+/// disabled alt stack's address/size are meaningless); otherwise the real `(sp, size)` pair is
+/// stored verbatim — no minimum-size enforcement here since this kernel never actually switches
+/// to this stack, and musl's own wrapper already enforces `_SC_MINSIGSTKSZ` client-side before
+/// this is ever reached.
+pub fn do_sigaltstack(pid: Pid, ss_ptr: u64, old_ptr: u64) -> Result<u64, u64> {
+    #[repr(C)]
+    struct RawSigaltstack {
+        sp: u64,
+        flags: i32,
+        size: u64,
+    }
+
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&pid)
+        .expect("sigaltstack: current process missing from table");
+
+    if old_ptr != 0 {
+        let raw = RawSigaltstack {
+            sp: proc.altstack.sp,
+            // This kernel never actually executes a handler on the alt stack -- SS_ONSTACK is
+            // always reported unset, an honest reflection of what actually happens (see
+            // AltStack's own doc comment).
+            flags: proc.altstack.flags & !SS_ONSTACK,
+            size: proc.altstack.size,
+        };
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        unsafe { (old_ptr as *mut RawSigaltstack).write_unaligned(raw) };
+    }
+    if ss_ptr != 0 {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        let raw = unsafe { (ss_ptr as *const RawSigaltstack).read_unaligned() };
+        if raw.flags & !SS_DISABLE != 0 {
+            return Err(EINVAL);
+        }
+        proc.altstack = if raw.flags & SS_DISABLE != 0 {
+            AltStack::default()
+        } else {
+            AltStack {
+                sp: raw.sp,
+                flags: 0,
+                size: raw.size,
+            }
         };
     }
     Ok(0)
