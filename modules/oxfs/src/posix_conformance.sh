@@ -64,7 +64,11 @@ for rel in $(cat /posix-tests/manifest.txt); do
         continue
     fi
 
-    /posix-tests/t0 5 "$bin" >/posix-tests/run-out.txt 2>&1
+    # 40s, not 5s: nanosleep/10000-1.c alone legitimately sleeps through ~27 real seconds of valid
+    # durations (0+1+1+2+10+13s) before it even reaches its invalid-parameter checks -- a real,
+    # working nanosleep() genuinely needs that long, not a hang. Found live: an earlier 5s bound
+    # timed it out and misclassified a passing test as TIMEOUT.
+    /posix-tests/t0 40 "$bin" >/posix-tests/run-out.txt 2>&1
     status=$?
 
     case "$status" in
