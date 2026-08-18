@@ -53,7 +53,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64;
     fn oxidebsd_sys_getpid() -> i64;
     fn oxidebsd_sys_getppid() -> i64;
-    fn oxidebsd_sys_mmap(addr_hint: u64, len: u64, prot: u64) -> i64;
+    fn oxidebsd_sys_mmap(addr_hint: u64, len: u64, prot: u64, packed: u64) -> i64;
     fn oxidebsd_sys_munmap(addr: u64, len: u64) -> i64;
     fn oxidebsd_sys_brk(addr: u64) -> i64;
     fn oxidebsd_sys_mprotect(addr: u64, len: u64, prot: u64) -> i64;
@@ -107,9 +107,9 @@ extern "C" fn handle_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: 
     unsafe { oxidebsd_sys_wait4(pid, status_ptr, options, rusage_ptr) }
 }
 
-/// The one handler that actually reads its 4th argument (`envp_ptr`, via `R10`) -- see
-/// `src/syscall.rs`'s module doc comment for why `R10` only became a real, read argument once
-/// `execve` needed real `envp` passthrough.
+/// One of two handlers in this module that actually read their 4th argument (`envp_ptr`, via
+/// `R10`) -- see `src/syscall.rs`'s module doc comment for why `R10` only became a real, read
+/// argument once `execve` needed real `envp` passthrough. `handle_mmap` below is the other.
 extern "C" fn handle_execve(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     unsafe { oxidebsd_sys_execve(path_ptr, path_len, argv_ptr, envp_ptr) }
 }
@@ -122,8 +122,10 @@ extern "C" fn handle_getppid(_arg0: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> 
     unsafe { oxidebsd_sys_getppid() }
 }
 
-extern "C" fn handle_mmap(addr_hint: u64, len: u64, prot: u64, _arg3: u64) -> i64 {
-    unsafe { oxidebsd_sys_mmap(addr_hint, len, prot) }
+/// `packed` (real `R10`) carries `fd`/`off` -- see the kernel-side `oxidebsd_sys_mmap`'s own doc
+/// comment for the packed wire format.
+extern "C" fn handle_mmap(addr_hint: u64, len: u64, prot: u64, packed: u64) -> i64 {
+    unsafe { oxidebsd_sys_mmap(addr_hint, len, prot, packed) }
 }
 
 extern "C" fn handle_munmap(addr: u64, len: u64, _arg2: u64, _arg3: u64) -> i64 {

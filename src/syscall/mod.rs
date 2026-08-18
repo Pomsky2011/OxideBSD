@@ -91,6 +91,11 @@ pub(crate) const ENOSYS: u64 = 38;
 pub(crate) const ECHILD: u64 = 10;
 pub(crate) const ENOEXEC: u64 = 8;
 pub(crate) const ENOMEM: u64 = 12;
+/// Used by `process::mm::do_mmap`'s real fd-backed path: a real, open fd that isn't backed by an
+/// identifiable file (`crate::fs::fd::content_id_of` returns `None` -- a pipe, socket, console,
+/// or a brand-new not-yet-committed write fd, see that function's own doc comment). Same value on
+/// Linux and the BSDs.
+pub(crate) const ENODEV: u64 = 19;
 /// Returned by `crate::fs::pipe`'s `pipe_write` once a pipe's read end has been closed.
 pub(crate) const EPIPE: u64 = 32;
 /// Returned by `sys_kill` when the target pid doesn't exist -- "no such process," identical on

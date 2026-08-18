@@ -72,6 +72,28 @@ unsafe extern "C" {
         write: extern "C" fn(u64, u64, u64) -> i64,
         close: extern "C" fn(u64) -> i64,
     ) -> i32;
+    /// Same as `oxidebsd_register_fd_ops`, plus a `content_id` callback — see
+    /// `crate::fs::fd::FdContentId`'s own doc comment (kernel tree) for why this exists: real
+    /// fd-backed `MAP_SHARED` mmap (`crate::process::mm::do_mmap`) needs a live "what real inode
+    /// does this fd resolve to right now" query, keyed by nothing this module already exposes
+    /// generically. Only used for oxfs's own real file-backed `OpenFile` variants below
+    /// (`register_open_file` calls this instead of the plain `oxidebsd_register_fd_ops`
+    /// unconditionally — `oxfs_content_id` itself returns `-1` for every non-file variant).
+    fn oxidebsd_register_fd_ops_with_content_id(
+        fd: u64,
+        read: extern "C" fn(u64, u64, u64) -> i64,
+        write: extern "C" fn(u64, u64, u64) -> i64,
+        close: extern "C" fn(u64) -> i64,
+        content_id: extern "C" fn(u64) -> i64,
+    ) -> i32;
+    /// See `crate::fs::fd::ContentRead`/`ContentWrite`/`ContentSize`'s own doc comment (kernel
+    /// tree) for why real fd-backed `MAP_SHARED` mmap needs this instead of the plain per-fd
+    /// read/write callbacks. Called once, from this module's own `module_init`.
+    fn oxidebsd_register_content_accessors(
+        read: extern "C" fn(u64, u64, u64, u64) -> i64,
+        write: extern "C" fn(u64, u64, u64) -> i64,
+        size: extern "C" fn(u64) -> i64,
+    );
     fn oxidebsd_close_fd(fd: u64) -> i32;
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
@@ -1943,10 +1965,82 @@ fn register_open_file(open_file: OpenFile) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
     let fd = unsafe { oxidebsd_alloc_fd() };
     *slot = Some((fd, open_file));
-    // SAFETY: oxfs_read/oxfs_write/oxfs_close are this module's own functions, already relocated
-    // by the time module_init (which makes this function reachable) runs.
-    unsafe { oxidebsd_register_fd_ops(fd, oxfs_read, oxfs_write, oxfs_close) };
+    // SAFETY: oxfs_read/oxfs_write/oxfs_close/oxfs_content_id are this module's own functions,
+    // already relocated by the time module_init (which makes this function reachable) runs.
+    // Always the `_with_content_id` variant, not just for `FileRead`/`Write` -- `oxfs_content_id`
+    // itself already returns `-1` for every other variant, so there's no need to discriminate here.
+    unsafe {
+        oxidebsd_register_fd_ops_with_content_id(
+            fd,
+            oxfs_read,
+            oxfs_write,
+            oxfs_close,
+            oxfs_content_id,
+        )
+    };
     fd as i64
+}
+
+/// `content_id` callback for `oxidebsd_register_fd_ops_with_content_id` — see that import's own
+/// doc comment. Reuses `resolve_write_fd_inode` (the same helper `oxfs_ftruncate`/`oxfs_fstat`
+/// already call) rather than only recognizing an *already*-committed inode -- found live:
+/// `mmap/1-1.c` (the POSIX conformance pilot) calls `open(O_CREAT|O_RDWR|O_EXCL) -> write() ->
+/// mmap()` with no intervening `ftruncate()`/`fstat()`, so a real caller's fd genuinely can still
+/// be an uncommitted `Write { existing_inode: None, .. }` at `mmap()` time -- an earlier version
+/// of this function returned `-1` for exactly that case, making every such `mmap()` fail outright
+/// (`ENODEV`) rather than forcing the same early commit `ftruncate`/`fstat` already do on demand.
+/// `-1` only for a fd `resolve_write_fd_inode` genuinely can't identify at all: any synthetic
+/// variant (`DirListing`/`ProcRead`/`ProcDir`/`DevRandom`/`DevNull`/`DevZero`), or a commit that
+/// itself failed (e.g. `ENOSPC`).
+///
+/// **Known, accepted quirk**: forcing early commit here calls the same `dir_insert` a real
+/// `close()` would -- if the caller already `unlink()`d this exact path *before* ever committing
+/// (nothing stops a real program from `open() -> unlink() -> write() -> mmap()`, and this pilot's
+/// own `mmap/1-1.c`/`mmap/12-1.c` do exactly that), the name reappears in its parent directory,
+/// where real POSIX would have kept it permanently anonymous (data preserved, but never
+/// re-findable by path) once unlinked. Not fixed here: doing so needs oxfs's own pending-`Write`
+/// state to track "this target name was already unlinked," a distinct, non-trivial gap in this
+/// filesystem's write-commit model, not something real fd-backed mmap content resolution can or
+/// should paper over. No test in this pilot's own manifest checks for the resurrected name itself
+/// except `mmap/12-1.c`, which fails on exactly this pre-existing behavior regardless of mmap.
+extern "C" fn oxfs_content_id(real_fd: u64) -> i64 {
+    match resolve_write_fd_inode(real_fd) {
+        Some(inode) => inode as i64,
+        None => -1,
+    }
+}
+
+/// `read` accessor for `oxidebsd_register_content_accessors` — reads directly from `inode`'s real,
+/// committed block content via `read_inode_at`, bypassing any fd's own `OpenFile` state entirely.
+/// See `crate::fs::fd::ContentRead`'s own doc comment (kernel tree) for why this exists instead of
+/// reusing `oxfs_read`.
+extern "C" fn oxfs_inode_content_read(inode: u64, offset: u64, ptr: u64, len: u64) -> i64 {
+    // SAFETY: same trust boundary as elsewhere -- caller (crate::process::mm, kernel-core) owns
+    // this pointer/length, always a page-aligned kernel staging buffer in practice.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+    read_inode_at(inode as u32, offset as usize, out) as i64
+}
+
+/// `write` accessor for `oxidebsd_register_content_accessors` -- replaces `inode`'s complete real
+/// content with exactly `len` bytes via `write_inode_data`, same one-shot whole-content write
+/// primitive every other real write in this module ultimately goes through (see `OpenFile::Write`'s
+/// own doc comment). Reachable from kernel core without going through any fd's own
+/// `OpenFile::Write` buffer/close machinery, which real fd-backed mmap writeback can't use anyway
+/// -- see `crate::process::mm::do_mmap_file_backed`'s own doc comment.
+extern "C" fn oxfs_inode_content_write(inode: u64, ptr: u64, len: u64) -> i64 {
+    // SAFETY: same trust boundary as above.
+    let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    if write_inode_data(inode as u32, data) {
+        len as i64
+    } else {
+        -EIO
+    }
+}
+
+/// `size` accessor for `oxidebsd_register_content_accessors` -- `inode`'s real current content
+/// length in bytes.
+extern "C" fn oxfs_inode_content_size(inode: u64) -> i64 {
+    read_inode(inode as u32).size as i64
 }
 
 fn find_open_file(fd: u64) -> Option<&'static mut OpenFile> {
@@ -2414,8 +2508,16 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
     if path.starts_with(b"/proc") && (path.len() == 5 || path[5] == b'/') {
         return proc_open(&path[5..]);
     }
+    // Only the four magic device names are intercepted here -- anything else under `/dev/`
+    // (`/dev/shm/...` for POSIX named shared memory/semaphores -- see `format_fresh_filesystem`'s
+    // own `/dev/shm` seeding -- or a real `mknod`-created device node) falls through to ordinary
+    // real path resolution below instead of an unconditional `ENOENT`, now that `/dev` is seeded
+    // as a real directory rather than existing only as this prefix interception.
     if path.starts_with(b"/dev/") {
-        return dev_open(&path[5..]);
+        let suffix = &path[5..];
+        if matches!(suffix, b"random" | b"urandom" | b"null" | b"zero") {
+            return dev_open(suffix);
+        }
     }
 
     let cwd = match current_cwd() {
@@ -5365,6 +5467,35 @@ fn format_fresh_filesystem() -> bool {
         write_inode(user_home, inode);
     }
 
+    // /tmp -- real POSIX conformance-suite tests (`mmap`'s own pilot subset) `open(O_CREAT|
+    // O_EXCL)` a scratch file here as their first setup step; a missing directory ENOENTs before
+    // the behavior actually under test ever runs, misclassifying every one of them UNRESOLVED
+    // rather than a real PASS/FAIL. Mode 01777 matches real POSIX world-writable-plus-sticky `/tmp`
+    // convention -- the sticky bit is cosmetic here (oxfs's own `chmod` already masks input to
+    // `0o777`, no sticky-bit eviction-protection is enforced anywhere in this kernel), but every
+    // caller in this pilot runs as root anyway, which bypasses permission bits entirely regardless.
+    let tmp = ensure_dir(root, b"tmp");
+    {
+        let mut inode = read_inode(tmp);
+        inode.mode = 0o1777;
+        write_inode(tmp, inode);
+    }
+
+    // /dev/shm -- POSIX named shared memory/semaphores. musl's own `shm_open()`/`sem_open()`
+    // (third_party/musl/src/mman/shm_open.c, src/thread/sem_open.c) aren't separate syscalls at
+    // all -- both are pure userspace wrappers over a plain `open("/dev/shm/<name>", ...)` -- so
+    // this is real infra, not a stub: no new syscall needed, just a real directory for that
+    // `open()` to land in instead of the unconditional `/dev/` prefix interception's `ENOENT`
+    // (see `oxfs_open`'s own updated doc comment above). Distinct from the four magic
+    // `/dev/{random,urandom,null,zero}` paths, which stay intercepted before reaching here.
+    let dev = ensure_dir(root, b"dev");
+    let dev_shm = ensure_dir(dev, b"shm");
+    {
+        let mut inode = read_inode(dev_shm);
+        inode.mode = 0o1777;
+        write_inode(dev_shm, inode);
+    }
+
     // TinyCC's own on-target runtime tree -- see CLAUDE.md's TinyCC section. `/usr/include`,
     // `/usr/lib`, `/usr/lib/tcc` exactly match tcc's own compiled-in defaults (`CONFIG_TCCDIR`/
     // `CONFIG_TCC_CRTPREFIX`/`CONFIG_TCC_SYSINCLUDEPATHS`, baked in via build.rs's
@@ -6287,6 +6418,11 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_FLOCK, oxfs_flock);
         oxidebsd_register_syscall(SYS_STATFS, oxfs_statfs);
         oxidebsd_register_syscall(SYS_FSTATFS, oxfs_fstatfs);
+        oxidebsd_register_content_accessors(
+            oxfs_inode_content_read,
+            oxfs_inode_content_write,
+            oxfs_inode_content_size,
+        );
     }
 
     if ok { 0 } else { -1 }

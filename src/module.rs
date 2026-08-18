@@ -716,6 +716,12 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_dup2" => Some(crate::syscall::oxidebsd_sys_dup2 as *const () as u64),
         "oxidebsd_alloc_fd" => Some(crate::fs::fd::oxidebsd_alloc_fd as *const () as u64),
         "oxidebsd_register_fd_ops" => Some(crate::fs::fd::oxidebsd_register_fd_ops as *const () as u64),
+        "oxidebsd_register_fd_ops_with_content_id" => {
+            Some(crate::fs::fd::oxidebsd_register_fd_ops_with_content_id as *const () as u64)
+        }
+        "oxidebsd_register_content_accessors" => {
+            Some(crate::fs::fd::oxidebsd_register_content_accessors as *const () as u64)
+        }
         "oxidebsd_close_fd" => Some(crate::fs::fd::oxidebsd_close_fd as *const () as u64),
         "oxidebsd_get_cwd" => Some(crate::process::oxidebsd_get_cwd as *const () as u64),
         "oxidebsd_set_cwd" => Some(crate::process::oxidebsd_set_cwd as *const () as u64),

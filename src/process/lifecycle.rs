@@ -139,6 +139,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sigsuspend_restore_mask: None,
         sysv_sem_undo: Vec::new(),
         sysv_shm_attach: Vec::new(),
+        mmap_file_regions: Vec::new(),
         pending_siginfo: [QueuedSigInfo::default(); 32],
     };
 
@@ -353,6 +354,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited either -- see this field's own doc comment (tied to this kernel's own
         // "no copy-on-write fork" limitation, not an independent design choice).
         sysv_shm_attach: Vec::new(),
+        // Not inherited -- same reasoning, see this field's own doc comment on Process.
+        mmap_file_regions: Vec::new(),
         // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
         // for a forked child too, so there's nothing meaningful to carry over).
         pending_siginfo: [QueuedSigInfo::default(); 32],
@@ -731,6 +734,9 @@ pub fn do_execve(
     // Must run after the PROCESS_TABLE-locked block above ends, not inside it -- this function
     // takes that same lock itself, briefly, to drain the attachment list.
     crate::fs::sysv_shm::detach_all_for_exit(caller_pid);
+    // Same story for any real fd-backed mmap the old image had live -- see `mm::
+    // cleanup_mmap_file_regions_for_exit`'s own doc comment.
+    mm::cleanup_mmap_file_regions_for_exit(caller_pid);
 
     let frame = syscall::current_frame();
     // SAFETY: frame is this exact syscall's own live frame -- do_execve is only ever reached via
@@ -925,6 +931,14 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
     // `crate::fs::sysv_shm::detach_all_for_exit`'s own doc comment for why this must run before
     // `PROCESS_TABLE` is locked below, same reasoning as the `apply_undo_for_exit` call above.
     crate::fs::sysv_shm::detach_all_for_exit(pid);
+    // Real fd-backed mmap semantics: every mapping this process still had live gets its content
+    // written back and its extra reference released -- see `mm::
+    // cleanup_mmap_file_regions_for_exit`'s own doc comment. Must run after the `close_all` call
+    // above (which releases each mapped fd's *own* reference first, leaving only the mmap-held one
+    // for this call to release -- matching real POSIX's "mmap() keeps the file open past close()")
+    // and, for the same reentrant-`Mutex` reason as the two calls above, before `PROCESS_TABLE` is
+    // locked below.
+    mm::cleanup_mmap_file_regions_for_exit(pid);
     let mut table = PROCESS_TABLE.lock();
     match table.get_mut(&pid) {
         Some(me) if matches!(me.state, ProcState::Zombie(_)) => return, // already dead

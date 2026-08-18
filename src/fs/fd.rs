@@ -58,11 +58,27 @@ use crate::syscall::EBADF;
 pub(crate) type FdReadWrite = extern "C" fn(u64, u64, u64) -> i64;
 pub(crate) type FdClose = extern "C" fn(u64) -> i64;
 
+/// `content_id`'s shape — real Linux/POSIX has no analogous concept at the syscall boundary, this
+/// is purely internal plumbing for `crate::process::mm::do_mmap`'s fd-backed `MAP_SHARED` support:
+/// a stable identity for "the same underlying file," queried live (not cached at registration
+/// time) so it reflects a fd's *current* state — e.g. `modules/oxfs`'s own `OpenFile::Write`
+/// variant only gets a real backing inode once `ftruncate`/`write`/`close` actually allocates one,
+/// which can happen strictly after `open()` but before `mmap()` in the same real call sequence
+/// (`open(O_CREAT|O_EXCL) -> ftruncate() -> mmap()`, the shape every POSIX conformance test that
+/// needs this uses). Returns `-1` for "not identifiable / not mmap-able as a real file" (every fd
+/// kind except `modules/oxfs`'s own file-backed `OpenFile` variants, via `no_content_id` below).
+pub(crate) type FdContentId = extern "C" fn(u64) -> i64;
+
+extern "C" fn no_content_id(_real_fd: u64) -> i64 {
+    -1
+}
+
 #[derive(Clone, Copy)]
 struct FdOps {
     read: FdReadWrite,
     write: FdReadWrite,
     close: FdClose,
+    content_id: FdContentId,
     /// The fd this entry's callbacks are actually invoked with — itself for a fresh registration,
     /// or another entry's own `real_fd` for a `dup2`/`fork_inherit`-created alias (see this file's
     /// module doc comment). Chains never nest more than one level deep in practice, but every alias
@@ -121,18 +137,42 @@ pub(crate) extern "C" fn oxidebsd_register_fd_ops(
     write: FdReadWrite,
     close: FdClose,
 ) -> i32 {
-    register(scheduler::current_pid(), fd, read, write, close);
+    register(scheduler::current_pid(), fd, read, write, close, no_content_id);
     0
 }
 
-/// The non-`extern "C"` body `oxidebsd_register_fd_ops` and `init` (stdin/stdout/stderr) both share.
-fn register(pid: u64, fd: u64, read: FdReadWrite, write: FdReadWrite, close: FdClose) {
+/// Same as `oxidebsd_register_fd_ops`, plus a `content_id` callback — only `modules/oxfs` calls
+/// this (for its own file-backed `OpenFile` variants; its synthetic ones still pass `no_content_id`
+/// via the plain function above), so every other fd-registering module (pipes, sockets, mqueues,
+/// ...) needed zero changes. See `FdContentId`'s own doc comment for why this exists.
+pub(crate) extern "C" fn oxidebsd_register_fd_ops_with_content_id(
+    fd: u64,
+    read: FdReadWrite,
+    write: FdReadWrite,
+    close: FdClose,
+    content_id: FdContentId,
+) -> i32 {
+    register(scheduler::current_pid(), fd, read, write, close, content_id);
+    0
+}
+
+/// The non-`extern "C"` body every registration entry point (`oxidebsd_register_fd_ops`,
+/// `oxidebsd_register_fd_ops_with_content_id`, `init`'s stdin/stdout/stderr) shares.
+fn register(
+    pid: u64,
+    fd: u64,
+    read: FdReadWrite,
+    write: FdReadWrite,
+    close: FdClose,
+    content_id: FdContentId,
+) {
     TABLE.lock().insert(
         (pid, fd),
         FdOps {
             read,
             write,
             close,
+            content_id,
             real_fd: fd,
         },
     );
@@ -319,6 +359,73 @@ pub(crate) fn real_fd_of(fd: u64) -> Option<u64> {
         .map(|ops| ops.real_fd)
 }
 
+/// Live "is this fd backed by an identifiable real file, and if so which one" query — see
+/// `FdContentId`'s own doc comment for why this calls the registered callback fresh every time
+/// rather than reading a value cached at registration. Used by `crate::process::mm::do_mmap` to
+/// decide whether a real fd-backed `MAP_SHARED` mapping is even possible, and to key its own
+/// cross-open shared-frame cache. `None` covers both "no such fd" and "not identifiable right now."
+pub(crate) fn content_id_of(fd: u64) -> Option<u64> {
+    let ops = *TABLE.lock().get(&(scheduler::current_pid(), fd))?;
+    let id = (ops.content_id)(ops.real_fd);
+    if id < 0 { None } else { Some(id as u64) }
+}
+
+/// Real fd-backed `MAP_SHARED` mmap (`crate::process::mm`) reads/writes content *directly* by
+/// `content_id` (a real inode number), not through a fd's own read/write callbacks — found live,
+/// not designed in up front: `modules/oxfs`'s `oxfs_read` unconditionally fails (`-EBADF`) for a
+/// fd still in `OpenFile::Write` state, which is exactly the state every real caller's fd is still
+/// in at `mmap()` time (`open(O_CREAT|O_RDWR) -> ftruncate()/fstat() -> mmap()`, never `close()`d
+/// first) — so a population/writeback path built on the generic per-fd `read`/`write` callbacks
+/// could never actually read or write real content for any of them. Content-by-identity sidesteps
+/// this entirely (and, as a bonus, needs no positioned/`pread`-style read either, and gives
+/// writeback a real, queryable object length to clamp against — see `crate::process::mm::
+/// do_mmap_file_backed`'s own doc comment for why that clamp matters). A **global** registration,
+/// not per-fd like `FdOps` — `content_id` is a stable identity independent of which fd (if any) is
+/// currently open against it, so there's nothing to key a per-fd table by. Only `modules/oxfs`
+/// calls this (once, from its own `module_init`); every other fd-registering module is unaffected.
+pub(crate) type ContentRead = extern "C" fn(u64, u64, u64, u64) -> i64;
+pub(crate) type ContentWrite = extern "C" fn(u64, u64, u64) -> i64;
+pub(crate) type ContentSize = extern "C" fn(u64) -> i64;
+
+static CONTENT_ACCESSORS: Mutex<Option<(ContentRead, ContentWrite, ContentSize)>> =
+    Mutex::new(None);
+
+pub(crate) extern "C" fn oxidebsd_register_content_accessors(
+    read: ContentRead,
+    write: ContentWrite,
+    size: ContentSize,
+) {
+    *CONTENT_ACCESSORS.lock() = Some((read, write, size));
+}
+
+/// `(content_id, offset, ptr, len) -> bytes read`, `-1` if no module ever registered content
+/// accessors (never happens once `modules/oxfs` has loaded, which it always has by the time any
+/// real syscall is reachable).
+pub(crate) fn content_read(content_id: u64, offset: u64, ptr: u64, len: u64) -> i64 {
+    match *CONTENT_ACCESSORS.lock() {
+        Some((read, _, _)) => read(content_id, offset, ptr, len),
+        None => -1,
+    }
+}
+
+/// `(content_id, ptr, len) -> bytes written` — always replaces the object's complete content with
+/// exactly `len` bytes, matching `modules/oxfs`'s own one-shot write model (see that module's
+/// `OpenFile::Write` doc comment).
+pub(crate) fn content_write(content_id: u64, ptr: u64, len: u64) -> i64 {
+    match *CONTENT_ACCESSORS.lock() {
+        Some((_, write, _)) => write(content_id, ptr, len),
+        None => -1,
+    }
+}
+
+/// Real current content length of `content_id`, in bytes.
+pub(crate) fn content_size(content_id: u64) -> i64 {
+    match *CONTENT_ACCESSORS.lock() {
+        Some((_, _, size)) => size(content_id),
+        None => -1,
+    }
+}
+
 /// FFI wrapper over `real_fd_of` for modules that own their own fd-keyed state (`modules/oxfs`'s
 /// `OPEN_FILES`, keyed by `real_fd` like every `FdOps` callback already is) but can't call
 /// `crate::fd` directly -- modules only ever call *into* the kernel, through their own hand-curated
@@ -401,6 +508,7 @@ pub fn init() {
         stdin_read,
         write_not_permitted,
         stdio_close,
+        no_content_id,
     );
     register(
         BOOTSTRAP_PID,
@@ -408,6 +516,7 @@ pub fn init() {
         read_not_permitted,
         stdout_write,
         stdio_close,
+        no_content_id,
     );
     TABLE.lock().insert(
         (BOOTSTRAP_PID, 2),
@@ -415,6 +524,7 @@ pub fn init() {
             read: read_not_permitted,
             write: stdout_write,
             close: stdio_close,
+            content_id: no_content_id,
             real_fd: 1,
         },
     );

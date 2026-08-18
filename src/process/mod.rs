@@ -742,6 +742,12 @@ pub struct Process {
     /// unreachable): matches real Linux, where `execve(2)` destroying the old address space is
     /// itself a real implicit detach of everything that was attached to it.
     pub sysv_shm_attach: Vec<(u64, i32)>,
+    /// Real fd-backed `MAP_SHARED` mappings still live in this process's own address space (see
+    /// `mm::MmapFileRegion`'s own doc comment) — one entry per successful `mmap(fd >= 0, ...)`,
+    /// removed by a matching `munmap` or by exit/`execve` cleanup (`mm::
+    /// cleanup_mmap_file_regions_for_exit`). **Not inherited by `fork`** — same documented
+    /// simplification, and the same underlying reason, as `sysv_shm_attach` immediately above.
+    pub mmap_file_regions: Vec<mm::MmapFileRegion>,
     /// Real per-signal-number sender identity/payload, indexed `1..=31` same as `sigactions`
     /// (index `0` unused) -- see `QueuedSigInfo`'s own doc comment. Not copied by `fork` (a forked
     /// child starts with `pending_signals == 0` too, so there's nothing meaningful to carry over);
