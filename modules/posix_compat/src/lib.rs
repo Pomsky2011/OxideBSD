@@ -139,6 +139,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_getegid() -> i64;
     fn oxidebsd_sys_setuid(uid: u64) -> i64;
     fn oxidebsd_sys_setgid(gid: u64) -> i64;
+    fn oxidebsd_sys_setresuid(ruid: u64, euid: u64, suid: u64) -> i64;
     fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64;
     fn oxidebsd_sys_setgroups(count: u64, list_ptr: u64) -> i64;
     fn oxidebsd_sys_prlimit64(pid: u64, resource: u64, new_ptr: u64, old_ptr: u64) -> i64;
@@ -210,6 +211,11 @@ const SYS_GETGID: u64 = 160;
 const SYS_GETEGID: u64 = 161;
 const SYS_SETUID: u64 = 162;
 const SYS_SETGID: u64 = 163;
+/// Real, unclaimed `__NR_setresuid` -- moved here from its original real value `117` by the
+/// numeric-collision sweep (see `docs/MISSING_POSIX_SYSCALLS.md`'s own table: `117` collided with
+/// this ABI's own `SYS_SIGACTION`). Also backs `seteuid()` -- see `process::do_setresuid`'s own
+/// doc comment.
+const SYS_SETRESUID: u64 = 499;
 const SYS_GETGROUPS: u64 = 164;
 /// Invented -- real `__NR_setgroups` (`116`) was already independently claimed by this ABI's own
 /// `SYS_KILL`, a real collision found live (see `third_party/musl/arch/x86_64/bits/syscall.h.in`'s
@@ -378,6 +384,10 @@ extern "C" fn handle_setuid(uid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
 
 extern "C" fn handle_setgid(gid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_setgid(gid) }
+}
+
+extern "C" fn handle_setresuid(ruid: u64, euid: u64, suid: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_setresuid(ruid, euid, suid) }
 }
 
 extern "C" fn handle_getgroups(size: u64, list_ptr: u64, _a2: u64, _a3: u64) -> i64 {
@@ -555,6 +565,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_GETEGID, handle_getegid);
         oxidebsd_register_syscall(SYS_SETUID, handle_setuid);
         oxidebsd_register_syscall(SYS_SETGID, handle_setgid);
+        oxidebsd_register_syscall(SYS_SETRESUID, handle_setresuid);
         oxidebsd_register_syscall(SYS_GETGROUPS, handle_getgroups);
         oxidebsd_register_syscall(SYS_SETGROUPS, handle_setgroups);
         oxidebsd_register_syscall(SYS_PRLIMIT64, handle_prlimit64);
@@ -592,7 +603,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SHMDT, handle_shmdt);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
     );
     0
 }

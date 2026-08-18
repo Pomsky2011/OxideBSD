@@ -452,6 +452,20 @@ pub(crate) fn sys_setgid(gid: u64) -> Result<u64, u64> {
     crate::process::do_setgid(crate::process::scheduler::current_pid(), gid as u32)
 }
 
+/// `SYS_SETRESUID` (`499` — real, unclaimed `__NR_setresuid`, see `docs/MISSING_POSIX_SYSCALLS.md`'s
+/// numeric-collision sweep for why it isn't at its original real value `117`) — real `(ruid, euid,
+/// suid)` wire format, each a `uid_t` cast through `int`/`long` so a real `-1` ("leave unchanged")
+/// arrives sign-extended and reads back correctly as `i64`. See `process::do_setresuid`'s own doc
+/// comment for the real POSIX permission rule and why this single handler also backs `seteuid()`.
+pub(crate) fn sys_setresuid(ruid: u64, euid: u64, suid: u64) -> Result<u64, u64> {
+    crate::process::do_setresuid(
+        crate::process::scheduler::current_pid(),
+        ruid as i64,
+        euid as i64,
+        suid as i64,
+    )
+}
+
 /// `SYS_GETGROUPS` (`164`) — real `getgroups(int size, gid_t list[])` wire format, no
 /// argument-convention patch needed (a plain `(size, ptr)` pair, no string argument to mismatch).
 /// See `process::do_getgroups`'s own doc comment for why the caller's own `gid` is the complete,
@@ -1211,6 +1225,10 @@ pub(crate) extern "C" fn oxidebsd_sys_setuid(uid: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_setgid(gid: u64) -> i64 {
     result_to_ffi(sys_setgid(gid))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_setresuid(ruid: u64, euid: u64, suid: u64) -> i64 {
+    result_to_ffi(sys_setresuid(ruid, euid, suid))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_getgroups(size: u64, list_ptr: u64) -> i64 {

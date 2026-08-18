@@ -149,6 +149,42 @@ pub fn do_setgid(caller_pid: Pid, gid: u32) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// `SYS_SETRESUID`'s real logic — backs both real `setresuid(3)` directly and `seteuid(2)`
+/// (musl's own `seteuid(euid)` is a thin wrapper: `setresuid(-1, euid, -1)`, confirmed against
+/// `third_party/musl/src/unistd/seteuid.c` — both funnel through the exact same `__setxid(
+/// SYS_setresuid, ...)` call musl's own `setuid()`/`setgid()` already prove works correctly on
+/// this kernel's single-threaded model, see `do_setuid`'s own doc comment). Found live: `sem_open`
+/// conformance test `sem_open/3-1.c` (Open POSIX Test Suite) needs to drop root privilege via
+/// `seteuid()` before it can exercise its own real assertion, and reported a misleading
+/// `PTS_UNTESTED` instead — not because `sem_open` itself doesn't exist here (that's a separate,
+/// much bigger, already-tracked gap, see `docs/POSIX_COMPLIANCE_CHECKLIST.md`), but because
+/// `seteuid()` itself was an `[boot] unrecognized syscall number 499` the whole time.
+///
+/// **Real `-1`-means-"leave unchanged" semantics** (each argument arrives sign-extended from a
+/// `uid_t` cast to `int` then to a 64-bit syscall register — real `-1` reads back as `i64::-1`
+/// reliably at every step of that chain, confirmed against `setxid.c`'s own call sites). **A real,
+/// documented simplification**: this kernel's `Process` has no separate real/effective/saved-uid
+/// fields to update independently (see `do_setuid`'s own doc comment) — every provided (non `-1`)
+/// value is checked against the exact same root-or-no-op `do_setuid` rule, and the *effective* one
+/// (`euid` if given, else `ruid`, else `suid`) is what actually lands in the single `Process::uid`
+/// field, matching `seteuid()`'s own real-world purpose (change what governs future permission
+/// checks) even though a real three-way split isn't tracked.
+pub fn do_setresuid(caller_pid: Pid, ruid: i64, euid: i64, suid: i64) -> Result<u64, u64> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table
+        .get_mut(&caller_pid)
+        .expect("setresuid: current process missing from table");
+    for requested in [ruid, euid, suid] {
+        if requested != -1 && proc.uid != 0 && requested as u32 != proc.uid {
+            return Err(EPERM);
+        }
+    }
+    if let Some(target) = [euid, ruid, suid].into_iter().find(|&v| v != -1) {
+        proc.uid = target as u32;
+    }
+    Ok(0)
+}
+
 /// `SYS_GETGROUPS`'s real logic — this kernel has no supplementary-group concept at all, so the
 /// calling process's own single group (`Process::gid`) is the complete, correct group list to
 /// report, matching a real POSIX user with no supplementary groups. `size == 0` is the real
