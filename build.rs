@@ -89,6 +89,10 @@ fn main() {
         "SYSV_SHM_SYSCALL_SMOKE_ELF_PATH",
     );
     build_userland_crate("sig-syscall-smoke", "SIG_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate(
+        "posix-conformance-driver",
+        "POSIX_CONFORMANCE_DRIVER_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -123,6 +127,14 @@ fn main() {
     let tinycc_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/tinycc");
     let tcc_elf_path = build_tinycc(&musl_sysroot);
     let tcc_runtime_manifest_path = write_tcc_runtime_manifest(&musl_sysroot, &tinycc_dir);
+
+    // A real POSIX conformance baseline: see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own
+    // "Verification" section and `modules/oxfs/src/posix_conformance.sh`'s doc comment. Source-only
+    // (compiled on-target by `tcc`, not cross-compiled here) -- see `write_posix_test_manifest`'s
+    // own doc comment for why.
+    let posixtestsuite_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/posixtestsuite");
+    let posix_test_manifest_path = write_posix_test_manifest(&posixtestsuite_dir);
 
     // Real PT_INTERP / dynamic-linking milestone 1: a real, separate shared musl build (see
     // `build_musl_sysroot_shared`'s own doc comment for why it can't reuse the static sysroot
@@ -567,6 +579,10 @@ fn main() {
         (
             "TCC_RUNTIME_MANIFEST_PATH",
             tcc_runtime_manifest_path.to_str().unwrap(),
+        ),
+        (
+            "POSIX_TEST_MANIFEST_PATH",
+            posix_test_manifest_path.to_str().unwrap(),
         ),
         (
             "OXFS_DYNLINK_LIBC_SO_PATH",
@@ -1794,8 +1810,10 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
     // real `-lm`/`-lpthread`/etc. link-line compatibility even though musl merges everything into
     // libc.a itself). `rcrt1.o`/`Scrt1.o` (PIE-only crt variants) and `musl-gcc.specs` (a host
     // build-tool artifact, meaningless inside a target sysroot) are deliberately skipped -- tcc on
-    // this kernel always links `-static`, never PIE (this kernel's `elf.rs` has no `PT_INTERP`
-    // support at all).
+    // this kernel always links `-static`, never PIE (a real, separate decision made in
+    // `third_party/tinycc/libtcc.c`'s own `tcc_new()`, not a missing kernel capability -- `elf.rs`
+    // does now have real `PT_INTERP` support, see CLAUDE.md's "Dynamic linking" section, just never
+    // wired up for tcc's own output).
     let mut lib_files: Vec<(String, PathBuf)> = collect_dir_files(&musl_sysroot.join("lib"))
         .into_iter()
         .filter(|(rel, _)| !matches!(rel.as_str(), "rcrt1.o" | "Scrt1.o" | "musl-gcc.specs"))
@@ -1821,6 +1839,159 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
             .map(|(rel, abs)| (format!("include/{rel}"), abs)),
     );
     write_array(&mut src, "TCC_RUNTIME_FILES", &tcc_runtime_files);
+
+    std::fs::write(&out_path, src)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
+    out_path
+}
+
+/// A curated pilot subset of `third_party/posixtestsuite`'s `conformance/interfaces/` assertion
+/// files -- see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s "Verification" section for why this exists
+/// at all (a real conformance-suite baseline, not self-assessment against a checklist) and
+/// `modules/oxfs/src/posix_conformance.sh`'s own doc comment for how these get compiled and run.
+///
+/// **Deliberately not the whole suite** (1750 `.c` files in `conformance/interfaces/` alone,
+/// before `functional`/`stress`): this pilot exists to prove the whole pipeline -- seed source,
+/// compile on-target with `tcc`, run under a real timeout, classify the real POSIX result code --
+/// works end to end, and to get a first, real (if partial) pass/fail baseline, not to be the final
+/// coverage. Picked from interfaces this session already knows the implementation status of (real
+/// handlers for `kill`/`sigqueue`/`clock_gettime`/`nanosleep`/`sigwait`/`mq_open`, real-but-
+/// anonymous-only `mmap`, and the two POSIX-named — not SysV — IPC gaps `sem_open`/`shm_open`
+/// intentionally included as expected-failure controls), restricted to files that don't reference
+/// `pthread_create`/`testfrmw.h` (real threading doesn't exist yet -- see
+/// `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own foundational-blockers list -- so a test needing it
+/// would only add noise, not signal, to this first pass). All 69 confirmed to compile clean against
+/// real `musl-gcc` before being added here (a real, if imperfect, proxy for "the source itself is
+/// sound" -- `tcc`'s own more limited C support is a separate, expected source of pilot failures,
+/// classified separately by the runner script from a genuine kernel/runtime gap).
+const POSIX_TEST_PILOT_FILES: &[&str] = &[
+    "clock_gettime/1-1.c",
+    "clock_gettime/1-2.c",
+    "clock_gettime/2-1.c",
+    "clock_gettime/3-1.c",
+    "clock_gettime/4-1.c",
+    "clock_gettime/7-1.c",
+    "clock_gettime/8-1.c",
+    "clock_gettime/8-2.c",
+    "kill/1-1.c",
+    "kill/1-2.c",
+    "kill/2-1.c",
+    "kill/2-2.c",
+    "kill/3-1.c",
+    "mmap/10-1.c",
+    "mmap/11-1.c",
+    "mmap/11-2.c",
+    "mmap/11-3.c",
+    "mmap/11-4.c",
+    "mmap/11-5.c",
+    "mmap/1-1.c",
+    "mmap/12-1.c",
+    "mq_open/10-1.c",
+    "mq_open/11-1.c",
+    "mq_open/1-1.c",
+    "mq_open/12-1.c",
+    "mq_open/13-1.c",
+    "mq_open/14-1.c",
+    "mq_open/15-1.c",
+    "mq_open/16-1.c",
+    "nanosleep/10000-1.c",
+    "nanosleep/1-1.c",
+    "nanosleep/1-2.c",
+    "nanosleep/1-3.c",
+    "nanosleep/2-1.c",
+    "nanosleep/3-1.c",
+    "sem_open/10-1.c",
+    "sem_open/1-1.c",
+    "sem_open/1-2.c",
+    "sem_open/1-3.c",
+    "sem_open/1-4.c",
+    "sem_open/2-1.c",
+    "sem_open/2-2.c",
+    "sem_open/3-1.c",
+    "shm_open/10-1.c",
+    "shm_open/11-1.c",
+    "shm_open/1-1.c",
+    "shm_open/12-1.c",
+    "shm_open/13-1.c",
+    "shm_open/14-2.c",
+    "shm_open/15-1.c",
+    "shm_open/16-1.c",
+    "sigqueue/10-1.c",
+    "sigqueue/11-1.c",
+    "sigqueue/1-1.c",
+    "sigqueue/12-1.c",
+    "sigqueue/2-1.c",
+    "sigqueue/2-2.c",
+    "sigqueue/3-1.c",
+    "sigqueue/4-1.c",
+    "sigqueue/5-1.c",
+    "sigqueue/6-1.c",
+    "sigqueue/7-1.c",
+    "sigqueue/8-1.c",
+    "sigqueue/9-1.c",
+    "sigwait/1-1.c",
+    "sigwait/2-1.c",
+    "sigwait/3-1.c",
+    "sigwait/4-1.c",
+    "sigwait/8-1.c",
+];
+
+/// Generates `target/generated/posix_test_manifest.rs` (same `include!`-a-generated-file idiom
+/// `write_tcc_runtime_manifest` above already established, for the same reason: real file content
+/// embedded via literal-path `include_bytes!`, not the `env!()`-per-file pattern every hand-written
+/// embedded ELF in this codebase uses -- there's no reason to invent ~70 one-off names for data
+/// with no other identity need). `POSIX_TEST_PILOT_FILES` above is the single source of truth for
+/// *which* files get embedded; this function just resolves each into `(third_party/posixtestsuite`-
+/// relative path, absolute host path)` pairs, embeds `include/posixtest.h` (every pilot file's own
+/// `#include "posixtest.h"` target) and `t0.c` (the suite's own real timeout-wrapper utility, see
+/// `posix_conformance.sh`'s own doc comment for why a real `alarm()`-based wrapper matters on a
+/// kernel with no preemption), and writes out a plain-text `manifest.txt` (one relative path per
+/// line) generated from the exact same list, so the seeded corpus and the runner script's own
+/// iteration list can never drift apart.
+fn write_posix_test_manifest(posixtestsuite_dir: &Path) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let out_dir = Path::new(manifest_dir).join("target/generated");
+    std::fs::create_dir_all(&out_dir).expect("failed to create target/generated");
+    let out_path = out_dir.join("posix_test_manifest.rs");
+
+    let interfaces_dir = posixtestsuite_dir.join("conformance/interfaces");
+    let mut src = String::new();
+    src.push_str("pub static POSIX_TEST_FILES: &[(&str, &[u8])] = &[\n");
+    let mut manifest_txt = String::new();
+    for rel in POSIX_TEST_PILOT_FILES {
+        let abs = interfaces_dir.join(rel);
+        println!("cargo:rerun-if-changed={}", abs.display());
+        src.push_str(&format!(
+            "    (\"src/{rel}\", include_bytes!({:?})),\n",
+            abs.display()
+        ));
+        manifest_txt.push_str(rel);
+        manifest_txt.push('\n');
+    }
+    let posixtest_h = posixtestsuite_dir.join("include/posixtest.h");
+    println!("cargo:rerun-if-changed={}", posixtest_h.display());
+    src.push_str(&format!(
+        "    (\"include/posixtest.h\", include_bytes!({:?})),\n",
+        posixtest_h.display()
+    ));
+    let t0_c = posixtestsuite_dir.join("t0.c");
+    println!("cargo:rerun-if-changed={}", t0_c.display());
+    src.push_str(&format!(
+        "    (\"t0.c\", include_bytes!({:?})),\n",
+        t0_c.display()
+    ));
+    let manifest_txt_path = out_dir.join("posix_test_manifest.txt");
+    std::fs::write(&manifest_txt_path, &manifest_txt).unwrap_or_else(|e| {
+        panic!(
+            "failed to write {}: {e}",
+            manifest_txt_path.display()
+        )
+    });
+    src.push_str(&format!(
+        "    (\"manifest.txt\", include_bytes!({:?})),\n",
+        manifest_txt_path.display()
+    ));
+    src.push_str("];\n");
 
     std::fs::write(&out_path, src)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));

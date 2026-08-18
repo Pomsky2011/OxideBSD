@@ -272,6 +272,10 @@ name = "poll-syscall-smoke"
 version = "0.1.0"
 
 [[package]]
+name = "posix-conformance-driver"
+version = "0.1.0"
+
+[[package]]
 name = "posix-timer-syscall-smoke"
 version = "0.1.0"
 
