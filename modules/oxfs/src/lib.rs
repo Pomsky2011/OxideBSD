@@ -4707,10 +4707,11 @@ fn format_fresh_filesystem() -> bool {
     ok &= seed_file(root, b"test_busybox.sh", include_bytes!("test_busybox.sh"));
 
     // The real POSIX conformance pilot's own runner, meant to be run by hand at the hush prompt
-    // (`sh /posix_conformance.sh`) -- see that file's own header comment. Compiles each seeded
-    // `/posix-tests/src/**/*.c` on-target with `tcc`, runs it under `t0`'s real timeout, and
-    // classifies the real POSIX result code -- same "hand-run broad coverage script" tier as
-    // `test_busybox.sh` immediately above, not a `cargo test`.
+    // (`sh /posix_conformance.sh`) -- see that file's own header comment. Runs each seeded, real
+    // pre-built `/posix-tests/bin/**` ELF (cross-compiled host-side with musl-gcc -- see
+    // `write_posix_test_manifest`'s own doc comment for why not on-target `tcc`) under `t0`'s real
+    // timeout, and classifies the real POSIX result code -- same "hand-run broad coverage script"
+    // tier as `test_busybox.sh` immediately above, not a `cargo test`.
     ok &= seed_file(
         root,
         b"posix_conformance.sh",
@@ -5379,12 +5380,13 @@ fn format_fresh_filesystem() -> bool {
 
     // A real POSIX conformance baseline (see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own
     // "Verification" section): a curated pilot subset of `third_party/posixtestsuite`'s own
-    // assertion source files under `/posix-tests/src`, its `posixtest.h` under
-    // `/posix-tests/include`, its real `t0` timeout-wrapper source at `/posix-tests/t0.c`, and a
-    // plain-text `/posix-tests/manifest.txt` the runner script below iterates -- see
+    // assertion files, each cross-compiled host-side with musl-gcc into a real ELF under
+    // `/posix-tests/bin`, its real `t0` timeout-wrapper (also pre-built) at `/posix-tests/t0`, and
+    // a plain-text `/posix-tests/manifest.txt` the runner script below iterates -- see
     // `write_posix_test_manifest`'s own doc comment in build.rs for how this set was chosen and why
-    // it's seeded as source (compiled on-target by `tcc`, exercising the exact same real toolchain
-    // any other on-target C program would use) rather than cross-compiled ahead of time.
+    // it's cross-compiled ahead of time rather than seeded as source and compiled on-target by
+    // `tcc` (a real `tcc` GOT/PLT linker bug, found live investigating this exact pilot's own
+    // early crashes).
     let posix_tests = ensure_dir(root, b"posix-tests");
     ok &= seed_tree(posix_tests, POSIX_TEST_FILES);
 

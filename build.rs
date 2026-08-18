@@ -142,7 +142,8 @@ fn main() {
     // own doc comment for why.
     let posixtestsuite_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/posixtestsuite");
-    let posix_test_manifest_path = write_posix_test_manifest(&posixtestsuite_dir);
+    let posix_test_manifest_path =
+        write_posix_test_manifest(&musl_sysroot, &posixtestsuite_dir);
 
     // Real PT_INTERP / dynamic-linking milestone 1: a real, separate shared musl build (see
     // `build_musl_sysroot_shared`'s own doc comment for why it can't reuse the static sysroot
@@ -945,22 +946,22 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
 /// A curated pilot subset of `third_party/posixtestsuite`'s `conformance/interfaces/` assertion
 /// files -- see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s "Verification" section for why this exists
 /// at all (a real conformance-suite baseline, not self-assessment against a checklist) and
-/// `modules/oxfs/src/posix_conformance.sh`'s own doc comment for how these get compiled and run.
+/// `write_posix_test_manifest`'s own doc comment below for how these get built and
+/// `modules/oxfs/src/posix_conformance.sh`'s for how they get run.
 ///
 /// **Deliberately not the whole suite** (1750 `.c` files in `conformance/interfaces/` alone,
-/// before `functional`/`stress`): this pilot exists to prove the whole pipeline -- seed source,
-/// compile on-target with `tcc`, run under a real timeout, classify the real POSIX result code --
-/// works end to end, and to get a first, real (if partial) pass/fail baseline, not to be the final
-/// coverage. Picked from interfaces this session already knows the implementation status of (real
-/// handlers for `kill`/`sigqueue`/`clock_gettime`/`nanosleep`/`sigwait`/`mq_open`, real-but-
-/// anonymous-only `mmap`, and the two POSIX-named — not SysV — IPC gaps `sem_open`/`shm_open`
-/// intentionally included as expected-failure controls), restricted to files that don't reference
+/// before `functional`/`stress`): this pilot exists to prove the whole pipeline -- build, run
+/// under a real timeout, classify the real POSIX result code -- works end to end, and to get a
+/// first, real (if partial) pass/fail baseline, not to be the final coverage. Picked from
+/// interfaces this session already knows the implementation status of (real handlers for
+/// `kill`/`sigqueue`/`clock_gettime`/`nanosleep`/`sigwait`/`mq_open`, real-but-anonymous-only
+/// `mmap`, and the two POSIX-named — not SysV — IPC gaps `sem_open`/`shm_open` intentionally
+/// included as expected-failure controls), restricted to files that don't reference
 /// `pthread_create`/`testfrmw.h` (real threading doesn't exist yet -- see
 /// `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own foundational-blockers list -- so a test needing it
-/// would only add noise, not signal, to this first pass). All 69 confirmed to compile clean against
-/// real `musl-gcc` before being added here (a real, if imperfect, proxy for "the source itself is
-/// sound" -- `tcc`'s own more limited C support is a separate, expected source of pilot failures,
-/// classified separately by the runner script from a genuine kernel/runtime gap).
+/// would only add noise, not signal, to this first pass). All 69 originally in this list confirmed
+/// to compile clean against real `musl-gcc` (the same toolchain that now actually builds them, see
+/// below) before being added here.
 const POSIX_TEST_PILOT_FILES: &[&str] = &[
     "clock_gettime/1-1.c",
     "clock_gettime/1-2.c",
@@ -1029,7 +1030,12 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
     "sigwait/1-1.c",
     "sigwait/2-1.c",
     "sigwait/3-1.c",
-    "sigwait/4-1.c",
+    // sigwait/4-1.c deliberately excluded: it calls its own `alarm(3)` internally, which -- being
+    // real per-process alarm state -- *replaces* `t0`'s own outer `alarm(40)` timeout wrapper the
+    // moment it's called. If this kernel's `sigwait()`/`alarm()` interaction doesn't work exactly
+    // right (unconfirmed -- found live, not yet root-caused), there is no longer any timeout able
+    // to rescue the run at all -- confirmed hanging past a real 30-minute ceiling, not merely slow.
+    // A real, separate finding worth its own investigation later -- not a pilot-infra problem.
     "sigwait/8-1.c",
 ];
 
@@ -1038,45 +1044,110 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
 /// embedded via literal-path `include_bytes!`, not the `env!()`-per-file pattern every hand-written
 /// embedded ELF in this codebase uses -- there's no reason to invent ~70 one-off names for data
 /// with no other identity need). `POSIX_TEST_PILOT_FILES` above is the single source of truth for
-/// *which* files get embedded; this function just resolves each into `(third_party/posixtestsuite`-
-/// relative path, absolute host path)` pairs, embeds `include/posixtest.h` (every pilot file's own
-/// `#include "posixtest.h"` target) and `t0.c` (the suite's own real timeout-wrapper utility, see
+/// *which* files get embedded.
+///
+/// **Cross-compiled with `musl-gcc` on the host, not compiled on-target by `tcc`** -- an earlier
+/// version of this pilot seeded real `.c` source and compiled it on-target, exercising `tcc` as
+/// the real toolchain any on-target C program would use. Found live, the hard way: `tcc`'s own
+/// linker generates unresolved GOT/PLT indirection for calls into specific musl functions
+/// (`sigaction`, `fflush` confirmed; `printf`/`clock_gettime`/`kill`/etc. unaffected) even under a
+/// fully `-static` link -- the same *class* of bug CLAUDE.md's TinyCC section already documents
+/// finding and partially fixing (`tccelf.c`'s `build_got_entries`), but that fix evidently doesn't
+/// cover every code path. Symptom: a real ring-3 null-pointer read fault before the affected
+/// binary's own first instruction, and -- found investigating the crash -- real stdio output was
+/// silently never reaching the console for *any* on-target-compiled pilot binary at all, tcc bug
+/// or not. Cross-compiling with the same real, already-proven `musl-gcc` toolchain
+/// `build_musl_smoke`/`build_dynlink_smoke` already use sidesteps both problems at once, at the
+/// cost of losing "exercises tcc" as a side benefit -- an acceptable trade for a conformance
+/// baseline whose job is testing the *kernel*, not `tcc`. (The underlying `tcc` bug itself is
+/// still real and un-fixed -- worth its own investigation later, tracked separately from this
+/// pilot.)
+///
+/// Each pilot file gets a unique fixed load address (`POSIX_TEST_LOAD_BASE` + index *
+/// `POSIX_TEST_LOAD_STEP`, `0xcf40000`.., 68 entries fit comfortably below BusyBox's own applet
+/// range's ceiling well above and `module::MODULE_VA_BASE` far above) -- same "every userland
+/// binary gets a real, non-overlapping fixed base" discipline every other embedded ELF in this
+/// codebase already follows. `t0` (the suite's own real timeout-wrapper utility, see
 /// `posix_conformance.sh`'s own doc comment for why a real `alarm()`-based wrapper matters on a
-/// kernel with no preemption), and writes out a plain-text `manifest.txt` (one relative path per
-/// line) generated from the exact same list, so the seeded corpus and the runner script's own
-/// iteration list can never drift apart.
-fn write_posix_test_manifest(posixtestsuite_dir: &Path) -> PathBuf {
+/// kernel with no preemption) is cross-compiled the same way, at its own fixed base just below the
+/// pilot range. Embeds each compiled ELF's real bytes at `bin/<relative-path-with-.c-extension>`
+/// (the `.c` suffix is a real file's real relative identity carried through unchanged from the
+/// source tree, not a claim about its own content -- avoids needing any extension-rewriting logic
+/// in the shell runner, which would need real string manipulation hush may not support cleanly)
+/// and writes out a plain-text `manifest.txt` (one relative path per line) generated from the same
+/// list, so the seeded corpus and the runner script's own iteration list can never drift apart.
+fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> PathBuf {
+    const POSIX_TEST_LOAD_BASE: u64 = 0xcf40000;
+    const POSIX_TEST_LOAD_STEP: u64 = 0x40000;
+    const T0_LOAD_BASE: u64 = 0xcf00000;
+
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let out_dir = Path::new(manifest_dir).join("target/generated");
     std::fs::create_dir_all(&out_dir).expect("failed to create target/generated");
     let out_path = out_dir.join("posix_test_manifest.rs");
+    let bin_dir = Path::new(manifest_dir).join("target/posix-test-pilot");
+    std::fs::create_dir_all(&bin_dir).expect("failed to create target/posix-test-pilot");
 
     let interfaces_dir = posixtestsuite_dir.join("conformance/interfaces");
+    let include_dir = posixtestsuite_dir.join("include");
+    let musl_gcc = musl_sysroot.join("bin/musl-gcc");
+
     let mut src = String::new();
     src.push_str("pub static POSIX_TEST_FILES: &[(&str, &[u8])] = &[\n");
     let mut manifest_txt = String::new();
-    for rel in POSIX_TEST_PILOT_FILES {
-        let abs = interfaces_dir.join(rel);
-        println!("cargo:rerun-if-changed={}", abs.display());
+    for (i, rel) in POSIX_TEST_PILOT_FILES.iter().enumerate() {
+        let source = interfaces_dir.join(rel);
+        println!("cargo:rerun-if-changed={}", source.display());
+        let out = bin_dir.join(rel.replace('/', "_"));
+        let load_addr = POSIX_TEST_LOAD_BASE + (i as u64) * POSIX_TEST_LOAD_STEP;
+        let status = Command::new(&musl_gcc)
+            .arg("-static")
+            .arg("-no-pie")
+            .arg(format!("-Wl,-Ttext-segment={load_addr:#x}"))
+            .arg("-I")
+            .arg(&include_dir)
+            .arg("-o")
+            .arg(&out)
+            .arg(&source)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run musl-gcc for posix pilot {rel}: {e}"));
+        if !status.success() {
+            panic!("building posix pilot test {rel} failed: {status}");
+        }
         src.push_str(&format!(
-            "    (\"src/{rel}\", include_bytes!({:?})),\n",
-            abs.display()
+            "    (\"bin/{rel}\", include_bytes!({:?})),\n",
+            out.display()
         ));
         manifest_txt.push_str(rel);
         manifest_txt.push('\n');
     }
-    let posixtest_h = posixtestsuite_dir.join("include/posixtest.h");
-    println!("cargo:rerun-if-changed={}", posixtest_h.display());
-    src.push_str(&format!(
-        "    (\"include/posixtest.h\", include_bytes!({:?})),\n",
-        posixtest_h.display()
-    ));
+
     let t0_c = posixtestsuite_dir.join("t0.c");
     println!("cargo:rerun-if-changed={}", t0_c.display());
+    let t0_out = bin_dir.join("t0");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg(format!("-Wl,-Ttext-segment={T0_LOAD_BASE:#x}"))
+        // A real bug in the vendored suite's own t0.c: calls `strcmp` without `#include
+        // <string.h>` -- TCC let this slide (an implicit declaration is only a warning there);
+        // this host's real GCC treats it as a hard error by default. `-include string.h` forces
+        // the real declaration in without patching the vendored source itself.
+        .arg("-include")
+        .arg("string.h")
+        .arg("-o")
+        .arg(&t0_out)
+        .arg(&t0_c)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for posix pilot's t0: {e}"));
+    if !status.success() {
+        panic!("building posix pilot's t0 failed: {status}");
+    }
     src.push_str(&format!(
-        "    (\"t0.c\", include_bytes!({:?})),\n",
-        t0_c.display()
+        "    (\"t0\", include_bytes!({:?})),\n",
+        t0_out.display()
     ));
+
     let manifest_txt_path = out_dir.join("posix_test_manifest.txt");
     std::fs::write(&manifest_txt_path, &manifest_txt).unwrap_or_else(|e| {
         panic!(

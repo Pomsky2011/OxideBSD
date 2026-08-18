@@ -278,11 +278,13 @@ test-args = [
   "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
 ]
 test-success-exit-code = 33
-# 900 (was 300): shared across every [[test]] target (bootimage's own per-binary timeout, not
-# per-check), bumped for posix_conformance_smoke -- 69 real on-target tcc compiles plus real
-# t0-guarded runs (each individually bounded, but the sum across the whole pilot can approach the
-# old 300s ceiling under QEMU TCG). Harmless headroom for every faster existing test.
-test-timeout = 900
+# 1800 (was 300, then 900): shared across every [[test]] target (bootimage's own per-binary
+# timeout, not per-check), bumped for posix_conformance_smoke -- 69 real t0-guarded runs (each
+# individually bounded at 40s, but the sum across the whole pilot can genuinely approach a lower
+# ceiling if several tests each burn their full timeout, confirmed live: a 900s ceiling wasn't
+# enough once the pilot switched to real pre-built ELFs and started actually running every test
+# instead of crashing partway through). Harmless headroom for every faster existing test.
+test-timeout = 1800
 run-args = [
   "-accel", "kvm",
   "-accel", "tcg",
