@@ -559,7 +559,7 @@ elsewhere.
 
 | POSIX interface(s) | Backing concept | Notes |
 |---|---|---|
-| `mq_open`, `mq_close`, `mq_unlink`, `mq_send`, `mq_receive`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getattr`, `mq_setattr` | POSIX message queues | Pre-reserved at `536-541` (see "Pre-reserved ahead of implementation" below — no handler registered yet). No seeded applet uses these; `src/fs/pipe.rs`'s existing blocking-buffer machinery (already reused for `socketpair`) is the natural backing if ever needed. |
+| `mq_open`, `mq_close`, `mq_unlink`, `mq_send`, `mq_receive`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getattr`, `mq_setattr` | POSIX message queues | `536-541`, all now implemented — see "Pre-reserved batch: third implementation" above. No seeded applet uses these yet (no live caller in the current roster), but a real handler exists for any future one. |
 | `sem_init`, `sem_destroy`, `sem_wait`, `sem_trywait`, `sem_timedwait`, `sem_post`, `sem_getvalue` (unnamed semaphores) | futex-backed | Needs a real `futex(2)` first (see "structurally inapplicable" below for why that's currently out of scope) — blocked on the same prerequisite as thread sync primitives generally. No distinct syscall of its own to reserve a number for — not part of the pre-reservation batch below. |
 | `sem_open`, `sem_close`, `sem_unlink` (named semaphores) | `/dev/shm`-backed `open`+`mmap` | No live caller; would also want the `shm_open` path below first. Not a distinct syscall either — not part of the pre-reservation batch below. |
 | `shm_open`, `shm_unlink` | POSIX shared memory | No live caller in roster. Implemented via plain `open`/`mkdir` on real Linux, not a distinct syscall — not part of the pre-reservation batch below. |
