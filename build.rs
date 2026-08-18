@@ -1629,6 +1629,16 @@ fn write_data_disk_images() {
     let zeroed = vec![0u8; OXFS_DISK_IMAGE_BYTES as usize];
 
     let dev_disk_path = target_dir.join("oxfs_disk.img");
+    // Load-bearing, not a nicety: this file lives under `target/`, never touched by any other
+    // `rerun-if-changed` path this build script declares, so a plain `cargo run` after someone
+    // deletes it (e.g. to force a reformat/reseed) would otherwise skip this whole function --
+    // cargo only reruns a build script when a declared watched path actually changed, and an
+    // untracked deletion doesn't qualify. Cargo's own documented behavior for a `rerun-if-changed`
+    // path that doesn't exist is "always rerun the build script" -- exactly the case that needs
+    // covering here. Emitted unconditionally (both branches below), not just in the `Err` arm, so
+    // this stays watched on every future run too, including the ordinary case where the file
+    // already exists at the right size and nothing else needs to happen to it.
+    println!("cargo:rerun-if-changed={}", dev_disk_path.display());
     match std::fs::metadata(&dev_disk_path) {
         Err(_) => {
             std::fs::write(&dev_disk_path, &zeroed)
