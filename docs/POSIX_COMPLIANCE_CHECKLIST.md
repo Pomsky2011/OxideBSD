@@ -69,13 +69,23 @@ if this becomes real future work rather than just a tracking exercise.
       argument at all, always anonymous. `msync`/`mlock`/`munlock`/`mlockall` are correctly
       no-ops-by-construction *for anonymous memory* (no swap, nothing ever paged out — see
       `docs/MISSING_POSIX_SYSCALLS.md`'s "structurally inapplicable" table) but that framing
-      stops being true the moment a real file-backed mapping needs to flush back to its file.
-- [ ] **Real dynamic linking**: `PT_INTERP` support in `elf.rs`, real `mprotect(2)` enforcement
-      (currently a no-op — see CLAUDE.md's known-simplifications list, "no `NO_EXECUTE` on any ELF
-      segment"). **Why:** blocks `dlopen`/`dlsym`/`dlclose`/`dlerror` (musl's own implementation is
-      pure userspace logic over `mmap`/`mprotect`/relocation processing once a `.so` is mapped —
-      not a syscall gap, a real-enforcement gap) and any dynamically-linked binary at all (every
-      binary in this system is static today).
+      stops being true the moment a real file-backed mapping needs to flush back to its file. Real
+      enforcement here (not just file-backing) is also the milestone-2 dynamic-linking blocker
+      immediately below — the same gap shows up from two directions.
+- [x] **Milestone 1 done, milestone 2 open** — corrected from an earlier draft of this doc, which
+      wrongly said no `PT_INTERP` support existed at all; CLAUDE.md itself was stale on this same
+      point until this pass. **Milestone 1 (done, `e72fc7d`)**: a real `fork`+`execve` of a
+      genuinely dynamically-linked ELF works end to end — `elf.rs` accepts `ET_DYN`, loads a real
+      `PT_INTERP` interpreter (musl's own `ld.so`, i.e. `libc.so` itself) alongside the main binary,
+      and that interpreter performs real self-relocation and symbol resolution, verified by a real
+      libc call round-tripping (`tests/dynlink_syscall_smoke.rs`). See CLAUDE.md's "Dynamic
+      linking" section for the full design. **Milestone 2 (not started)**: `dlopen`/`dlsym`/
+      `dlclose`/`dlerror` — loading a *second*, independently-chosen shared object at runtime.
+      musl's own implementation of that is pure userspace logic over `mmap`/`mprotect`/relocation
+      processing once a `.so` is mapped, not a new syscall gap — but genuinely blocked on real
+      `mmap`/`mprotect` enforcement below, since milestone 1's kernel-driven single-interpreter load
+      never needed either capability for real (`SYS_MPROTECT` exists now but is a permissive
+      no-op stub).
 
 ## Filesystem / IPC gaps
 

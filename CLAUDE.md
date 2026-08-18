@@ -1215,9 +1215,10 @@ reverse).
 ## TinyCC: a real, on-target C compiler (`third_party/tinycc`, `modules/oxfs`, `build.rs`)
 
 OxideBSD's first C compiler that runs *on* the target itself. GCC/Clang are a much bigger lift
-(real multi-process pipelines, usually real dynamic linking, often threads — none of which this
-kernel has: `elf.rs` has zero `PT_INTERP` support, `clone`/`futex`/`mprotect` unregistered). TinyCC
-is a single monolithic static binary with real, maintained upstream musl support
+(real multi-process pipelines, often threads — `clone`/`futex` still unregistered — and, at the
+time this section was first written, real dynamic linking too; **milestone 1 of that has since
+landed, see "Dynamic linking" below** — TinyCC itself still doesn't need it, see bug 3 below).
+TinyCC is a single monolithic static binary with real, maintained upstream musl support
 (`--config-musl`) — the natural first target.
 
 - Vendored as a submodule (`Pomsky2011/tinycc-oxidebsd`, `oxidebsd` branch, tag `release_0_9_27`).
@@ -1255,8 +1256,9 @@ working — both root-caused via raw ELF/GOT/PLT byte inspection, not guessed**:
    real linker (GNU ld) already does automatically for every other static binary here.
 3. **A real, separate crash found testing further**: a bare `tcc hello.c` (no `-static`) produced a
    dynamically-linked `a.out` that page-faulted at `VirtAddr(0x0)` on its first indirect call
-   (`elf.rs` has zero `PT_INTERP`/dynamic-relocation support, so PLT/GOT slots stay zero-
-   initialized forever). Fixed at the root: `third_party/tinycc/libtcc.c`'s `tcc_new()` now
+   (`elf.rs` had zero `PT_INTERP`/dynamic-relocation support at the time — since added, see
+   "Dynamic linking" below, but TinyCC's own output was never revisited to actually use it; this
+   fix keeps every `tcc` invocation static instead). Fixed at the root: `third_party/tinycc/libtcc.c`'s `tcc_new()` now
    defaults `s->static_link = 1` unconditionally — every on-target `tcc` invocation links
    statically regardless of flags.
 
@@ -1314,6 +1316,60 @@ broke in three separately-real ways:
    disk file stayed physically short regardless, so mount's own reads would run off the end before
    bug 3's check ever got the chance to decide mount-vs-format. Fixed: an existing dev disk smaller
    than the current expected size gets grown in place (zeros appended, real bytes untouched).
+
+## Dynamic linking: milestone 1, real `PT_INTERP` (`src/process/elf.rs`, `src/process/lifecycle.rs`, `build.rs`, `modules/oxfs`)
+
+A real, working `fork`+`execve` of a genuinely dynamically-linked ELF, resolved and relocated by
+musl's own real `ld.so` running as the interpreter — not this kernel doing the linking itself.
+Landed in `e72fc7d` but never written up here until now — this section existed only in
+`docs/MISSING_POSIX_SYSCALLS.md`'s own `dlopen` row and code comments; every other mention of
+`PT_INTERP`/dynamic linking elsewhere in this file predates it and said "zero support" — now fixed
+at each of those mentions to point here instead.
+
+- **A second, fully separate `-fPIC`/shared musl build** (`build.rs`'s `build_musl_sysroot_shared`,
+  kept isolated from the existing static sysroot every other consumer — TinyCC, BusyBox, the
+  original `musl-smoke` — still depends on) produces a real `libc.so`. Matches musl's own real
+  convention: there's no separate `ld.so` binary — `/lib/ld-musl-x86_64.so.1` is a symlink to
+  `libc.so` itself, which is both the C library and its own dynamic linker.
+- **`elf.rs` accepts `ET_DYN` alongside `ET_EXEC`** — solely for a `PT_INTERP` interpreter image,
+  which is always `ET_DYN`, never a real position-independent load (this kernel does no
+  relocation-at-arbitrary-base anywhere else). `elf::load` gained a real, kernel-chosen additive
+  `bias` parameter, applied to every segment's `p_vaddr` — necessary arithmetic, not optional.
+- **Found the hard way, via a real page fault, why a fixed link-time base doesn't work**: the
+  original plan was linking `libc.so` directly at `INTERP_LOAD_BASE`. That bakes already-absolute
+  addresses into the interpreter's own `.rela.dyn`/`DT_RELA` table, but musl's own self-relocation
+  bootstrap (`ldso/dlstart.c`) always computes `real_addr = AT_BASE + stored_value`, expecting
+  `stored_value` to already be zero-based — a fixed-base link double-counts the base and produces a
+  wild pointer. Fixed by linking `libc.so` at its own natural (near-zero) base and applying the
+  real bias in `elf::load` instead, matching how a real kernel loads a `PT_INTERP` interpreter.
+  `INTERP_LOAD_BASE = 0xc000000` (`src/process/lifecycle.rs`) is one fixed VA for the interpreter
+  load, not per-binary — nothing here needs more than one interpreter resident at once.
+- **`do_execve` loads the interpreter alongside the main binary** when one is present (a real
+  `PT_INTERP` segment's NUL-terminated content, read via `elf.rs`'s own interpreter-path accessor),
+  both sharing the same fresh address space (unlike every other fixed-base userland binary in this
+  codebase, which never coexists with another image at once) — the real jump target becomes the
+  interpreter's own entry point, not the main binary's, and `user_stack::build` reports the real
+  bias as `AT_BASE` (`ld.so` reads this to find itself).
+- **A permissive `SYS_MPROTECT = 492` stub** (`process::do_mprotect`, same shape `do_munmap`
+  already established) — `ld.so`'s own RELRO-protection step calls real `mprotect` even in this
+  single-interpreter case, so it needed to stop `ENOSYS`ing, but doesn't yet enforce anything (no
+  `NO_EXECUTE`/write-protection actually applied — matches this kernel's existing "no W^X anywhere"
+  stance). Also needed a matching `__NR_mprotect` remap in musl's own `bits/syscall.h.in` (real
+  Linux's inert-until-now `10`, pushed on the `oxidebsd` musl branch separately) — the same
+  numbering discipline every other syscall addition here follows.
+- **Verified end-to-end**: `tests/dynlink_syscall_smoke.rs` + `userland/dynlink-syscall-smoke/` —
+  a real `fork`+`execve` of `/dynlink-smoke.elf` (built by `build_dynlink_smoke` against the shared
+  sysroot, a trivial one-`write()`-call fixture) through a genuine `PT_INTERP` load: real
+  self-relocation, real symbol resolution against `libc.so`, and a real libc call (not just "the
+  loader didn't crash") all round-trip correctly.
+- **Milestone 2, not started**: `dlopen`/`dlsym`/`dlclose`/`dlerror` — loading a *second*,
+  independently-chosen shared object at runtime, the way a real `dlopen()` call would. musl's own
+  implementation of that is pure userspace logic over `mmap`/`mprotect`/relocation processing once
+  a `.so` is already mapped — not a new syscall gap, but genuinely blocked on `mmap`/`mprotect`
+  actually enforcing real placement/protection (both are still permissive no-ops/bump-allocators —
+  `do_mmap` is anonymous-only, no fd-backed mapping exists at all, and the `mprotect` stub above
+  enforces nothing). Milestone 1's own single-interpreter case never needed either capability for
+  real: the interpreter's own load is kernel-driven (`do_execve`), not `dlopen`-driven.
 
 ## Real `getrandom(2)`/`sysinfo(2)`/`sigaltstack(2)`/`pause(2)`/`sigsuspend(2)`/POSIX timers/POSIX message queues/SysV IPC (message queues, semaphores, shared memory): all 28 items of the pre-reserved batch (`modules/posix_compat`, `modules/signal`, `modules/clock`, `src/syscall/ffi.rs`, `src/process/signals.rs`, `src/process/timers.rs`, `src/fs/mqueue.rs`, `src/fs/sysv_msg.rs`, `src/fs/sysv_sem.rs`, `src/fs/sysv_shm.rs`, `src/fs/sysv_ipc.rs`)
 
