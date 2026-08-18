@@ -76,6 +76,11 @@ use x86_64::registers::rflags::RFlags;
 
 use crate::cpu::gdt;
 use crate::serial_println;
+/// musl's own `siginfo_t` on x86_64, real sender-identity/payload-populated now -- lives in
+/// `crate::process` (`RawSiginfo`) since `process::signals`'s own `do_sigtimedwait`/`do_sigqueue`
+/// need the exact same wire layout; re-imported here under its original name rather than every
+/// call site in this file growing a `crate::process::` prefix.
+use crate::process::RawSiginfo;
 
 /// Standard, POSIX-heritage errno values. `EBADF`/`EINVAL`/`ECHILD`/`ENOEXEC`/`EPIPE` happen to be
 /// identical on Linux and the BSDs; `ENOSYS` is not (see module doc comment) — unlike this group's
@@ -165,6 +170,15 @@ pub(crate) const ENOMSG: u64 = 42;
 /// the queue out from under a still-blocked caller -- real SysV IPC semantics. `43`, matching
 /// musl's own compiled-in value, same reasoning as `E2BIG`.
 pub(crate) const EIDRM: u64 = 43;
+/// Returned by `crate::fs::sysv_sem`'s `semop`/`semtimedop` for a `sem_num` outside the target
+/// set's own real `nsems` -- real SysV IPC's own (slightly surprising, but documented) choice of
+/// errno for this case, not `EINVAL`. `27`, matching musl's own compiled-in value, same
+/// must-match-musl reasoning `E2BIG`/`ENOMSG`/`EIDRM` above already establish.
+pub(crate) const EFBIG: u64 = 27;
+/// Returned by `crate::fs::sysv_sem`'s `semctl(SETVAL)`/`semop`'s own `SEM_UNDO` accumulation path
+/// when a value would fall outside real SysV's `[0, SEMVMX]` range. `34`, matching musl's own
+/// compiled-in value, same reasoning as `EFBIG`.
+pub(crate) const ERANGE: u64 = 34;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag
@@ -426,49 +440,6 @@ fn do_sigreturn(frame: &mut SyscallFrame) {
     }
 }
 
-/// musl's own `siginfo_t` on x86_64 (`third_party/musl/include/signal.h`): three `int`s
-/// (`si_signo`/`si_code`/`si_errno`, no `__SI_SWAP_ERRNO_CODE` on this arch), padded to 8-byte
-/// alignment, then the `__si_common` union's two sub-unions -- `si_pid`/`si_uid` (the
-/// `__piduid`/user-signal-generated shape, the only one this kernel ever actually fills; the
-/// `si_timerid`/`si_overrun` alternative in the same union slot is never populated, no real
-/// per-process timer identity exists to report) followed by `si_value`/`si_status`+`si_utime`+
-/// `si_stime` (also never populated -- see this struct's own field doc below), then padding out to
-/// the real, fixed 128-byte `siginfo_t` size shared across every real Linux architecture.
-#[repr(C)]
-struct RawSiginfo {
-    si_signo: i32,
-    si_code: i32,
-    si_errno: i32,
-    _pad0: i32,
-    /// `__si_fields.__si_common.__first.__piduid.si_pid` -- always `0` today. This kernel's
-    /// `pending_signals` is a plain per-signal-number bitmask with no sender identity attached
-    /// (`do_kill` never records *who* sent a signal), so there is no real value to report here --
-    /// `0` is an honest "unknown," not a fabricated pid, matching this codebase's usual
-    /// all-zero-placeholder tier (`RawRusage`, `RawTms`) rather than inventing a plausible-looking
-    /// number.
-    si_pid: i32,
-    /// `__si_fields.__si_common.__first.__piduid.si_uid` -- same "no sender identity tracked"
-    /// story as `si_pid` above.
-    si_uid: i32,
-    /// `__si_fields.__si_common.__second.si_value` (`union sigval`, `sival_ptr`-sized) --
-    /// `sigqueue(2)`'s own payload would land here once that syscall gets a real handler (tracked
-    /// in `docs/MISSING_POSIX_SYSCALLS.md`); every signal delivered through the existing
-    /// `kill`/`tkill` path has no payload to carry, so this is always `0`.
-    si_value: u64,
-    _tail: [u8; 128 - 4 * 4 - 2 * 4 - 8],
-}
-
-const _: () = assert!(core::mem::size_of::<RawSiginfo>() == 128);
-
-/// Real Linux `SI_USER` (`0`) -- every signal this kernel delivers arrives via `kill`/`tkill`
-/// (never a real hardware fault turned into `SIGSEGV`/`SIGBUS`/... -- `page_fault_handler` just
-/// logs and reboots, see CLAUDE.md's memory-management section), so `SI_USER` is always the
-/// correct `si_code` regardless of which specific signal number it is. Real Linux would report
-/// `SI_TKILL` (`-6`) specifically for the `tkill`-delivered case, but `do_kill`/`take_deliverable_
-/// signal` don't distinguish how a signal was raised (self, `kill`, or `tkill` all funnel through
-/// the same `pending_signals` bitmask) -- a real, documented simplification, not an oversight.
-const SI_USER: i32 = 0;
-
 /// musl's own `mcontext_t` on x86_64 under `_GNU_SOURCE` (`third_party/musl/arch/x86_64/bits/
 /// signal.h`) -- the layout this kernel's actual userland (BusyBox, built with `-D_GNU_SOURCE`)
 /// compiles against. `gregs` is real -- populated from the interrupted syscall's own saved
@@ -612,6 +583,7 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
             restorer,
             mask_to_add,
             flags,
+            siginfo: delivery_siginfo,
         } => {
             // Snapshotted *before* frame is mutated below -- this is the exact state the
             // interrupted syscall was about to resume into. `old_mask` is what that state was
@@ -680,12 +652,12 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
                 };
                 let siginfo = RawSiginfo {
                     si_signo: signum as i32,
-                    si_code: SI_USER,
+                    si_code: delivery_siginfo.code,
                     si_errno: 0,
                     _pad0: 0,
-                    si_pid: 0,
-                    si_uid: 0,
-                    si_value: 0,
+                    si_pid: delivery_siginfo.pid as i32,
+                    si_uid: delivery_siginfo.uid as i32,
+                    si_value: delivery_siginfo.value,
                     _tail: [0; 128 - 4 * 4 - 2 * 4 - 8],
                 };
                 // SAFETY: same known pointer-validation gap every other user-memory write in this

@@ -137,6 +137,9 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         stop_notify_pending: false,
         cont_notify_pending: false,
         sigsuspend_restore_mask: None,
+        sysv_sem_undo: Vec::new(),
+        sysv_shm_attach: Vec::new(),
+        pending_siginfo: [QueuedSigInfo::default(); 32],
     };
 
     {
@@ -345,6 +348,14 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         cont_notify_pending: false,
         // Never straddles a fork boundary -- see this field's own doc comment on Process.
         sigsuspend_restore_mask: None,
+        // Not inherited -- see this field's own doc comment (real SysV semadj/fork semantics).
+        sysv_sem_undo: Vec::new(),
+        // Not inherited either -- see this field's own doc comment (tied to this kernel's own
+        // "no copy-on-write fork" limitation, not an independent design choice).
+        sysv_shm_attach: Vec::new(),
+        // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
+        // for a forked child too, so there's nothing meaningful to carry over).
+        pending_siginfo: [QueuedSigInfo::default(); 32],
     };
 
     {
@@ -713,6 +724,13 @@ pub fn do_execve(
         // across execve -- see `Process::posix_timers`'s own doc comment.
         me.posix_timers = [None; MAX_POSIX_TIMERS];
     }
+    // Real SysV shm semantics: the old address space (just dropped above) is what every prior
+    // shmat's own mapping actually lived in -- the new image can't see any of it, so this is a
+    // real implicit detach of everything, exactly like a real process exit's own
+    // detach_all_for_exit call (see that function's own doc comment) except the process survives.
+    // Must run after the PROCESS_TABLE-locked block above ends, not inside it -- this function
+    // takes that same lock itself, briefly, to drain the attachment list.
+    crate::fs::sysv_shm::detach_all_for_exit(caller_pid);
 
     let frame = syscall::current_frame();
     // SAFETY: frame is this exact syscall's own live frame -- do_execve is only ever reached via
@@ -895,6 +913,18 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
     // Genuinely load-bearing, not just tidiness -- see crate::fs::fd::close_all's own doc comment for
     // why a leaked fd here can leave a pipe's reader blocked forever.
     crate::fs::fd::close_all(pid);
+    // Real SysV SEM_UNDO semantics: every accumulated adjustment this process ever recorded gets
+    // applied (added back) on termination -- see `Process::sysv_sem_undo`'s own doc comment. Must
+    // run *before* `PROCESS_TABLE` is locked below: `apply_undo_for_exit` takes that same lock
+    // itself (briefly, to drain the list) and then wakes any blocked `semop` waiters via a second,
+    // separate `process::table()` lock -- both would deadlock against `spin::Mutex`'s non-reentrant
+    // guarantee if nested inside the lock this function is about to take.
+    crate::fs::sysv_sem::apply_undo_for_exit(pid);
+    // Real SysV shm semantics: every segment this process still had attached gets a real implicit
+    // detach (nattch decrement, possible IPC_RMID finalization) -- see
+    // `crate::fs::sysv_shm::detach_all_for_exit`'s own doc comment for why this must run before
+    // `PROCESS_TABLE` is locked below, same reasoning as the `apply_undo_for_exit` call above.
+    crate::fs::sysv_shm::detach_all_for_exit(pid);
     let mut table = PROCESS_TABLE.lock();
     match table.get_mut(&pid) {
         Some(me) if matches!(me.state, ProcState::Zombie(_)) => return, // already dead

@@ -245,6 +245,37 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
                 crate::process::scheduler::enqueue_ready(pid);
             }
 
+            // Real `semtimedop` deadline expiry (`crate::fs::sysv_sem`) -- same dual-wake shape
+            // `WaitingForMqData`/`WaitingForMqSpace` just above already establish; `u64::MAX` (the
+            // plain, non-timed `semop` wrapper's case) never realistically matches `now`.
+            // `do_semop`/`do_semtimedop` re-check the whole op array from scratch after waking,
+            // same discipline `Sleeping` establishes.
+            if let crate::process::ProcState::Blocked(crate::process::BlockReason::WaitingForSemOp(
+                _,
+                _,
+                _,
+                deadline,
+            )) = proc.state
+                && now >= deadline
+            {
+                proc.state = crate::process::ProcState::Ready;
+                crate::process::scheduler::enqueue_ready(pid);
+            }
+
+            // Real `sigtimedwait` deadline expiry (`process::signals::do_sigtimedwait`) -- same
+            // dual-wake shape `WaitingForSemOp`/`WaitingForMqData` just above already establish;
+            // `u64::MAX` (the plain `sigwaitinfo`/`sigwait` case) never realistically matches
+            // `now`. `do_sigtimedwait`'s own loop re-checks `pending_signals & wait_set` fresh
+            // after waking, same discipline `Sleeping` establishes.
+            if let crate::process::ProcState::Blocked(
+                crate::process::BlockReason::WaitingForSpecificSignal(_, deadline),
+            ) = proc.state
+                && now >= deadline
+            {
+                proc.state = crate::process::ProcState::Ready;
+                crate::process::scheduler::enqueue_ready(pid);
+            }
+
             // `SYS_SETITIMER`'s `ITIMER_REAL` expiry (also backs real `alarm()`, a thin musl-side
             // wrapper around it -- see `process::do_setitimer`'s own doc comment). Just sets the
             // pending bit, the same simple, already-established pattern `process::do_kill`'s own

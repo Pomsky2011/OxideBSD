@@ -877,6 +877,20 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_msgsnd" => Some(crate::syscall::oxidebsd_sys_msgsnd as *const () as u64),
         "oxidebsd_sys_msgrcv" => Some(crate::syscall::oxidebsd_sys_msgrcv as *const () as u64),
         "oxidebsd_sys_msgctl" => Some(crate::syscall::oxidebsd_sys_msgctl as *const () as u64),
+        "oxidebsd_sys_semget" => Some(crate::syscall::oxidebsd_sys_semget as *const () as u64),
+        "oxidebsd_sys_semop" => Some(crate::syscall::oxidebsd_sys_semop as *const () as u64),
+        "oxidebsd_sys_semctl" => Some(crate::syscall::oxidebsd_sys_semctl as *const () as u64),
+        "oxidebsd_sys_semtimedop" => {
+            Some(crate::syscall::oxidebsd_sys_semtimedop as *const () as u64)
+        }
+        "oxidebsd_sys_sigtimedwait" => {
+            Some(crate::syscall::oxidebsd_sys_sigtimedwait as *const () as u64)
+        }
+        "oxidebsd_sys_sigqueue" => Some(crate::syscall::oxidebsd_sys_sigqueue as *const () as u64),
+        "oxidebsd_sys_shmget" => Some(crate::syscall::oxidebsd_sys_shmget as *const () as u64),
+        "oxidebsd_sys_shmat" => Some(crate::syscall::oxidebsd_sys_shmat as *const () as u64),
+        "oxidebsd_sys_shmctl" => Some(crate::syscall::oxidebsd_sys_shmctl as *const () as u64),
+        "oxidebsd_sys_shmdt" => Some(crate::syscall::oxidebsd_sys_shmdt as *const () as u64),
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
         "oxidebsd_block_device_present" => {

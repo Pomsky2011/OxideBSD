@@ -319,6 +319,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sig-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "sigaltstack-syscall-smoke"
 version = "0.1.0"
 
@@ -353,6 +357,14 @@ version = "0.1.0"
 
 [[package]]
 name = "sysv-msg-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "sysv-sem-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "sysv-shm-syscall-smoke"
 version = "0.1.0"
 
 [[package]]

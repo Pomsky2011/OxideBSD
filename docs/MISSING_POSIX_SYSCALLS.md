@@ -122,15 +122,16 @@ end-to-end `SYSCALL` smoke test (`tests/sa_siginfo_syscall_smoke.rs` +
 gap that function's own doc comment used to list. A handler installed with `SA_SIGINFO` is invoked
 as a genuine 3-argument `void (*)(int, siginfo_t *, void *)` — `rsi`/`rdx` point at a correctly
 sized/shaped `siginfo_t`/`ucontext_t` built on the handler's own stack frame, not `NULL`.
-Faithfully populated: `si_signo`, `si_code` (always `SI_USER` — every signal here arrives via
-`kill`/`tkill`, never a real hardware fault), the real general-purpose registers in
+Faithfully populated: `si_signo`, `si_code`, the real general-purpose registers in
 `uc_mcontext.gregs` (from the interrupted syscall's own saved frame), and `uc_sigmask` (the real
-pre-handler `blocked_signals`). Honestly zeroed, not fabricated: `si_pid`/`si_uid` (no sender
-identity is tracked anywhere in `pending_signals`), `si_value` (nothing populates it until
-`sigqueue` itself has a handler — see below), FPU state (never saved anywhere on this kernel),
-`uc_stack` (`sigaltstack` isn't implemented). This needed **zero module-side changes** — `sigaction`
-already threaded `flags` through to `Process::sigactions`; only the kernel-resident delivery path
-needed to consult it.
+pre-handler `blocked_signals`). Honestly zeroed, not fabricated: FPU state (never saved anywhere on
+this kernel), `uc_stack` (`sigaltstack` is bookkeeping-only, never actually switched to). This
+needed **zero module-side changes** — `sigaction` already threaded `flags` through to `Process::
+sigactions`; only the kernel-resident delivery path needed to consult it. **`si_pid`/`si_uid`/
+`si_value`/`si_code` were honest zeros at the time this was first written** (`SI_USER` was the only
+possible value, and no sender identity was tracked anywhere) — now real, see "Implemented:
+`sigtimedwait`/`sigwaitinfo`/`sigqueue`" below, which added the shared `Process::pending_siginfo`
+store this delivery path now reads from too.
 
 **Verified end-to-end**: `tests/sa_siginfo_syscall_smoke.rs` + `userland/sa-siginfo-syscall-smoke/`
 installs a real `SA_SIGINFO` handler for `SIGUSR1`, `tkill`s itself, and confirms — from inside the
@@ -142,6 +143,67 @@ previously-only-theoretical bug: `elf.rs`'s "flags aren't unioned across `PT_LOA
 a page" gap (already documented in CLAUDE.md) page-faulted this crate's very first static write,
 since it's the first userland crate with real writable globals — worked around at the linker-script
 level for this one crate, not fixed in `elf.rs` itself; see CLAUDE.md's own updated note on that gap.
+
+## Implemented: `sigtimedwait`/`sigwaitinfo`/`sigqueue`
+
+The two real, confirmed-live-caller gaps this doc's own "Missing, live caller confirmed" table
+tracked now have real handlers, landed in a later session than the batch below (this doc's own
+sections aren't in strict chronological order past this point — this one slots in here because it
+closes out the gap the table above first identified, ahead of the unrelated 28-syscall
+pre-reservation batch that follows).
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `sigtimedwait`, `sigwaitinfo`, `sigwait` | `SYS_SIGTIMEDWAIT = 495` (real, unclaimed `__NR_rt_sigtimedwait`) | `modules/signal` → `src/syscall/ffi.rs`'s `sys_sigtimedwait` → `src/process/signals.rs`'s `do_sigtimedwait` | Real `(mask_ptr, info_ptr, ts_ptr, sigsetsize)` wire format — confirmed directly against `third_party/musl/src/signal/sigtimedwait.c`'s own call site that no `SYS_rt_sigtimedwait_time64` sibling is ever defined for this arch, so the real syscall's own 4-argument shape already fits this ABI exactly, no musl call-site patch needed. `sigwaitinfo`/`sigwait` are thin musl-side wrappers around this same function (a null `ts`, and discarding everything but `si_signo`, respectively) — one kernel handler covers all three library entry points, the same "one syscall backs several libc names" shape `SYS_TKILL` already established for `raise`/`abort`/`pthread_kill`. **A genuinely new primitive, not just a state field**: `BlockReason::WaitingForSpecificSignal(wait_set, deadline)` — real semantics directly *consume* a pending signal matching `wait_set` and return its number, **bypassing the normal handler-invocation machinery entirely** (`take_deliverable_signal`/`deliver_pending_signal` are never involved), matching real POSIX's documented behavior that `sigwaitinfo` never runs an installed handler even when one exists. `info_ptr`, if non-null, is filled with a real (not fabricated) `siginfo_t`. Real `EAGAIN` on timeout (`semtimedop`'s own `ETIMEDOUT` is the wrong errno for this syscall specifically); the timeout is real-relative, same `resolve_relative_deadline` shape `crate::fs::sysv_sem`'s own semtimedop conversion already established (duplicated locally, not shared, same precedent). |
+| `sigqueue` | `SYS_SIGQUEUE = 496` (real, unclaimed `__NR_rt_sigqueueinfo`) | `do_sigqueue` | Real `(pid, sig, siginfo_ptr)` wire format, no musl call-site patch needed. Unlike `kill(2)`, only ever targets a single specific pid (`target_pid <= 0` is `EINVAL` — no process-group broadcast shape exists for it in real POSIX either). Reuses `do_kill`'s own single-target Discard/Terminate/Stop/SetPending disposition resolution, duplicated rather than factored out (same "small per-caller copy over cross-function abstraction" precedent `signal_foreground_group` already set for this exact enum/match shape). |
+
+**A real, shared per-pending-signal sender-identity/payload store, not just a bespoke sigqueue
+landing spot**: `Process::pending_siginfo: [QueuedSigInfo; 32]` (indexed like `sigactions`) — every
+`do_kill`/`signal_foreground_group`/`do_sigqueue` call site that used to just do `pending_signals |=
+1 << (sig - 1)` now goes through a new shared `record_pending` helper that also records real `si_code`
+(`SI_USER` for `kill`-shaped, `SI_QUEUE` for `sigqueue`-shaped), real sender `pid`/`uid` (`0` only
+for `signal_foreground_group`'s own two callers — a keyboard-generated Ctrl+C/Ctrl+Z or a
+`kill(-pgrp, sig)` broadcast — neither of which has one specific real sender process to attribute),
+and the real `sigqueue`-supplied value. **This closed a second, previously-separate gap for free**:
+the `SA_SIGINFO` handler-invocation path (`src/syscall/mod.rs`'s `deliver_pending_signal`,
+implemented in an earlier session — see "Implemented this session" above) used to report honest-zero
+`si_pid`/`si_uid`/`si_value` and a hardcoded `SI_USER` for every delivery; `take_deliverable_signal`
+now threads the real `QueuedSigInfo` it finds through `SignalDelivery::Handler`'s own new `siginfo`
+field, so a caught handler now sees real sender identity/payload too, not just `sigtimedwait`.
+`RawSiginfo` itself (the real 128-byte musl `siginfo_t` layout) moved from `src/syscall/mod.rs` to
+`crate::process` so both consumers (`deliver_pending_signal` and `process::signals`'s own
+`do_sigtimedwait`/`do_sigqueue`) share one verified-layout definition instead of risking two
+independently-drifting copies of a wire-format struct.
+
+**A real regression found live, not by review, while writing this feature's own smoke test**: an
+early test draft self-`sigqueue`d a signal with no installed handler (default disposition
+`Terminate`) expecting it to simply sit pending for a later `sigtimedwait` to consume — instead, the
+*same* `sigqueue` syscall's own normal delivery tail (`deliver_pending_signal`, run at the end of
+every completed syscall) found it immediately deliverable and terminated the process right there,
+before `sigtimedwait` was ever reached. This is real, correct POSIX behavior, not a kernel bug — the
+POSIX standard explicitly documents `sigwait`-family behavior as unspecified for a signal that isn't
+already blocked, precisely because it otherwise races the normal delivery path exactly like this.
+Separately, this kernel's own `do_kill`/`do_sigqueue` cross-process disposition resolution doesn't
+consult `blocked_signals` at all when deciding whether a *different* target's signal resolves
+immediately (an already-documented, accepted simplification — see `do_kill`'s own doc comment) — so
+a cross-process signal also needs a real handler installed (not just blocking) to defer as
+`SetPending` rather than terminating the target immediately. Fixed by correcting the *test* (install
+handlers for every signal used with `sigtimedwait`, block them first) rather than the kernel — both
+requirements are real, intentional POSIX/this-ABI's-own-documented behavior, not gaps.
+
+**Verified end-to-end**: `tests/sig_syscall_smoke.rs` + `userland/sig-syscall-smoke/` — same
+real-`SYSCALL` pattern. Seven parts: installs handlers for and blocks both `SIGUSR1`/`SIGUSR2`; a
+real self `sigqueue`/`sigtimedwait` round trip (`SI_QUEUE`, real `si_pid`/`si_value`, handler never
+ran); a real relative-timeout `EAGAIN`; a `fork()`-driven cross-process wake via plain `kill()`
+(`SI_USER`, real sender `si_pid`, `si_value == 0`); the same shape via `sigqueue` with a real
+nonzero value (`SI_QUEUE`); confirmation that `sigtimedwait` genuinely bypasses handler invocation
+one more time, followed by unblocking and a plain self-`kill()` that *does* still invoke it
+immediately (real POSIX ordering, same "handler already ran before the interrupted call returns"
+property `pause-syscall-smoke`/`sigsuspend-syscall-smoke` already proved); and real `EINVAL`
+validation (`sigqueue` against pid `0`/negative, signal `0`/`32`). **Passes.** Also re-verified
+clean: `sa_siginfo_syscall_smoke`, `pause_syscall_smoke`, `sigsuspend_syscall_smoke`,
+`sysv_sem_syscall_smoke` (the existing tests most likely to regress from the shared `record_pending`/
+`RawSiginfo`-relocation refactor) all still pass.
 
 ## Pre-reserved batch: first implementation
 
@@ -248,7 +310,11 @@ sub-batches (SysV IPC, items 17-28, remains unimplemented).
 | `mq_unlink` | `SYS_MQ_UNLINK = 537` | `do_mq_unlink` | Real `(name)` wire format, no patch needed. Removes the name immediately; the queue itself survives until every open descriptor closes, matching real POSIX. |
 | `mq_timedsend` (also backs `mq_send`) | `SYS_MQ_TIMEDSEND = 538` | `do_mq_timedsend` | Real Linux needs 5 syscall args (`mqd, msg, len, prio, at`); this ABI only carries 4. `third_party/musl/src/mq/mq_timedsend.c` is patched (`oxidebsd` branch) to pack `mqd`/`len` into one register (high 32 = len, low 32 = mqd) rather than dropping an argument the way `utimensat` drops its always-`AT_FDCWD` `fd` -- nothing here is redundant to drop. Real priority-ordered insertion (highest priority first, FIFO among ties), a real bounded block (`BlockReason::WaitingForMqSpace`) once `mq_maxmsg` is reached, real `EMSGSIZE` past `mq_msgsize`, and real `mq_notify` delivery on an empty-to-non-empty transition with no receiver already waiting. |
 | `mq_timedreceive` (also backs `mq_receive`) | `SYS_MQ_TIMEDRECEIVE = 539` | `do_mq_timedreceive` | Same 4-register packing as `mq_timedsend`. Real blocking (`BlockReason::WaitingForMqData`) on an empty queue, real `EMSGSIZE` if the caller's buffer is smaller than the queue's own `mq_msgsize`, real priority readback via the (optional) `prio_ptr` out-argument. |
-| `mq_notify` | `SYS_MQ_NOTIFY = 540` | `do_mq_notify` | Real `(mqd, sev_ptr)` wire format, no patch needed (`third_party/musl/src/mq/mq_notify.c` issues this raw syscall directly for every notify kind except `SIGEV_THREAD`, which never reaches the syscall boundary at all -- handled entirely in userspace over a real `AF_NETLINK` socket this port doesn't have). `SIGEV_SIGNAL` delivery reuses `process::do_kill` directly (no permission check to bypass, real disposition-respecting delivery) rather than a bespoke path. `SIGEV_THREAD`/`SIGEV_THREAD_ID` are real `EINVAL`. `si_value` is read but never delivered -- same already-documented gap `sigqueue`'s own "Missing, live caller confirmed" entry below has (`pending_signals` has nowhere to carry a payload). |
+| `mq_notify` | `SYS_MQ_NOTIFY = 540` | `do_mq_notify` | Real `(mqd, sev_ptr)` wire format, no patch needed (`third_party/musl/src/mq/mq_notify.c` issues this raw syscall directly for every notify kind except `SIGEV_THREAD`, which never reaches the syscall boundary at all -- handled entirely in userspace over a real `AF_NETLINK` socket this port doesn't have). `SIGEV_SIGNAL` delivery reuses `process::do_kill` directly (no permission check to bypass, real disposition-respecting delivery) rather than a bespoke path. `SIGEV_THREAD`/`SIGEV_THREAD_ID` are real `EINVAL`. `si_value` is read but was never delivered at
+the time this was first written -- `pending_signals` had nowhere to carry a payload; `mq_notify`
+still doesn't attach it (`process::do_kill`'s own signature has no room for one), but the
+underlying gap this row used to point at is now closed for `sigqueue` specifically -- see
+"Implemented: `sigtimedwait`/`sigwaitinfo`/`sigqueue`" below. |
 | `mq_getsetattr` (also backs `mq_getattr`/`mq_setattr`) | `SYS_MQ_GETSETATTR = 541` | `do_mq_getsetattr` | Real `(mqd, new, old)` wire format, no patch needed. Only `mq_flags`'s `O_NONBLOCK` bit is actually settable (`mq_maxmsg`/`mq_msgsize` are fixed at creation and silently ignored if passed in `new`, matching real Linux); `old` is always filled with the queue's real current state (`mq_curmsgs` included). |
 
 Real timeout support falls out of a genuine new dual-wake shape: `BlockReason::WaitingForMqData`/
@@ -323,6 +389,157 @@ empty queue, forcing the freshly forked child to run, which sends the message th
 This brings the batch to 20 of 28 items done (1-16, 25-28) -- only the shm/sem sub-batches (items
 17-24, `542-549`) remain, the biggest and most novel remaining subsystem with no live caller today.
 
+## Pre-reserved batch: fifth implementation
+
+Items 21-24 of the 28-syscall "pre-reserved ahead of implementation" batch above -- the real SysV
+semaphore sub-batch -- now have real handlers too, closing every sub-batch except SysV shared
+memory (items 17-20, `542-545` -- see "Pre-reserved batch: sixth implementation" below, which
+closes that one too).
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `semget` | `SYS_SEMGET = 546` | `modules/posix_compat` -> `src/syscall/ffi.rs`'s `sys_semget` -> `src/fs/sysv_sem.rs`'s `do_semget` | Real `(key, nsems, flag)` wire format, no musl call-site patch needed -- confirmed directly against every one of `third_party/musl/src/ipc/sem{get,op,ctl,timedop}.c`'s own call sites that no `SYS_ipc` multiplexer is ever defined on this arch, so this whole sub-batch needed **zero** musl-side patches (a first, compared to `msgrcv`/`mq_timedsend`/`mq_timedreceive` each needing one). Same "`key_t` -> id via a separate `KEYS`/`SETS` namespace, `IPC_PRIVATE` always fresh, real `IPC_CREAT`/`IPC_EXCL` semantics, bare integer id with no `crate::fs::fd` involvement" shape `msgget` already established -- real `nsems == 0` matches any existing set's size on a lookup, a nonzero mismatch is `EINVAL`. `src/fs/sysv_ipc.rs` is a new shared module factoring out `RawIpcPerm`/the rwx permission-check helpers `sysv_msg`'s own `check_access`/`is_owner_or_creator` used to duplicate, now that a second SysV IPC subsystem exists. |
+| `semop` | `SYS_SEMOP = 547` | `do_semop` -> shared `do_semop_impl` | Real `(id, sops, nsops)` wire format. **A whole `sembuf` array applies atomically**: simulated against a scratch copy of every touched semaphore value first -- if every op can proceed, all commit at once; if any op would block, nothing is applied and the caller either fails (`IPC_NOWAIT` on that specific op) or blocks on it, retrying the *entire* array from scratch once woken (same "block, `schedule()`, loop and re-check the real condition" pattern every blocking primitive here already follows). A negative `sem_op` decrements (blocking below zero); positive always succeeds immediately; zero blocks until the value is exactly zero. `sem_num` outside the set's real `nsems` is `EFBIG` (real SysV's own, not `EINVAL`). |
+| `semctl` | `SYS_SEMCTL = 548` | `do_semctl` | Real `(id, num, cmd, arg)` wire format. `cmd` always arrives with real glibc/musl's `IPC_64` bit OR'd in, masked off before matching, same `IPC_CMD()` convention `msgctl` already established. `arg`'s own interpretation is polymorphic by `cmd` (matching real Linux): the raw value itself for `SETVAL`, a real pointer for everything else. Implements `IPC_STAT`/`IPC_SET`/`IPC_RMID` (owner/creator/root-gated, same distinction from `semop`'s plain rwx check `msgctl` already established) plus `GETVAL`/`SETVAL`/`GETALL`/`SETALL` (range-checked into `[0, SEMVMX] = [0, 32767]`, real `ERANGE` past it) and `GETPID`/`GETNCNT`/`GETZCNT`. `SEM_STAT`/`SEM_STAT_ANY`/`IPC_INFO`/`SEM_INFO` are honest `EINVAL`, no live caller, matching `msgctl`'s own tier for its analogous commands. |
+| `semtimedop` | `SYS_SEMTIMEDOP = 549`, last of the batch | `do_semtimedop` -> shared `do_semop_impl` | Real `(id, sops, nsops, timeout)` wire format. **The one real wire-format wrinkle in this sub-batch, though not one needing a musl patch**: unlike `mq_timedsend`/`mq_timedreceive`'s own `at` (always absolute `CLOCK_REALTIME`), real `semtimedop(2)`'s `timeout` is a plain *relative* `struct timespec` -- `resolve_relative_deadline` deliberately mirrors `do_nanosleep`'s own whole-second/sub-second tick-rounding conversion, not `crate::process::abstime_to_ticks` (`crate::fs::mqueue`'s absolute-clock helper). |
+
+**Real `GETNCNT`/`GETZCNT`, not fabricated**: a new `BlockReason::WaitingForSemOp(semid, semnum,
+waiting_for_zero, deadline)` variant carries exactly the `(semnum, waiting_for_zero)` pair for
+whichever single op in a blocked multi-op array actually couldn't proceed (real POSIX allows
+picking any representative op for a wait queue when a multi-op array blocks -- this always picks
+the first one in program order, both for retry ordering and as this counting payload).
+`semctl(GETNCNT)`/`semctl(GETZCNT)` scan `process::table()` for an exact match, the same "IRQ/
+syscall handler reaches directly into `process::table()`" shape every other `BlockReason` here
+already uses for its own wake/introspection -- not an honest-zero placeholder the way `RawRusage`/
+`RawSysinfo`'s untracked fields are, since the real data already exists on the block state itself.
+
+**Real `SEM_UNDO` support** (`Process::sysv_sem_undo`, a new per-process field): every `sembuf`
+with `SEM_UNDO` set accumulates a signed adjustment, applied (added back, clamped into
+`[0, SEMVMX]`) automatically on process termination via a new `crate::fs::sysv_sem::
+apply_undo_for_exit`, called from `process::lifecycle::terminate_process` *before* that function's
+own `PROCESS_TABLE` lock is taken (avoids a real deadlock -- `apply_undo_for_exit` takes that same
+lock itself, then a second, separate lock to wake blocked waiters). Real POSIX semantics: not
+inherited by `fork` (a child starts with its own empty undo list, matching real Linux's `semadj`
+being fork-local), preserved across `execve` (untouched, since `do_execve` mutates the live
+`Process` in place and never assigns this field). **Known, accepted simplification**: real Linux
+also adjusts *other* processes' outstanding undo entries when a value-changing call on the same
+semaphore invalidates them -- not tracked here (would need a global scan of every process's own
+undo list on every value-changing call); no live caller to exercise the difference, and the one
+case that matters most (`IPC_RMID`) is already handled correctly since a removed `semid` just
+makes `apply_undo_for_exit` silently skip it.
+
+**Real timer-IRQ deadline support for `semtimedop`**: `interrupts::timer_interrupt_handler` gained
+a `WaitingForSemOp` scan alongside its existing `WaitingForMqData`/`WaitingForMqSpace` one -- same
+dual-wake shape (woken either by a matching `semop`/`semctl`/`IPC_RMID`, or by the deadline
+passing), same `u64::MAX` "no timeout" sentinel convention for the plain `semop` wrapper's case.
+
+`RawSembuf`/`RawSemidDs` (6/88 bytes) were verified via a direct `musl-gcc`/`sizeof`/`offsetof`
+probe against musl's real `struct sembuf`/`struct semid_ds` on this arch, same rigor
+`RawIpcPerm`/`RawMsqidDs` already established.
+
+**Two real bugs found live by this sub-batch's own smoke test, both fixed, neither theoretical**:
+1. **A precision bug in the wake mechanism itself**, found by the `GETZCNT` part of the fork
+   scenario below: an earlier draft's `wake_blocked_semop(semid)` woke *every* process blocked on
+   `semid`, regardless of which specific `semnum` it was actually waiting on. Harmless for
+   `semop`'s own correctness (a spuriously woken process just re-checks its whole op array from
+   scratch and re-blocks on its next turn -- the same discipline every blocking primitive here
+   already follows), but it broke `semctl(GETNCNT)`/`semctl(GETZCNT)`'s own "real, not fabricated"
+   count: a process genuinely still blocked on an *untouched* semaphore would transiently read back
+   as `Ready` (merely not yet rescheduled to re-block) the instant some *other* semaphore in the
+   same set changed -- reproduced deterministically by the smoke test's own two-semaphore fork
+   scenario (waking a parent blocked on `sem0` also spuriously flipped a child genuinely blocked on
+   `sem1` to `Ready`, undercounting `GETZCNT(sem1)`). Fixed: `wake_blocked_semop` now takes a
+   `touched: &[u16]` slice (the specific semnums the just-committed operation actually changed) and
+   only wakes a match on both `semid` *and* `semnum` -- real semantics, not just a precision nicety
+   (a process waiting on one semaphore's value has no reason to wake when a different semaphore in
+   the same set changes). `semctl(IPC_RMID)` is the one caller that still wants the old broad
+   behavior (the semid itself is gone, so every blocked process needs to wake and discover a real
+   `EIDRM` regardless of which semnum it cared about) -- kept as a separate `wake_blocked_semop_all`.
+2. **`do_semop_impl`'s own commit path wrote every semaphore's `sempid` unconditionally**, not just
+   the ones the just-applied op array actually named -- harmless for `val` (an untouched entry's
+   scratch copy is identical to its live value) but a real misattribution of `semctl(GETPID)`'s own
+   backing store: any semaphore in the set, however unrelated, would report the last caller of *any*
+   `semop` against the set, not the last caller that actually touched *that* semaphore. Fixed:
+   the commit loop now only writes the semaphores named in `ops`.
+
+**Verified end-to-end**: `tests/sysv_sem_syscall_smoke.rs` + `userland/sysv-sem-syscall-smoke/` --
+same real-`SYSCALL` pattern. Seven parts: `semget`'s `IPC_CREAT`/`IPC_EXCL`/`ENOENT`/nsems-mismatch
+`EINVAL`; `SETVAL`/`GETVAL`/`SETALL`/`GETALL` round trips plus `EFBIG` past the real `nsems`; a
+real atomic two-op `semop` (confirmed both ops landed together) plus a real `GETPID` readback;
+`IPC_NOWAIT` `EAGAIN`; a real `semtimedop` timeout that genuinely expires with `ETIMEDOUT`; a single
+orchestrated `fork()` round exercising a real block/wake pair (`GETNCNT` observed against a
+genuinely blocked parent), a second real block/wake pair on a *different* semaphore in the same set
+(`GETZCNT` observed against a genuinely blocked child -- the scenario that caught bug 1 above), and
+real `SEM_UNDO` (a child's own decrement, auto-reversed the instant it exits without ever explicitly
+undoing it); and `semctl(IPC_STAT)`/`IPC_SET` reporting/changing real state, followed by `IPC_RMID`
+and confirmation that `semop`/`semctl`/`semtimedop` against the removed `semid` are all real
+`EIDRM`. **Passes.**
+
+This brought the batch to 24 of 28 items done (1-16, 21-28) at the time -- only the shm sub-batch
+(items 17-20, `542-545`) remained; see immediately below for its own implementation.
+
+## Pre-reserved batch: sixth implementation
+
+Items 17-20 of the 28-syscall "pre-reserved ahead of implementation" batch above -- the real SysV
+shared-memory sub-batch -- now have real handlers too, closing the whole 28-syscall batch out (all
+28 of 28 items done).
+
+| POSIX interface(s) | Number | Handler | Notes |
+|---|---|---|---|
+| `shmget` | `SYS_SHMGET = 542` | `modules/posix_compat` -> `src/syscall/ffi.rs`'s `sys_shmget` -> `src/fs/sysv_shm.rs`'s `do_shmget` | Real `(key, size, shmflg)` wire format, no musl call-site patch needed -- same "no `SYS_ipc` multiplexer on this arch" finding `semget`'s own doc comment already made, confirmed again directly against `third_party/musl/src/ipc/shmget.c`. Same `key_t` -> id via `KEYS`/`SEGMENTS`, `IPC_PRIVATE` always fresh, real `IPC_CREAT`/`IPC_EXCL` semantics shape `msgget`/`semget` already established. **The one sub-batch that needs real memory-management plumbing, not just a `BTreeMap` namespace**: eagerly allocates a fixed `Vec<PhysFrame>` up front (same "hand out forward, never reclaim" policy `crate::process::mm::do_mmap` already establishes), zero-filled once (matching anonymous `mmap`'s own guarantee). An existing-key lookup accepts any `size` up to the real segment's own size (`EINVAL` past it) -- real `shmget(2)`'s own documented behavior, distinct from `semget`'s "must match exactly" rule since a segment's size can never change after creation either way. |
+| `shmat` | `SYS_SHMAT = 543` | `do_shmat` | Real `(id, shmaddr, shmflg)` wire format. `shmaddr` is always ignored (same simplification `do_mmap`'s own `addr_hint` already gets) -- real callers pass `NULL` for exactly this case anyway. **The actual proof of real shared memory**: every `shmat` against the same `id`, by any process, maps that segment's own already-allocated frames (not fresh ones) into the caller's page table at a freshly bump-allocated VA (`SHM_REGION_BASE = 0x_4000_0000_0000`, a window distinct from `crate::process::mm::MMAP_REGION_BASE`) -- a write through one process's mapping is genuinely visible through another's. Returns the real mapped address directly (this ABI's carry-flag success path already puts a handler's return value in `RAX`, matching real `void *shmat(...)`'s own calling convention with no special-casing needed). `SHM_RDONLY` omits `PageTableFlags::WRITABLE` on the caller's own mapping; `SHM_RND`/`SHM_REMAP`/`SHM_EXEC` are accepted but meaningless here (no caller-chosen address to round/replace; every user page is already executable, no `NO_EXECUTE`/`EFER.NXE` anywhere yet). An invalid `id` is `EINVAL` (real `shmat(2)`'s own documented errno for this case). |
+| `shmctl` | `SYS_SHMCTL = 544` | `do_shmctl` | Real `(id, cmd, buf)` wire format. `cmd` always arrives with real glibc/musl's `IPC_64` bit OR'd in, masked off before matching, same `IPC_CMD()` convention `semctl`/`msgctl` already established. Implements `IPC_STAT`/`IPC_SET`/`IPC_RMID` (owner/creator/root-gated); `SHM_LOCK`/`SHM_UNLOCK`/`SHM_STAT`/`SHM_STAT_ANY`/`SHM_INFO` are honest `EINVAL`, no live caller, matching `semctl`/`msgctl`'s own tier for their analogous unimplemented commands. **`IPC_RMID` on a still-attached segment defers real removal**: the key is unlinked from `KEYS` immediately (a fresh `shmget` on that key can never find this segment again) but `SEGMENTS` itself, and the segment's real backing frames, survive until the last attached process detaches -- real SysV lifecycle, same shape `semctl`/`msgctl`'s own `IPC_RMID` already established for their respective namespaces. **A lookup miss is `EIDRM`, not `EINVAL`** -- deliberately different from `shmat`'s own choice for the identical underlying situation, since real `shmat(2)`'s man page documents only `EINVAL` while real `shmctl(2)`'s documents both; this port doesn't distinguish "never valid" from "since removed" (a plain `BTreeMap` miss either way), so `shmctl` follows `semctl`/`msgctl`'s own established convention instead. |
+| `shmdt` | `SYS_SHMDT = 545`, last of the batch | `do_shmdt` | Real single-argument `(shmaddr)` wire format. Finds the calling process's own matching `(addr, shmid)` entry in a new `Process::sysv_shm_attach` list (an unmatched `shmaddr` is a real `EINVAL`), unmaps the real page-table range via `Mapper::unmap` (the one SysV IPC syscall in this whole batch that actually touches page tables on the way out, not just kernel-resident bookkeeping), then decrements the segment's `nattch` and finalizes a deferred `IPC_RMID` removal if this was the last attachment. |
+
+**Known, accepted simplification: not inherited across `fork`.** This kernel's own `fork` is a full
+eager address-space copy, not real copy-on-write (see CLAUDE.md's process section) --
+`AddressSpace::fork` duplicates the *content* of every user-accessible page into a brand-new
+physical frame, including whatever's mapped at a parent's own shm attachment addresses at fork
+time. A forked child therefore ends up with its own private snapshot at the same VA regardless of
+what this module does -- no amount of attachment-list inheritance would make the child's copy
+actually alias the segment's real frames, since the underlying page-table entries it inherits
+already point at freshly-copied ones, not the segment's own. Given that pre-existing architectural
+fact, `Process::sysv_shm_attach` simply starts empty in a forked child (same "starts fresh across
+fork" precedent `Process::sysv_sem_undo` already established) rather than pretending to support
+real Linux's "child inherits attached segments" behavior. The cross-process sharing case this
+module *does* support fully, proven end-to-end by this section's own smoke test below, is the far
+more common real-world one anyway: unrelated (or related) processes independently `shmget`ing the
+same `key` and `shmat`ing it themselves.
+
+**Real implicit detach on both process exit and `execve`**: `crate::fs::sysv_shm::
+detach_all_for_exit(pid)` is called from two places -- `process::lifecycle::terminate_process`
+(same "before `PROCESS_TABLE` is locked" placement `crate::fs::sysv_sem::apply_undo_for_exit`
+already established, and for the identical reason), and `do_execve`, right after the new
+`AddressSpace` is committed (the old one, and every prior `shmat`'s own mapping into it, is what
+just became unreachable -- a real implicit detach of everything, matching real Linux's own
+`execve(2)` destroying the old address space). Neither call site unmaps any page-table entries
+itself (unlike `do_shmdt`) -- a terminating or `execve`'d process's *old* address space is never
+freed anywhere in this kernel regardless, so there's nothing that needs unmapping before it's gone
+either way; only the `nattch`/possible-removal bookkeeping needs to run.
+
+`RawShmidDs` (112 bytes) was verified via a direct `musl-gcc`/`sizeof`/`offsetof` probe against
+this port's own patched sysroot (`target/musl-sysroot`), same rigor `RawIpcPerm`/`RawMsqidDs`/
+`RawSemidDs` already established.
+
+**Verified end-to-end**: `tests/sysv_shm_syscall_smoke.rs` + `userland/sysv-shm-syscall-smoke/` --
+same real-`SYSCALL` pattern. Six parts: `shmget`'s `IPC_CREAT`/`IPC_EXCL`/`ENOENT`/oversized-`size`
+`EINVAL`; a real `shmat` mapping with a real pattern written through it plus `shmctl(IPC_STAT)`
+reporting real `key`/`mode`/`segsz`/`nattch`/`cpid` (and a safe, read-only exercise of the
+`SHM_RDONLY` flag path); **the core proof of real physical sharing** -- a `fork()`, then the child
+performs its own *independent* `shmat` against the same `id` (not an inherited mapping, per the
+simplification above) and reads back the parent's exact pattern, then writes its own pattern back
+and `shmdt`s before exiting, after which the parent confirms *it* now sees the child's pattern
+through its own original mapping (real bidirectional sharing, not just shared initial content);
+`nattch` correctly back to `1` after the child's own `shmdt` and real exit (proving neither path
+double-decrements); a real `IPC_RMID`-while-still-attached lifecycle on a second key (a fresh
+`shmget` on the same key immediately gets a genuinely different id even though the old segment
+survives, followed by real `EIDRM` once the last attachment actually detaches); and a final
+`shmdt` to `nattch == 0` triggering an *immediate* `IPC_RMID` removal, followed by real `ENOENT`/
+`EINVAL`/`EIDRM` against the fully-removed segment and an already-detached address. **Passes.**
+
+This brings the batch to 28 of 28 items done -- the whole 28-syscall pre-reserved batch is
+complete.
+
 ## Missing, live caller confirmed
 
 Interfaces musl's own C source calls directly (grepped, not inferred) that have no registered
@@ -330,8 +547,8 @@ OxideBSD handler.
 
 | POSIX interface(s) | Backing syscall | Live caller | Suggested number | Notes |
 |---|---|---|---|---|
-| `sigtimedwait`, `sigwaitinfo` | `rt_sigtimedwait(2)` | `src/signal/sigtimedwait.c:19,22` | `495` (already remapped, see sweep above — no handler registered yet) | No blocking-on-signal primitive exists yet; would need a new `BlockReason` variant, more than a number remap. |
-| `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496` (already remapped, see sweep above — no handler registered yet) | `SA_SIGINFO` handler invocation is now real (see "Implemented this session" above) — `RawSiginfo::si_value` already exists as a landing spot. Still needs: a real `SYS_SIGQUEUE` handler (currently unregistered), and `pending_signals` would need to grow from a plain bitmask into something that can carry one queued `union sigval` per signal number, since today's bitmask has nowhere to stash a payload between `do_kill`-style setting and `take_deliverable_signal`-style draining. |
+| `sigtimedwait`, `sigwaitinfo` | `rt_sigtimedwait(2)` | `src/signal/sigtimedwait.c:19,22` | `495`, now implemented | See "Implemented: `sigtimedwait`/`sigwaitinfo`/`sigqueue`" below. |
+| `sigqueue` | `rt_sigqueueinfo(2)` | `src/signal/sigqueue.c:19` | `496`, now implemented | See "Implemented: `sigtimedwait`/`sigwaitinfo`/`sigqueue`" below. |
 
 ## Missing, POSIX-mandated, no live caller yet in ported userland
 
@@ -346,7 +563,7 @@ elsewhere.
 | `sem_init`, `sem_destroy`, `sem_wait`, `sem_trywait`, `sem_timedwait`, `sem_post`, `sem_getvalue` (unnamed semaphores) | futex-backed | Needs a real `futex(2)` first (see "structurally inapplicable" below for why that's currently out of scope) — blocked on the same prerequisite as thread sync primitives generally. No distinct syscall of its own to reserve a number for — not part of the pre-reservation batch below. |
 | `sem_open`, `sem_close`, `sem_unlink` (named semaphores) | `/dev/shm`-backed `open`+`mmap` | No live caller; would also want the `shm_open` path below first. Not a distinct syscall either — not part of the pre-reservation batch below. |
 | `shm_open`, `shm_unlink` | POSIX shared memory | No live caller in roster. Implemented via plain `open`/`mkdir` on real Linux, not a distinct syscall — not part of the pre-reservation batch below. |
-| `shmget`, `shmat`, `shmctl`, `shmdt`, `msgget`, `msgctl`, `msgrcv`, `msgsnd`, `semget`, `semctl`, `semop`, `semtimedop` | SysV IPC | Pre-reserved at `542-553` (see "Pre-reserved ahead of implementation" below — no handler registered yet). `ipcrm`/`ipcs` were already cut from the BusyBox roster before v0.1 specifically because this doesn't exist — see CLAUDE.md's own gap-analysis table. |
+| `shmget`, `shmat`, `shmctl`, `shmdt`, `msgget`, `msgctl`, `msgrcv`, `msgsnd`, `semget`, `semctl`, `semop`, `semtimedop` | SysV IPC | `542-553`, all now implemented — see "Pre-reserved batch: fourth/fifth/sixth implementation" above. `ipcrm`/`ipcs` were already cut from the BusyBox roster before v0.1 (this didn't exist yet at the time) and haven't been added back — see CLAUDE.md's own gap-analysis table; a real handler now exists for any future BusyBox roster change that wants them back. |
 | `aio_read`, `aio_write`, `aio_fsync`, `aio_error`, `aio_return`, `aio_cancel`, `aio_suspend`, `lio_listio` | POSIX async I/O | On real Linux, musl implements these via a userspace thread pool (`src/aio/aio.c`), not a true async-I/O syscall — not meaningfully "missing" at the kernel level at all; would only become relevant once real threading exists. Not part of the pre-reservation batch below. |
 | `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | POSIX per-process timers | Pre-reserved at `531-535` (see "Pre-reserved ahead of implementation" below — no handler registered yet). Distinct from the already-implemented `setitimer`/`getitimer` (`ITIMER_REAL` only). No live caller confirmed; `timer_delete.c` does call `tkill` internally (see Priority 1 above) but only after a real `timer_create` has ever succeeded, which can't happen yet. |
 | `select`, `pselect` | fd readiness | `poll(2)` already exists and covers every confirmed live caller (musl's DNS resolver). `src/select/poll.c` doesn't route through `pselect6` on this build (confirmed: `SYS_poll` is used directly). The only BusyBox callers of raw `select` (`inetd`, `telnetd`, `dhcprelay`, `fdisk`, ...) are already cut from the roster. Not part of the pre-reservation batch below — genuinely not needed. |
@@ -424,14 +641,14 @@ handler — this is the tracking list for the batch, not just historical numberi
 - [x] 14. `mq_timedreceive` (`539`)
 - [x] 15. `mq_notify` (`540`)
 - [x] 16. `mq_getsetattr` (`541`)
-- [ ] 17. `shmget` (`542`)
-- [ ] 18. `shmat` (`543`)
-- [ ] 19. `shmctl` (`544`)
-- [ ] 20. `shmdt` (`545`)
-- [ ] 21. `semget` (`546`)
-- [ ] 22. `semop` (`547`)
-- [ ] 23. `semctl` (`548`)
-- [ ] 24. `semtimedop` (`549`)
+- [x] 17. `shmget` (`542`)
+- [x] 18. `shmat` (`543`)
+- [x] 19. `shmctl` (`544`)
+- [x] 20. `shmdt` (`545`)
+- [x] 21. `semget` (`546`)
+- [x] 22. `semop` (`547`)
+- [x] 23. `semctl` (`548`)
+- [x] 24. `semtimedop` (`549`)
 - [x] 25. `msgget` (`550`)
 - [x] 26. `msgsnd` (`551`)
 - [x] 27. `msgrcv` (`552`)
@@ -451,9 +668,14 @@ existing primitives first, most architecturally novel last):
 | 11-16 | `536-541` | `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/`mq_getsetattr` | `240-245` | Needs a new blocking primitive, but `src/fs/pipe.rs`'s existing blocking-buffer machinery (already reused for `socketpair`) is the natural backing. |
 | 17-28 | `542-553` | SysV IPC: `shmget`/`shmat`/`shmctl`/`shmdt`, `semget`/`semop`/`semctl`/`semtimedop`, `msgget`/`msgsnd`/`msgrcv`/`msgctl` | `29-31`/`64-71`/`220` | Biggest, most novel subsystem, no live caller today, and `ipcrm`/`ipcs` are already cut from the BusyBox roster — lowest priority of the batch. |
 
-No kernel-side handler exists for any of these 28 yet — this batch is purely the number
-reservation, matching the collision-sweep's own "safety fix, not a functional regression" framing
-above. Implementing any of them is separate future work.
+This table reflects the batch's state *at reservation time* — purely the number reservation,
+matching the collision-sweep's own "safety fix, not a functional regression" framing above, with
+implementation left as separate future work. That future work is now done: see "Pre-reserved
+batch: first/second/third/fourth/fifth/sixth implementation" above for all 28 items' real
+handlers, landed across six sessions in real POSIX/SysV order rather than this table's own
+original priority order (items 17-28, the SysV IPC sub-batches, were originally expected to land
+last given their novelty — msg (25-28) and sem (21-24) each turned out simpler than shm (17-20),
+so shm ended up genuinely last, matching this table's own prediction after all).
 
 ## Non-POSIX interfaces worth a footnote
 

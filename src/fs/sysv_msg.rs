@@ -59,6 +59,7 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
+use crate::fs::sysv_ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, RawIpcPerm};
 use crate::process::{self, BlockReason, Pid, ProcState};
 use crate::process::scheduler;
 use crate::syscall::{E2BIG, EACCES, EAGAIN, EIDRM, EINVAL, ENOENT, ENOMSG};
@@ -69,13 +70,6 @@ const IPC_EXCL: u64 = 0o2000;
 const IPC_NOWAIT: u64 = 0o4000;
 const MSG_NOERROR: u64 = 0o10000;
 const MSG_EXCEPT: u64 = 0o20000;
-
-const IPC_RMID: u64 = 0;
-const IPC_SET: u64 = 1;
-const IPC_STAT: u64 = 2;
-/// Real glibc/musl `IPC_64` bit -- see this module's own doc comment for why `msgctl`'s `cmd`
-/// always arrives with this OR'd in on this build.
-const IPC_64: u64 = 0x100;
 
 /// Real Linux's own `MSGMNB` default (max total bytes queued at once) -- what a fresh `msgget`
 /// with no privileged override starts at; adjustable per-queue via `msgctl(IPC_SET)`.
@@ -130,28 +124,8 @@ static QUEUES: Mutex<BTreeMap<i32, MsgQueue>> = Mutex::new(BTreeMap::new());
 /// semantics (see this module's own doc comment).
 static KEYS: Mutex<BTreeMap<i32, i32>> = Mutex::new(BTreeMap::new());
 
-/// musl's own `struct ipc_perm` on x86_64 (`third_party/musl/arch/generic/bits/ipc.h`, the arch
-/// this port falls back to -- no x86_64-specific override exists) -- confirmed 48 bytes via a
-/// direct `musl-gcc`/`sizeof`/`offsetof` probe against that exact field list, same rigor
-/// `RawSysinfo` (`src/syscall/ffi.rs`) already established, rather than assumed from Rust
-/// `repr(C)` layout rules alone.
-#[repr(C)]
-struct RawIpcPerm {
-    key: i32,
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
-    mode: u32,
-    seq: i32,
-    pad1: i64,
-    pad2: i64,
-}
-
-const _: () = assert!(core::mem::size_of::<RawIpcPerm>() == 48);
-
 /// musl's own `struct msqid_ds` on x86_64 (`third_party/musl/arch/generic/bits/msg.h`) -- same
-/// probe-confirmed rigor as `RawIpcPerm` above (120 bytes total).
+/// probe-confirmed rigor as `crate::fs::sysv_ipc::RawIpcPerm` above (120 bytes total).
 #[repr(C)]
 struct RawMsqidDs {
     msg_perm: RawIpcPerm,
@@ -173,25 +147,11 @@ const _: () = assert!(core::mem::size_of::<RawMsqidDs>() == 120);
 /// `uid`/`gid` (first match wins) -- same shape `modules/oxfs`'s own `check_access` already
 /// established for inode permissions, just against `MsgQueue` instead.
 fn check_access(q: &MsgQueue, uid: u32, gid: u32, want_write: bool) -> bool {
-    if uid == 0 {
-        return true;
-    }
-    let bit = if want_write { 0o2 } else { 0o4 };
-    let shift = if uid == q.uid {
-        6
-    } else if gid == q.gid {
-        3
-    } else {
-        0
-    };
-    (q.mode >> shift) & bit != 0
+    crate::fs::sysv_ipc::check_access(q.uid, q.gid, q.mode, uid, gid, want_write)
 }
 
-/// `IPC_SET`/`IPC_RMID`'s own stricter check -- real SysV semantics: only root, the owner, or the
-/// *creator* (which can differ from the current owner after a prior `IPC_SET` changed `uid`) may
-/// reconfigure or remove a queue, regardless of its rwx bits.
 fn is_owner_or_creator(q: &MsgQueue, uid: u32) -> bool {
-    uid == 0 || uid == q.uid || uid == q.cuid
+    crate::fs::sysv_ipc::is_owner_or_creator(q.uid, q.cuid, uid)
 }
 
 fn wake_blocked_senders(msqid: i32) {

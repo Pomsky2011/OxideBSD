@@ -171,6 +171,14 @@ unsafe extern "C" {
     fn oxidebsd_sys_msgsnd(q: u64, m: u64, len: u64, flag: u64) -> i64;
     fn oxidebsd_sys_msgrcv(q_and_flag: u64, m: u64, len: u64, msgtyp: u64) -> i64;
     fn oxidebsd_sys_msgctl(q: u64, cmd: u64, buf_ptr: u64) -> i64;
+    fn oxidebsd_sys_semget(key: u64, nsems: u64, flag: u64) -> i64;
+    fn oxidebsd_sys_semop(id: u64, sops_ptr: u64, nsops: u64) -> i64;
+    fn oxidebsd_sys_semctl(id: u64, semnum: u64, cmd: u64, arg: u64) -> i64;
+    fn oxidebsd_sys_semtimedop(id: u64, sops_ptr: u64, nsops: u64, ts_ptr: u64) -> i64;
+    fn oxidebsd_sys_shmget(key: u64, size: u64, shmflg: u64) -> i64;
+    fn oxidebsd_sys_shmat(id: u64, shmaddr: u64, shmflg: u64) -> i64;
+    fn oxidebsd_sys_shmctl(id: u64, cmd: u64, arg: u64) -> i64;
+    fn oxidebsd_sys_shmdt(shmaddr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -287,6 +295,18 @@ const SYS_MSGGET: u64 = 550;
 const SYS_MSGSND: u64 = 551;
 const SYS_MSGRCV: u64 = 552;
 const SYS_MSGCTL: u64 = 553;
+/// Items 21-24 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved batch. See
+/// `src/fs/sysv_sem.rs`'s own doc comment for the full design.
+const SYS_SEMGET: u64 = 546;
+const SYS_SEMOP: u64 = 547;
+const SYS_SEMCTL: u64 = 548;
+const SYS_SEMTIMEDOP: u64 = 549;
+/// Items 17-20, the last sub-batch of the same 28-syscall pre-reserved batch, closing the whole
+/// thing out. See `src/fs/sysv_shm.rs`'s own doc comment for the full design.
+const SYS_SHMGET: u64 = 542;
+const SYS_SHMAT: u64 = 543;
+const SYS_SHMCTL: u64 = 544;
+const SYS_SHMDT: u64 = 545;
 
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
@@ -482,6 +502,38 @@ extern "C" fn handle_msgctl(q: u64, cmd: u64, buf_ptr: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_msgctl(q, cmd, buf_ptr) }
 }
 
+extern "C" fn handle_semget(key: u64, nsems: u64, flag: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_semget(key, nsems, flag) }
+}
+
+extern "C" fn handle_semop(id: u64, sops_ptr: u64, nsops: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_semop(id, sops_ptr, nsops) }
+}
+
+extern "C" fn handle_semctl(id: u64, semnum: u64, cmd: u64, arg: u64) -> i64 {
+    unsafe { oxidebsd_sys_semctl(id, semnum, cmd, arg) }
+}
+
+extern "C" fn handle_semtimedop(id: u64, sops_ptr: u64, nsops: u64, ts_ptr: u64) -> i64 {
+    unsafe { oxidebsd_sys_semtimedop(id, sops_ptr, nsops, ts_ptr) }
+}
+
+extern "C" fn handle_shmget(key: u64, size: u64, shmflg: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_shmget(key, size, shmflg) }
+}
+
+extern "C" fn handle_shmat(id: u64, shmaddr: u64, shmflg: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_shmat(id, shmaddr, shmflg) }
+}
+
+extern "C" fn handle_shmctl(id: u64, cmd: u64, arg: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_shmctl(id, cmd, arg) }
+}
+
+extern "C" fn handle_shmdt(shmaddr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_shmdt(shmaddr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -530,9 +582,17 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MSGSND, handle_msgsnd);
         oxidebsd_register_syscall(SYS_MSGRCV, handle_msgrcv);
         oxidebsd_register_syscall(SYS_MSGCTL, handle_msgctl);
+        oxidebsd_register_syscall(SYS_SEMGET, handle_semget);
+        oxidebsd_register_syscall(SYS_SEMOP, handle_semop);
+        oxidebsd_register_syscall(SYS_SEMCTL, handle_semctl);
+        oxidebsd_register_syscall(SYS_SEMTIMEDOP, handle_semtimedop);
+        oxidebsd_register_syscall(SYS_SHMGET, handle_shmget);
+        oxidebsd_register_syscall(SYS_SHMAT, handle_shmat);
+        oxidebsd_register_syscall(SYS_SHMCTL, handle_shmctl);
+        oxidebsd_register_syscall(SYS_SHMDT, handle_shmdt);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
     );
     0
 }

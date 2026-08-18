@@ -350,6 +350,29 @@ pub(crate) fn sys_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> Result<u64, u64>
     crate::process::do_sigsuspend(crate::process::scheduler::current_pid(), mask_ptr)
 }
 
+/// `SYS_SIGTIMEDWAIT` (`495`, real, unclaimed `__NR_rt_sigtimedwait`) — matches real
+/// `sigtimedwait(2)`'s exact `(mask_ptr, info_ptr, ts_ptr, sigsetsize)` wire format, no musl
+/// call-site patch needed. Delegates straight to `process::signals::do_sigtimedwait` — see that
+/// function's own doc comment for the real signal-consuming (not handler-invoking) semantics this
+/// needed, and why it's a genuinely different primitive from `do_pause`/`do_sigsuspend`.
+pub(crate) fn sys_sigtimedwait(mask_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize: u64) -> Result<u64, u64> {
+    let _ = sigsetsize;
+    crate::process::do_sigtimedwait(crate::process::scheduler::current_pid(), mask_ptr, info_ptr, ts_ptr)
+}
+
+/// `SYS_SIGQUEUE` (`496`, real, unclaimed `__NR_rt_sigqueueinfo`) — matches real `sigqueue(2)`'s
+/// exact `(pid, sig, siginfo_ptr)` wire format, no musl call-site patch needed. Delegates straight
+/// to `process::signals::do_sigqueue` — see that function's own doc comment for the real
+/// sender-identity/payload delivery this needed.
+pub(crate) fn sys_sigqueue(pid: u64, sig: u64, siginfo_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sigqueue(
+        crate::process::scheduler::current_pid(),
+        pid as i64,
+        sig as i64,
+        siginfo_ptr,
+    )
+}
+
 /// `SYS_TKILL` (real, unclaimed Linux number `200` — used directly, no invented number or musl-
 /// side remap needed, same "still completely unassigned in this ABI's own registry" story
 /// `SYS_FCHMOD`/`SYS_FCHDIR` already have). Matches real `tkill(2)`'s exact `(tid, sig)` wire
@@ -1133,6 +1156,19 @@ pub(crate) extern "C" fn oxidebsd_sys_sigsuspend(mask_ptr: u64, sigsetsize: u64)
     result_to_ffi(sys_sigsuspend(mask_ptr, sigsetsize))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_sigtimedwait(
+    mask_ptr: u64,
+    info_ptr: u64,
+    ts_ptr: u64,
+    sigsetsize: u64,
+) -> i64 {
+    result_to_ffi(sys_sigtimedwait(mask_ptr, info_ptr, ts_ptr, sigsetsize))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sigqueue(pid: u64, sig: u64, siginfo_ptr: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_sigqueue(pid, sig, siginfo_ptr))
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_tkill(tid: u64, sig: u64) -> i64 {
     result_to_ffi(sys_tkill(tid, sig))
 }
@@ -1453,6 +1489,84 @@ pub(crate) extern "C" fn oxidebsd_sys_msgrcv(
 
 pub(crate) extern "C" fn oxidebsd_sys_msgctl(q: u64, cmd: u64, buf_ptr: u64, _a3: u64) -> i64 {
     result_to_ffi(sys_msgctl(q, cmd, buf_ptr))
+}
+
+/// `SYS_SEMGET = 546` through `SYS_SEMTIMEDOP = 549` (registered by `modules/posix_compat`, items
+/// 21-24 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved batch) -- real SysV
+/// semaphores, built on `crate::fs::sysv_sem`. See that module's own doc comment for the full
+/// wire-format/permission/blocking/`SEM_UNDO` design.
+pub(crate) fn sys_semget(key: u64, nsems: u64, flag: u64) -> Result<u64, u64> {
+    crate::fs::sysv_sem::do_semget(key, nsems, flag)
+}
+
+pub(crate) fn sys_semop(id: u64, sops_ptr: u64, nsops: u64) -> Result<u64, u64> {
+    crate::fs::sysv_sem::do_semop(id, sops_ptr, nsops)
+}
+
+pub(crate) fn sys_semctl(id: u64, semnum: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
+    crate::fs::sysv_sem::do_semctl(id, semnum, cmd, arg)
+}
+
+pub(crate) fn sys_semtimedop(id: u64, sops_ptr: u64, nsops: u64, ts_ptr: u64) -> Result<u64, u64> {
+    crate::fs::sysv_sem::do_semtimedop(id, sops_ptr, nsops, ts_ptr)
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_semget(key: u64, nsems: u64, flag: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_semget(key, nsems, flag))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_semop(id: u64, sops_ptr: u64, nsops: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_semop(id, sops_ptr, nsops))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_semctl(id: u64, semnum: u64, cmd: u64, arg: u64) -> i64 {
+    result_to_ffi(sys_semctl(id, semnum, cmd, arg))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_semtimedop(
+    id: u64,
+    sops_ptr: u64,
+    nsops: u64,
+    ts_ptr: u64,
+) -> i64 {
+    result_to_ffi(sys_semtimedop(id, sops_ptr, nsops, ts_ptr))
+}
+
+/// `SYS_SHMGET = 542` through `SYS_SHMDT = 545` (registered by `modules/posix_compat`, items
+/// 17-20 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall pre-reserved batch, the last
+/// sub-batch, closing the whole thing out) -- real SysV shared memory, built on `crate::fs::
+/// sysv_shm`. See that module's own doc comment for the full wire-format/permission/real-mapping
+/// design.
+pub(crate) fn sys_shmget(key: u64, size: u64, shmflg: u64) -> Result<u64, u64> {
+    crate::fs::sysv_shm::do_shmget(key, size, shmflg)
+}
+
+pub(crate) fn sys_shmat(id: u64, shmaddr: u64, shmflg: u64) -> Result<u64, u64> {
+    crate::fs::sysv_shm::do_shmat(id, shmaddr, shmflg)
+}
+
+pub(crate) fn sys_shmctl(id: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
+    crate::fs::sysv_shm::do_shmctl(id, cmd, arg)
+}
+
+pub(crate) fn sys_shmdt(shmaddr: u64) -> Result<u64, u64> {
+    crate::fs::sysv_shm::do_shmdt(shmaddr)
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_shmget(key: u64, size: u64, shmflg: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_shmget(key, size, shmflg))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_shmat(id: u64, shmaddr: u64, shmflg: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_shmat(id, shmaddr, shmflg))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_shmctl(id: u64, cmd: u64, arg: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_shmctl(id, cmd, arg))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_shmdt(shmaddr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    result_to_ffi(sys_shmdt(shmaddr))
 }
 
 /// Thin FFI adapters over `src/process.rs`'s `do_fork_from_current`/`do_wait4`/`do_execve`/

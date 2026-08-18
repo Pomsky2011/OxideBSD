@@ -80,6 +80,15 @@ fn main() {
         "sysv-msg-syscall-smoke",
         "SYSV_MSG_SYSCALL_SMOKE_ELF_PATH",
     );
+    build_userland_crate(
+        "sysv-sem-syscall-smoke",
+        "SYSV_SEM_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
+        "sysv-shm-syscall-smoke",
+        "SYSV_SHM_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate("sig-syscall-smoke", "SIG_SYSCALL_SMOKE_ELF_PATH");
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.

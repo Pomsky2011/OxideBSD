@@ -29,6 +29,9 @@ members = [
   "userland/posix-timer-syscall-smoke",
   "userland/mq-syscall-smoke",
   "userland/sysv-msg-syscall-smoke",
+  "userland/sysv-sem-syscall-smoke",
+  "userland/sysv-shm-syscall-smoke",
+  "userland/sig-syscall-smoke",
   "userland/lsoxmod",
   "modules/hello",
   "modules/native_abi",
@@ -205,6 +208,18 @@ harness = false
 
 [[test]]
 name = "sysv_msg_syscall_smoke"
+harness = false
+
+[[test]]
+name = "sysv_sem_syscall_smoke"
+harness = false
+
+[[test]]
+name = "sysv_shm_syscall_smoke"
+harness = false
+
+[[test]]
+name = "sig_syscall_smoke"
 harness = false
 
 # -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool

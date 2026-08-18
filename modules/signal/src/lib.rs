@@ -37,6 +37,16 @@
 //! `do_sigsuspend`) is kernel-resident and reuses `do_pause`'s own `BlockReason::WaitingForSignal`
 //! primitive, adding a temporary, atomic swap of `blocked_signals` around the same wait — this
 //! module's own `handle_sigsuspend` is, same as everything else here, a thin wrapper.
+//!
+//! `SYS_SIGTIMEDWAIT = 495`/`SYS_SIGQUEUE = 496` (real, unclaimed `__NR_rt_sigtimedwait`/
+//! `__NR_rt_sigqueueinfo`, confirmed collision-free by `docs/MISSING_POSIX_SYSCALLS.md`'s own full
+//! header sweep) back real `sigtimedwait(2)`/`sigwaitinfo(2)`/`sigwait(3)` and `sigqueue(2)` — the
+//! two real, confirmed-live-caller gaps that doc's own "Missing, live caller confirmed" table
+//! tracked. Real logic (`src/process/signals.rs`'s `do_sigtimedwait`/`do_sigqueue`) is
+//! kernel-resident, same thin-wrapper pattern as everything else in this module — see those
+//! functions' own doc comments for the genuinely new signal-consuming (not handler-invoking)
+//! primitive `do_sigtimedwait` needed, and the real sender-identity/payload tracking
+//! (`Process::pending_siginfo`) both now share with the `SA_SIGINFO` handler-invocation path.
 #![no_std]
 
 unsafe extern "C" {
@@ -52,6 +62,8 @@ unsafe extern "C" {
     fn oxidebsd_sys_sigaltstack(ss_ptr: u64, old_ptr: u64) -> i64;
     fn oxidebsd_sys_pause() -> i64;
     fn oxidebsd_sys_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64;
+    fn oxidebsd_sys_sigtimedwait(mask_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize: u64) -> i64;
+    fn oxidebsd_sys_sigqueue(pid: u64, sig: u64, siginfo_ptr: u64, arg3: u64) -> i64;
 }
 
 const SYS_KILL: u64 = 116;
@@ -75,6 +87,13 @@ const SYS_PAUSE: u64 = 529;
 /// Item 5 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall "pre-reserved ahead of
 /// implementation" batch -- same reasoning `SYS_PAUSE` just above already has.
 const SYS_SIGSUSPEND: u64 = 530;
+/// Real, unclaimed Linux `__NR_rt_sigtimedwait` value -- used directly, no invented number or
+/// musl-side remap needed (already confirmed collision-free by `docs/MISSING_POSIX_SYSCALLS.md`'s
+/// own full header sweep). Backs `sigtimedwait(2)`/`sigwaitinfo(2)`/`sigwait(3)`.
+const SYS_SIGTIMEDWAIT: u64 = 495;
+/// Real, unclaimed Linux `__NR_rt_sigqueueinfo` value -- same story as `SYS_SIGTIMEDWAIT` above.
+/// Backs `sigqueue(2)`.
+const SYS_SIGQUEUE: u64 = 496;
 
 extern "C" fn handle_kill(pid: u64, sig: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_kill(pid, sig) }
@@ -108,6 +127,14 @@ extern "C" fn handle_sigsuspend(mask_ptr: u64, sigsetsize: u64, _arg2: u64, _arg
     unsafe { oxidebsd_sys_sigsuspend(mask_ptr, sigsetsize) }
 }
 
+extern "C" fn handle_sigtimedwait(mask_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize: u64) -> i64 {
+    unsafe { oxidebsd_sys_sigtimedwait(mask_ptr, info_ptr, ts_ptr, sigsetsize) }
+}
+
+extern "C" fn handle_sigqueue(pid: u64, sig: u64, siginfo_ptr: u64, arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sigqueue(pid, sig, siginfo_ptr, arg3) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -119,6 +146,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SIGALTSTACK, handle_sigaltstack);
         oxidebsd_register_syscall(SYS_PAUSE, handle_pause);
         oxidebsd_register_syscall(SYS_SIGSUSPEND, handle_sigsuspend);
+        oxidebsd_register_syscall(SYS_SIGTIMEDWAIT, handle_sigtimedwait);
+        oxidebsd_register_syscall(SYS_SIGQUEUE, handle_sigqueue);
     }
     0
 }

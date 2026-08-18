@@ -166,6 +166,37 @@ pub enum BlockReason {
     /// The read-side counterpart to `WaitingForSysvMsgSend` -- blocked in `do_msgrcv` with no
     /// message matching its own real `msgtyp` selection available yet.
     WaitingForSysvMsgRecv(u64),
+    /// Blocked in `crate::fs::sysv_sem`'s `do_semop`/`do_semtimedop` on a real SysV semaphore set
+    /// (`semid`, real Linux's own SysV IPC id) -- a whole `sembuf` array is applied atomically, so
+    /// exactly one op in it is ever the one that couldn't proceed; `semnum`/`waiting_for_zero`
+    /// identify *that* op (real semantics: an op with `sem_op < 0` blocks waiting for the
+    /// semaphore's value to increase, `sem_op == 0` blocks waiting for it to reach zero -- these
+    /// two payload fields exist specifically so `semctl(GETNCNT)`/`semctl(GETZCNT)` can report a
+    /// real, not fabricated, count by scanning `process::table()` for a match, the same "IRQ/
+    /// syscall handler reaches directly into `process::table()`" shape every other `BlockReason`
+    /// here already uses for its own wake/introspection). Woken by any successful `semop`/
+    /// `semctl(SETVAL/SETALL)`/`semctl(IPC_RMID)` against this `semid`, or by
+    /// `interrupts::timer_interrupt_handler`'s own deadline scan for a real `semtimedop` timeout
+    /// (final `u64` field; `u64::MAX` for the plain, non-timed `semop` wrapper's case, same
+    /// sentinel convention `WaitingForMqData` already established) -- always re-checks the *whole*
+    /// op array from scratch on wake, never trusts the wake reason alone, same discipline every
+    /// blocking primitive in this codebase already follows.
+    WaitingForSemOp(u64, u16, bool, u64),
+    /// Blocked in `do_sigtimedwait` (`SYS_SIGTIMEDWAIT`, backing real `sigtimedwait(2)`/
+    /// `sigwaitinfo(2)`/`sigwait(3)`) waiting for any signal in the carried `wait_set` bitmask to
+    /// become pending. Deliberately **not** the same primitive `WaitingForSignal` (`pause`/
+    /// `sigsuspend`) uses: those wake up so the *normal* delivery machinery
+    /// (`take_deliverable_signal`/`deliver_pending_signal`) can invoke a real handler or terminate
+    /// the process; `sigtimedwait` instead directly *consumes* a pending signal itself and returns
+    /// its number synchronously -- no handler is ever invoked, even if one is installed, matching
+    /// real POSIX semantics. `deadline` is the same `u64::MAX`-sentinel "no timeout" convention
+    /// `WaitingForSemOp`'s own final field already establishes (the plain `sigwaitinfo`/`sigwait`
+    /// case, both of which pass a null timeout). Woken by `do_kill`/`signal_foreground_group`/
+    /// `do_sigqueue`'s own `Action::SetPending` arm (`wake_if_sigwaiting`, the same shape
+    /// `WaitingForSignal`'s own `wake_if_paused` already establishes) or by `interrupts::
+    /// timer_interrupt_handler`'s own deadline scan; `do_sigtimedwait`'s own loop always re-checks
+    /// `pending_signals & wait_set` fresh after waking, never trusts the wake reason alone.
+    WaitingForSpecificSignal(u64, u64),
 }
 /// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
 /// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own
@@ -227,6 +258,75 @@ impl SigAction {
         mask: 0,
     };
 }
+
+/// Real Linux `si_code` values for the two ways a signal can become pending on this kernel --
+/// `third_party/musl/include/bits/siginfo.h`'s own `SI_USER = 0`/`SI_QUEUE = -1`. Every signal
+/// this kernel delivers arrives via `kill`/`tkill` (`SI_USER`) or `sigqueue` (`SI_QUEUE`) -- never
+/// a real hardware fault turned into `SIGSEGV`/`SIGBUS`/... (`page_fault_handler` just logs and
+/// reboots, see CLAUDE.md's memory-management section), and never `SI_TKILL` specifically (`do_kill`/
+/// `take_deliverable_signal` don't distinguish how a signal was raised -- self, `kill`, or `tkill`
+/// all funnel through the same `pending_signals` bitmask, a real, documented simplification).
+pub(crate) const SI_USER: i32 = 0;
+pub(crate) const SI_QUEUE: i32 = -1;
+
+/// Real, per-pending-signal sender identity/payload -- `Process::pending_siginfo`'s own element
+/// type. Backs both the `SA_SIGINFO` handler-invocation path's `si_pid`/`si_uid`/`si_value` fields
+/// (`src/syscall/mod.rs`'s `deliver_pending_signal`, previously honest zeros -- see `RawSiginfo`'s
+/// own doc comment history) and `sigtimedwait`/`sigwaitinfo`'s own real `siginfo_t` readback
+/// (`process::signals::do_sigtimedwait`). Real semantics: this kernel has no realtime signals and
+/// therefore no real per-signal-number *queue* (see `SigAction`'s own doc comment) -- a second
+/// `kill`/`sigqueue` against an already-pending signal simply overwrites this slot, the same
+/// "at most one pending instance" collapsing every standard (non-realtime) Unix signal already has.
+#[derive(Clone, Copy, Default)]
+pub struct QueuedSigInfo {
+    /// `SI_USER` or `SI_QUEUE` -- see those constants' own doc comment.
+    pub code: i32,
+    /// The real sending process's pid -- `0` only for `signal_foreground_group`'s own two callers
+    /// (a real keyboard-generated Ctrl+C/Ctrl+Z, or `do_kill`'s own `kill(-pgrp, sig)` broadcast),
+    /// neither of which has one specific real sender process to attribute (an accepted
+    /// simplification, not a live-caller-exercised gap -- no seeded applet inspects `si_pid` for a
+    /// process-group-broadcast signal).
+    pub pid: Pid,
+    /// The real sending process's uid -- same "`0` only for the two broadcast callers" story as
+    /// `pid` above.
+    pub uid: u32,
+    /// The real `union sigval` payload -- only ever nonzero for a signal that arrived via
+    /// `sigqueue(3)` (`SI_QUEUE`); always `0` for a plain `kill`-shaped (`SI_USER`) signal, which
+    /// carries no payload in real POSIX either.
+    pub value: u64,
+}
+
+/// musl's own `siginfo_t` on x86_64 (`third_party/musl/include/signal.h`): three `int`s
+/// (`si_signo`/`si_code`/`si_errno`, no `__SI_SWAP_ERRNO_CODE` on this arch), padded to 8-byte
+/// alignment, then the `__si_common` union's two sub-unions -- `si_pid`/`si_uid` (the
+/// `__piduid`/user-signal-generated shape, the only one this kernel ever actually fills; the
+/// `si_timerid`/`si_overrun` alternative in the same union slot is never populated, no real
+/// per-process timer identity exists to report) followed by `si_value`/`si_status`+`si_utime`+
+/// `si_stime` (also never populated), then padding out to the real, fixed 128-byte `siginfo_t` size
+/// shared across every real Linux architecture. Shared by two real consumers -- the `SA_SIGINFO`
+/// handler-invocation path (`src/syscall/mod.rs`'s `deliver_pending_signal`) and `sigtimedwait`/
+/// `sigqueue`'s own read/write (`process::signals`) -- rather than duplicated a second time, since
+/// getting a wire-format struct's exact layout right in two places independently is exactly the
+/// kind of divergence risk this codebase's own "verified via a direct probe" rigor exists to avoid.
+#[repr(C)]
+pub(crate) struct RawSiginfo {
+    pub si_signo: i32,
+    pub si_code: i32,
+    pub si_errno: i32,
+    pub _pad0: i32,
+    /// `__si_fields.__si_common.__first.__piduid.si_pid` -- real sender identity now (`QueuedSigInfo::pid`),
+    /// not the honest-zero placeholder this field used to always be.
+    pub si_pid: i32,
+    /// `__si_fields.__si_common.__first.__piduid.si_uid` -- same "real now" story as `si_pid` above.
+    pub si_uid: i32,
+    /// `__si_fields.__si_common.__second.si_value` (`union sigval`, `sival_ptr`-sized) -- real
+    /// `sigqueue(2)` payload now (`QueuedSigInfo::value`), not the honest-zero placeholder this
+    /// field used to always be.
+    pub si_value: u64,
+    pub _tail: [u8; 128 - 4 * 4 - 2 * 4 - 8],
+}
+
+const _: () = assert!(core::mem::size_of::<RawSiginfo>() == 128);
 
 /// Real `sigaltstack(2)` flag bits (`third_party/musl/include/signal.h`). `SS_ONSTACK` is a
 /// read-only status bit a caller can observe but never set (musl's own `sigaltstack()` wrapper
@@ -378,6 +478,11 @@ pub(crate) enum SignalDelivery {
         /// The installed `sa_flags`, forwarded so `deliver_pending_signal` can check
         /// `SA_SIGINFO` without a second table lookup.
         flags: u64,
+        /// Real sender identity/payload for this exact signal, snapshotted at the moment it was
+        /// picked as deliverable (`Process::pending_siginfo`) -- what the `SA_SIGINFO` case's own
+        /// constructed `siginfo_t` (`RawSiginfo`) now populates `si_pid`/`si_uid`/`si_value`/
+        /// `si_code` from, in place of the honest zeros this used to always report.
+        siginfo: QueuedSigInfo,
     },
 }
 /// A process's own kernel stack: heap-allocated (not a fixed-size `static`/`static mut` array like
@@ -615,6 +720,34 @@ pub struct Process {
     /// fresh child/keep it `None` rather than threading it through either constructor's own
     /// parent-state tuple.
     pub sigsuspend_restore_mask: Option<u64>,
+    /// Real SysV `SEM_UNDO` bookkeeping (`crate::fs::sysv_sem`) -- one accumulated adjustment per
+    /// `(semid, semnum)` this process has ever `semop`'d with `SEM_UNDO` set, applied (added back)
+    /// automatically on process termination (`terminate_process`, before the table lock is taken --
+    /// see that function's own doc comment on why) and cleared afterward. Real POSIX semantics:
+    /// **not inherited by `fork`** (a child starts with its own empty undo list -- real Linux's
+    /// `semadj` is `fork`-local); **preserved across `execve`** (untouched here since `do_execve`
+    /// mutates the live `Process` in place and never assigns this field, the same "leave it alone"
+    /// treatment `cwd`/`pgid`/`rlimits` already get).
+    pub sysv_sem_undo: Vec<(i32, u16, i32)>,
+    /// Real SysV shared-memory attachment bookkeeping (`crate::fs::sysv_shm`) -- one `(addr,
+    /// shmid)` pair per successful `shmat`, in call order, so `shmdt(addr)` can find (and remove)
+    /// the matching entry and `crate::fs::sysv_shm::detach_all_for_exit` can decrement every
+    /// still-attached segment's own `nattch` on real process termination. **Not inherited by
+    /// `fork`** -- a deliberate, documented simplification tied to this kernel's own "no
+    /// copy-on-write fork" limitation, not an independent design choice; see `crate::fs::
+    /// sysv_shm`'s own doc comment for why inheriting the list wouldn't actually preserve real
+    /// sharing anyway. **Real implicit detach on `execve`** — `do_execve` calls the exact same
+    /// `crate::fs::sysv_shm::detach_all_for_exit` a real process exit does (after committing the
+    /// new `AddressSpace`, which is what actually makes every prior `shmat`'s own mapping
+    /// unreachable): matches real Linux, where `execve(2)` destroying the old address space is
+    /// itself a real implicit detach of everything that was attached to it.
+    pub sysv_shm_attach: Vec<(u64, i32)>,
+    /// Real per-signal-number sender identity/payload, indexed `1..=31` same as `sigactions`
+    /// (index `0` unused) -- see `QueuedSigInfo`'s own doc comment. Not copied by `fork` (a forked
+    /// child starts with `pending_signals == 0` too, so there's nothing meaningful to carry over);
+    /// untouched by `execve` (same "leave it alone" treatment `pending_signals`/`blocked_signals`
+    /// already get there).
+    pub pending_siginfo: [QueuedSigInfo; 32],
 }
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());

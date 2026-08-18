@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 
-use crate::syscall::{EINTR, EINVAL, ESRCH, SyscallFrame};
+use crate::syscall::{EAGAIN, EINTR, EINVAL, ESRCH, SyscallFrame};
 use super::*;
 
 /// `SYS_KILL`'s real logic. Signals `1..=31` only; anything else is `EINVAL`, matching real
@@ -42,6 +42,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     if !(0..=31).contains(&sig) {
         return Err(EINVAL);
     }
+    let caller_uid = oxidebsd_current_uid() as u32;
 
     if target_pid <= 0 {
         // Real POSIX process-group broadcast: `0` targets the caller's own group, `< 0` targets
@@ -103,7 +104,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         let me = table
             .get_mut(&caller_pid)
             .expect("kill: current process missing from table");
-        me.pending_signals |= 1 << (sig - 1);
+        record_pending(me, sig, SI_USER, caller_pid, caller_uid, 0);
         return Ok(0);
     }
 
@@ -170,8 +171,9 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         Action::SetPending => {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {
-                proc.pending_signals |= 1 << (sig - 1);
+                record_pending(proc, sig, SI_USER, caller_pid, caller_uid, 0);
                 wake_if_paused(target, proc, sig);
+                wake_if_sigwaiting(target, proc, sig);
             }
         }
     }
@@ -261,11 +263,42 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
             Action::SetPending => {
                 let mut table = PROCESS_TABLE.lock();
                 if let Some(proc) = table.get_mut(&pid) {
-                    proc.pending_signals |= 1 << (sig - 1);
+                    // No real single sending process to attribute -- see QueuedSigInfo::pid's own
+                    // doc comment for why this is an honest 0, not a fabricated one.
+                    record_pending(proc, sig, SI_USER, 0, 0, 0);
                     wake_if_paused(pid, proc, sig);
+                    wake_if_sigwaiting(pid, proc, sig);
                 }
             }
         }
+    }
+}
+
+/// Sets `sig` pending on `proc`, recording real sender identity/payload alongside the bitmask --
+/// see `QueuedSigInfo`'s own doc comment for why this replaces every bare `proc.pending_signals |=
+/// 1 << (sig - 1)` this codebase used to have. `code` is `SI_USER` for a plain `kill`/`tkill`-
+/// shaped signal, `SI_QUEUE` for one that arrived via `do_sigqueue`.
+fn record_pending(proc: &mut Process, sig: u64, code: i32, sender_pid: Pid, sender_uid: u32, value: u64) {
+    proc.pending_signals |= 1 << (sig - 1);
+    proc.pending_siginfo[sig as usize] = QueuedSigInfo {
+        code,
+        pid: sender_pid,
+        uid: sender_uid,
+        value,
+    };
+}
+
+/// Wakes `pid` if it's blocked in `do_sigtimedwait` and `sig` is a member of the set it's waiting
+/// on -- shared by every `Action::SetPending` arm (`do_kill`/`signal_foreground_group`/
+/// `do_sigqueue`), the same shape `wake_if_paused` below already establishes for `do_pause`/
+/// `do_sigsuspend`. Spurious wakes aren't possible: `do_sigtimedwait`'s own loop re-checks
+/// `pending_signals & wait_set` fresh after waking regardless of why it woke.
+fn wake_if_sigwaiting(pid: Pid, proc: &mut Process, sig: u64) {
+    if let ProcState::Blocked(BlockReason::WaitingForSpecificSignal(wait_set, _)) = proc.state
+        && wait_set & (1 << (sig - 1)) != 0
+    {
+        proc.state = ProcState::Ready;
+        scheduler::enqueue_ready(pid);
     }
 }
 
@@ -583,6 +616,7 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
         }
         let signum = deliverable.trailing_zeros() as u64 + 1;
         proc.pending_signals &= !(1 << (signum - 1));
+        let siginfo = proc.pending_siginfo[signum as usize];
 
         let action = proc.sigactions[signum as usize];
         match action.handler {
@@ -605,6 +639,7 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
                     restorer: action.restorer,
                     mask_to_add,
                     flags: action.flags,
+                    siginfo,
                 });
             }
         }
@@ -641,4 +676,216 @@ pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<SyscallFrame> {
     let saved = proc.signal_saved_frame.take()?;
     proc.blocked_signals = proc.signal_saved_blocked;
     Some(saved)
+}
+
+/// Real relative-timeout conversion for `sigtimedwait` -- the same whole-second/sub-second tick
+/// rounding `crate::fs::sysv_sem`'s own `resolve_relative_deadline`/`do_nanosleep` already
+/// establish (duplicated locally, not shared -- same "small per-module copy over cross-module
+/// abstraction" precedent that module's own doc comment already sets for this exact shape).
+/// `ts_ptr == 0` blocks indefinitely -- `sigwaitinfo`/`sigwait`'s own null-timeout case, matching
+/// real POSIX (`sigwaitinfo(mask, si)` is exactly `sigtimedwait(mask, si, NULL)`).
+fn resolve_relative_deadline(ts_ptr: u64) -> Result<u64, u64> {
+    if ts_ptr == 0 {
+        return Ok(u64::MAX);
+    }
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let (sec, nsec) = unsafe {
+        let ts = ts_ptr as *const i64;
+        (*ts, *ts.add(1))
+    };
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(EINVAL);
+    }
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    let whole_second_ticks = sec as u64 * hz;
+    let sub_second_ticks = (nsec as u64 * hz).div_ceil(1_000_000_000);
+    Ok(crate::cpu::interrupts::ticks() + whole_second_ticks + sub_second_ticks)
+}
+
+/// `SYS_SIGTIMEDWAIT = 495` -- backs real `sigtimedwait(2)`/`sigwaitinfo(2)`/`sigwait(3)`, all
+/// three musl library entry points route through this one real syscall (`sigwaitinfo` passes a
+/// null `ts`; `sigwait` passes its own stack `siginfo_t` and discards everything but `si_signo`) --
+/// one of the two real, confirmed-live-caller gaps `docs/MISSING_POSIX_SYSCALLS.md`'s own "Missing,
+/// live caller confirmed" table tracked (`src/signal/sigtimedwait.c:19,22`). Real `(mask_ptr,
+/// info_ptr, ts_ptr, sigsetsize)` wire format already fits this ABI's 4 real register args --
+/// confirmed directly against that file's own call site: no `SYS_rt_sigtimedwait_time64` sibling is
+/// ever defined for this arch (`bits/syscall.h.in` never declares one), so only the plain
+/// `__syscall_cp(SYS_rt_sigtimedwait, mask, si, ts, _NSIG/8)` branch ever compiles in -- zero musl
+/// call-site patches needed, the same "already fits" story `semget`'s own sub-batch established.
+///
+/// **Real semantics, deliberately distinct from `do_pause`/`do_sigsuspend`**: this directly
+/// *consumes* a pending signal matching `wait_set` from `pending_signals` and returns its number --
+/// no handler is ever invoked, even if one is installed for it (real POSIX: `sigwaitinfo` bypasses
+/// the normal disposition/handler machinery entirely), so this never goes through
+/// `take_deliverable_signal`/`deliver_pending_signal` at all. Checks `pending_signals & wait_set`
+/// directly, **not** `& !blocked_signals` -- a signal in `wait_set` doesn't need to already be
+/// blocked via `sigprocmask` for this to see it, though real usage always blocks it first anyway
+/// (the standard idiom this call exists for), and this kernel already lets a blocked signal
+/// accumulate in `pending_signals` regardless (see `do_kill`'s own doc comment).
+///
+/// `info_ptr`, if non-null, is filled with a real (not fabricated) `siginfo_t` built from
+/// `Process::pending_siginfo` -- real `si_code` (`SI_USER` for a plain `kill`, `SI_QUEUE` for
+/// `sigqueue`), real sender `si_pid`/`si_uid`, and the real `sigqueue`-supplied `si_value` if any.
+///
+/// Real `EAGAIN` on timeout -- `sigtimedwait(2)`'s own documented errno for this case, distinct
+/// from `semtimedop`'s `ETIMEDOUT`. Checks the real wake condition before ever blocking and loops/
+/// re-checks after every wake, same "avoid a lost wakeup, never trust the wake reason alone"
+/// discipline every blocking primitive in this codebase already follows.
+pub fn do_sigtimedwait(pid: Pid, mask_ptr: u64, info_ptr: u64, ts_ptr: u64) -> Result<u64, u64> {
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let wait_set = unsafe { (mask_ptr as *const u64).read() };
+    let deadline = resolve_relative_deadline(ts_ptr)?;
+
+    loop {
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let proc = table
+                .get_mut(&pid)
+                .expect("sigtimedwait: current process missing from table");
+            let ready = proc.pending_signals & wait_set;
+            if ready != 0 {
+                let signum = ready.trailing_zeros() as u64 + 1;
+                proc.pending_signals &= !(1 << (signum - 1));
+                let info = proc.pending_siginfo[signum as usize];
+                drop(table);
+                if info_ptr != 0 {
+                    let raw = RawSiginfo {
+                        si_signo: signum as i32,
+                        si_code: info.code,
+                        si_errno: 0,
+                        _pad0: 0,
+                        si_pid: info.pid as i32,
+                        si_uid: info.uid as i32,
+                        si_value: info.value,
+                        _tail: [0; 128 - 4 * 4 - 2 * 4 - 8],
+                    };
+                    // SAFETY: same known pointer-validation gap every other user-memory write in
+                    // this codebase already has.
+                    unsafe { (info_ptr as *mut RawSiginfo).write_unaligned(raw) };
+                }
+                return Ok(signum);
+            }
+            if crate::cpu::interrupts::ticks() >= deadline {
+                return Err(EAGAIN);
+            }
+            proc.state = ProcState::Blocked(BlockReason::WaitingForSpecificSignal(wait_set, deadline));
+        }
+        scheduler::schedule();
+    }
+}
+
+/// `SYS_SIGQUEUE = 496` -- backs real `sigqueue(3)`, the other of the two real, confirmed-live-
+/// caller gaps `docs/MISSING_POSIX_SYSCALLS.md`'s own "Missing, live caller confirmed" table
+/// tracked (`src/signal/sigqueue.c:19`). Real `(pid, sig, siginfo_ptr)` wire format
+/// (`third_party/musl/src/signal/sigqueue.c`'s own `syscall(SYS_rt_sigqueueinfo, pid, sig, &si)`),
+/// no musl call-site patch needed. Unlike `kill(2)`, real `sigqueue(2)` only ever targets a single
+/// specific pid -- no `0`/negative process-group broadcast shape exists for it, so `target_pid <=
+/// 0` is a real `EINVAL` here (real Linux's kernel does technically permit a couple of edge-case
+/// pid values through `rt_sigqueueinfo` -- no live caller to exercise the difference, and musl's own
+/// `sigqueue(3)` wrapper only ever takes a plain `pid_t` from its own caller unmodified).
+///
+/// **Real sender-identity/payload delivery**: unlike `do_kill` (which never recorded who sent a
+/// signal until this session -- see `QueuedSigInfo`'s own doc comment), this reads the real
+/// `si_value` the caller built at `siginfo_ptr + 24` (musl's own `siginfo_t` layout, matching
+/// `RawSiginfo`'s field order exactly: `si_signo`/`si_code`/`si_errno`/pad/`si_pid`/`si_uid` = 24
+/// bytes, then `si_value`) and records it alongside the *kernel's own* authoritative `caller_pid`/
+/// its real uid -- not whatever `si_pid`/`si_uid` musl happened to put in the caller's own buffer,
+/// matching real Linux's kernel-side behavior of always overwriting those two fields with the true
+/// sender identity regardless of what userspace supplied. Lands in `Process::pending_siginfo`, the
+/// same store `sigtimedwait`/`sigwaitinfo` read back from and the `SA_SIGINFO` handler-invocation
+/// path (`src/syscall/mod.rs`'s `deliver_pending_signal`) now populates its own `si_pid`/`si_uid`/
+/// `si_value` from.
+///
+/// Reuses the same Discard/Terminate/Stop/SetPending disposition resolution `do_kill`'s own
+/// single-target tail already establishes (duplicated rather than factored out -- same "small
+/// per-caller copy over cross-function abstraction" precedent `signal_foreground_group` already set
+/// for this exact enum/match shape). `SI_QUEUE`/the real value only ever matters for the
+/// `SetPending` arm -- the only shape a caught handler or a blocked `sigtimedwait` could ever
+/// actually observe it through.
+pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64) -> Result<u64, u64> {
+    if !(1..=31).contains(&sig) {
+        return Err(EINVAL);
+    }
+    if target_pid <= 0 {
+        return Err(EINVAL);
+    }
+    let target = target_pid as u64;
+    let sig = sig as u64;
+    let caller_uid = oxidebsd_current_uid() as u32;
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has; si_value sits at byte offset 24 in musl's own siginfo_t, matching RawSiginfo's
+    // field layout exactly (see this function's own doc comment).
+    let value = unsafe { *((siginfo_ptr + 24) as *const u64) };
+
+    if target == caller_pid {
+        let mut table = PROCESS_TABLE.lock();
+        let me = table
+            .get_mut(&caller_pid)
+            .expect("sigqueue: current process missing from table");
+        record_pending(me, sig, SI_QUEUE, caller_pid, caller_uid, value);
+        return Ok(0);
+    }
+
+    enum Action {
+        Discard,
+        Terminate,
+        Stop,
+        SetPending,
+    }
+
+    let action = {
+        let mut table = PROCESS_TABLE.lock();
+        let proc = table.get(&target).ok_or(ESRCH)?;
+        if matches!(proc.state, ProcState::Zombie(_)) {
+            return Ok(0);
+        }
+        // Real SIGCONT semantics -- same pre-dispatch step do_kill's own cross-process branch
+        // already establishes.
+        if sig == SIGCONT && matches!(proc.state, ProcState::Stopped(_)) {
+            let proc = table.get_mut(&target).unwrap();
+            proc.state = ProcState::Ready;
+            proc.cont_notify_pending = true;
+            proc.stop_notify_pending = false;
+            proc.pending_signals &= !((1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)));
+            scheduler::enqueue_ready(target);
+        }
+        let proc = table.get(&target).unwrap();
+        match proc.sigactions[sig as usize].handler {
+            1 => Action::Discard, // SIG_IGN
+            0 => match default_disposition(sig) {
+                DefaultDisposition::Ignore => Action::Discard,
+                DefaultDisposition::Terminate => Action::Terminate,
+                DefaultDisposition::Stop => Action::Stop,
+            },
+            _ => Action::SetPending,
+        }
+    };
+
+    match action {
+        Action::Discard => {}
+        Action::Terminate => terminate_process(target, 128 + sig as i32),
+        Action::Stop => {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(proc) = table.get_mut(&target) {
+                if proc.state == ProcState::Ready {
+                    scheduler::remove_ready(target);
+                }
+                proc.state = ProcState::Stopped(sig);
+                proc.stop_notify_pending = true;
+                proc.pending_signals &= !(1 << (SIGCONT - 1));
+                wake_parent_if_waiting(&mut table, target);
+            }
+        }
+        Action::SetPending => {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(proc) = table.get_mut(&target) {
+                record_pending(proc, sig, SI_QUEUE, caller_pid, caller_uid, value);
+                wake_if_paused(target, proc, sig);
+                wake_if_sigwaiting(target, proc, sig);
+            }
+        }
+    }
+    Ok(0)
 }
