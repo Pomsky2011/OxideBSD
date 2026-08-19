@@ -127,6 +127,30 @@ fn test_exit(pass: bool) -> ! {
     }
 }
 
+/// Polls `f` (a non-blocking check, e.g. a `semctl(GET*CNT)` call) until it returns `true` or a
+/// generous bound is exhausted -- **required now that the scheduler is real preemptive**, not
+/// just defensive: an event another process just triggered (a real block registering, a real
+/// wake) used to be guaranteed observable by this exact process's very next syscall, back when
+/// this kernel's scheduler only ever switched at an explicit blocking point (strict, fully
+/// deterministic cooperative round-robin). Real preemption (see CLAUDE.md's own scheduler section)
+/// means the *other* process can now be interrupted and resumed at arbitrary points relative to
+/// this one, so "the other side already reached its checkpoint by the time I check" is no longer
+/// something a single one-shot check can assume -- it has to be polled for. Busy-spinning (not a
+/// blocking syscall) is deliberate and correct here: this process's own repeated non-blocking
+/// checks don't stop the other process from making progress, since the timer preempts *this*
+/// process's ring-3 loop on a fixed quantum regardless of what it's doing.
+fn poll_until(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..2_000_000u32 {
+        if f() {
+            return true;
+        }
+        for _ in 0..64 {
+            spin_loop();
+        }
+    }
+    false
+}
+
 macro_rules! check {
     ($cond:expr, $msg:expr) => {
         if !$cond {
@@ -258,15 +282,21 @@ fn wait4(pid: u64) -> Result<(u64, i32), u64> {
 fn child_process(semid: u64) -> ! {
     write_bytes(b"sysv-sem-syscall-smoke: child running\n");
 
-    // The parent is (or is about to be) blocked wanting sem0 to increase -- real GETNCNT.
+    // The parent is (or is about to be) blocked wanting sem0 to increase -- real GETNCNT. Polled,
+    // not a one-shot check: under real preemption the parent's own blocking semop call isn't
+    // guaranteed to have already run by the time this freshly forked child gets its first turn --
+    // see poll_until's own doc comment.
     check!(
-        semctl_raw(semid, 0, GETNCNT, 0) == Ok(1),
+        poll_until(|| semctl_raw(semid, 0, GETNCNT, 0) == Ok(1)),
         "child's GETNCNT(sem0) didn't see the parent's real block"
     );
 
-    // Wakes the parent's blocked decrement -- the parent stays Ready (not yet re-scheduled),
-    // since this cooperative kernel only switches at the next blocking point, which is still
-    // ahead of us in this same child.
+    // Wakes the parent's blocked decrement. Under the old cooperative-only scheduler the parent
+    // was guaranteed to stay merely Ready (not actually resumed) until this child hit its own next
+    // blocking call -- real preemption means the parent can now genuinely run concurrently with
+    // whatever this child does next (including being preempted mid-syscall-sequence and racing
+    // ahead), which is exactly why the parent's own corresponding GETZCNT(sem1) check below is
+    // polled rather than a one-shot assumption.
     check!(
         semop(semid, &[RawSembuf { sem_num: 0, sem_op: 1, sem_flg: 0 }]).is_ok(),
         "child's wake-up V on sem0 failed"
@@ -407,14 +437,17 @@ pub extern "C" fn _start() -> ! {
         "parent's blocking decrement on sem0 didn't eventually succeed"
     );
 
-    // The child has since moved on to blocking wait-for-zero on sem1 (see child_process) --
-    // sem0's own waiter count is back to zero.
+    // sem0's own waiter count is back to zero the moment this process resumes (it was the only
+    // waiter, and it just woke) -- not a race, no polling needed.
     check!(
         semctl_raw(semid, 0, GETNCNT, 0) == Ok(0),
         "GETNCNT(sem0) after waking didn't drop back to 0"
     );
+    // The child moves on to blocking wait-for-zero on sem1 next (see child_process), but under real
+    // preemption isn't guaranteed to have reached it yet by the time this parent resumes -- polled,
+    // same reasoning as the child's own GETNCNT poll above (see poll_until's own doc comment).
     check!(
-        semctl_raw(semid, 1, GETZCNT, 0) == Ok(1),
+        poll_until(|| semctl_raw(semid, 1, GETZCNT, 0) == Ok(1)),
         "GETZCNT(sem1) didn't see the child's real wait-for-zero block"
     );
 

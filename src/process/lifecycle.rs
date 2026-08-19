@@ -141,6 +141,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sysv_shm_attach: Vec::new(),
         mmap_file_regions: Vec::new(),
         pending_siginfo: [QueuedSigInfo::default(); 32],
+        fpu_state: crate::cpu::fpu::clean_state(),
     };
 
     {
@@ -249,6 +250,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_sched_policy,
         parent_sched_priority,
         parent_umask,
+        parent_fpu_state,
     ) = {
         let mut table = PROCESS_TABLE.lock();
         let parent = table
@@ -294,6 +296,11 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             parent.sched_policy,
             parent.sched_priority,
             parent.umask,
+            // Real fork() semantics: the child's own FPU/SSE register state starts as an exact
+            // copy of the parent's live state at the moment of the fork() call (the parent's own
+            // in-flight computation, if any, is a real thing the child should see too) -- same
+            // "copied, not reset" treatment as uid/gid/rlimits above.
+            parent.fpu_state,
         )
     };
 
@@ -359,6 +366,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
         // for a forked child too, so there's nothing meaningful to carry over).
         pending_siginfo: [QueuedSigInfo::default(); 32],
+        fpu_state: parent_fpu_state,
     };
 
     {

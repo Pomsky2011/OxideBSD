@@ -40,7 +40,8 @@ Current state:
   a much bigger lift than this kernel currently supports).
 
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
-no preemption, no copy-on-write fork, no frame deallocation anywhere, `sys_read` on stdin is
+no *kernel-mode* preemption (real ring-3/user-mode preemption exists — see "Real preemptive
+scheduling" below), no copy-on-write fork, no frame deallocation anywhere, `sys_read` on stdin is
 non-blocking (busy-polled by userland), no general block-device-agnostic VFS/mount-table layer (a
 real ATA disk driver + oxfs mount/format persistence + a scoped bind/tmpfs mount table exist now —
 see "Real disk persistence"/"Mount table" — but only for oxfs's own fixed backing store), no IPv6,
@@ -283,9 +284,10 @@ future syscall port, so re-check these when adding one:
   sibling's (left at its inert real-Linux number), resurrecting the exact collision the remap was
   meant to close. Both are now remapped and kept in sync — any future syscall with a same-shaped
   64-bit sibling (`__NR_stat64`, `__NR_fstatat64`, ...) needs the same audit.
-- SSE was never enabled at the hardware level (`CR0.EM`/`CR4.OSFXSR`/`OSXMMEXCPT`); `src/fpu.rs::
-  init()` enables it once at boot. No save/restore across context switches — fine only while at
-  most one SSE-using process is ever mid-computation (true today, no preemption).
+- SSE was never enabled at the hardware level (`CR0.EM`/`CR4.OSFXSR`/`OSXMMEXCPT`); `src/cpu/
+  fpu.rs::init()` enables it once at boot. Real per-process `FXSAVE`/`FXRSTOR` save/restore across
+  every context switch now exists (`Process::fpu_state`) — see "Real preemptive scheduling" below
+  for why this became load-bearing rather than optional once ring-3 preemption landed.
 - `src/process/user_stack.rs` builds a real System V argc/argv/envp/auxv initial stack. `AT_PHDR` is
   derived from whichever `PT_LOAD` segment has the smallest `p_offset` (this project's own linker
   scripts don't map the ELF header into any segment). `AT_RANDOM` is a fixed placeholder.
@@ -1593,6 +1595,90 @@ sections for the complete per-item write-up.
   writable static (`HANDLER_RAN: AtomicBool`) hit the exact same `elf.rs` PT_LOAD-segment-sharing-
   a-page issue documented above for `sa-siginfo-syscall-smoke` — same linker-script
   `ALIGN(0x1000)` workaround applied.
+
+## Real preemptive scheduling (`src/process/scheduler.rs`, `src/cpu/interrupts.rs`, `src/cpu/fpu.rs`)
+
+The scheduler is no longer purely cooperative. A process still leaves `Running` voluntarily by
+calling `scheduler::schedule()` itself (`do_exit`/`do_wait4`/every other blocking primitive,
+unchanged) — but it can now also be preempted: `interrupts::timer_interrupt_handler` calls that
+same `schedule()` directly whenever it catches a process executing ring-3 (user-mode) code and a
+time quantum (`PREEMPT_QUANTUM_TICKS = 4` ticks = 40ms at `TIMER_HZ = 100`) has elapsed since the
+last check.
+
+- **Deliberately scoped to ring-3 only, not full kernel preemption.** Checked via the interrupted
+  frame's own `code_segment` RPL bits (`stack_frame.code_segment.0 & 0x3 == 3`), not any software
+  flag. Kernel/syscall/module code is never preempted — `IA32_SFMASK` already clears `IF` for a
+  `SYSCALL`'s entire duration (see the Syscall ABI section above), and nothing else in this
+  codebase runs with `IF` set for long. This is the load-bearing scoping decision: user-mode code
+  never holds a kernel `spin::Mutex` or touches module static state, so limiting preemption to
+  ring-3 means **no existing critical section anywhere in this codebase needed auditing for
+  preemption-safety** — the alternative (real kernel-mode preemption) would have required exactly
+  that, a far larger and riskier undertaking.
+- **The mechanism is unchanged `scheduler::schedule()`, called from a new site.** No raw-asm timer
+  entry point was needed, despite `scheduler.rs`'s own module doc comment once predicting one would
+  be (that prediction is now corrected in place) — `schedule()`/`switch_context` is just a
+  stack-pointer-swap primitive agnostic to *why* the caller is yielding. Calling it directly from
+  the existing `extern "x86-interrupt" fn timer_interrupt_handler` works unmodified: the preempted
+  process's own compiler-generated interrupt-return sequence (culminating in a real `iretq`) sits
+  dormant on *its own* kernel stack, below wherever `switch_context`'s `ret` suspended it, until
+  this exact pid is picked again — at which point unwinding back up through `schedule()` and this
+  handler's own call site reaches that dormant `iretq` naturally, restoring the interrupted ring-3
+  context exactly as if the call had returned immediately. Each process having its own private
+  kernel stack (already true before this work) is what makes this sound: nothing else ever touches
+  that dormant memory while the process waits its turn.
+- **EOI is sent before the possible `schedule()` call, not after** — load-bearing, not stylistic.
+  `schedule()` can switch away to a different process for an arbitrary stretch of wall-clock time
+  before this exact call returns; until the EOI is sent, the PIC still considers IRQ0 "in service"
+  and won't deliver *any* further timer interrupt to *anyone* — freezing not just future preemption
+  but every other `ticks()`-gated wakeup in `interrupts.rs` (sleepers, POSIX timers, `SIGALRM`,
+  mqueue/semaphore timeouts, ...) permanently.
+- **A real, previously-flagged correctness gap this closed**: `cpu::fpu.rs` had long documented
+  that SSE/x87 register state was never saved/restored across a context switch, "fine only while at
+  most one process is ever actually using SSE at a time without yielding mid-computation — true
+  under the old cooperative-only scheduler... a real gap the moment two SSE-using processes could
+  interleave." Cooperative yielding was always safe without this: a process only ever gave up the
+  CPU at a real function-call boundary (a syscall), where the SysV ABI already forces the compiler
+  to spill any XMM state it cares about to its own stack before the call. Real preemption breaks
+  that: the timer can now interrupt a process at literally any instruction, including
+  mid-computation with live XMM register content the compiler never spilled (no call boundary
+  requires it). Fixed by adding `Process::fpu_state` (a 16-byte-aligned 512-byte `FXSAVE`/`FXRSTOR`
+  area, `cpu::fpu::FxSaveArea`) — `scheduler::schedule`/`start` now `fxsave` the outgoing process
+  and `fxrstor` the incoming one on **every** switch, not just a preemptive one (simpler and
+  cheaper to reason about than special-casing cooperative vs. preemptive switches). A freshly
+  spawned/forked process starts from `cpu::fpu::clean_state()` — a real CPU-reset image captured
+  once via a genuine `fninit`+`fxsave` at boot (right after `fpu::init()` enables SSE), not a
+  hand-guessed all-zero buffer (the x87 control word and `MXCSR` both have real nonzero hardware
+  reset defaults, so an all-zero image isn't actually legal state). A forked child copies the
+  parent's live `fpu_state` (real `fork()` semantics); `execve` currently leaves it untouched
+  (real Linux resets FP state on `exec` for hygiene — not done here, a known minor gap, not a
+  correctness issue since nothing depends on it).
+- **A real regression found and fixed by this session's own full test-suite pass, not by review**:
+  `userland/sysv-sem-syscall-smoke`'s part 6 (block/wake across `fork()`, exercising
+  `GETNCNT`/`GETZCNT`) started failing intermittently — its own pre-existing source comment
+  explicitly assumed the old cooperative guarantee ("the parent stays Ready, not yet re-scheduled,
+  since this cooperative kernel only switches at the next blocking point"). Real preemption
+  breaks exactly that assumption: a process waking another (a real `semop` V operation) no longer
+  guarantees the waker keeps running uninterrupted until its own next blocking call — the woken
+  process can now genuinely race ahead if the waker gets preempted first. Root-caused by
+  reproducing reliably on this branch (100% pass on master, intermittent failure here) and tracing
+  the exact `READY_QUEUE` reordering a preemption mid-sequence causes. Fixed in the test itself
+  (not the kernel): the two one-shot `GETNCNT`/`GETZCNT` checks that depended on strict
+  before/after ordering are now bounded polling loops (`poll_until`) — a pattern that was actually
+  *unsound* under the old pure-cooperative scheduler (a busy-spinning process would never yield the
+  CPU to let the other side make progress) and only becomes valid now that the timer forces
+  fairness regardless of what a ring-3 loop is doing. No other test in the suite carried this same
+  assumption (checked via a source-wide grep for similarly-worded scheduling-order comments before
+  concluding this was the only one) — every other cross-process test already synchronized through a
+  real blocking primitive rather than an implicit ordering assumption, and passed unmodified.
+- **Verification**: `cargo build`/`cargo clippy` clean, no new warnings. Every integration test in
+  the suite passes (two pre-existing, unrelated compile failures — `rtl8139_smoke`/`icmp_smoke`/
+  `ping_smoke` reference a stale `oxidebsd::interrupts` import path that predates this session and
+  needs `oxidebsd::cpu::interrupts` — were already broken on `master` before this work and are out
+  of this session's scope), including `fork_wait`/every `*_syscall_smoke` test exercising real
+  fork/signals/IPC/networking/musl/BusyBox/TinyCC userland through genuine preemptible execution.
+  Not covered by automated testing: real-world responsiveness/fairness under sustained concurrent
+  CPU-bound load (e.g. a background `yes > /dev/null &` while using the shell) — manual-QEMU-only,
+  same category as every other interactive/timing-sensitive claim in this file.
 
 ## BusyBox gap analysis: what's needed for more applets
 

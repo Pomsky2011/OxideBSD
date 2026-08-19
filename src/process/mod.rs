@@ -754,6 +754,15 @@ pub struct Process {
     /// untouched by `execve` (same "leave it alone" treatment `pending_signals`/`blocked_signals`
     /// already get there).
     pub pending_siginfo: [QueuedSigInfo; 32],
+    /// This process's saved `FXSAVE`/`FXRSTOR` (SSE/x87) register state — see `cpu::fpu`'s own
+    /// module doc comment for why this exists at all (real preemption, unlike the old
+    /// cooperative-only scheduler, can interrupt a process mid-computation with live XMM state the
+    /// compiler never spilled). Saved by `scheduler::schedule`/`start` right before switching away
+    /// from this process, restored right before switching into it — on *every* switch, not just a
+    /// preemptive one, so there's no cooperative/preemptive special case to get wrong. Starts as
+    /// `cpu::fpu::clean_state()` (a real CPU-reset image, not zeroed) for a freshly spawned/forked
+    /// process; a forked child copies the parent's live state (real `fork()` semantics).
+    pub fpu_state: crate::cpu::fpu::FxSaveArea,
 }
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());

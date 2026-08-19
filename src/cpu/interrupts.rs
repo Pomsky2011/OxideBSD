@@ -206,7 +206,35 @@ extern "x86-interrupt" fn double_fault_handler(
     reboot();
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// How many timer ticks (`TIMER_HZ = 100`, see `cpu::pit.rs`) a process gets before it's
+/// preempted — `4` ticks = 40ms, a fairly conventional interactive quantum (in the same ballpark
+/// as classic Linux's old `HZ=100` default). Only ever consulted for a process actually caught
+/// running ring-3 (user-mode) code — see `timer_interrupt_handler`'s own doc comment.
+const PREEMPT_QUANTUM_TICKS: u64 = 4;
+
+/// Real preemption lives here: on top of the tick/sleeper-wake bookkeeping this handler has always
+/// done, it now also decides whether to force a reschedule.
+///
+/// **Deliberately scoped to ring-3 only** — checked via `stack_frame.code_segment`'s RPL bits (the
+/// CPU's own record of what was interrupted, not anything this handler has to track itself): a
+/// hardware interrupt gate automatically switches onto `TSS.RSP0` (this process's own kernel
+/// stack, kept in sync by `gdt::set_kernel_stack` on every context switch) whenever it catches
+/// ring-3 code, so by the time this function runs, we're already on the right stack to suspend
+/// this exact process via an ordinary `scheduler::schedule()` call. Ring-0 code (a syscall handler,
+/// another IRQ handler, this very function's own housekeeping) is never preempted — deliberately,
+/// not just "not implemented yet": user-mode code never holds a kernel `spin::Mutex` or touches
+/// module static state, so scoping preemption to ring-3 sidesteps auditing every critical section
+/// in this codebase for preemption-safety. See `scheduler.rs`'s own module doc comment for why
+/// calling `schedule()` directly from this `extern "x86-interrupt" fn` is sound even though it may
+/// not return for an arbitrary stretch of wall-clock time.
+///
+/// **EOI is sent before the possible `schedule()` call, not after** — load-bearing, not stylistic.
+/// `schedule()` can switch away to a completely different process for an arbitrary amount of time
+/// before this exact call returns (i.e. before this exact process is picked again); until the EOI
+/// is sent, the PIC still considers IRQ0 "in service" and won't deliver *any* further timer
+/// interrupt to anyone — which would freeze not just future preemption but every other
+/// `ticks()`-gated wakeup in this file (sleepers, POSIX timers, `SIGALRM`, ...) for good.
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Wake any process blocked in `process::do_nanosleep` (`BlockReason::Sleeping`) whose deadline
@@ -332,8 +360,17 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         }
     }
 
+    // Must happen before the preemption check below can call scheduler::schedule() -- see this
+    // function's own doc comment.
     unsafe {
         pic::notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+
+    // Ring check via the CPU's own saved CS RPL bits (`& 0x3`), not e.g. `scheduler::current_pid()`
+    // state -- see this function's own doc comment for why ring-3-only is the deliberate scope.
+    let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
+    if interrupted_ring3 && now.is_multiple_of(PREEMPT_QUANTUM_TICKS) {
+        crate::process::scheduler::schedule();
     }
 }
 

@@ -3,12 +3,24 @@
 //! to on the next ring-3→ring-0 transition) before handing off to
 //! `context_switch::switch_context`.
 //!
-//! Cooperative round-robin only: a process only ever leaves `Running` by calling `schedule()`
-//! itself (via `process::do_exit`/`do_wait4`), never because a timer interrupt preempted it. The
-//! deliberate, documented seam for a later preemptive scheduler: `interrupts::timer_interrupt_handler`
-//! would need converting from an `extern "x86-interrupt" fn` to a raw asm entry point (the same
-//! way `syscall::syscall_entry` already is) so it can hand off full GPR state before deciding to
-//! switch — not implemented here.
+//! **Real preemption**: a process leaves `Running` either voluntarily (calling `schedule()` itself
+//! via `process::do_exit`/`do_wait4`/every other blocking primitive — unchanged) *or* because
+//! `interrupts::timer_interrupt_handler` caught it executing ring-3 (user-mode) code and called
+//! this exact same `schedule()` directly, once a time quantum elapsed. No raw-asm timer-entry
+//! conversion needed (an earlier version of this comment predicted one would be) — `schedule()`
+//! itself is just a stack-pointer-swap primitive (`switch_context`) agnostic to *why* the caller
+//! is yielding, so calling it from inside the existing `extern "x86-interrupt" fn` works
+//! unmodified: the preempted process's own compiler-generated interrupt-return sequence sits
+//! dormant on its own kernel stack (below wherever `switch_context`'s `ret` suspended it) until
+//! this exact same pid is picked again, at which point unwinding back up through `schedule()` and
+//! this file's own call site reaches that dormant `iretq` naturally. **Deliberately scoped to
+//! ring-3 only** — kernel/syscall/module code is never preempted (`IA32_SFMASK` already clears
+//! `IF` for a `SYSCALL`'s whole duration, and nothing else here runs with `IF` set for long), so no
+//! kernel `spin::Mutex`/module-static-data critical section anywhere in this codebase needed
+//! auditing for preemption-safety — user-mode code never holds one. See
+//! `interrupts::timer_interrupt_handler`'s own doc comment for the ring check/quantum/EOI-ordering
+//! details, and `cpu::fpu`'s module doc comment for the one real correctness gap preemption opened
+//! up (unsaved SSE/x87 state) and how it's closed (`Process::fpu_state`).
 //!
 //! **"Nothing runnable" no longer means "spin forever with interrupts masked."** `schedule()`'s
 //! own fallback used to be `crate::hlt_loop()` — a deliberate, permanent dead end, safe only
@@ -108,6 +120,11 @@ pub fn schedule() {
         let prev_rsp_slot: *mut u64 = if has_prev {
             let mut table = process::table().lock();
             let prev = table.get_mut(&prev_pid).unwrap();
+            // SAFETY: prev is the outgoing process, about to be switched away from on the very
+            // next line below — its live hardware FPU/SSE state genuinely belongs to it (see
+            // cpu::fpu's own module doc comment for why this capture is required now that
+            // preemption exists) and fpu_state is a valid, 16-byte-aligned FxSaveArea field.
+            unsafe { crate::cpu::fpu::save(&mut prev.fpu_state as *mut _) };
             &mut prev.rsp as *mut u64
         } else {
             &raw mut BOOT_SCRATCH_RSP
@@ -199,5 +216,12 @@ fn activate_and_prepare(pid: Pid) -> u64 {
     // *other* process last called SYS_SET_FS_BASE. See Process::fs_base's own doc comment for the
     // real crash this fixed.
     x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(next.fs_base));
+    // Same "restore before the switch actually lands" reasoning as schedule()'s own fpu::save
+    // call on the outgoing side — by the time switch_context's `ret` hands control to next, the
+    // hardware FPU/SSE registers must already hold *its* state, not whichever process ran last.
+    // SAFETY: next.fpu_state is a valid, 16-byte-aligned FxSaveArea — either a real prior
+    // fpu::save() (a process that's run before) or cpu::fpu::clean_state()'s own output (a
+    // never-run process, see process::lifecycle::spawn/do_fork_from_current).
+    unsafe { crate::cpu::fpu::restore(&next.fpu_state as *const _) };
     next.rsp
 }
