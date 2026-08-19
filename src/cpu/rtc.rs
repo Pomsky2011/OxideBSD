@@ -92,3 +92,40 @@ pub fn unix_epoch_seconds() -> i64 {
     let days = days_from_civil(year as i64, month as u32, day as u32);
     days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64
 }
+
+/// Real, calibrated-once mapping between `interrupts::ticks()` and this chip's own wall-clock
+/// reading -- see `unix_epoch_now_precise`'s own doc comment for why a single calibration point
+/// beats reading the RTC fresh on every call once real sub-second precision is needed. `spin::Once`,
+/// not a plain `static mut` -- this is genuinely lazy (first real caller wins), and nothing here
+/// needs the `gdt.rs`/`module.rs` "write must be observable through an exported function" dead-
+/// store gotcha's workaround (a `Once` read is itself the exported access).
+static REALTIME_BASE_TICKS: spin::Once<i64> = spin::Once::new();
+
+/// Real, sub-second-precision wall-clock time, as `(tv_sec, tv_nsec)` -- unlike
+/// `unix_epoch_seconds` above (kept as-is, still used by SysV IPC's own `stime`/`rtime`/`ctime`,
+/// which only ever need whole seconds), this backs `CLOCK_REALTIME` in `sys_clock_gettime`, which
+/// real POSIX `nanosleep(2)` conformance tests genuinely check to sub-second precision. Found
+/// live: `nanosleep/1-1.c`/`2-1.c` sleep for as little as a handful of nanoseconds and then expect
+/// `clock_gettime` to observe *some* elapsed time -- a fixed `tv_nsec = 0` can never show that
+/// unless the RTC's own 1 Hz second boundary happens to land inside the sleep by pure luck (it
+/// almost never does), so both tests failed regardless of how correct `nanosleep`'s own real sleep
+/// duration was.
+///
+/// Calibrates a fixed `ticks() -> real seconds` offset exactly once, lazily, on first call
+/// (`base = unix_epoch_seconds() * TIMER_HZ - ticks()`), then derives every later reading purely
+/// from `interrupts::ticks()` against that fixed base -- the same real, `TIMER_HZ`-cadence
+/// technique `CLOCK_MONOTONIC` already uses, just shifted by a real wall-clock epoch instead of
+/// starting at `0`. Deliberately *not* re-reading the RTC on every call the way `unix_epoch_seconds`
+/// does: mixing a fresh RTC second-boundary read with a `ticks()`-derived sub-second offset that
+/// isn't phase-locked to that same boundary would make `tv_sec`/`tv_nsec` disagree with each other
+/// (a real, if usually brief, backward jump every time the two disagree) -- a single calibration
+/// point avoids that by construction, at the honest cost of the RTC's own already-documented
+/// "doesn't wait out an in-progress update" off-by-one-second risk applying once, at calibration
+/// time, rather than on every read (a real improvement, not just a wash).
+pub fn unix_epoch_now_precise() -> (i64, i64) {
+    let hz = crate::cpu::pit::TIMER_HZ as i64;
+    let base = *REALTIME_BASE_TICKS
+        .call_once(|| unix_epoch_seconds() * hz - crate::cpu::interrupts::ticks() as i64);
+    let total_ticks = crate::cpu::interrupts::ticks() as i64 + base;
+    (total_ticks / hz, (total_ticks % hz) * 1_000_000_000 / hz)
+}

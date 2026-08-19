@@ -190,13 +190,16 @@ pub(crate) fn sys_set_tid_address(_tidptr: u64) -> Result<u64, u64> {
 /// `src/net/tcp.rs`'s `tcp_read`), so `O_NONBLOCK` on one of those is accepted and tracked but
 /// doesn't change behavior.
 ///
-/// `F_SETFD` only recognizes `FD_CLOEXEC` and accepts it as a pure no-op -- this kernel has no
-/// close-on-exec enforcement in `process::do_execve` at all yet, so tracking the bit would be a
-/// write nobody ever reads. `F_DUPFD`/`F_DUPFD_CLOEXEC` delegate to `crate::fs::fd::dup` (ignoring
-/// the real "minimum fd number" hint in `arg` -- this kernel's bump allocator has no notion of it)
-/// -- added mainly so musl's own `F_DUPFD_CLOEXEC` fallback in `fcntl.c` (which always tries that
-/// command first, then falls back through `F_DUPFD`) resolves cleanly instead of chasing `EINVAL`
-/// down every branch.
+/// **`F_GETFD`/`F_SETFD` are real now** -- `crate::fs::fd::is_cloexec`/`set_cloexec`, a genuine
+/// per-`(pid, fd)` `FD_CLOEXEC` bit, enforced by `process::do_execve` via `close_cloexec` (found
+/// live: `shm_open/11-1.c`, the Open POSIX Test Suite pilot, checks it directly via `F_GETFD` --
+/// real `shm_open()` always passes `O_CLOEXEC` to `open()`). `F_DUPFD`/`F_DUPFD_CLOEXEC` delegate
+/// to `crate::fs::fd::dup` (ignoring the real "minimum fd number" hint in `arg` -- this kernel's
+/// bump allocator has no notion of it); `F_DUPFD_CLOEXEC` additionally marks the *new* fd
+/// close-on-exec (real POSIX: unlike a plain `dup`/`F_DUPFD`, this variant's whole point is
+/// atomically setting the flag on the fresh fd) -- added mainly so musl's own `F_DUPFD_CLOEXEC`
+/// fallback in `fcntl.c` (which always tries that command first, then falls back through
+/// `F_DUPFD`) resolves cleanly instead of chasing `EINVAL` down every branch.
 const F_DUPFD: u64 = 0;
 const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
@@ -204,11 +207,16 @@ const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const O_NONBLOCK: u64 = 0o4000;
+/// Real `fcntl(2)` `FD_CLOEXEC` value (`third_party/musl/include/fcntl.h`) -- distinct from
+/// `open(2)`'s own `O_CLOEXEC` flag value (`0o2000000`, consulted by `modules/oxfs`'s `oxfs_open`
+/// directly, not here).
+const FD_CLOEXEC: u64 = 1;
 
 pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
     let Some(real_fd) = crate::fs::fd::real_fd_of(fd) else {
         return Err(EBADF);
     };
+    let pid = crate::process::scheduler::current_pid();
     match cmd {
         F_GETFL => Ok(if crate::fs::fd::is_nonblocking(real_fd) {
             O_NONBLOCK
@@ -219,9 +227,21 @@ pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
             crate::fs::fd::set_nonblocking(real_fd, arg & O_NONBLOCK != 0);
             Ok(0)
         }
-        F_GETFD => Ok(0), // FD_CLOEXEC never actually tracked -- see this function's doc comment
-        F_SETFD => Ok(0),
-        F_DUPFD | F_DUPFD_CLOEXEC => crate::fs::fd::dup(fd).map_err(|_| EBADF),
+        F_GETFD => Ok(if crate::fs::fd::is_cloexec(pid, fd) {
+            FD_CLOEXEC
+        } else {
+            0
+        }),
+        F_SETFD => {
+            crate::fs::fd::set_cloexec(pid, fd, arg & FD_CLOEXEC != 0);
+            Ok(0)
+        }
+        F_DUPFD => crate::fs::fd::dup(fd).map_err(|_| EBADF),
+        F_DUPFD_CLOEXEC => {
+            let newfd = crate::fs::fd::dup(fd).map_err(|_| EBADF)?;
+            crate::fs::fd::set_cloexec(pid, newfd, true);
+            Ok(newfd)
+        }
         _ => Err(EINVAL),
     }
 }
@@ -994,6 +1014,8 @@ struct RawTimespec {
 /// syscall numbers, so no remapping needed, unlike `SYS_clock_gettime` itself below.
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 
 /// `SYS_CLOCK_GETTIME` (registered as `138` by `modules/clock`, continuing on from `SYS_UNAME =
 /// 137`) — matches real `clock_gettime(2)`'s exact `(clockid, timespec_ptr)` wire format, so only
@@ -1001,25 +1023,41 @@ const CLOCK_MONOTONIC: u64 = 1;
 /// time.c`/`gettimeofday.c`) are both plain wrappers around `clock_gettime(CLOCK_REALTIME, ...)`
 /// at the C level, not separate syscalls, so this one remap is enough to unlock all three.
 ///
-/// `CLOCK_REALTIME` reads `src/cpu/rtc.rs`'s CMOS RTC live on every call (see that module's own
-/// doc comment for why that's simpler and more honest than caching a boot-time baseline).
-/// `CLOCK_MONOTONIC` converts `src/cpu/interrupts.rs`'s `ticks()` against `src/cpu/pit.rs`'s
+/// `CLOCK_REALTIME` reports real, sub-second-precision wall-clock time
+/// (`src/cpu/rtc.rs`'s `unix_epoch_now_precise` -- a `ticks()`-derived offset calibrated once
+/// against the CMOS RTC, not a fresh RTC read every call; see that function's own doc comment for
+/// why). `CLOCK_MONOTONIC` converts `src/cpu/interrupts.rs`'s `ticks()` against `src/cpu/pit.rs`'s
 /// now-known `TIMER_HZ`, seconds since boot -- not wall-clock time, matching real `CLOCK_MONOTONIC`
-/// semantics (unspecified epoch, only meaningful as a delta between two readings). Any other
-/// `clockid` (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`, ...) is `EINVAL` -- this
-/// kernel tracks neither per-process nor per-thread CPU time.
+/// semantics (unspecified epoch, only meaningful as a delta between two readings).
+/// `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` both read `Process::cpu_ticks` (see that
+/// field's own doc comment for why real threading's absence makes the two clockids equivalent
+/// here, and for the real gap this closes: `clock_gettime/4-1.c`, the Open POSIX Test Suite
+/// pilot). Any other `clockid` is `EINVAL`.
 pub(crate) fn sys_clock_gettime(clockid: u64, ts_ptr: u64) -> Result<u64, u64> {
     let ts = match clockid {
-        CLOCK_REALTIME => RawTimespec {
-            tv_sec: crate::cpu::rtc::unix_epoch_seconds(),
-            tv_nsec: 0,
-        },
+        CLOCK_REALTIME => {
+            let (tv_sec, tv_nsec) = crate::cpu::rtc::unix_epoch_now_precise();
+            RawTimespec { tv_sec, tv_nsec }
+        }
         CLOCK_MONOTONIC => {
             let ticks = crate::cpu::interrupts::ticks();
             let hz = crate::cpu::pit::TIMER_HZ as u64;
             RawTimespec {
                 tv_sec: (ticks / hz) as i64,
                 tv_nsec: ((ticks % hz) * 1_000_000_000 / hz) as i64,
+            }
+        }
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            let pid = crate::process::scheduler::current_pid();
+            let cpu_ticks = crate::process::table()
+                .lock()
+                .get(&pid)
+                .map(|p| p.cpu_ticks)
+                .unwrap_or(0);
+            let hz = crate::cpu::pit::TIMER_HZ as u64;
+            RawTimespec {
+                tv_sec: (cpu_ticks / hz) as i64,
+                tv_nsec: ((cpu_ticks % hz) * 1_000_000_000 / hz) as i64,
             }
         }
         _ => return Err(EINVAL),

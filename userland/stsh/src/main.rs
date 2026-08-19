@@ -59,6 +59,11 @@ const STDOUT: u64 = 1;
 /// Real POSIX `O_CREAT`'s value, not an arbitrary bit -- see `modules/fat32/src/lib.rs`'s own
 /// `O_CREAT` doc comment for why this constant must match `fat32_open`'s exactly.
 const O_CREAT: u64 = 0o100;
+/// Real POSIX `open(2)` access-mode bit -- needed explicitly now that `modules/oxfs`'s own
+/// `oxfs_open` enforces the caller's real requested access mode even on a brand-new `O_CREAT`
+/// file (`OpenFile::Write::readonly`, see that field's own doc comment) rather than always
+/// granting write access regardless of what was actually asked for.
+const O_WRONLY: u64 = 0o1;
 
 const LINE_CAPACITY: usize = 128;
 /// Bounds how many words past the command name `execve`'s argv[1..] can carry -- a sanity cap,
@@ -467,7 +472,14 @@ fn run_write(rest: &[u8]) {
         write_bytes(b"usage: write <name> <text>\n");
         return;
     }
-    let fd = match unsafe { syscall(SYS_OPEN, name.as_ptr() as u64, name.len() as u64, O_CREAT) } {
+    let fd = match unsafe {
+        syscall(
+            SYS_OPEN,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            O_CREAT | O_WRONLY,
+        )
+    } {
         Ok(fd) => fd,
         Err(errno) => {
             write_bytes(b"write: open failed, errno ");

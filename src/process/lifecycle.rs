@@ -46,6 +46,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
 
     let stack_top = VirtAddr::new(USER_STACK_TOP);
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
+    crate::process::fault_trampoline::map(&mut mapper, phys_offset);
     // spawn() has no real invocation path to use as argv[0] (unlike do_execve, which knows exactly
     // what path it opened) -- this is only ever pid 1, built directly from an embedded ELF at
     // boot, so a fixed placeholder is all there is to give. pid 1 is a real musl-linked binary
@@ -143,6 +144,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         pending_siginfo: [QueuedSigInfo::default(); 32],
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: crate::cpu::fpu::clean_state(),
+        cpu_ticks: 0,
     };
 
     {
@@ -370,6 +372,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited -- same reasoning as pending_siginfo above.
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: parent_fpu_state,
+        // Not inherited -- real POSIX: a forked child's own CPU time starts at 0, it hasn't run
+        // yet (see this field's own doc comment on Process).
+        cpu_ticks: 0,
     };
 
     {
@@ -646,6 +651,7 @@ pub fn do_execve(
 
     let stack_top = VirtAddr::new(USER_STACK_TOP);
     let mapped_pages = map_user_stack(&mut mapper, stack_top);
+    crate::process::fault_trampoline::map(&mut mapper, phys_offset);
     // raw_argv (read above, while the caller's own address space was still active) is the caller's
     // complete, real argv[] -- including a real, caller-chosen argv[0], which need not equal
     // path_bytes (see RawArgvEntry's own doc comment). An empty raw_argv (argv_ptr == 0, or a
@@ -748,6 +754,9 @@ pub fn do_execve(
     // Same story for any real fd-backed mmap the old image had live -- see `mm::
     // cleanup_mmap_file_regions_for_exit`'s own doc comment.
     mm::cleanup_mmap_file_regions_for_exit(caller_pid);
+    // Real close-on-exec: any fd this process marked FD_CLOEXEC (fcntl(F_SETFD)/open(O_CLOEXEC),
+    // see `crate::fs::fd::CLOEXEC`'s own doc comment) doesn't survive into the new program image.
+    crate::fs::fd::close_cloexec(caller_pid);
 
     let frame = syscall::current_frame();
     // SAFETY: frame is this exact syscall's own live frame -- do_execve is only ever reached via

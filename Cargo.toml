@@ -33,6 +33,7 @@ members = [
   "userland/sysv-shm-syscall-smoke",
   "userland/sig-syscall-smoke",
   "userland/rt-signal-syscall-smoke",
+  "userland/mmap-syscall-smoke",
   "userland/posix-conformance-driver",
   "userland/lsoxmod",
   "modules/hello",
@@ -226,6 +227,10 @@ harness = false
 
 [[test]]
 name = "rt_signal_syscall_smoke"
+harness = false
+
+[[test]]
+name = "mmap_syscall_smoke"
 harness = false
 
 [[test]]

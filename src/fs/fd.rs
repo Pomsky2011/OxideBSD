@@ -124,6 +124,62 @@ pub(crate) fn is_nonblocking(real_fd: u64) -> bool {
     NONBLOCKING.lock().contains(&real_fd)
 }
 
+/// Real per-`(pid, fd)` `FD_CLOEXEC` state -- unlike `NONBLOCKING` above, POSIX defines this as a
+/// property of the file descriptor itself, not the underlying open file description, so it's keyed
+/// by the same `(pid, fd)` pair `TABLE` uses (found live via `shm_open/11-1.c`, the Open POSIX Test
+/// Suite pilot: musl's own `shm_open()` always passes real `O_CLOEXEC` to `open()`, and the test
+/// reads it back via `fcntl(fd, F_GETFD)`). Set by `modules/oxfs`'s own `open()` path when the
+/// caller's real `O_CLOEXEC` flag is present, or by `fcntl(F_SETFD, FD_CLOEXEC)`
+/// (`syscall::sys_fcntl`); `dup`/`dup2` deliberately do *not* copy it to the new `(pid, fd)` entry
+/// (real POSIX: only `F_DUPFD_CLOEXEC`/`dup3(..., O_CLOEXEC)` would, and this kernel's own
+/// `F_DUPFD_CLOEXEC` handling sets it explicitly afterward rather than inheriting it here) --
+/// `fork_inherit` does copy it (real `fork()` preserves each fd's own close-on-exec flag into the
+/// child). Never cleaned up on close, same "identities aren't reclaimed" convention `NONBLOCKING`
+/// already documents.
+static CLOEXEC: Mutex<BTreeSet<(u64, u64)>> = Mutex::new(BTreeSet::new());
+
+pub(crate) fn set_cloexec(pid: u64, fd: u64, on: bool) {
+    if on {
+        CLOEXEC.lock().insert((pid, fd));
+    } else {
+        CLOEXEC.lock().remove(&(pid, fd));
+    }
+}
+
+pub(crate) fn is_cloexec(pid: u64, fd: u64) -> bool {
+    CLOEXEC.lock().contains(&(pid, fd))
+}
+
+/// Sets `FD_CLOEXEC` on `fd` in the *current* process's own table -- exported to modules (see
+/// `src/module.rs`'s kernel API table), since `set_cloexec` above needs the caller's real pid,
+/// which modules can't resolve themselves (only the kernel exports `scheduler::current_pid`
+/// indirectly, through functions like this one). `modules/oxfs`'s own `oxfs_open` is the one real
+/// caller today, right after a successful real `O_CLOEXEC` open.
+pub(crate) extern "C" fn oxidebsd_set_fd_cloexec(fd: u64, on: u64) -> i64 {
+    set_cloexec(scheduler::current_pid(), fd, on != 0);
+    0
+}
+
+/// Real `execve()` close-on-exec enforcement -- closes every fd this process has marked
+/// `FD_CLOEXEC`, real Unix semantics ("file descriptors open... which are marked
+/// close-on-exec... shall be closed"). Called from `process::do_execve`, right after the new
+/// program image is committed (fds live in this file's own table, entirely independent of the
+/// address space `do_execve` otherwise replaces, so this is a genuinely separate step, not
+/// something that happens automatically). Not previously implemented at all -- `F_SETFD` used to
+/// be a pure no-op (see `syscall::sys_fcntl`'s own doc comment), so there was nothing to enforce.
+pub(crate) fn close_cloexec(pid: u64) {
+    let fds: alloc::vec::Vec<u64> = CLOEXEC
+        .lock()
+        .iter()
+        .filter(|&&(p, _)| p == pid)
+        .map(|&(_, fd)| fd)
+        .collect();
+    for fd in fds {
+        close_one(pid, fd);
+        CLOEXEC.lock().remove(&(pid, fd));
+    }
+}
+
 pub(crate) extern "C" fn oxidebsd_alloc_fd() -> u64 {
     let mut next = NEXT_FD.lock();
     let fd = *next;
@@ -254,6 +310,11 @@ pub(crate) fn fork_inherit(parent: u64, child: u64) {
     for (fd, ops) in parent_entries {
         table.insert((child, fd), ops);
         *refcounts.entry(ops.real_fd).or_insert(0) += 1;
+        // Real fork() preserves each fd's own close-on-exec flag into the child -- see CLOEXEC's
+        // own doc comment for why this is a per-(pid, fd) copy, not shared state.
+        if is_cloexec(parent, fd) {
+            set_cloexec(child, fd, true);
+        }
     }
 }
 

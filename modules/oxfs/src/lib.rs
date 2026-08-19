@@ -95,6 +95,10 @@ unsafe extern "C" {
         size: extern "C" fn(u64) -> i64,
     );
     fn oxidebsd_close_fd(fd: u64) -> i32;
+    /// Sets (`on != 0`) or clears real `FD_CLOEXEC` on `fd`, in the *current* process's own table
+    /// -- see `crate::fs::fd::oxidebsd_set_fd_cloexec`'s own doc comment (kernel tree). `oxfs_open`
+    /// is the one caller here, right after a successful real `O_CLOEXEC` open.
+    fn oxidebsd_set_fd_cloexec(fd: u64, on: u64) -> i64;
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
     fn oxidebsd_get_root() -> u64;
@@ -256,6 +260,12 @@ const O_CREAT: u64 = 0o100;
 /// caller actually asked for).
 const O_ACCMODE: u64 = 0o3;
 const O_APPEND: u64 = 0o2000;
+/// Real generic `open(2)` `O_CLOEXEC` value -- distinct from `fcntl(2)`'s own `FD_CLOEXEC` value
+/// (`src/syscall/ffi.rs`'s `sys_fcntl` consults that one instead). Found live via `shm_open/
+/// 11-1.c` (the Open POSIX Test Suite pilot): real `shm_open()` (`third_party/musl/src/mman/
+/// shm_open.c`) always passes this to `open()` directly, not through a separate `fcntl()` call --
+/// `oxfs_open`'s own tail (see below) is what actually marks the returned fd.
+const O_CLOEXEC: u64 = 0o2000000;
 
 /// Real POSIX `st_mode` file-type bits (`S_IFREG`/`S_IFDIR`/`S_IFLNK`) -- these are the type bits
 /// only, ORed with an inode's own real `mode` field (permission bits) when building a `stat`
@@ -1900,6 +1910,31 @@ enum OpenFile {
         /// the specific case of `close()`/`fsync()` running with *zero* real `write()` calls ever
         /// having happened on this fd.
         resized_directly: bool,
+        /// Set by `oxfs_unlink` when it's called against `(parent_inode, name)` before this fd's
+        /// first commit -- i.e. while `existing_inode` is still `None`, so there's no directory
+        /// entry yet for `unlink` to actually remove. Found live via `mmap/12-1.c` (the POSIX
+        /// conformance pilot): real `open(O_CREAT|O_EXCL) -> unlink() -> ftruncate() -> mmap() ->
+        /// close()` unlinks the file *before* anything ever committed it, so `oxfs_unlink`'s normal
+        /// `dir_lookup` found nothing and returned `ENOENT` -- then `ftruncate()`'s own forced early
+        /// commit (`resolve_write_fd_inode`) went ahead and inserted a directory entry anyway,
+        /// silently resurrecting a name real POSIX says must stay gone. `commit_write_buffer`
+        /// checks this flag and skips the `dir_insert` call when set, while still allocating a real
+        /// inode and writing real content to it -- matches real Unix: an unlinked-but-still-open
+        /// file keeps working through this fd/any mapping of it, it just can never be found by path
+        /// again.
+        unlinked: bool,
+        /// The caller's own real requested access mode at `open()` time (`true` for `O_RDONLY`,
+        /// i.e. `flags & O_ACCMODE == 0`) -- **not** whether this variant is internally
+        /// `Write`-shaped, which is unconditional for a brand-new `O_CREAT` file regardless of the
+        /// caller's actual intent (a real inode still has to exist for the deferred-commit design
+        /// to work, see `existing_inode`'s own doc comment). `oxfs_write`/`oxfs_ftruncate`/
+        /// `oxfs_fallocate` all check this and refuse (`EBADF`/`EINVAL`) when set -- found live via
+        /// `shm_open/13-1.c` (the Open POSIX Test Suite pilot): `shm_open(O_RDONLY|O_CREAT, ...)`
+        /// on a brand-new object used to silently accept a later `ftruncate()`, since nothing
+        /// re-checked the caller's original access mode once past `open()`'s own create-path
+        /// (which never gated on it at all, unlike the existing-path branch's own `want_write`
+        /// check).
+        readonly: bool,
     },
     /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
     /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
@@ -2549,7 +2584,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
         Err(e) => return errno_for(e),
     };
 
-    match dir_lookup(parent, leaf) {
+    let result = match dir_lookup(parent, leaf) {
         Some(inode_num) => {
             // `dir_lookup` is a bare lookup -- unlike `resolve_path`, it doesn't apply the mount
             // redirect `resolve_path_impl`'s own loop does for every *intermediate* component.
@@ -2621,6 +2656,8 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                         owner_uid: inode.uid,
                         existing_inode: Some(resolved),
                         resized_directly: false,
+                        unlinked: false,
+                        readonly: false, // this whole arm only runs when want_write is true
                     })
                 }
                 _ => register_open_file(OpenFile::FileRead {
@@ -2646,10 +2683,24 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                 owner_uid: uid as u32,
                 existing_inode: None,
                 resized_directly: false,
+                unlinked: false,
+                // Real O_RDONLY is 0 -- "anything but that" in the low two bits means
+                // O_WRONLY/O_RDWR, same real-access-mode convention the existing-path branch
+                // above already uses via its own `want_write` -- this create-path branch never
+                // gated on it before (see `readonly`'s own doc comment for the real bug this
+                // closes).
+                readonly: flags & O_ACCMODE == 0,
             })
         }
         None => -ENOENT,
+    };
+    // Real O_CLOEXEC: musl's own shm_open() always passes this to open() directly (see
+    // O_CLOEXEC's own doc comment) -- applied here, once, on the way out, rather than in every
+    // branch above, since it's the same real fd-number regardless of which branch produced it.
+    if result >= 0 && flags & O_CLOEXEC != 0 {
+        unsafe { oxidebsd_set_fd_cloexec(result as u64, 1) };
     }
+    result
 }
 
 extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
@@ -2726,8 +2777,12 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
             buffer,
             len: buf_len,
             resized_directly,
+            readonly,
             ..
         } => {
+            if *readonly {
+                return -EBADF;
+            }
             let available = MAX_WRITE_BUFFER - *buf_len;
             let n = available.min(len as usize);
             if n == 0 && len > 0 {
@@ -2772,6 +2827,8 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         owner_uid,
         existing_inode,
         resized_directly,
+        unlinked,
+        readonly: _,
     } = file
     else {
         return 0;
@@ -2808,6 +2865,14 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     write_inode(new_inode, inode);
     if !write_inode_data(new_inode, &buffer[..*len]) {
         return -EIO;
+    }
+    // Real Unix semantics: this fd's own name was already unlinked before it ever got the chance
+    // to name anything (see `unlinked`'s own doc comment) -- a real inode still gets allocated and
+    // populated, so the fd (and any mmap of it) keeps working, but no directory entry is ever
+    // inserted for it.
+    if *unlinked {
+        *existing_inode = Some(new_inode);
+        return 0;
     }
     match dir_insert(*parent_inode, &name[..*name_len as usize], new_inode) {
         Ok(()) => {
@@ -2911,6 +2976,20 @@ fn resolve_write_fd_inode(real_fd: u64) -> Option<u32> {
     }
 }
 
+/// Real POSIX `ftruncate(2)`/`fallocate(2)`: `EINVAL` when `fd` isn't open for writing -- shared by
+/// both callers below. Peeks the still-registered `OpenFile::Write` state directly (rather than
+/// going through `resolve_write_fd_inode`, which only ever returns a bare inode number, with no
+/// access-mode context left to check) -- see `OpenFile::Write::readonly`'s own doc comment.
+fn ftruncate_blocked_readonly(real_fd: u64) -> bool {
+    matches!(
+        find_open_file(real_fd),
+        Some(OpenFile::Write {
+            readonly: true,
+            ..
+        })
+    )
+}
+
 /// Registered for `SYS_FTRUNCATE`. Resizes the fd's real inode directly (`resize_inode_data`) --
 /// if this fd is also still mid-write (an existing file opened `O_WRONLY`, not yet `close()`d),
 /// a later `write()`/`close()` on it will still overwrite this content again as usual, matching
@@ -2924,7 +3003,11 @@ extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
     if real_fd < 0 {
         return -EBADF;
     }
-    let Some(inode_num) = resolve_write_fd_inode(real_fd as u64) else {
+    let real_fd = real_fd as u64;
+    if ftruncate_blocked_readonly(real_fd) {
+        return -EINVAL;
+    }
+    let Some(inode_num) = resolve_write_fd_inode(real_fd) else {
         return -EBADF;
     };
     if read_inode(inode_num).kind == InodeKind::Dir {
@@ -2935,7 +3018,7 @@ extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
     }
     if let Some(OpenFile::Write {
         resized_directly, ..
-    }) = find_open_file(real_fd as u64)
+    }) = find_open_file(real_fd)
     {
         *resized_directly = true;
     }
@@ -2947,13 +3030,18 @@ extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
 /// applet in this port's roster needs past). Zero-extends the file to `offset + len` if it's
 /// currently shorter; otherwise a real no-op (real `fallocate()` never shrinks a file). Marks the
 /// fd's own `resized_directly` on an actual resize -- see `oxfs_ftruncate`'s own doc comment for
-/// why (same real bug, same fix, shared with that syscall).
+/// why (same real bug, same fix, shared with that syscall). Same real `EINVAL`-if-not-open-for-
+/// writing check as `oxfs_ftruncate` (`ftruncate_blocked_readonly`).
 extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 {
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
         return -EBADF;
     }
-    let Some(inode_num) = resolve_write_fd_inode(real_fd as u64) else {
+    let real_fd = real_fd as u64;
+    if ftruncate_blocked_readonly(real_fd) {
+        return -EINVAL;
+    }
+    let Some(inode_num) = resolve_write_fd_inode(real_fd) else {
         return -EBADF;
     };
     let inode = read_inode(inode_num);
@@ -2969,7 +3057,7 @@ extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 
     }
     if let Some(OpenFile::Write {
         resized_directly, ..
-    }) = find_open_file(real_fd as u64)
+    }) = find_open_file(real_fd)
     {
         *resized_directly = true;
     }
@@ -3288,6 +3376,29 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
         Err(e) => return errno_for(e),
     };
     let Some(target) = dir_lookup(parent, leaf) else {
+        // No directory entry exists yet -- real ENOENT, *unless* some still-open fd is mid-`open
+        // (O_CREAT)` against this exact (parent, name) and hasn't committed (inserted its own
+        // directory entry) yet. Real POSIX: `unlink()` racing ahead of a not-yet-`close()`d
+        // `creat()` on the same path must still make the name unreachable the moment the create
+        // eventually commits -- see `OpenFile::Write::unlinked`'s own doc comment (found live via
+        // `mmap/12-1.c`).
+        let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
+        for slot in slots.iter_mut().flatten() {
+            if let (_, OpenFile::Write {
+                parent_inode,
+                name,
+                name_len,
+                existing_inode: None,
+                unlinked,
+                ..
+            }) = slot
+                && *parent_inode == parent
+                && &name[..*name_len as usize] == leaf
+            {
+                *unlinked = true;
+                return 0;
+            }
+        }
         return -ENOENT;
     };
     let mut target_inode = read_inode(target);

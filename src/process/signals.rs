@@ -194,6 +194,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
                 let _ = record_pending(proc, sig, SI_USER, caller_pid, caller_uid, 0);
                 wake_if_paused(target, proc, sig);
                 wake_if_sigwaiting(target, proc, sig);
+                wake_if_sleeping(target, proc, sig);
             }
         }
     }
@@ -290,6 +291,7 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                     let _ = record_pending(proc, sig, SI_USER, 0, 0, 0);
                     wake_if_paused(pid, proc, sig);
                     wake_if_sigwaiting(pid, proc, sig);
+                    wake_if_sleeping(pid, proc, sig);
                 }
             }
         }
@@ -365,6 +367,22 @@ fn wake_if_sigwaiting(pid: Pid, proc: &mut Process, sig: u64) {
 /// condition `do_pause`'s own loop re-checks after waking anyway.
 fn wake_if_paused(pid: Pid, proc: &mut Process, sig: u64) {
     if proc.state == ProcState::Blocked(BlockReason::WaitingForSignal)
+        && proc.blocked_signals & (1 << (sig - 1)) == 0
+    {
+        proc.state = ProcState::Ready;
+        scheduler::enqueue_ready(pid);
+    }
+}
+
+/// Wakes `pid` if it's blocked in `process::timers::do_nanosleep` and `sig` isn't currently
+/// blocked by it -- same shape `wake_if_paused` above already establishes, for the identical real
+/// POSIX reason: `nanosleep(2)` must be interrupted early by a signal that will invoke a caught
+/// handler, not just have its pending bit set while remaining genuinely `Blocked` (which would
+/// leave it waiting out the full deadline regardless -- `do_nanosleep`'s own loop only re-checks
+/// deliverability right before each re-block, so without this hook nothing would ever notice
+/// early). Found live via the Open POSIX Test Suite pilot's `nanosleep/1-3.c`.
+fn wake_if_sleeping(pid: Pid, proc: &mut Process, sig: u64) {
+    if let ProcState::Blocked(BlockReason::Sleeping(_)) = proc.state
         && proc.blocked_signals & (1 << (sig - 1)) == 0
     {
         proc.state = ProcState::Ready;
@@ -985,6 +1003,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
                 record_pending(proc, sig, SI_QUEUE, caller_pid, caller_uid, value)?;
                 wake_if_paused(target, proc, sig);
                 wake_if_sigwaiting(target, proc, sig);
+                wake_if_sleeping(target, proc, sig);
             }
         }
     }

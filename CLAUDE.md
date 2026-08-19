@@ -1741,6 +1741,178 @@ Closes the Open POSIX Test Suite pilot's own "Real-time signal queuing" architec
   generally needs a real signal-stack/handler-chaining design — a separate, larger architectural
   decision, not attempted.
 
+## Real ring-3 fault-to-signal delivery, and two mmap fixes (`src/cpu/interrupts.rs`, `src/process/fault_trampoline.rs`, `src/process/mm.rs`, `modules/oxfs/`)
+
+Closes the Open POSIX Test Suite pilot's `mmap/11-2.c`/`11-3.c`/`12-1.c` FAILs, and a much bigger
+standing gap those tests happened to surface: **`interrupts::page_fault_handler` used to reboot the
+whole kernel on any page fault, ring-3 or not.** A wild pointer deref in any userland/BusyBox/
+TinyCC-compiled program took the entire VM down with it — no `SIGSEGV`, no isolation, nothing.
+
+- **Real MPR-correct partial mapping**: `mm::do_mmap_file_backed` used to map every page in the
+  caller's requested `len`, zero-filled, regardless of the underlying object's own real size — so a
+  reference into a whole page mapped past a file's real (page-rounded) extent just silently
+  succeeded against a zero page instead of raising `SIGBUS`, real POSIX "Memory Protection" (MPR)
+  behavior. Fixed: `covered_pages = real_size.div_ceil(4096).min(page_count)` is the only range ever
+  actually backed by real frames and mapped into the page table; `[covered_pages, page_count)` is
+  deliberately left with **no page-table entry at all**. `MmapFileRegion` gained `mapped_pages`
+  (frozen at `mmap()` time, not re-checked against the object's live size on every fault — a real
+  Linux dynamically re-checks current inode size on each fault, letting a later `ftruncate()` grow
+  retroactively into what SIGBUSed before; no pilot test needs that).
+- **Real fault-to-signal delivery, from scratch**: `interrupts::page_fault_handler` now checks the
+  interrupted frame's own CS RPL (`& 0x3 == 3`, same technique `timer_interrupt_handler`'s own
+  preemption check already established) — a ring-0 fault is still an unconditional reboot (a real
+  bug in this kernel itself, unchanged safety net), but a ring-3 fault now resolves a real signal
+  (`mm::signal_for_user_fault`: `SIGBUS` for a reference into a live mapping's own reserved-but-
+  unbacked tail, `SIGSEGV` for everything else) and records it pending via `do_kill`'s own
+  self-signal path, then redirects the interrupted context to a **real, kernel-authored, user-
+  executable trampoline page** (`process::fault_trampoline`, mapped at a fixed VA —
+  `0x_1FFF_FFFF_F000`, directly below `mm::MMAP_REGION_BASE` — in every fresh address space,
+  `process::spawn`/`do_execve`; a forked child gets its own copy for free via `AddressSpace::fork`'s
+  existing eager copy).
+  - **Why the fault handler can't just invoke the process's own handler directly, right there**:
+    `extern "x86-interrupt"`'s compiler-generated entry/exit saves and restores every clobbered GPR
+    itself, with zero Rust-visible fields for them — unlike `syscall::SyscallFrame`, built by hand
+    in `syscall_entry`'s own raw asm, every GPR an explicit mutable field. A real handler call needs
+    `RDI = signum` (and `RSI`/`RDX` for `SA_SIGINFO`) set directly; `InterruptStackFrame::as_mut()`
+    only exposes `instruction_pointer`/`stack_pointer`/`cpu_flags`/the segment selectors, nothing
+    else.
+  - **The fix**: the trampoline is just `mov eax, SYS_FAULT_PUMP` (`554`, this ABI's own invention,
+    continuing past `SYS_MSGCTL = 553`, never issued by real userland) `; syscall ; ud2`. Redirecting
+    `instruction_pointer` there forces the process straight back through a **real** `SYSCALL`
+    instruction — landing in `syscall_entry`'s already-correct, GPR-complete capture, and
+    `syscall_dispatch`, which special-cases `SYS_FAULT_PUMP` exactly like `SYS_SIGRETURN` (bypasses
+    `SYSCALL_TABLE` entirely, just calls `deliver_pending_signal` directly). That function then finds
+    the signal the fault just queued and redirects the *real* `SyscallFrame` — the exact same
+    machinery already proven correct for `kill()`-shaped delivery, reused verbatim. Default
+    disposition (no handler) naturally resolves to `do_exit` from there too — a real fix in its own
+    right, not just plumbing for the handler case: any ring-3 fault with no handler installed now
+    cleanly terminates just the one offending process instead of rebooting the VM. The `ud2` tail is
+    a real safety net (should never execute — a fault always queues something deliverable first) and
+    also why a handler that "returns" or `sigreturn`s from a fault-delivered signal resumes into a
+    hard stop rather than the (never actually valid) original faulting instruction — matches real
+    POSIX's own "undefined behavior to return from a `SIGSEGV`/`SIGBUS` handler" stance; a real
+    handler is expected to `_exit`/`longjmp` out, exactly what both the pilot's own
+    `sigbus_handler` and this session's own smoke test's handler do.
+- **A real, separate bug found chasing `mmap/12-1.c`, not actually about mmap at all**:
+  `open(O_CREAT)` on a brand-new path defers allocating a real inode/directory entry until the fd's
+  first commit (`ftruncate`/`fsync`/`close` — `OpenFile::Write`'s own `existing_inode: None` design,
+  see the Filesystem section above). `unlink()`ing the path *before* that first commit used to find
+  nothing to remove (no entry exists yet) and silently no-op — then the deferred commit went ahead
+  and inserted the entry anyway, resurrecting a name real POSIX says must stay gone
+  (`open -> unlink -> ftruncate -> close -> open` must `ENOENT` on the last `open`). Fixed:
+  `OpenFile::Write` gained `unlinked: bool` — `oxfs_unlink`, finding no directory entry, now scans
+  `OPEN_FILES` for a still-uncommitted `Write` fd matching `(parent_inode, name)` and sets this flag
+  instead of `ENOENT`ing; `commit_write_buffer` still allocates a real inode and writes real content
+  (the fd, and any mapping of it, keeps working — real Unix "unlinked but still open" semantics) but
+  skips `dir_insert` when set.
+- **Verified**: `tests/mmap_syscall_smoke.rs` + `userland/mmap-syscall-smoke/` — part 1 reproduces
+  the `open -> unlink -> ftruncate -> mmap -> close` race and confirms the path stays `ENOENT`
+  while the live mapping keeps working; parts 2-4 each run in their own forked child (a fault is
+  fundamentally disruptive to whichever process it hits, so each gets an isolated child whose real
+  `wait4`-reported exit status is the pass/fail signal): a real installed `SIGBUS` handler actually
+  runs with the correct signal number (part 2), default-disposition `SIGBUS` on the same
+  reserved-but-unbacked mmap tail cleanly terminates the child via signal `7` (part 3), and
+  default-disposition `SIGSEGV` on an ordinary wild pointer cleanly terminates via signal `11`
+  (part 4) — proving the `SIGSEGV` fallback independent of the mmap-specific path. `cargo build`/
+  `cargo clippy` clean; the full existing test suite (`fork_wait`, `sig_syscall_smoke`,
+  `rt_signal_syscall_smoke`, `needs_syscall_smoke`, `sysv_shm_syscall_smoke`,
+  `session_syscall_smoke`, `mount_syscall_smoke`, `sa_siginfo_syscall_smoke`,
+  `pause_syscall_smoke`) still passes unmodified.
+- **Not covered by this pass**: `SA_SIGINFO` handler invocation from a fault (only the plain
+  1-argument shape is exercised — no pilot test or real caller needs `siginfo_t`/`ucontext_t` from a
+  fault yet, and the machinery `deliver_pending_signal` already has for that case applies unchanged
+  once one does); real dynamic re-check of a grown file's size against an already-`mmap()`'d
+  region's own `mapped_pages`.
+
+## Three more pilot fixes: signal-interruptible `nanosleep`, real `FD_CLOEXEC`, real per-process CPU-time clocks (`src/cpu/rtc.rs`, `src/process/timers.rs`, `src/process/signals.rs`, `src/fs/fd.rs`, `modules/oxfs/`, `src/syscall/ffi.rs`, `src/process/mod.rs`, `src/cpu/interrupts.rs`)
+
+Continued working the same 68-file Open POSIX Test Suite pilot subset after the mmap pass above —
+three more real, independent gaps, closing `nanosleep/1-1.c`/`1-3.c`/`2-1.c`,
+`shm_open/11-1.c`/`13-1.c`, and `clock_gettime/4-1.c`.
+
+- **Real sub-second `CLOCK_REALTIME`** (`src/cpu/rtc.rs`'s `unix_epoch_now_precise`): `tv_nsec` used
+  to be hardcoded `0` (whole-second RTC precision only), so `nanosleep/1-1.c`/`2-1.c` — which sleep
+  for as little as a handful of nanoseconds and then check that `clock_gettime` observed *some*
+  elapsed time — failed regardless of whether the real sleep duration was correct, since the RTC's
+  own 1 Hz second boundary almost never happened to land inside the sleep. Fixed by calibrating a
+  fixed `ticks() -> real seconds` offset against the RTC exactly once (lazily, `spin::Once`), then
+  deriving every later `CLOCK_REALTIME` reading purely from `interrupts::ticks()` against that base
+  — the same technique `CLOCK_MONOTONIC` already uses, just shifted by a real wall-clock epoch.
+  Deliberately *not* a fresh RTC read on every call any more: mixing a fresh RTC second-boundary
+  read with a `ticks()`-derived sub-second offset that isn't phase-locked to that same boundary
+  would make `tv_sec`/`tv_nsec` disagree with each other (a real backward jump whenever they do) —
+  a single calibration point avoids that by construction. `unix_epoch_seconds` (whole seconds) is
+  kept as-is for SysV IPC's own `stime`/`rtime`/`ctime`, which never needed sub-second precision.
+- **Real signal-interrupts-sleep** (`process::timers::do_nanosleep`): real POSIX requires a signal
+  that will invoke a caught handler to interrupt `nanosleep()` early (`EINTR`, real remaining time
+  written back), not just sit blocked until the deadline naturally passes — `nanosleep/1-3.c` forks
+  a child that sleeps 30 real seconds and expects a `SIGABRT` sent 1 second in to cut that short.
+  `do_nanosleep`'s own blocking loop now checks `pending_signals & !blocked_signals != 0` right
+  before each re-block (same "avoid a lost wakeup" reasoning `do_pause`'s identical check already
+  establishes) and returns `EINTR` with the real remaining time if so — `deliver_pending_signal`
+  (this syscall's own tail) then resolves what actually happens next. This alone wasn't enough:
+  `record_pending`'s `Action::SetPending` path only ever set the bit, leaving a genuinely `Blocked`
+  process waiting out its full deadline regardless (the loop's own check never gets a chance to run
+  again until the process is rescheduled). Fixed with a new `signals::wake_if_sleeping` (mirroring
+  `wake_if_paused`'s existing shape exactly), wired into the same three `Action::SetPending` call
+  sites `wake_if_paused`/`wake_if_sigwaiting` already are (`do_kill`, `signal_foreground_group`,
+  `do_sigqueue`).
+- **Real per-`(pid, fd)` `FD_CLOEXEC`** (`src/fs/fd.rs`'s `CLOEXEC` set, `set_cloexec`/`is_cloexec`,
+  the new `oxidebsd_set_fd_cloexec` kernel-API export): `F_GETFD`/`F_SETFD` used to be a pure no-op
+  (`fcntl`'s own doc comment used to say so explicitly) — `shm_open/11-1.c` reads the flag back via
+  `fcntl(fd, F_GETFD)` right after `shm_open()`, which (per `third_party/musl/src/mman/shm_open.c`)
+  always passes real `O_CLOEXEC` straight to `open()`. Real per-`(pid, fd)` scoping (not per-`real_fd`
+  the way `O_NONBLOCK` is) — POSIX defines this as a property of the descriptor itself, not the
+  underlying open file description — so `dup`/`dup2` deliberately don't copy it (only
+  `F_DUPFD_CLOEXEC`, now real, sets it on the fresh fd explicitly) while `fork_inherit` does. `oxfs_open`
+  sets it directly from the real `O_CLOEXEC` open flag (`modules/oxfs`'s own `O_CLOEXEC = 0o2000000`
+  constant, distinct from `fcntl`'s `FD_CLOEXEC = 1`). **Real enforcement, not just a readback**:
+  `do_execve` now calls a new `fs::fd::close_cloexec` right after the new program image is
+  committed — the first real close-on-exec behavior this kernel has ever had.
+- **Real per-fd access-mode enforcement on write/`ftruncate`/`fallocate`** (`OpenFile::Write::readonly`
+  in `modules/oxfs`): `shm_open/13-1.c` opens a *brand-new* object `O_RDONLY|O_CREAT` and expects
+  `ftruncate()` on it to fail `EINVAL` — but `oxfs_open`'s create-path branch has always
+  unconditionally produced a real, writable `OpenFile::Write` regardless of the caller's actual
+  requested access mode (needed regardless, to support the deferred-commit design for a brand-new
+  file — see `existing_inode`'s own doc comment), and nothing re-checked that mode again later. Fixed
+  by recording the caller's real requested mode (`flags & O_ACCMODE == 0` for `O_RDONLY`) in a new
+  `readonly` field, checked by `oxfs_write`/`oxfs_ftruncate`/`oxfs_fallocate` (`EBADF`/`EINVAL`
+  respectively) — the existing-path branch's own `want_write` check already covered the
+  already-exists case correctly, only the create-path branch was gapped.
+  **A real regression found immediately by the full test suite, not by review**: several existing
+  userland smoke-test crates (`access-syscall-smoke`, `mount-syscall-smoke`, `needs-syscall-smoke`,
+  `needs-syscall2-smoke`, `oxfs-persistence-syscall-smoke`, `uid-syscall-smoke`) and `stsh`'s own
+  `write` command all called `open(path, O_CREAT)` with no explicit `O_WRONLY`/`O_RDWR` bit,
+  relying on this kernel's own prior permissiveness to still get a writable fd back — real,
+  latent bugs in each (real POSIX/Linux `open(O_CREAT)` alone genuinely means read-only, no
+  exceptions; no real production C code, including everything BusyBox/musl/tcc actually ship,
+  makes this mistake) that this fix's own correctness surfaced for the first time. Fixed by adding
+  the missing explicit access-mode bit to each of those six real call sites.
+- **Real per-process CPU-time accounting** (`Process::cpu_ticks`): `clock_gettime/4-1.c` went
+  `UNRESOLVED`, not the legitimate `UNSUPPORTED` its own `sysconf(_SC_CPUTIME) == -1` escape hatch
+  would have produced — musl's own `sysconf()` unconditionally reports `_SC_CPUTIME` as supported
+  (a compile-time claim, `third_party/musl/src/conf/sysconf.c`, not a runtime capability probe), so
+  the test proceeded to call `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ...)` and hit a real,
+  until-now-unhandled `EINVAL`. Fixed with a new `Process::cpu_ticks: u64`, incremented by exactly
+  `1` on every timer tick where that process is the one actually `Running` when the tick lands
+  (`interrupts::timer_interrupt_handler`, alongside its own preemption check) — tick-granularity,
+  doesn't distinguish user/kernel time or subtract time spent `Blocked`/`Stopped`, the same honesty
+  tier `ticks()`-derived `CLOCK_MONOTONIC` already sets, but enough for what this pilot test (and
+  any real caller) actually checks: successive reads non-decreasing under real work.
+  `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` both read this same counter (no real
+  threading exists — a process's only "thread" is itself, same simplification `/proc/<pid>/task`
+  already uses). Starts at `0` for both `spawn` and a forked child (real POSIX: CPU time never
+  carries over from a parent); preserved by `execve`.
+- **Verified**: `cargo build`/`cargo clippy` clean. Re-ran the full pilot after each of the three
+  fixes — `nanosleep/1-1,1-3,2-1.c` and `shm_open/11-1,13-1.c` and `clock_gettime/4-1.c` all flip
+  FAIL/UNRESOLVED → PASS with zero regressions elsewhere each time (byte-for-byte identical
+  FAIL/UNRESOLVED/UNTESTED lines otherwise). Pilot moved 52P/9F/3U/4UT (this doc's own prior
+  baseline) → **61P/1F/2U/4UT/0TIMEOUT/0CRASH** across this whole session (the mmap pass above plus
+  these three). Also re-ran `itimer_syscall_smoke`/`posix_timer_syscall_smoke` (both touch real
+  timer/clock machinery) and the broader fd/exec-touching suite (`needs_syscall_smoke`,
+  `needs_syscall2_smoke`, `mount_syscall_smoke`, `uid_syscall_smoke`,
+  `oxfs_persistence_syscall_smoke`, `access_syscall_smoke`, `fork_wait`) — all still pass.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a

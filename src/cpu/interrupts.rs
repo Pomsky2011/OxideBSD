@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 use spin::{Lazy, Mutex};
+use x86_64::VirtAddr;
 use x86_64::instructions::port::Port;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -185,10 +186,59 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     reboot();
 }
 
+/// Ring-3 faults no longer reboot the whole kernel — they terminate (or, if a real handler is
+/// installed, signal) just the one offending process. A kernel-mode fault (a real bug in this
+/// kernel itself) is unchanged: still an unconditional reboot, the same safety net as before.
+///
+/// **Why this can't just invoke the process's own handler directly, right here**: unlike
+/// `syscall::SyscallFrame` (built by hand, every GPR an explicit mutable field),
+/// `extern "x86-interrupt"`'s compiler-generated entry/exit leaves the interrupted GPRs
+/// (`RDI`/`RSI`/`RDX`/...) completely inaccessible to this function — only
+/// `InterruptStackFrame`'s handful of fields (`instruction_pointer`, `stack_pointer`, `cpu_flags`,
+/// the segment selectors) can be read or changed via its own `as_mut()`. A real, argument-correct
+/// handler call needs to set `RDI = signum` (and `RSI`/`RDX` for `SA_SIGINFO`) directly, which this
+/// function has no way to do. See `process::fault_trampoline`'s own module doc comment for the real
+/// fix: record the signal as pending, then redirect `instruction_pointer` to a tiny kernel-authored
+/// trampoline page that forces the process straight back through a real `SYSCALL` instruction,
+/// landing in the already-correct, GPR-complete `syscall::deliver_pending_signal` machinery
+/// instead.
+///
+/// `signal_for_user_fault` decides `SIGBUS` (a reference into a real fd-backed mapping's own
+/// reserved-but-unbacked tail — `mmap/11-2.c`/`11-3.c` in the conformance pilot) vs. `SIGSEGV`
+/// (every other unmapped/invalid ring-3 reference) — either way, `do_kill`'s own self-signal path
+/// (just sets the pending bit, doesn't act on it) is reused rather than hand-rolling a second
+/// "record this signal" path; `deliver_pending_signal`, reached via the trampoline, resolves the
+/// real disposition (terminate, by default — a real fix in its own right, replacing a full reboot
+/// — or a genuine handler invocation).
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
+    if interrupted_ring3
+        && let Ok(fault_addr) = Cr2::read()
+    {
+        let pid = crate::process::scheduler::current_pid();
+        if pid != 0 {
+            let sig = crate::process::signal_for_user_fault(pid, fault_addr.as_u64());
+            // Self-signal: always just records the pending bit (see do_kill's own doc comment),
+            // safe to call from here for the identical reason timer_interrupt_handler's own calls
+            // into process::table()/scheduler already are (this interrupt gate runs with IF
+            // cleared, same single-core non-reentrancy this whole file already relies on).
+            let _ = crate::process::do_kill(pid, pid as i64, sig as i64);
+            // SAFETY: only the resume RIP is changed -- redirecting straight into a real,
+            // kernel-mapped, user-executable trampoline page (see its own module doc comment).
+            // RSP/RFLAGS/the segment selectors are left exactly as they were; this process has
+            // exactly one ring-3 code/data selector pair, already correct.
+            unsafe {
+                stack_frame.as_mut().update(|f| {
+                    f.instruction_pointer =
+                        VirtAddr::new(crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA);
+                });
+            }
+            return;
+        }
+    }
     serial_println!(
         "EXCEPTION: PAGE FAULT\naccessed address: {:?}\nerror code: {:?}\n{:#?}",
         Cr2::read(),
@@ -247,6 +297,15 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // code this interrupt could actually preempt.
     {
         let mut table = crate::process::table().lock();
+        // Real per-process CPU-time accounting (`Process::cpu_ticks`, see its own doc comment) --
+        // the process this tick actually interrupted is the one that was consuming the CPU for it.
+        // `current_pid() == 0` only at boot, before any real process exists.
+        let current = crate::process::scheduler::current_pid();
+        if current != 0
+            && let Some(proc) = table.get_mut(&current)
+        {
+            proc.cpu_ticks += 1;
+        }
         for (&pid, proc) in table.iter_mut() {
             if let crate::process::ProcState::Blocked(crate::process::BlockReason::Sleeping(
                 deadline,

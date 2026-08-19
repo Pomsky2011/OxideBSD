@@ -2,7 +2,7 @@
 
 
 
-use crate::syscall::{EAGAIN, EINVAL};
+use crate::syscall::{EAGAIN, EINTR, EINVAL};
 use super::*;
 
 /// musl's own `struct timespec` on x86_64 -- see `src/syscall.rs`'s `RawTimespec` (duplicated
@@ -30,10 +30,18 @@ struct RawTimespec {
 /// `nanosleep`'s own "at least this long" contract) — a `{0, 0}` request returns immediately
 /// without ever blocking at all.
 ///
-/// `rem_ptr` (if non-null) is always zeroed on return — this kernel has no signal-delivery-during-
-/// sleep interruption path yet (a real early wake with a meaningful "how much time was left"), so
-/// a sleep always either runs to its full requested duration or (via `SIGKILL`'s own immediate,
-/// no-handler termination path) never returns at all.
+/// **Real signal-interrupts-sleep support**: a signal that will invoke a caught handler (real
+/// POSIX `nanosleep(2)`'s own interruption contract) now wakes this loop early via
+/// `process::signals::wake_if_sleeping` (called from the same `Action::SetPending` sites
+/// `do_pause`'s own `wake_if_paused` already is) rather than leaving the caller genuinely
+/// `Blocked` until its own deadline naturally passes — found live chasing the Open POSIX Test
+/// Suite pilot's `nanosleep/1-3.c`, which forks a child that `nanosleep()`s for 30 real seconds and
+/// expects a `SIGABRT` sent 1 second in to cut that short. `rem_ptr` (if non-null) reports the real
+/// remaining time (`deadline - ticks()`, converted back to a timespec) on this `EINTR` path — a
+/// zeroed `rem_ptr` only for the ordinary "slept the full requested duration" success path. A
+/// `SIGKILL`-style immediate, no-handler termination still doesn't go through this path at all
+/// (`do_kill`'s own `Action::Terminate` calls `terminate_process` directly, unaffected by this
+/// process's `ProcState`).
 pub fn do_nanosleep(pid: Pid, req_ptr: u64, rem_ptr: u64) -> Result<u64, u64> {
     // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
     // already has -- req_ptr isn't checked against the caller's actual mappings first.
@@ -63,8 +71,31 @@ pub fn do_nanosleep(pid: Pid, req_ptr: u64, rem_ptr: u64) -> Result<u64, u64> {
         while crate::cpu::interrupts::ticks() < deadline {
             {
                 let mut table = PROCESS_TABLE.lock();
-                table.get_mut(&pid).unwrap().state =
-                    ProcState::Blocked(BlockReason::Sleeping(deadline));
+                let proc = table.get_mut(&pid).unwrap();
+                // Real POSIX: a signal that will invoke a caught handler interrupts the sleep
+                // early -- checked before (re-)blocking, same "avoid a lost wakeup" reasoning
+                // `do_pause`'s own identical check already establishes. Once a signal is actually
+                // pending here, `deliver_pending_signal` (this syscall's own tail, back in
+                // `syscall_dispatch`) resolves what really happens next (handler invocation, or a
+                // self-signaled default-Terminate) -- this function's only job is to stop waiting
+                // and hand control back.
+                if proc.pending_signals & !proc.blocked_signals != 0 {
+                    let now = crate::cpu::interrupts::ticks();
+                    let remaining = deadline.saturating_sub(now);
+                    drop(table);
+                    if rem_ptr != 0 {
+                        // SAFETY: same known pointer-validation gap as every other user-memory
+                        // write in this codebase.
+                        unsafe {
+                            *(rem_ptr as *mut RawTimespec) = RawTimespec {
+                                tv_sec: (remaining / hz) as i64,
+                                tv_nsec: ((remaining % hz) * 1_000_000_000 / hz) as i64,
+                            }
+                        };
+                    }
+                    return Err(EINTR);
+                }
+                proc.state = ProcState::Blocked(BlockReason::Sleeping(deadline));
             } // lock dropped before schedule() -- see process::table()'s own doc comment
             crate::process::scheduler::schedule();
         }

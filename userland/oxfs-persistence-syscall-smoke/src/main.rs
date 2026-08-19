@@ -34,6 +34,11 @@ const SYS_TEST_EXIT: u64 = 9999;
 
 const STDOUT: u64 = 1;
 const O_CREAT: u64 = 0o100;
+/// Real POSIX `open(2)` access-mode bit -- needed explicitly now that `modules/oxfs`'s own
+/// `oxfs_open` enforces the caller's real requested access mode even on a brand-new `O_CREAT`
+/// file (`OpenFile::Write::readonly`, see that field's own doc comment) rather than always
+/// granting write access regardless of what was actually asked for.
+const O_WRONLY: u64 = 0o1;
 
 const CONTENT: &[u8] = b"real disk persistence, write-through, verified live\n";
 
@@ -83,7 +88,14 @@ pub extern "C" fn _start() -> ! {
     // the exact scenario this test exists to exercise. A hang here (the class of bug this test is
     // for) means the whole QEMU instance times out rather than reporting FAIL cleanly -- see this
     // file's own module doc comment.
-    let fd = unsafe { syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, O_CREAT) };
+    let fd = unsafe {
+        syscall(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            O_CREAT | O_WRONLY,
+        )
+    };
     let Ok(fd) = fd else {
         write_bytes(b"oxfs-persistence-syscall-smoke: creating /persisttest failed\n");
         test_exit(false);

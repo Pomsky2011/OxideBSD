@@ -92,6 +92,18 @@ fn release_mmap_file_ref(content_id: u64) {
 pub struct MmapFileRegion {
     va_start: u64,
     npages: u64,
+    /// How many pages starting at `va_start` are actually backed by real frames -- always
+    /// `<= npages`, computed once at `mmap()` time from the object's own real length rounded up to
+    /// a whole page (`do_mmap_file_backed`'s own doc comment). Frozen at creation, not re-checked
+    /// against the object's current length on every fault -- a documented simplification (real
+    /// Linux dynamically re-checks the current inode size on each fault, letting a later
+    /// `ftruncate()` grow retroactively into what SIGBUSed before; no test in this kernel's own
+    /// conformance pilot exercises that). Pages `[mapped_pages, npages)` are deliberately left
+    /// *unmapped* in the caller's page table -- real POSIX MPR: a reference anywhere in that range
+    /// must raise `SIGBUS`, not silently succeed against a zero-filled page -- see
+    /// `signal_for_user_fault` below, which is what actually turns "unmapped" into a real signal
+    /// instead of the reboot every other unmapped ring-3 reference still gets.
+    mapped_pages: u64,
     content_id: u64,
     writable: bool,
 }
@@ -201,22 +213,28 @@ fn do_mmap_file_backed(
     let content_id = crate::fs::fd::content_id_of(fd).ok_or(ENODEV)?;
 
     let phys_offset = memory::phys_mem_offset();
-    let region_len = page_count * 4096;
     let real_size = crate::fs::fd::content_size(content_id).max(0) as u64;
+    // Real POSIX MPR (`mmap/11-2.c`/`11-3.c` in the conformance pilot): only pages actually
+    // overlapping the object's own real content -- including its final, real-content-plus-
+    // zero-padding partial page -- ever get backed by a real frame. Anything past that, up to the
+    // caller's own requested `page_count`, is deliberately left unmapped so a reference there
+    // real-faults instead of silently succeeding against a zero-filled page; `signal_for_user_fault`
+    // below is what turns that fault into a real `SIGBUS` rather than a reboot.
+    let covered_pages = real_size.div_ceil(4096).min(page_count);
 
     let frames: Vec<PhysFrame<Size4KiB>> = {
         let mut cache = MMAP_FILE_CACHE.lock();
         let existing_len = cache.get(&content_id).map(Vec::len).unwrap_or(0) as u64;
-        if existing_len < page_count {
-            // First mmap of this file, or a later mmap asking for more pages than any earlier one
-            // did -- allocate+zero exactly the *new* frames needed and append them, never
-            // discarding whatever's already cached (those frames may already be live in another
-            // process's, or this same process's, own page table -- see MMAP_FILE_CACHE's own doc
-            // comment for why replacing them outright would be a real correctness bug, not just a
-            // missed optimization).
+        if existing_len < covered_pages {
+            // First mmap of this file, or a later mmap asking for more real-content pages than any
+            // earlier one did -- allocate+zero exactly the *new* frames needed and append them,
+            // never discarding whatever's already cached (those frames may already be live in
+            // another process's, or this same process's, own page table -- see MMAP_FILE_CACHE's
+            // own doc comment for why replacing them outright would be a real correctness bug, not
+            // just a missed optimization).
             let new_frames: Vec<PhysFrame<Size4KiB>> = with_frame_allocator(|fa| {
-                let mut new_frames = Vec::with_capacity((page_count - existing_len) as usize);
-                for _ in existing_len..page_count {
+                let mut new_frames = Vec::with_capacity((covered_pages - existing_len) as usize);
+                for _ in existing_len..covered_pages {
                     let frame = fa.allocate_frame().ok_or(ENOMEM)?;
                     let frame_ptr =
                         (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
@@ -235,7 +253,10 @@ fn do_mmap_file_backed(
             // zeroed), matching POSIX's own "bytes past EOF within the mapped region read as
             // zero".
             let new_region_start = existing_len * 4096;
-            let read_len = real_size.saturating_sub(new_region_start).min(region_len - new_region_start);
+            let covered_len = covered_pages * 4096;
+            let read_len = real_size
+                .saturating_sub(new_region_start)
+                .min(covered_len - new_region_start);
             if read_len > 0 {
                 let mut staging = alloc::vec![0u8; read_len as usize];
                 let n = crate::fs::fd::content_read(
@@ -257,15 +278,23 @@ fn do_mmap_file_backed(
             }
             cache.entry(content_id).or_default().extend(new_frames);
         }
+        // `.entry(...).or_default()`, not `.get(...).expect(...)`: the growth block above is
+        // skipped entirely when `covered_pages == 0` (an object with no real content yet, e.g. a
+        // freshly `open(O_CREAT)`'d file `mmap()`'d before any `write()`/`ftruncate()`) *and*
+        // nothing was cached for this content_id before (`existing_len == 0`, so `0 < 0` is
+        // false) -- the very first such mmap of a file had no entry to `.get()`, and the `.expect`
+        // here panicked instead of just producing the correct empty `frames` list. Found live, not
+        // caught by this session's own smoke test (every scenario there `ftruncate`s first).
         cache
-            .get(&content_id)
-            .expect("just inserted/grown above")
+            .entry(content_id)
+            .or_default()
             .iter()
-            .take(page_count as usize)
+            .take(covered_pages as usize)
             .copied()
             .collect()
     };
 
+    let region_len = page_count * 4096;
     let base = {
         let mut next = NEXT_MMAP_PAGE.lock();
         let base = *next;
@@ -290,32 +319,64 @@ fn do_mmap_file_backed(
     // SAFETY: see do_mmap's identical reasoning -- me.address_space is the currently active
     // address space.
     let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
-    let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + region_len - 1));
-    with_frame_allocator(|fa| -> Result<(), u64> {
-        for (page, frame) in Page::range_inclusive(start_page, end_page).zip(frames.iter()) {
-            // SAFETY: `frame` is one of MMAP_FILE_CACHE's own real backing frames (never reused
-            // for anything else -- this kernel has no frame-deallocation path), and `page` falls
-            // in this process's own, freshly bump-allocated mmap region.
-            unsafe {
-                mapper
-                    .map_to(page, *frame, flags, fa)
-                    .map_err(|_| ENOMEM)?
-                    .flush();
+    // Only `[base, base + covered_pages*4096)` is actually mapped -- `[covered_pages, page_count)`
+    // is deliberately left with no page-table entry at all, real POSIX MPR (see MmapFileRegion's
+    // own `mapped_pages` field doc comment); `covered_pages == 0` (the whole reservation is beyond
+    // the object's own real content) skips this loop entirely.
+    if covered_pages > 0 {
+        let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
+        let end_page =
+            Page::<Size4KiB>::containing_address(VirtAddr::new(base + covered_pages * 4096 - 1));
+        with_frame_allocator(|fa| -> Result<(), u64> {
+            for (page, frame) in Page::range_inclusive(start_page, end_page).zip(frames.iter()) {
+                // SAFETY: `frame` is one of MMAP_FILE_CACHE's own real backing frames (never reused
+                // for anything else -- this kernel has no frame-deallocation path), and `page` falls
+                // in this process's own, freshly bump-allocated mmap region.
+                unsafe {
+                    mapper
+                        .map_to(page, *frame, flags, fa)
+                        .map_err(|_| ENOMEM)?
+                        .flush();
+                }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })?;
+    }
 
     *MMAP_FILE_REFCOUNT.lock().entry(content_id).or_insert(0) += 1;
     me.mmap_file_regions.push(MmapFileRegion {
         va_start: base,
         npages: page_count,
+        mapped_pages: covered_pages,
         content_id,
         writable,
     });
 
     Ok(base)
+}
+
+/// Real POSIX MPR (`mmap/11-2.c`/`11-3.c`): resolves what signal a ring-3 reference to `addr`
+/// should raise, for `interrupts::page_fault_handler`'s own real-fault-to-signal delivery.
+/// `SIGBUS` when `addr` falls inside a live fd-backed mapping's own reserved-but-unbacked tail
+/// (`[mapped_pages, npages)` of one of `caller_pid`'s own `mmap_file_regions` -- see
+/// `MmapFileRegion::mapped_pages`'s own doc comment), `SIGSEGV` for every other unmapped ring-3
+/// reference (a real general fix in its own right -- this kernel used to reboot on any such
+/// reference at all, ring-3 or not, rather than terminate just the one offending process).
+pub fn signal_for_user_fault(caller_pid: Pid, addr: u64) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    let Some(me) = table.get(&caller_pid) else {
+        return crate::process::SIGSEGV;
+    };
+    let in_reserved_tail = me.mmap_file_regions.iter().any(|r| {
+        let backed_end = r.va_start + r.mapped_pages * 4096;
+        let reserved_end = r.va_start + r.npages * 4096;
+        addr >= backed_end && addr < reserved_end
+    });
+    if in_reserved_tail {
+        crate::process::SIGBUS
+    } else {
+        crate::process::SIGSEGV
+    }
 }
 
 /// Writes one region's current frame content back to its real underlying file via

@@ -789,6 +789,26 @@ pub struct Process {
     /// `cpu::fpu::clean_state()` (a real CPU-reset image, not zeroed) for a freshly spawned/forked
     /// process; a forked child copies the parent's live state (real `fork()` semantics).
     pub fpu_state: crate::cpu::fpu::FxSaveArea,
+    /// Real per-process CPU-time accounting, in `interrupts::TICKS`-cadence ticks (`TIMER_HZ`,
+    /// same clock `CLOCK_MONOTONIC` already converts from) -- incremented by exactly `1` on every
+    /// timer tick where this process is the one actually `Running` when the tick lands
+    /// (`interrupts::timer_interrupt_handler`, right alongside its own preemption check). Backs
+    /// `sys_clock_gettime`'s `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` (no real
+    /// threading exists -- a process's only "thread" is itself, same simplification `/proc/<pid>/
+    /// task` already uses -- so both clockids read this same counter). Found live: `clock_gettime/
+    /// 4-1.c` (the Open POSIX Test Suite pilot) went UNRESOLVED, not the legitimate `UNSUPPORTED`
+    /// its own `sysconf(_SC_CPUTIME) == -1` escape hatch would have produced -- musl's own
+    /// `sysconf()` unconditionally reports `_SC_CPUTIME` as supported (`third_party/musl/src/conf/
+    /// sysconf.c`, a compile-time claim, not a runtime capability probe), so the test proceeded to
+    /// call `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ...)` and got a real, until-now-unhandled
+    /// `EINVAL` instead. Not real, precise CPU-time accounting (it's tick-granularity, and doesn't
+    /// distinguish user/kernel time or subtract time spent `Blocked`/`Stopped`) -- but it's the
+    /// same honesty tier `ticks()`-derived `CLOCK_MONOTONIC` already sets, and is enough to satisfy
+    /// what any real caller here actually checks (this pilot test only requires successive reads to
+    /// be non-decreasing under real work, not wall-clock-accurate). Starts at `0` for spawn *and*
+    /// a forked child (real POSIX: a process's own CPU time never carries over from a parent);
+    /// preserved by `execve` (the same process, still accumulating, just running a new image).
+    pub cpu_ticks: u64,
 }
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());
@@ -838,6 +858,7 @@ pub mod timers;
 // `crate::process::X`) rather than being re-exported.
 pub mod context_switch;
 pub mod elf;
+pub mod fault_trampoline;
 pub mod scheduler;
 pub mod user_stack;
 pub mod usermode;

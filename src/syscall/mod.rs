@@ -387,6 +387,15 @@ pub(crate) unsafe fn redirect_frame(frame: *mut SyscallFrame, rip: VirtAddr, rsp
 /// registered like every other syscall.
 const SYS_SIGRETURN: u64 = 119;
 
+/// OxideBSD's own invention, continuing this ABI's own highest already-assigned number (past
+/// `SYS_MSGCTL = 553`) -- see `process::fault_trampoline`'s own module doc comment for why this
+/// exists at all: it's never issued by real userland/musl, only by the tiny kernel-authored
+/// trampoline page a ring-3 page fault gets redirected into. Bypasses `SYSCALL_TABLE`/`dispatch`
+/// entirely, same shape as `SYS_SIGRETURN` above -- its only job is to *be* a real `SYSCALL`
+/// instruction (so this function's own GPR-capturing entry/exit runs), not to do anything once
+/// it's landed here.
+pub(crate) const SYS_FAULT_PUMP: u64 = 554;
+
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // SAFETY: frame points at syscall_entry's just-pushed register block, on the current
@@ -400,6 +409,15 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // value. See `do_sigreturn`'s own doc comment.
     if frame.rax == SYS_SIGRETURN {
         do_sigreturn(frame);
+        return;
+    }
+
+    // Also bypasses the normal table lookup -- see this constant's own doc comment. The real
+    // pending fault-signal `interrupts::page_fault_handler` recorded before redirecting here is
+    // exactly what `deliver_pending_signal` finds and acts on; nothing else about this "syscall"
+    // needs to happen at all.
+    if frame.rax == SYS_FAULT_PUMP {
+        deliver_pending_signal(frame);
         return;
     }
 

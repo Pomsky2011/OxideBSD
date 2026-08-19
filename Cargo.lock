@@ -205,6 +205,10 @@ name = "lsoxmod"
 version = "0.1.0"
 
 [[package]]
+name = "mmap-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "mount-syscall-smoke"
 version = "0.1.0"
 

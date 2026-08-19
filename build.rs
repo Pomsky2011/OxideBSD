@@ -37,6 +37,7 @@ fn main() {
     build_userland_crate("proc-smoke", "PROC_SMOKE_ELF_PATH");
     build_userland_crate("itimer-syscall-smoke", "ITIMER_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("uid-syscall-smoke", "UID_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("mmap-syscall-smoke", "MMAP_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
         "oxfs-persistence-syscall-smoke",
         "OXFS_PERSISTENCE_SYSCALL_SMOKE_ELF_PATH",

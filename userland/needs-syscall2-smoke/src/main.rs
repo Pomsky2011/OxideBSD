@@ -60,6 +60,11 @@ const SYS_TEST_EXIT: u64 = 9999;
 
 const STDOUT: u64 = 1;
 const O_CREAT: u64 = 0o100;
+/// Real POSIX `open(2)` access-mode bit -- needed explicitly now that `modules/oxfs`'s own
+/// `oxfs_open` enforces the caller's real requested access mode even on a brand-new `O_CREAT`
+/// file (`OpenFile::Write::readonly`, see that field's own doc comment) rather than always
+/// granting write access regardless of what was actually asked for.
+const O_WRONLY: u64 = 0o1;
 const S_IFREG: u32 = 0o100000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFMT: u32 = 0o170000;
@@ -179,7 +184,14 @@ fn stat_of(path: &[u8]) -> Result<MuslStat, u64> {
 }
 
 fn open_create(path: &[u8]) -> Result<u64, u64> {
-    unsafe { syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, O_CREAT) }
+    unsafe {
+        syscall(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            O_CREAT | O_WRONLY,
+        )
+    }
 }
 
 fn close(fd: u64) {

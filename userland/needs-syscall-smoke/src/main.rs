@@ -46,6 +46,11 @@ const SYS_TEST_EXIT: u64 = 9999;
 
 const STDOUT: u64 = 1;
 const O_CREAT: u64 = 0o100;
+/// Real POSIX `open(2)` access-mode bit -- needed explicitly now that `modules/oxfs`'s own
+/// `oxfs_open` enforces the caller's real requested access mode even on a brand-new `O_CREAT`
+/// file (`OpenFile::Write::readonly`, see that field's own doc comment) rather than always
+/// granting write access regardless of what was actually asked for.
+const O_WRONLY: u64 = 0o1;
 const EAGAIN: u64 = 11;
 
 const LOCK_EX: u64 = 2;
@@ -157,7 +162,14 @@ pub extern "C" fn _start() -> ! {
     // --- fsync: a still-open write fd's content is force-committed, visible to an independent
     // concurrent reader before the writer ever closes. ---
     let f1 = b"/nsfsync";
-    let wfd = unsafe { syscall(SYS_OPEN, f1.as_ptr() as u64, f1.len() as u64, O_CREAT) };
+    let wfd = unsafe {
+        syscall(
+            SYS_OPEN,
+            f1.as_ptr() as u64,
+            f1.len() as u64,
+            O_CREAT | O_WRONLY,
+        )
+    };
     check!(wfd.is_ok(), b"create /nsfsync failed");
     let wfd = wfd.unwrap();
     unsafe {

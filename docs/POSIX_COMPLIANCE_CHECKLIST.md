@@ -88,16 +88,17 @@ if this becomes real future work rather than just a tracking exercise.
       `kill/2-2,3-1.c` and `sigqueue/2-1,2-2,3-1,11-1,12-1.c` from FAIL to real PASS — pilot moved
       45P/16F/3U/4UT → 52P/9F/3U/4UT. Verified via `sig-syscall-smoke`'s new part 8 (real
       `ESRCH`/`EPERM` enforcement, including a forked, uid-dropped child).
-- [ ] **File-backed `mmap`**: `MAP_SHARED`/`MAP_PRIVATE` against a real file descriptor, plus real
-      `msync(2)`. **Why:** POSIX's base `mmap(2)` is not optional, and its most common real use
-      (mapping a file, not just anonymous scratch memory) doesn't exist here — confirmed directly:
-      `src/process/mm.rs`'s `do_mmap(caller_pid, addr_hint, len, prot)` takes no fd/offset
-      argument at all, always anonymous. `msync`/`mlock`/`munlock`/`mlockall` are correctly
-      no-ops-by-construction *for anonymous memory* (no swap, nothing ever paged out — see
-      `docs/MISSING_POSIX_SYSCALLS.md`'s "structurally inapplicable" table) but that framing
-      stops being true the moment a real file-backed mapping needs to flush back to its file. Real
-      enforcement here (not just file-backing) is also the milestone-2 dynamic-linking blocker
-      immediately below — the same gap shows up from two directions.
+- [x] **File-backed `mmap`**: done — corrected from an earlier draft of this doc, which said
+      `do_mmap` took no fd/offset argument at all; that was true when this row was first written
+      but real `MAP_SHARED` fd-backed mapping landed since (see CLAUDE.md's "Real /tmp, /dev/shm,
+      and real fd-backed MAP_SHARED mmap" section), and real MPR (`SIGBUS` past a mapped object's
+      own real extent) plus real ring-3 fault-to-signal delivery landed after that (see CLAUDE.md's
+      "Real ring-3 fault-to-signal delivery, and two mmap fixes" section) — closes
+      `mmap/11-2.c`/`11-3.c`/`12-1.c` in the pilot below. `MAP_PRIVATE` still always behaves as
+      `MAP_SHARED` (no copy-on-write page-fault tracking exists — a documented simplification, not
+      yet hit by any real caller requesting `MAP_PRIVATE` against a real fd) and real `msync(2)`
+      itself still doesn't exist as its own syscall (writeback only happens at `munmap`/exit) —
+      genuine remaining gaps, just narrower than this row used to claim.
 - [x] **Milestone 1 done, milestone 2 open** — corrected from an earlier draft of this doc, which
       wrongly said no `PT_INTERP` support existed at all; CLAUDE.md itself was stale on this same
       point until this pass. **Milestone 1 (done, `e72fc7d`)**: a real `fork`+`execve` of a

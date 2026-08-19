@@ -44,6 +44,11 @@ const SYS_TEST_EXIT: u64 = 9999;
 
 const STDOUT: u64 = 1;
 const O_CREAT: u64 = 0o100;
+/// Real POSIX `open(2)` access-mode bit -- needed explicitly now that `modules/oxfs`'s own
+/// `oxfs_open` enforces the caller's real requested access mode even on a brand-new `O_CREAT`
+/// file (`OpenFile::Write::readonly`, see that field's own doc comment) rather than always
+/// granting write access regardless of what was actually asked for.
+const O_WRONLY: u64 = 0o1;
 /// Real value, matches `modules/oxfs/src/lib.rs`'s own `EINVAL` -- identical on Linux/BSD/musl.
 const EINVAL: u64 = 22;
 /// Real value, matches `modules/oxfs/src/lib.rs`'s own `ENOENT`.
@@ -235,7 +240,8 @@ pub extern "C" fn _start() -> ! {
 
     // A file created inside the tmpfs mount is real, round-trips, and reports the tmpfs st_dev.
     let f = b"/mnttest/f";
-    let Ok(fd) = (unsafe { syscall(SYS_OPEN, f.as_ptr() as u64, f.len() as u64, O_CREAT) }) else {
+    let Ok(fd) = (unsafe { syscall(SYS_OPEN, f.as_ptr() as u64, f.len() as u64, O_CREAT | O_WRONLY) })
+    else {
         write_bytes(b"mount-syscall-smoke: create /mnttest/f failed\n");
         test_exit(false);
     };

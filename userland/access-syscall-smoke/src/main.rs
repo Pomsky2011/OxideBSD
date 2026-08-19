@@ -43,6 +43,11 @@ const SYS_TEST_EXIT: u64 = 9999;
 
 const STDOUT: u64 = 1;
 const O_CREAT: u64 = 0o100;
+/// Real POSIX `open(2)` access-mode bit -- needed explicitly now that `modules/oxfs`'s own
+/// `oxfs_open` enforces the caller's real requested access mode even on a brand-new `O_CREAT`
+/// file (`OpenFile::Write::readonly`, see that field's own doc comment) rather than always
+/// granting write access regardless of what was actually asked for.
+const O_WRONLY: u64 = 0o1;
 /// Real POSIX `access(2)` `amode` bits -- see `modules/oxfs/src/lib.rs`'s own `check_access` doc
 /// comment for why these need no translation at the kernel boundary.
 const F_OK: u64 = 0;
@@ -132,7 +137,14 @@ fn check_root_access() -> bool {
 /// Part 2 -- see this file's own module doc comment.
 fn setup_accesstest() -> bool {
     let path = b"/accesstest";
-    let fd = unsafe { syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, O_CREAT) };
+    let fd = unsafe {
+        syscall(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            O_CREAT | O_WRONLY,
+        )
+    };
     let Ok(fd) = fd else {
         write_bytes(b"access-syscall-smoke: creating /accesstest failed\n");
         return false;
