@@ -77,6 +77,17 @@ if this becomes real future work rather than just a tracking exercise.
       `sigqueue/8-1.c` UNRESOLVED, both for this exact reason). Fixing this generally needs a real
       signal-stack/handler-chaining mechanism, a separate architectural decision from RT queuing
       itself — not attempted here.
+      **A follow-up pass fixed a second real gap the pilot's remaining `sigqueue`/`kill` FAILs
+      converged on**: real `kill(2)`/`sigqueue(2)` permission checking, plus `sigqueue`'s own real
+      `sig == 0` null-signal existence(+permission)-only convention (previously always `EINVAL`,
+      unlike `kill(pid, 0)`, which already had this). `has_signal_permission` (`src/process/
+      signals.rs`) is the real POSIX rule — sender is root, or sender's uid matches the target's —
+      checked by both `do_kill`/`do_sigqueue`'s single-target cross-process paths (not
+      `signal_foreground_group`'s own process-group broadcast; no pilot test needs it, and real
+      POSIX's own per-member partial-success rule there is meaningfully more complex). Flips
+      `kill/2-2,3-1.c` and `sigqueue/2-1,2-2,3-1,11-1,12-1.c` from FAIL to real PASS — pilot moved
+      45P/16F/3U/4UT → 52P/9F/3U/4UT. Verified via `sig-syscall-smoke`'s new part 8 (real
+      `ESRCH`/`EPERM` enforcement, including a forked, uid-dropped child).
 - [ ] **File-backed `mmap`**: `MAP_SHARED`/`MAP_PRIVATE` against a real file descriptor, plus real
       `msync(2)`. **Why:** POSIX's base `mmap(2)` is not optional, and its most common real use
       (mapping a file, not just anonymous scratch memory) doesn't exist here — confirmed directly:

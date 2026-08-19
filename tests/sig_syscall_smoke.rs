@@ -1,7 +1,8 @@
 //! Boots the full kernel, loads `native_abi` (write/exit/fork/wait4/getpid's own syscall
-//! registration path) and `signal` (`SYS_KILL`/`SYS_SIGACTION`/`SYS_SIGTIMEDWAIT`/
-//! `SYS_SIGQUEUE`), then spawns `userland/sig-syscall-smoke/` as pid 1 -- see that crate's own
-//! module doc comment for the full seven-part scenario.
+//! registration path), `signal` (`SYS_KILL`/`SYS_SIGACTION`/`SYS_SIGTIMEDWAIT`/`SYS_SIGQUEUE`),
+//! and `posix_compat` (`SYS_SETUID`, needed for part 8's real cross-uid EPERM check), then spawns
+//! `userland/sig-syscall-smoke/` as pid 1 -- see that crate's own module doc comment for the full
+//! eight-part scenario.
 //!
 //! Same `SYS_TEST_EXIT` convention `tests/fork_wait.rs` established: `scheduler::start`/
 //! `process::do_exit` never return control to this file's own `main`, so the child reports
@@ -68,6 +69,19 @@ fn main(boot_info: &'static BootInfo) -> ! {
         &mut frame_allocator,
     )
     .unwrap_or_else(|e| panic!("failed to load the signal module: {e:?}"));
+
+    // Populates SYS_SETUID -- needed for part 8's real cross-uid kill/sigqueue EPERM check.
+    const POSIX_COMPAT_MOD: &[u8] = include_bytes!(env!("POSIX_COMPAT_MOD_PATH"));
+    const POSIX_COMPAT_PANIC_SYMBOL: &str = env!("POSIX_COMPAT_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "posix_compat",
+        POSIX_COMPAT_MOD,
+        POSIX_COMPAT_PANIC_SYMBOL,
+        false,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
 
     oxidebsd::memory::install_global_memory_state(frame_allocator, physical_memory_offset);
     oxidebsd::fs::fd::init();

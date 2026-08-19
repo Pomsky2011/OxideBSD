@@ -42,10 +42,12 @@
 //! real event-driven wake instead of being purely time-based.
 //!
 //! **`mq_notify`'s `SIGEV_SIGNAL` delivery reuses `process::do_kill` directly**, not a bespoke
-//! delivery path -- `do_kill`'s own doc comment already establishes it performs no permission
-//! check for any signal, so calling it with the notifying process as both "caller" and "target" is
-//! exactly the real POSIX behavior (respects `SIG_IGN`/a caught handler/default disposition, same
-//! as an actual `kill()` would). `SIGEV_THREAD`/`SIGEV_THREAD_ID` are real `EINVAL` -- this kernel
+//! delivery path -- calling it with the notifying process as both "caller" and "target" is a real
+//! self-signal, always taking `do_kill`'s own self-target early-return (never its cross-process
+//! permission check, see `src/process/signals.rs`'s `has_signal_permission` -- irrelevant here
+//! regardless, since a process always has permission to signal itself), so this is exactly the
+//! real POSIX behavior (respects `SIG_IGN`/a caught handler/default disposition, same as an actual
+//! `kill()` would). `SIGEV_THREAD`/`SIGEV_THREAD_ID` are real `EINVAL` -- this kernel
 //! has no `clone(2)`/`AF_NETLINK`, and real musl's own `SIGEV_THREAD` emulation
 //! (`third_party/musl/src/mq/mq_notify.c`) never even issues the raw syscall for that case (it's
 //! handled entirely in userspace over a netlink socket this port doesn't have). `si_value`

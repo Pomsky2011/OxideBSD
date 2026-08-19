@@ -37,7 +37,14 @@
 //!    unblocks `SIGUSR1` and confirms a plain self-`kill(SIGUSR1)` *does* still run it immediately
 //!    (real POSIX ordering, same "handler already ran before the interrupted call returns"
 //!    property `pause-syscall-smoke` already proved).
-//! 7. Real `EINVAL` validation: `sigqueue` against pid `0`/negative, and against signal `0`/`32`.
+//! 7. Real `EINVAL` validation: `sigqueue` against pid `0`/negative, against signal `32`, and
+//!    confirms `sig == 0` (the real POSIX null-signal existence-check convention) now *succeeds*
+//!    against self rather than `EINVAL`ing.
+//! 8. Real `ESRCH`/`EPERM` enforcement for `kill`/`sigqueue`'s `sig == 0` path: a nonexistent pid
+//!    is `ESRCH` regardless of caller privilege; a second forked child drops to uid `1`
+//!    (`setuid`) and confirms both `kill(parent, 0)`/`sigqueue(parent, 0, ...)` genuinely fail
+//!    `EPERM` against the still-root parent -- mirrors the Open POSIX Test Suite pilot's own
+//!    `kill/2-2,3-1.c` + `sigqueue/2-1,2-2,3-1,11-1,12-1.c`.
 #![no_std]
 #![no_main]
 
@@ -54,6 +61,8 @@ const SYS_GETPID: u64 = 20;
 const SYS_KILL: u64 = 116;
 const SYS_SIGACTION: u64 = 117;
 const SYS_SIGPROCMASK: u64 = 118;
+/// Needed for part 8's real cross-uid kill/sigqueue `EPERM` check.
+const SYS_SETUID: u64 = 162;
 /// Real, unremapped Linux `__NR_sigreturn` slot -- see `third_party/musl/src/signal/x86_64/
 /// restore.s`'s own comment for why every arch's restorer hardcodes its trap number directly
 /// rather than going through a shared macro.
@@ -71,6 +80,9 @@ const SIGUSR2: u64 = 12;
 
 const EINVAL: u64 = 22;
 const EAGAIN: u64 = 11;
+/// Real value, matches `src/syscall/mod.rs`'s own `EPERM` -- identical on Linux/BSD/musl.
+const EPERM: u64 = 1;
+const ESRCH: u64 = 3;
 
 /// Real `sigprocmask(2)` `how` values -- matches `src/process/signals.rs`'s own `do_sigprocmask`.
 const SIG_BLOCK: u64 = 0;
@@ -258,6 +270,27 @@ fn child_process(parent_pid: u64) -> ! {
     }
 }
 
+/// Runs entirely inside a second forked child, for part 8's own real cross-uid `EPERM` scenario --
+/// drops from root to uid 1 (`setuid`), then confirms both `kill(parent, 0)` and
+/// `sigqueue(parent, 0, ...)` genuinely fail `EPERM` against the still-root parent (mirrors the
+/// Open POSIX Test Suite pilot's own `kill/2-2,3-1.c`/`sigqueue/3-1,12-1.c` scenario). Reports
+/// pass/fail via its own real exit status, checked by `wait4` back in `_start`.
+fn permission_child(parent_pid: u64) -> ! {
+    write_bytes(b"sig-syscall-smoke: permission child dropping to uid 1\n");
+    let ok = unsafe { syscall(SYS_SETUID, 1, 0, 0) }.is_ok()
+        && unsafe { syscall(SYS_KILL, parent_pid, 0, 0) } == Err(EPERM)
+        && sigqueue(parent_pid, 0, 0) == Err(EPERM);
+    if !ok {
+        write_bytes(b"sig-syscall-smoke: permission child's cross-uid EPERM checks failed\n");
+    }
+    unsafe {
+        let _ = syscall(SYS_EXIT, if ok { 0 } else { 1 }, 0, 0);
+    }
+    loop {
+        spin_loop();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     write_bytes(b"sig-syscall-smoke: starting\n");
@@ -404,9 +437,44 @@ pub extern "C" fn _start() -> ! {
         unsafe { syscall(SYS_SIGQUEUE, u64::MAX, SIGUSR1, 0) } == Err(EINVAL),
         "sigqueue against a negative pid wasn't EINVAL"
     );
-    check!(sigqueue(pid, 0, 0) == Err(EINVAL), "sigqueue with sig=0 wasn't EINVAL");
+    // sig=0 is the real POSIX null-signal existence(+permission)-only check (same convention
+    // kill(pid, 0) already has) -- a self-targeted one always succeeds, matches sigqueue/2-1.c's
+    // own assertion in the Open POSIX Test Suite pilot.
+    check!(sigqueue(pid, 0, 0) == Ok(0), "self sigqueue with sig=0 didn't succeed");
     check!(sigqueue(pid, 32, 0) == Err(EINVAL), "sigqueue with sig=32 wasn't EINVAL");
     write_bytes(b"sig-syscall-smoke: part 7 (EINVAL validation) OK\n");
+
+    // --- Part 8: real ESRCH/EPERM enforcement (kill/sigqueue's sig=0 existence+permission path)
+    // --- mirrors kill/2-2,3-1.c and sigqueue/2-1,2-2,3-1,11-1,12-1.c in the Open POSIX Test Suite
+    // pilot. A nonexistent pid is ESRCH regardless of caller privilege; a real permission mismatch
+    // (checked from inside a forked, uid-dropped child so this process's own root identity stays
+    // intact for a hypothetical later part) is EPERM.
+    check!(
+        unsafe { syscall(SYS_KILL, 999999, 0, 0) } == Err(ESRCH),
+        "kill against a nonexistent pid wasn't ESRCH"
+    );
+    check!(
+        sigqueue(999999, 0, 0) == Err(ESRCH),
+        "sigqueue against a nonexistent pid wasn't ESRCH"
+    );
+    let fork_result2 = unsafe { syscall(SYS_FORK, 0, 0, 0) };
+    let child2_pid = match fork_result2 {
+        Ok(0) => permission_child(pid),
+        Ok(child2_pid) => child2_pid,
+        Err(_) => {
+            write_bytes(b"sig-syscall-smoke: second fork failed\n");
+            test_exit(false);
+        }
+    };
+    let (reaped_pid2, status2) = wait4(child2_pid).unwrap_or_else(|_| {
+        write_bytes(b"sig-syscall-smoke: part 8 wait4 failed\n");
+        test_exit(false);
+    });
+    check!(
+        reaped_pid2 == child2_pid && status2 == 0,
+        "permission child's cross-uid EPERM checks didn't all pass"
+    );
+    write_bytes(b"sig-syscall-smoke: part 8 (ESRCH/EPERM enforcement) OK\n");
 
     write_bytes(b"sig-syscall-smoke: PASS\n");
     test_exit(true);

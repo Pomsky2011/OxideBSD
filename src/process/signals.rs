@@ -3,11 +3,26 @@
 use alloc::vec::Vec;
 
 
-use crate::syscall::{EAGAIN, EINTR, EINVAL, ESRCH, SyscallFrame};
+use crate::syscall::{EAGAIN, EINTR, EINVAL, EPERM, ESRCH, SyscallFrame};
 use super::*;
 
+/// Real POSIX `kill(2)`/`sigqueue(2)` permission rule: the sender must either be root, or its own
+/// uid must match the target's -- "the real or effective user ID of the sending process shall
+/// match the real or saved set-user-ID of the receiving process, unless the sending process has
+/// appropriate privileges" (POSIX). This kernel has no separate real/effective/saved uid triple
+/// (see `Process::uid`'s own doc comment: no setuid-bit `execve` support to ever make them
+/// diverge), so a single equality check against the target's one `uid` field covers the whole real
+/// rule. Checked by both `do_kill`/`do_sigqueue`'s single-target cross-process paths -- **not**
+/// `signal_foreground_group`'s own process-group broadcast (no pilot test exercises group-kill
+/// permission semantics, and real POSIX's own per-member-partial-success rule there is
+/// meaningfully more complex than a flat allow/deny).
+fn has_signal_permission(caller_uid: u32, target_uid: u32) -> bool {
+    caller_uid == 0 || caller_uid == target_uid
+}
+
 /// `SYS_KILL`'s real logic. Signals `1..=31` (standard) or `SIGRTMIN..=SIGRTMAX` (real-time) only;
-/// anything else is `EINVAL`, matching real `kill()`'s own validation. `target_pid == 0`/`< 0` are
+/// anything else is `EINVAL`, matching real `kill()`'s own validation. Real permission checking now
+/// exists (`has_signal_permission`) for the single-target case -- `target_pid == 0`/`< 0` are
 /// real POSIX process-group broadcasts
 /// (`0` = the caller's own group, `< 0` = group `|target_pid|`) — see the `target_pid <= 0` branch
 /// below for that path; everything past this doc comment's remaining bullets describes the
@@ -83,18 +98,17 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
     }
     let target = target_pid as u64;
 
-    // Real kill(pid, 0): no signal is actually sent -- only existence (real kill(2) also checks
-    // permission, which this kernel's own do_kill doesn't check for any signal, see this
-    // function's own doc comment) is checked. The standard POSIX idiom for "is this pid still
-    // alive" (`kill -0 $pid`) depends on this, and would otherwise always fail EINVAL since 0
-    // isn't a real signal number.
+    // Real kill(pid, 0): no signal is actually sent -- only existence and permission are checked.
+    // The standard POSIX idiom for "is this pid still alive" (`kill -0 $pid`) depends on this, and
+    // would otherwise always fail EINVAL since 0 isn't a real signal number.
     if sig == 0 {
         if target == caller_pid {
             return Ok(0);
         }
         let table = PROCESS_TABLE.lock();
         return match table.get(&target) {
-            Some(_) => Ok(0), // zombie counts too -- still "exists" until reaped
+            Some(proc) if has_signal_permission(caller_uid, proc.uid) => Ok(0), // zombie counts too -- still "exists" until reaped
+            Some(_) => Err(EPERM),
             None => Err(ESRCH),
         };
     }
@@ -124,6 +138,9 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         // doc comment already establishes for every other function here).
         let mut table = PROCESS_TABLE.lock();
         let proc = table.get(&target).ok_or(ESRCH)?;
+        if !has_signal_permission(caller_uid, proc.uid) {
+            return Err(EPERM);
+        }
         if matches!(proc.state, ProcState::Zombie(_)) {
             return Ok(0); // still "exists" until reaped, but there's nothing left to signal
         }
@@ -865,8 +882,14 @@ pub fn do_sigtimedwait(pid: Pid, mask_ptr: u64, info_ptr: u64, ts_ptr: u64) -> R
 /// for this exact enum/match shape). `SI_QUEUE`/the real value only ever matters for the
 /// `SetPending` arm -- the only shape a caught handler or a blocked `sigtimedwait` could ever
 /// actually observe it through.
+///
+/// **Real `sig == 0`**: same real POSIX existence-and-permission-only convention `do_kill`'s own
+/// `kill(pid, 0)` already establishes (musl's `sigqueue(3)` wrapper places no extra restriction on
+/// `sig` beyond what a real signal number check would already reject) -- no signal is actually
+/// queued, `Err(EPERM)`/`Err(ESRCH)` via `has_signal_permission`/table lookup exactly mirrors
+/// `do_kill`'s own `sig == 0` branch.
 pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64) -> Result<u64, u64> {
-    if !((1..=31).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
+    if sig != 0 && !((1..=31).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
         return Err(EINVAL);
     }
     if target_pid <= 0 {
@@ -875,6 +898,18 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
     let target = target_pid as u64;
     let sig = sig as u64;
     let caller_uid = oxidebsd_current_uid() as u32;
+
+    if sig == 0 {
+        if target == caller_pid {
+            return Ok(0);
+        }
+        let table = PROCESS_TABLE.lock();
+        return match table.get(&target) {
+            Some(proc) if has_signal_permission(caller_uid, proc.uid) => Ok(0),
+            Some(_) => Err(EPERM),
+            None => Err(ESRCH),
+        };
+    }
     // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
     // already has; si_value sits at byte offset 24 in musl's own siginfo_t, matching RawSiginfo's
     // field layout exactly (see this function's own doc comment).
@@ -901,6 +936,9 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
     let action = {
         let mut table = PROCESS_TABLE.lock();
         let proc = table.get(&target).ok_or(ESRCH)?;
+        if !has_signal_permission(caller_uid, proc.uid) {
+            return Err(EPERM);
+        }
         if matches!(proc.state, ProcState::Zombie(_)) {
             return Ok(0);
         }

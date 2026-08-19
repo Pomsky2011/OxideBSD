@@ -809,7 +809,11 @@ Real signal numbers (`SIGHUP=1`...`SIGSYS=31`, no realtime signals).
   against a blocked target — this immediate path does **not** consult `blocked_signals` at all, an
   intentional simplification: a target with no handler installed for a signal always resolves its
   default disposition right there regardless of whether that signal happens to be blocked);
-  deferred until next-scheduled only if the target has a custom handler. No permission checks.
+  deferred until next-scheduled only if the target has a custom handler. **Real permission
+  checking** (`has_signal_permission`, see "Real-time signal queuing" below): sender must be root
+  or share the target's uid, else `EPERM` — checked by `do_kill`/`do_sigqueue`'s own single-target
+  paths only, not `signal_foreground_group`'s process-group broadcast (no live caller needs it
+  there, and real POSIX's own per-member partial-success rule is meaningfully more complex).
   **Real process-group targeting** (`target_pid == 0`/`< 0`, POSIX `kill(-pgrp, sig)`) — see "Real
   job control" below.
 - **Real `SA_SIGINFO` handler invocation**: a handler installed with that flag is invoked as a
@@ -1403,7 +1407,9 @@ their own item numbering, since each turned out to need more novel machinery tha
   real `TIMER_ABSTIME`-shaped deadline (`BlockReason::WaitingForMqData`/`WaitingForMqSpace`, woken
   either by the matching send/receive or by the same timer-IRQ deadline scan the POSIX-timer batch
   added), and real `mq_notify`/`SIGEV_SIGNAL` delivery via `process::do_kill` directly (no bespoke
-  delivery path — `do_kill` already performs no permission check for any signal). `mq_close` isn't
+  delivery path — always a genuine self-signal, `caller_pid == target_pid`, so `do_kill`'s own
+  cross-process permission check, see "Real-time signal queuing..." below, never applies here).
+  `mq_close` isn't
   its own syscall: real `mq_close(3)` is a bare `syscall(SYS_close, mqd)`, so an mqd rides the
   ordinary `crate::fs::fd` registry exactly like a pipe/socketpair end.
   `third_party/musl/src/mq/mq_timedsend.c`/`mq_timedreceive.c` needed a real call-site patch (
@@ -1679,6 +1685,61 @@ last check.
   Not covered by automated testing: real-world responsiveness/fairness under sustained concurrent
   CPU-bound load (e.g. a background `yes > /dev/null &` while using the shell) — manual-QEMU-only,
   same category as every other interactive/timing-sensitive claim in this file.
+
+## Real-time signal queuing and kill/sigqueue permission checking (`src/process/mod.rs`, `src/process/signals.rs`, `src/syscall/ffi.rs`)
+
+Closes the Open POSIX Test Suite pilot's own "Real-time signal queuing" architecture blocker (see
+`docs/POSIX_COMPLIANCE_CHECKLIST.md`), landed in two passes.
+
+- **`SIGRTMIN..=SIGRTMAX` (`35..=64`)** — matches musl's own `sigrtmin.c`/`sigrtmax.c` exactly
+  (`SIGRTMIN` hardcoded to `35`; `SIGRTMAX = _NSIG - 1 = 64`); `32..=34` stay permanently unclaimed,
+  matching real glibc/musl convention of reserving a few RT numbers below `SIGRTMIN` for
+  libc-internal use. `do_kill`/`do_sigqueue`/`sys_sigaction` all extend their range checks to accept
+  it alongside the existing `1..=31` standard range. `Process::sigactions` grew `[SigAction; 32]` →
+  `[SigAction; 65]` to cover the new indices.
+- **`Process::pending_signals`/`blocked_signals` (plain `u64` bitmasks) needed zero changes** — bit
+  `34..63` already worked with the existing `1 << (sig - 1)` arithmetic. The real gap was genuine
+  multi-instance *queuing*: **`Process::rt_queue: [Vec<QueuedSigInfo>; RT_SIGNAL_COUNT]`** gives
+  each RT signal number its own small fixed-capacity (`RT_QUEUE_CAP = 16`,
+  `src/process/signals.rs`) FIFO — a second `sigqueue`/`raise` against an already-pending RT signal
+  genuinely queues rather than merging into a single bit the way a standard signal still does (POSIX
+  requires this distinction; standard signals staying bitmask-collapsed is explicitly permitted).
+  Not copied by `fork` (starts empty, same "no meaningful state to carry over" reasoning
+  `pending_siginfo` already has); untouched by `execve`.
+- **`record_pending`** (`src/process/signals.rs`) is now RT-aware and fallible: `sig >= SIGRTMIN`
+  pushes/pops `rt_queue` instead of overwriting `pending_siginfo`'s single slot, and returns
+  `Err(EAGAIN)` once that signal's own queue is full — the real, documented `sigqueue(2)` errno for
+  this case. `do_sigqueue` propagates it to the caller; `do_kill`/`signal_foreground_group` (whose
+  own callers have no path to observe it, and for whom the pending bit is already set regardless)
+  drop the excess instance instead. `take_deliverable_signal`/`do_sigtimedwait` only clear an RT
+  signal's `pending_signals` bit once its own queue is actually empty — the key semantic difference
+  from a standard signal's unconditional clear-on-consume.
+- **Real `kill(2)`/`sigqueue(2)` permission checking** (`has_signal_permission`): sender must be
+  root, or its own uid must match the target's (this kernel's single, non-diverging `Process::uid`
+  covers the real POSIX "real or effective... shall match the real or saved" rule in one equality
+  check) — checked by both `do_kill`/`do_sigqueue`'s single-target cross-process paths, **not**
+  `signal_foreground_group`'s own process-group broadcast (no pilot test exercises group-kill
+  permission semantics, and real POSIX's own per-member partial-success rule there is meaningfully
+  more complex than a flat allow/deny). `do_sigqueue` also gained real `sig == 0` handling — the
+  same null-signal existence(+permission)-only convention `do_kill`'s own `kill(pid, 0)` already had
+  (previously a flat `EINVAL`, since `0` fell outside `do_sigqueue`'s own `1..=31` range check).
+- **Verified**: `tests/rt_signal_syscall_smoke.rs` + `userland/rt-signal-syscall-smoke/` (multi-
+  instance queuing/delivery count, real `EAGAIN` past `RT_QUEUE_CAP` + real FIFO drain via
+  `sigtimedwait`, lowest-signal-number-first delivery order, partial-drain pending-bit semantics,
+  `EINVAL` boundary validation) and `userland/sig-syscall-smoke/`'s own part 8 (real `ESRCH`/`EPERM`
+  enforcement, including a forked, uid-dropped child). Pilot moved 40P/16F/8U/4UT → 52P/9F/3U/4UT
+  across both passes (`sigqueue/1-1,2-1,2-2,3-1,5-1,6-1,7-1,11-1,12-1.c`, `sigwait/2-1.c`, and
+  `kill/2-2,3-1.c` all UNRESOLVED/FAIL → PASS).
+- **A real, separate, pre-existing gap surfaced by the RT work, not caused by it, and not fixed
+  here**: `deliver_pending_signal` only ever delivers **one** signal per completed syscall (no real
+  signal stack to chain further handler redirects within one return path — see the Signal handling
+  module section's own "no nesting" gap above). Real POSIX code that unblocks several already-queued
+  RT instances in a single call (`sighold()`/one `sigrelse()`, then immediately checking a counter)
+  only ever sees one delivered — `sigqueue/4-1.c` (real FAIL) and `sigqueue/8-1.c` (UNRESOLVED) both
+  hit this, confirmed not a queuing bug (`rt-signal-syscall-smoke`'s own part 1 passes the identical
+  scenario only because it explicitly works around this with extra pump syscalls). Fixing it
+  generally needs a real signal-stack/handler-chaining design — a separate, larger architectural
+  decision, not attempted.
 
 ## BusyBox gap analysis: what's needed for more applets
 
