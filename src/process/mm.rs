@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB,
+    FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
+use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
 use crate::syscall::{EINVAL, ENODEV, ENOMEM};
@@ -406,6 +407,25 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr + region_len - 1));
+
+    // Real x86 hardware DIRTY-bit check, read *before* unmapping (Mapper::unmap removes the PTE
+    // entirely, so this has to happen first) -- lets writeback_region below skip real work
+    // entirely for a mapping that was never actually written through, not just a writable one.
+    // Found live, not designed in up front: `mmap/10-1.c` (the POSIX conformance pilot)
+    // mmap()+munmap()s the same never-written-to file 100,000 times in a loop -- harmless with no
+    // real disk attached (every automated `cargo test` target boots that way, see CLAUDE.md's
+    // disk-persistence section), but with a real persistent disk attached (an ordinary interactive
+    // `cargo run`), unconditional writeback meant 100,000 real, individually-polled-PIO ATA writes
+    // -- easily enough to blow past `t0`'s own 40s timeout on real hardware/QEMU-TCG timing, even
+    // though not one byte was ever actually modified.
+    let any_dirty = file_region_idx.is_some()
+        && Page::range_inclusive(start_page, end_page).any(|page| {
+            matches!(
+                mapper.translate(page.start_address()),
+                TranslateResult::Mapped { flags, .. } if flags.contains(PageTableFlags::DIRTY)
+            )
+        });
+
     for page in Page::range_inclusive(start_page, end_page) {
         if let Ok((_, flush)) = mapper.unmap(page) {
             flush.flush();
@@ -415,7 +435,9 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     if let Some(idx) = file_region_idx {
         let region = me.mmap_file_regions.remove(idx);
         drop(table);
-        writeback_region(&region, phys_offset);
+        if any_dirty {
+            writeback_region(&region, phys_offset);
+        }
         release_mmap_file_ref(region.content_id);
     }
 
