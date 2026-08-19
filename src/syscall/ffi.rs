@@ -288,8 +288,9 @@ pub(crate) fn sys_sigaction(
     sigsetsize: u64,
 ) -> Result<u64, u64> {
     let _ = sigsetsize;
-    if !(1..=31).contains(&sig) || sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP
-    {
+    let in_range = (1..=31).contains(&sig)
+        || (crate::process::SIGRTMIN..=crate::process::SIGRTMAX).contains(&sig);
+    if !in_range || sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
         return Err(EINVAL);
     }
     crate::process::do_sigaction(crate::process::scheduler::current_pid(), sig, act_ptr, oldact_ptr)

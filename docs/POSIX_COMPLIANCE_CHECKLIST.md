@@ -51,17 +51,32 @@ if this becomes real future work rather than just a tracking exercise.
       (`src/thread/x86_64/clone.s`, `__unmapself.s`) already hardcode raw Linux numbers directly
       (same bypass-the-remap-table bug class already fixed once for `vfork.s`) — dead code until
       this is attempted, a real landmine if threading work starts without re-patching them first.
-- [ ] **Real-time signal queuing**: `SIGRTMIN`..`SIGRTMAX` (POSIX requires `_POSIX_RTSIG_MAX >= 8`
-      distinct RT signal numbers) plus genuine multi-instance queuing per signal — a second
-      `sigqueue`/`sigqueue`d instance of the *same* signal number must not merge with a first still
-      pending. **Why it's not done today:** `Process::pending_signals` is a single `u64` bitmask —
-      confirmed directly (`src/process/mod.rs`), not inferred — so even standard signals only ever
-      track "pending or not," and real signal numbers stop at `SIGSYS = 31` (no RT range at all).
-      Real POSIX conformance for `sigqueue(2)` explicitly requires queuing to not silently drop a
-      second instance for RT signals — a real gap, not just an untested corner. Needs a genuine
-      per-signal queue (e.g. a small fixed-capacity ring per RT signal number, standard signals can
-      stay bitmask-collapsed since POSIX allows that for non-RT), not just growing the bitmask
-      width.
+- [x] **Real-time signal queuing**: done. `SIGRTMIN..=SIGRTMAX` (`35..=64`, matching musl's own
+      `sigrtmin.c`/`sigrtmax.c`; `32..=34` stay permanently unclaimed, matching real glibc/musl
+      convention) now validate through `do_kill`/`do_sigqueue`/`sys_sigaction`, and
+      `Process::rt_queue` (`src/process/mod.rs`) gives each RT signal number its own small
+      fixed-capacity (`RT_QUEUE_CAP = 16`) FIFO — a second `sigqueue`/`raise` against an
+      already-pending RT signal number genuinely queues rather than merging into
+      `pending_signals`' single bit, matching real POSIX. Standard signals (`1..=31`) are
+      unchanged (still bitmask-collapsed, which POSIX permits for non-RT). Verified via
+      `tests/rt_signal_syscall_smoke.rs` + `userland/rt-signal-syscall-smoke/` (queuing count,
+      real per-signal `EAGAIN` past `RT_QUEUE_CAP`, lowest-signal-number-first delivery order,
+      partial-drain pending-bit semantics) and by re-running the Open POSIX Test Suite pilot: flips
+      `sigqueue/1-1,5-1,6-1,7-1.c` and `sigwait/2-1.c` from UNRESOLVED to real PASS.
+      **A real, separate, pre-existing gap this surfaced for the first time** (not a bug in the
+      queuing work above — confirmed by `tests/rt_signal_syscall_smoke.rs`'s own part 1, which
+      passes the identical scenario using an explicit multi-syscall "pump" workaround):
+      `deliver_pending_signal` (`src/syscall/mod.rs`) only ever delivers **one** signal per
+      completed syscall, by design (redirecting the live frame into a handler once; no real signal
+      stack exists to chain further redirects within the same return path — see the Signal
+      handling module section's own "a second signal during handler execution overwrites
+      `signal_saved_frame` rather than nesting" gap). Real POSIX code that unblocks several
+      already-queued RT instances in one call (`sigqueue/4-1.c`/`8-1.c`: `sigrelse()` once, then
+      immediately expects all 5 queued instances already delivered) only sees one delivered before
+      it checks — genuinely fails/goes UNRESOLVED (that pilot run: `sigqueue/4-1.c` FAIL,
+      `sigqueue/8-1.c` UNRESOLVED, both for this exact reason). Fixing this generally needs a real
+      signal-stack/handler-chaining mechanism, a separate architectural decision from RT queuing
+      itself — not attempted here.
 - [ ] **File-backed `mmap`**: `MAP_SHARED`/`MAP_PRIVATE` against a real file descriptor, plus real
       `msync(2)`. **Why:** POSIX's base `mmap(2)` is not optional, and its most common real use
       (mapping a file, not just anonymous scratch memory) doesn't exist here — confirmed directly:

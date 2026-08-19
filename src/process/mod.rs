@@ -198,9 +198,9 @@ pub enum BlockReason {
     /// `pending_signals & wait_set` fresh after waking, never trusts the wake reason alone.
     WaitingForSpecificSignal(u64, u64),
 }
-/// Real signal numbers (Linux/BSD-shared low range) -- classic, non-real-time signals only,
-/// `1..=31`; this ABI doesn't support real-time signals (`32..=64`) at all, see `SigAction`'s own
-/// doc comment. Using real numbers here (rather than inventing OxideBSD-own ones, unlike most of
+/// Real signal numbers (Linux/BSD-shared low range) -- the classic, standard `1..=31` range;
+/// real-time signals (`SIGRTMIN..=SIGRTMAX`, `35..=64`) are handled separately, see `SIGRTMIN`'s
+/// own doc comment. Using real numbers here (rather than inventing OxideBSD-own ones, unlike most of
 /// this ABI's own syscalls) is deliberate: a signal *number* is just a plain argument value, not a
 /// syscall number, so there's no ABI collision risk the way `open`/`execve` had -- and using the
 /// real values is what let `bits/syscall.h.in`'s own remap of `SYS_kill`/`SYS_rt_sigaction`/
@@ -237,11 +237,22 @@ pub const SIGPROF: u64 = 27;
 pub const SIGWINCH: u64 = 28;
 pub const SIGIO: u64 = 29;
 pub const SIGSYS: u64 = 31;
-/// One process's disposition for one signal, indexed `1..=31` into `Process::sigactions`
-/// (index `0` is unused). Mirrors real POSIX `sigaction`'s own `handler` sentinel convention
-/// directly -- `0` = `SIG_DFL`, `1` = `SIG_IGN`, anything else is a real handler address -- which
-/// is why `do_sigaction`'s own wire-format read/write needs no translation: musl's real `SIG_DFL`/
-/// `SIG_IGN` macros already expand to these exact values.
+/// Real-time signal range (musl's own `sigrtmin.c`/`sigrtmax.c`: `SIGRTMIN` hardcoded to `35`,
+/// `SIGRTMAX = _NSIG - 1 = 64` -- `32..=34` stay permanently unclaimed, matching real glibc/musl
+/// convention of reserving a few RT numbers below `SIGRTMIN` for libc-internal use). Unlike the
+/// standard range above, multiple `sigqueue`/`raise` instances of the same RT signal number must
+/// remain separately queued rather than collapsing to "pending or not" -- see `Process::rt_queue`'s
+/// own doc comment for the real per-signal FIFO this requires.
+pub const SIGRTMIN: u64 = 35;
+pub const SIGRTMAX: u64 = 64;
+/// How many RT signal numbers exist (`SIGRTMIN..=SIGRTMAX`) -- `Process::rt_queue`'s own length.
+pub(crate) const RT_SIGNAL_COUNT: usize = (SIGRTMAX - SIGRTMIN + 1) as usize;
+/// One process's disposition for one signal, indexed `1..=64` into `Process::sigactions`
+/// (index `0`, and `32..=34`, unused -- see `SIGRTMIN`'s own doc comment). Mirrors real POSIX
+/// `sigaction`'s own `handler` sentinel convention directly -- `0` = `SIG_DFL`, `1` = `SIG_IGN`,
+/// anything else is a real handler address -- which is why `do_sigaction`'s own wire-format
+/// read/write needs no translation: musl's real `SIG_DFL`/`SIG_IGN` macros already expand to these
+/// exact values.
 #[derive(Clone, Copy)]
 pub struct SigAction {
     pub handler: u64,
@@ -270,13 +281,14 @@ pub(crate) const SI_USER: i32 = 0;
 pub(crate) const SI_QUEUE: i32 = -1;
 
 /// Real, per-pending-signal sender identity/payload -- `Process::pending_siginfo`'s own element
-/// type. Backs both the `SA_SIGINFO` handler-invocation path's `si_pid`/`si_uid`/`si_value` fields
-/// (`src/syscall/mod.rs`'s `deliver_pending_signal`, previously honest zeros -- see `RawSiginfo`'s
-/// own doc comment history) and `sigtimedwait`/`sigwaitinfo`'s own real `siginfo_t` readback
-/// (`process::signals::do_sigtimedwait`). Real semantics: this kernel has no realtime signals and
-/// therefore no real per-signal-number *queue* (see `SigAction`'s own doc comment) -- a second
-/// `kill`/`sigqueue` against an already-pending signal simply overwrites this slot, the same
-/// "at most one pending instance" collapsing every standard (non-realtime) Unix signal already has.
+/// type (and, for the real-time range, `Process::rt_queue`'s own element type too). Backs both the
+/// `SA_SIGINFO` handler-invocation path's `si_pid`/`si_uid`/`si_value` fields (`src/syscall/mod.rs`'s
+/// `deliver_pending_signal`, previously honest zeros -- see `RawSiginfo`'s own doc comment history)
+/// and `sigtimedwait`/`sigwaitinfo`'s own real `siginfo_t` readback (`process::signals::
+/// do_sigtimedwait`). Real semantics: a second `kill`/`sigqueue` against an already-pending
+/// *standard* (`1..=31`) signal simply overwrites `pending_siginfo`'s slot -- POSIX explicitly
+/// permits collapsing non-realtime signals to "at most one pending instance." Real-time signals
+/// (`SIGRTMIN..=SIGRTMAX`) don't get this collapse -- see `Process::rt_queue`.
 #[derive(Clone, Copy, Default)]
 pub struct QueuedSigInfo {
     /// `SI_USER` or `SI_QUEUE` -- see those constants' own doc comment.
@@ -441,10 +453,9 @@ enum DefaultDisposition {
 /// at every call site *before* this function is even consulted (see `do_kill`/
 /// `signal_foreground_group`'s own doc comments) -- a `SIGCONT` that reaches this function at all
 /// (self-signal, or a target that wasn't actually stopped) really does just mean "ignore" by
-/// default, matching real POSIX. A signal number outside `1..=31` (real-time signals, or garbage)
-/// isn't reachable here at all -- every caller (`sys_kill`/`sys_sigaction`,
-/// `take_deliverable_signal`'s own pending-bit scan) is already bounded to that range before this
-/// is consulted.
+/// default, matching real POSIX. Real-time signals (`SIGRTMIN..=SIGRTMAX`) fall through to the
+/// catch-all `Terminate` arm below, matching real POSIX's own RT-signal default -- none of the
+/// named constants matched above are ever in that range.
 fn default_disposition(sig: u64) -> DefaultDisposition {
     match sig {
         SIGSTOP | SIGTSTP => DefaultDisposition::Stop,
@@ -587,8 +598,8 @@ pub struct Process {
     /// `stash_signal_context` for the duration of a handler's own execution (restored by
     /// `take_signal_saved_frame` on `sigreturn`).
     pub blocked_signals: u64,
-    /// Indexed `1..=31` (index `0` unused) — see `SigAction`'s own doc comment.
-    pub sigactions: [SigAction; 32],
+    /// Indexed `1..=64` (index `0`, and `32..=34`, unused) — see `SigAction`'s own doc comment.
+    pub sigactions: [SigAction; (SIGRTMAX + 1) as usize],
     /// The interrupted context a `Handler`-disposition delivery snapshotted, restored verbatim by
     /// `sigreturn` (`take_signal_saved_frame`) once the handler itself returns. `None` whenever
     /// this process isn't currently inside a signal handler.
@@ -748,12 +759,27 @@ pub struct Process {
     /// cleanup_mmap_file_regions_for_exit`). **Not inherited by `fork`** — same documented
     /// simplification, and the same underlying reason, as `sysv_shm_attach` immediately above.
     pub mmap_file_regions: Vec<mm::MmapFileRegion>,
-    /// Real per-signal-number sender identity/payload, indexed `1..=31` same as `sigactions`
-    /// (index `0` unused) -- see `QueuedSigInfo`'s own doc comment. Not copied by `fork` (a forked
-    /// child starts with `pending_signals == 0` too, so there's nothing meaningful to carry over);
-    /// untouched by `execve` (same "leave it alone" treatment `pending_signals`/`blocked_signals`
-    /// already get there).
+    /// Real per-standard-signal-number sender identity/payload, indexed `1..=31` same as
+    /// `sigactions` (index `0` unused) -- see `QueuedSigInfo`'s own doc comment. Not copied by
+    /// `fork` (a forked child starts with `pending_signals == 0` too, so there's nothing
+    /// meaningful to carry over); untouched by `execve` (same "leave it alone" treatment
+    /// `pending_signals`/`blocked_signals` already get there). Real-time signals use `rt_queue`
+    /// below instead -- this array is never indexed past `31`.
     pub pending_siginfo: [QueuedSigInfo; 32],
+    /// Real per-real-time-signal-number FIFO queue, indexed `sig - SIGRTMIN` (`0..RT_SIGNAL_COUNT`).
+    /// Unlike `pending_siginfo` above, a real-time signal must not collapse multiple queued
+    /// instances into one -- POSIX explicitly requires `sigqueue`/`raise` against an already-pending
+    /// RT signal number to add a *separate* queued instance, not overwrite it (what
+    /// `sigqueue/4-1.c`/`sigwait/2-1.c` in the Open POSIX Test Suite pilot actually check). Each
+    /// signal number's own `Vec` is capped at `signals::RT_QUEUE_CAP` -- exceeding it is a real,
+    /// documented `sigqueue(2)` `EAGAIN` case, not a soundness concern (small and fixed, same tier
+    /// as every other bounded queue in this codebase). Pushed to the back by `signals::
+    /// record_pending`, popped from the front (real FIFO delivery order within one signal number)
+    /// by `take_deliverable_signal`/`do_sigtimedwait` -- `Process::pending_signals`' own bit for
+    /// this signal number stays set as long as this queue is non-empty, only clearing once the last
+    /// queued instance is actually consumed. Not copied by `fork`, same reasoning as
+    /// `pending_siginfo`; untouched by `execve`.
+    pub rt_queue: [Vec<QueuedSigInfo>; RT_SIGNAL_COUNT],
     /// This process's saved `FXSAVE`/`FXRSTOR` (SSE/x87) register state — see `cpu::fpu`'s own
     /// module doc comment for why this exists at all (real preemption, unlike the old
     /// cooperative-only scheduler, can interrupt a process mid-computation with live XMM state the

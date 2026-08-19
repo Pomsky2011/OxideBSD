@@ -113,7 +113,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         root_inode: 0,
         pending_signals: 0,
         blocked_signals: 0,
-        sigactions: [SigAction::DEFAULT; 32],
+        sigactions: [SigAction::DEFAULT; (SIGRTMAX + 1) as usize],
         signal_saved_frame: None,
         signal_saved_blocked: 0,
         altstack: AltStack::default(),
@@ -141,6 +141,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sysv_shm_attach: Vec::new(),
         mmap_file_regions: Vec::new(),
         pending_siginfo: [QueuedSigInfo::default(); 32],
+        rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: crate::cpu::fpu::clean_state(),
     };
 
@@ -366,6 +367,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
         // for a forked child too, so there's nothing meaningful to carry over).
         pending_siginfo: [QueuedSigInfo::default(); 32],
+        // Not inherited -- same reasoning as pending_siginfo above.
+        rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: parent_fpu_state,
     };
 

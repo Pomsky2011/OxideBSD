@@ -98,6 +98,10 @@ fn main() {
     );
     build_userland_crate("sig-syscall-smoke", "SIG_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
+        "rt-signal-syscall-smoke",
+        "RT_SIGNAL_SYSCALL_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
         "posix-conformance-driver",
         "POSIX_CONFORMANCE_DRIVER_ELF_PATH",
     );

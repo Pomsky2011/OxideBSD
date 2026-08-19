@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use crate::syscall::{EAGAIN, EINTR, EINVAL, ESRCH, SyscallFrame};
 use super::*;
 
-/// `SYS_KILL`'s real logic. Signals `1..=31` only; anything else is `EINVAL`, matching real
-/// `kill()`'s own validation. `target_pid == 0`/`< 0` are real POSIX process-group broadcasts
+/// `SYS_KILL`'s real logic. Signals `1..=31` (standard) or `SIGRTMIN..=SIGRTMAX` (real-time) only;
+/// anything else is `EINVAL`, matching real `kill()`'s own validation. `target_pid == 0`/`< 0` are
+/// real POSIX process-group broadcasts
 /// (`0` = the caller's own group, `< 0` = group `|target_pid|`) — see the `target_pid <= 0` branch
 /// below for that path; everything past this doc comment's remaining bullets describes the
 /// positive, single-target case.
@@ -39,7 +40,7 @@ use super::*;
 ///   has. `SIGCONT` gets its own pre-dispatch step *before* any of the above: an actually-`Stopped`
 ///   target always resumes regardless of its own `SIGCONT` disposition, real POSIX semantics.
 pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
-    if !(0..=31).contains(&sig) {
+    if !((0..=31).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
         return Err(EINVAL);
     }
     let caller_uid = oxidebsd_current_uid() as u32;
@@ -104,7 +105,9 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         let me = table
             .get_mut(&caller_pid)
             .expect("kill: current process missing from table");
-        record_pending(me, sig, SI_USER, caller_pid, caller_uid, 0);
+        // Real kill(2) has no path to report a queue-full EAGAIN back to a caller sending itself a
+        // signal -- see record_pending's own doc comment.
+        let _ = record_pending(me, sig, SI_USER, caller_pid, caller_uid, 0);
         return Ok(0);
     }
 
@@ -171,7 +174,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         Action::SetPending => {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {
-                record_pending(proc, sig, SI_USER, caller_pid, caller_uid, 0);
+                let _ = record_pending(proc, sig, SI_USER, caller_pid, caller_uid, 0);
                 wake_if_paused(target, proc, sig);
                 wake_if_sigwaiting(target, proc, sig);
             }
@@ -264,8 +267,10 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                 let mut table = PROCESS_TABLE.lock();
                 if let Some(proc) = table.get_mut(&pid) {
                     // No real single sending process to attribute -- see QueuedSigInfo::pid's own
-                    // doc comment for why this is an honest 0, not a fabricated one.
-                    record_pending(proc, sig, SI_USER, 0, 0, 0);
+                    // doc comment for why this is an honest 0, not a fabricated one. No caller here
+                    // can observe a queue-full EAGAIN either -- same reasoning as do_kill's own
+                    // cross-process arm.
+                    let _ = record_pending(proc, sig, SI_USER, 0, 0, 0);
                     wake_if_paused(pid, proc, sig);
                     wake_if_sigwaiting(pid, proc, sig);
                 }
@@ -274,18 +279,50 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
     }
 }
 
+/// Real per-real-time-signal-number instance cap -- small and fixed, same tier as every other
+/// bounded queue in this codebase (pipe/mqueue/flock table); every RT-signal pilot test only ever
+/// queues up to 5 instances (`sigqueue/4-1.c`'s own `NUMCALLS`). Exceeding it is a real, documented
+/// `sigqueue(2)` `EAGAIN` case (`man 3p sigqueue`: "No resources are available to queue the
+/// signal"), not a soundness concern.
+pub(crate) const RT_QUEUE_CAP: usize = 16;
+
 /// Sets `sig` pending on `proc`, recording real sender identity/payload alongside the bitmask --
 /// see `QueuedSigInfo`'s own doc comment for why this replaces every bare `proc.pending_signals |=
 /// 1 << (sig - 1)` this codebase used to have. `code` is `SI_USER` for a plain `kill`/`tkill`-
 /// shaped signal, `SI_QUEUE` for one that arrived via `do_sigqueue`.
-fn record_pending(proc: &mut Process, sig: u64, code: i32, sender_pid: Pid, sender_uid: u32, value: u64) {
+///
+/// Real-time signals (`sig >= SIGRTMIN`) get genuine multi-instance queuing via `Process::rt_queue`
+/// instead of `pending_siginfo`'s single-slot "last write wins" collapse -- POSIX requires a second
+/// `sigqueue`/`raise` against an already-pending RT signal number to queue separately, not merge.
+/// `Err(EAGAIN)` once that signal's own queue is full (`RT_QUEUE_CAP`) -- `do_sigqueue` propagates
+/// this to its caller; `do_kill`/`signal_foreground_group` (whose own `kill(2)`/broadcast callers
+/// have no path to observe a failure here, and for whom the pending bit is already set regardless)
+/// just drop the excess instance.
+fn record_pending(
+    proc: &mut Process,
+    sig: u64,
+    code: i32,
+    sender_pid: Pid,
+    sender_uid: u32,
+    value: u64,
+) -> Result<(), u64> {
     proc.pending_signals |= 1 << (sig - 1);
-    proc.pending_siginfo[sig as usize] = QueuedSigInfo {
+    let info = QueuedSigInfo {
         code,
         pid: sender_pid,
         uid: sender_uid,
         value,
     };
+    if sig >= SIGRTMIN {
+        let q = &mut proc.rt_queue[(sig - SIGRTMIN) as usize];
+        if q.len() >= RT_QUEUE_CAP {
+            return Err(EAGAIN);
+        }
+        q.push(info);
+    } else {
+        proc.pending_siginfo[sig as usize] = info;
+    }
+    Ok(())
 }
 
 /// Wakes `pid` if it's blocked in `do_sigtimedwait` and `sig` is a member of the set it's waiting
@@ -447,7 +484,8 @@ pub(crate) fn set_signal_saved_blocked_override(pid: Pid, mask: u64) {
     }
 }
 
-/// `SYS_SIGACTION`'s real logic (`sig` already validated — `1..=31`, not `SIGKILL`/`SIGSTOP` — by
+/// `SYS_SIGACTION`'s real logic (`sig` already validated — `1..=31` or `SIGRTMIN..=SIGRTMAX`, not
+/// `SIGKILL`/`SIGSTOP` — by
 /// `src/syscall.rs`'s `sys_sigaction` before this is reached). Reads/writes a real musl
 /// `struct k_sigaction` (`handler`, `flags`, `restorer`, then `mask` as a plain `u64` — matching
 /// what musl's own `_NSIG/8 == 8`-byte mask width already is on this ABI, see `SigAction`'s own
@@ -615,8 +653,21 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
             return None;
         }
         let signum = deliverable.trailing_zeros() as u64 + 1;
-        proc.pending_signals &= !(1 << (signum - 1));
-        let siginfo = proc.pending_siginfo[signum as usize];
+        // Real-time signals pop their own FIFO's front instance and only clear the pending bit
+        // once that queue is actually empty -- a second (or third, ...) still-queued instance must
+        // stay deliverable, unlike a standard signal's single-slot collapse. See
+        // Process::rt_queue's own doc comment.
+        let siginfo = if signum >= SIGRTMIN {
+            let q = &mut proc.rt_queue[(signum - SIGRTMIN) as usize];
+            let info = q.remove(0);
+            if q.is_empty() {
+                proc.pending_signals &= !(1 << (signum - 1));
+            }
+            info
+        } else {
+            proc.pending_signals &= !(1 << (signum - 1));
+            proc.pending_siginfo[signum as usize]
+        };
 
         let action = proc.sigactions[signum as usize];
         match action.handler {
@@ -747,8 +798,18 @@ pub fn do_sigtimedwait(pid: Pid, mask_ptr: u64, info_ptr: u64, ts_ptr: u64) -> R
             let ready = proc.pending_signals & wait_set;
             if ready != 0 {
                 let signum = ready.trailing_zeros() as u64 + 1;
-                proc.pending_signals &= !(1 << (signum - 1));
-                let info = proc.pending_siginfo[signum as usize];
+                // Same real-time-vs-standard split as take_deliverable_signal above.
+                let info = if signum >= SIGRTMIN {
+                    let q = &mut proc.rt_queue[(signum - SIGRTMIN) as usize];
+                    let info = q.remove(0);
+                    if q.is_empty() {
+                        proc.pending_signals &= !(1 << (signum - 1));
+                    }
+                    info
+                } else {
+                    proc.pending_signals &= !(1 << (signum - 1));
+                    proc.pending_siginfo[signum as usize]
+                };
                 drop(table);
                 if info_ptr != 0 {
                     let raw = RawSiginfo {
@@ -805,7 +866,7 @@ pub fn do_sigtimedwait(pid: Pid, mask_ptr: u64, info_ptr: u64, ts_ptr: u64) -> R
 /// `SetPending` arm -- the only shape a caught handler or a blocked `sigtimedwait` could ever
 /// actually observe it through.
 pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64) -> Result<u64, u64> {
-    if !(1..=31).contains(&sig) {
+    if !((1..=31).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
         return Err(EINVAL);
     }
     if target_pid <= 0 {
@@ -824,7 +885,9 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
         let me = table
             .get_mut(&caller_pid)
             .expect("sigqueue: current process missing from table");
-        record_pending(me, sig, SI_QUEUE, caller_pid, caller_uid, value);
+        // Real sigqueue(2) does document EAGAIN for a full queue -- propagate it, unlike do_kill's
+        // own self-target arm.
+        record_pending(me, sig, SI_QUEUE, caller_pid, caller_uid, value)?;
         return Ok(0);
     }
 
@@ -881,7 +944,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
         Action::SetPending => {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {
-                record_pending(proc, sig, SI_QUEUE, caller_pid, caller_uid, value);
+                record_pending(proc, sig, SI_QUEUE, caller_pid, caller_uid, value)?;
                 wake_if_paused(target, proc, sig);
                 wake_if_sigwaiting(target, proc, sig);
             }
