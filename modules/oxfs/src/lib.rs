@@ -5879,7 +5879,11 @@ fn format_fresh_filesystem() -> bool {
         log("[oxfs] self-check FAILED: chdir into sub failed\n");
     } else {
         let content = b"inside a subdirectory\n";
-        let fd = oxfs_open(b"in.txt".as_ptr() as u64, 6, O_CREAT, 0);
+        // O_WRONLY (0o1) is required now that a create-path fd's own requested access mode is
+        // actually enforced (see `oxfs_open`'s `readonly` field) -- this used to be `O_CREAT`
+        // alone, silently getting away with it back when every create-path fd was unconditionally
+        // writable regardless of what flags asked for.
+        let fd = oxfs_open(b"in.txt".as_ptr() as u64, 6, O_CREAT | 0o1, 0);
         if fd < 0 {
             ok = false;
             log("[oxfs] self-check FAILED: open(O_CREAT) sub/in.txt failed\n");
@@ -5981,13 +5985,20 @@ fn format_fresh_filesystem() -> bool {
         const O_APPEND: u64 = 0o2000;
         let path = b"/overwrite_test.txt";
 
-        let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, O_CREAT, 0);
+        // O_WRONLY required now that a create-path fd's own requested access mode is actually
+        // enforced -- this used to be `O_CREAT` alone, which silently made the write below a
+        // no-op (fixed here rather than left as a latent bug: harmless today only because the
+        // later O_WRONLY reopen + real truncate never depended on this write having landed).
+        let fd = oxfs_open(path.as_ptr() as u64, path.len() as u64, O_CREAT | O_WRONLY, 0);
         if fd < 0 {
             ok = false;
             log("[oxfs] self-check FAILED: create overwrite_test.txt failed\n");
         } else {
             let fd = fd as u64;
-            oxfs_write(fd, b"AAAAA".as_ptr() as u64, 5);
+            if oxfs_write(fd, b"AAAAA".as_ptr() as u64, 5) != 5 {
+                ok = false;
+                log("[oxfs] self-check FAILED: write overwrite_test.txt (initial AAAAA) failed\n");
+            }
             oxfs_close(fd);
 
             // Plain O_WRONLY on an existing path: real overwrite-from-scratch, including a real
