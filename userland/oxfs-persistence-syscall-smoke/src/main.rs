@@ -42,6 +42,11 @@ const O_WRONLY: u64 = 0o1;
 
 const CONTENT: &[u8] = b"real disk persistence, write-through, verified live\n";
 
+// `r10` is real OxideBSD `open(O_CREAT)`'s own 4th argument (the real requested creation mode) as
+// of the fix threading mode through the syscall ABI (see modules/oxfs's `oxfs_open` doc comment) --
+// `SYSCALL` doesn't clear it, so it must be explicitly zeroed here even though this crate never
+// reads it back, or this fd's `O_CREAT | O_WRONLY` open below would create `/persisttest` with
+// whatever garbage happened to be sitting in `r10`.
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
     let ret: u64;
@@ -54,6 +59,7 @@ unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u
             in("rdi") arg0,
             in("rsi") arg1,
             in("rdx") arg2,
+            in("r10") 0u64,
             failed = out(reg_byte) failed,
             lateout("rcx") _,
             lateout("r11") _,

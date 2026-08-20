@@ -1935,6 +1935,13 @@ enum OpenFile {
         /// (which never gated on it at all, unlike the existing-path branch's own `want_write`
         /// check).
         readonly: bool,
+        /// The real requested creation mode (`open(O_CREAT, mode)`'s own `mode` argument, masked
+        /// to `0o777`) -- only meaningful when `existing_inode` is still `None` at `commit_write_
+        /// buffer` time (a brand-new inode is being allocated, and this is what its own `mode`
+        /// field gets initialized to); ignored when overwriting/appending to an already-existing
+        /// inode, which keeps whatever real mode it already has. See `oxfs_open`'s own `mode`
+        /// parameter doc comment for why this exists at all.
+        mode: u16,
     },
     /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
     /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
@@ -2531,10 +2538,29 @@ fn known_device(rdev: u32, device_char: bool) -> Option<OpenFile> {
 /// already inside `/proc` is `proc_relative_open`'s job, below) is intercepted before any of the
 /// real, cwd-relative special-casing below, since it isn't backed by a real inode at all -- see
 /// `proc_open`. `/dev/...` gets the same treatment right after -- see `dev_open`.
+///
+/// `mode` (the 4th real syscall argument, `R10`) is `open(2)`'s own real creation-mode argument --
+/// only meaningful (and only ever read) when `O_CREAT` actually creates a brand-new inode (the
+/// `None if create` arm below); ignored for every other arm, the same way real `open(2)` ignores
+/// it for an existing path. **Found live, a real bug, not a preemptive addition**: this ABI's own
+/// `SYS_OPEN` used to carry no mode argument at all (`third_party/musl/src/fcntl/open.c`'s own old
+/// comment: "this filesystem doesn't model permissions" -- stale the moment the real per-inode
+/// `mode`/`uid`/`gid` permission model landed, see CLAUDE.md's own "Permission model" section, but
+/// never revisited), so every `open(O_CREAT, mode)` silently got `FIXED_PERM` (`0o755`) regardless
+/// of what the caller actually asked for -- `sem_open/3-1.c` (Open POSIX Test Suite pilot) expects
+/// a semaphore created `0444` to make a later write-access re-open genuinely `EACCES`, which can
+/// only happen if the requested `0444` really lands on the inode. Fixed by extending `open(2)`'s
+/// own wire format to a real 4-arg `(path_ptr, path_len, flags, mode)` -- `third_party/musl/src/
+/// fcntl/open.c` and `src/internal/syscall.h`'s own `__sys_open3`/`__sys_open_cp3` (the internal
+/// stdio-callers' path, see that file's own doc comment for the argument-shape history) now pass
+/// it through via `__syscall4`/`__syscall_cp4` instead of discarding it. **No umask consultation
+/// here** -- `Process::umask` is still real, tracked-but-unconsulted state everywhere else oxfs
+/// creates an inode (see CLAUDE.md's own umask section); wiring it in is a separate, still-open
+/// gap this fix's own scope doesn't extend to.
 /// `""`/`"."`/`".."`/`"/"` are special-cased next (mirroring `modules/fat32`'s own handling of
 /// them) before falling into `resolve_parent`, which -- unlike FAT32's single-component
 /// `to_short_name` -- handles an arbitrarily deep path (`sub/inner/file.txt`) in this one call.
-extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> i64 {
+extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> i64 {
     // SAFETY: same trust boundary as sys_write's own documented pointer-validation gap in
     // src/syscall.rs -- the caller (ultimately userland, via SYS_OPEN) owns this pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -2658,6 +2684,10 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                         resized_directly: false,
                         unlinked: false,
                         readonly: false, // this whole arm only runs when want_write is true
+                        // Unused: `commit_write_buffer`'s `existing_inode: Some(_)` branch never
+                        // touches `inode.mode` -- overwriting/appending to a file that already
+                        // exists never changes its own real, already-stored permission bits.
+                        mode: inode.mode,
                     })
                 }
                 _ => register_open_file(OpenFile::FileRead {
@@ -2690,6 +2720,17 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                 // gated on it before (see `readonly`'s own doc comment for the real bug this
                 // closes).
                 readonly: flags & O_ACCMODE == 0,
+                // Real requested creation mode -- see `oxfs_open`'s own `mode` parameter doc
+                // comment for the wire-format history (this ABI's `open(2)` used to have no way
+                // to carry `mode` at all, so every `O_CREAT` file silently got `FIXED_PERM`
+                // regardless of what the caller actually asked for; found live via `sem_open/
+                // 3-1.c`, the Open POSIX Test Suite pilot -- a semaphore created `0444` needs its
+                // own restricted mode to actually take effect for a later `EACCES` to be possible
+                // at all). No umask consultation here -- `Process::umask` is still real,
+                // documented, tracked-but-unconsulted state everywhere else oxfs creates an
+                // inode (see CLAUDE.md's own umask section), not something this fix's own scope
+                // extends to.
+                mode: (mode & 0o777) as u16,
             })
         }
         None => -ENOENT,
@@ -2829,6 +2870,7 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         resized_directly,
         unlinked,
         readonly: _,
+        mode,
     } = file
     else {
         return 0;
@@ -2862,6 +2904,7 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     };
     let mut inode = Inode::new(InodeKind::File);
     inode.uid = *owner_uid;
+    inode.mode = *mode;
     write_inode(new_inode, inode);
     if !write_inode_data(new_inode, &buffer[..*len]) {
         return -EIO;
