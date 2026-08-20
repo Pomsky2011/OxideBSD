@@ -303,7 +303,13 @@ pub(crate) fn do_shmat(id: u64, _shmaddr: u64, shmflg: u64) -> Result<u64, u64> 
     // same reason crate::process::mm::do_mmap's own identical comment already establishes.
     let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
 
-    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    // SHARED_LEAF: this segment's own `frames` are owned by `SEGMENTS`, not by any one attaching
+    // process's address space -- marks every leaf mapped from them so a real address-space teardown
+    // (`memory::address_space::AddressSpace::teardown`) never frees one out from under a still-live
+    // segment or a still-attached other process. See `SHARED_LEAF`'s own doc comment.
+    let mut flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | memory::address_space::SHARED_LEAF;
     if want_write {
         flags |= PageTableFlags::WRITABLE;
     }
@@ -311,9 +317,9 @@ pub(crate) fn do_shmat(id: u64, _shmaddr: u64, shmflg: u64) -> Result<u64, u64> 
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + region_len - 1));
     with_frame_allocator(|fa| -> Result<(), u64> {
         for (page, frame) in Page::range_inclusive(start_page, end_page).zip(frames.iter()) {
-            // SAFETY: `frame` is one of the segment's own real backing frames (never reused for
-            // anything else -- this kernel has no frame-deallocation path), and `page` falls in
-            // this process's own, freshly bump-allocated shm region, never mapped before.
+            // SAFETY: `frame` is one of the segment's own real backing frames (owned by `SEGMENTS`,
+            // marked SHARED_LEAF above so real address-space teardown never frees it), and `page`
+            // falls in this process's own, freshly bump-allocated shm region, never mapped before.
             unsafe {
                 mapper
                     .map_to(page, *frame, flags, fa)

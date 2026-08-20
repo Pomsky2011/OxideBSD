@@ -9,9 +9,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use spin::Mutex;
+use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{
+    FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB,
+};
 
 use crate::serial_println;
 
@@ -86,6 +89,11 @@ pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
     region_index: usize,
     frame_number: u64,
+    /// Head of a real, reusable free list -- see `FrameDeallocator`'s own impl below for the
+    /// mechanism and why it's safe to add on top of the bump-only design above without
+    /// resurrecting the exact `Box`/heap-during-construction trap that design's own doc comment
+    /// warns about.
+    free_list: Option<PhysFrame>,
 }
 
 impl BootInfoFrameAllocator {
@@ -114,12 +122,34 @@ impl BootInfoFrameAllocator {
             memory_map,
             region_index: 0,
             frame_number: 0,
+            free_list: None,
         }
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        // Real reuse first: `free_list` only ever becomes `Some` via `deallocate_frame` below,
+        // which never runs before `install_global_memory_state` has already populated
+        // `PHYS_MEM_OFFSET` (real process teardown, the only caller, happens well after boot) --
+        // so `phys_mem_offset()` below is always safe to call once this branch is actually taken,
+        // even though this exact function is also called during early boot (heap/module mapping)
+        // while that global is still unset; those early calls never see a populated free list and
+        // fall straight through to the bump path, never touching `phys_mem_offset()` at all.
+        if let Some(frame) = self.free_list.take() {
+            let offset = phys_mem_offset();
+            let next_ptr =
+                (offset + frame.start_address().as_u64()).as_ptr::<u64>();
+            // SAFETY: frame was previously handed to deallocate_frame, which wrote a real next-
+            // pointer (or the NONE sentinel) into its first 8 bytes through this same window.
+            let next = unsafe { next_ptr.read() };
+            self.free_list = if next == u64::MAX {
+                None
+            } else {
+                Some(PhysFrame::containing_address(PhysAddr::new(next)))
+            };
+            return Some(frame);
+        }
         loop {
             let region = self.memory_map.get(self.region_index)?;
             if region.region_type != MemoryRegionType::Usable {
@@ -139,6 +169,40 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
                 frame_number * 4096,
             )));
         }
+    }
+}
+
+/// Real frame reuse, closing the "no frame deallocation anywhere" gap CLAUDE.md long documented as
+/// a permanent limitation -- added once the expanded POSIX conformance pilot's own several-hundred
+/// real `fork`+`execve`+`exit` cycles per boot made the cost of never reclaiming concrete (see
+/// `memory::address_space::AddressSpace::teardown`'s own doc comment for the actual reclaim logic
+/// and why it's safe; this impl is purely the storage mechanism).
+///
+/// **An intrusive singly-linked free list stored in the freed frames themselves**, not a
+/// `Vec<PhysFrame>` -- deliberately: this allocator is constructed *before* `allocator::init_heap`
+/// (see `init`'s own doc comment above), so anything requiring the heap to exist yet would
+/// resurrect the exact chicken-and-egg trap that same comment already documents hitting once for a
+/// boxed-iterator attempt. A `Vec`-based free list would only ever be *populated* well after the
+/// heap exists (real teardown happens during process exit, long past boot) — but a data structure
+/// whose safety depends on "well, nothing calls this early in practice" is worse than one that's
+/// unconditionally heap-free by construction. Each freed frame's own first 8 bytes (viewed through
+/// the phys-mem-offset window, the same technique every other cross-address-space frame access in
+/// this codebase already uses) store the *previous* free-list head's physical address, or
+/// `u64::MAX` as a real "list ends here" sentinel (never a valid frame-aligned address — every real
+/// frame address is 4 KiB-aligned, so its low 12 bits are always zero, `u64::MAX`'s never are).
+impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        let offset = phys_mem_offset();
+        let next_ptr = (offset + frame.start_address().as_u64()).as_mut_ptr::<u64>();
+        let prev_head = self
+            .free_list
+            .map(|f| f.start_address().as_u64())
+            .unwrap_or(u64::MAX);
+        // SAFETY: frame was just handed back by a caller asserting it's no longer referenced by
+        // any live mapping (see AddressSpace::teardown's own doc comment for why that's true for
+        // every frame it passes here) -- safe to overwrite its content with free-list bookkeeping.
+        unsafe { next_ptr.write(prev_head) };
+        self.free_list = Some(frame);
     }
 }
 

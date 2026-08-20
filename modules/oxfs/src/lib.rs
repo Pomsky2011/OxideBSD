@@ -368,7 +368,13 @@ const BLOCK_SIZE: usize = 4096;
 /// mapping mean this whole pool becomes a real physical-memory commitment the moment the module
 /// loads (see `Cargo.toml`'s `[package.metadata.bootimage]` `-m` bump, made at the same time as
 /// this).
-const NUM_BLOCKS: usize = 8192;
+/// Raised again, 8192 -> 16384, once the Open POSIX Test Suite pilot (see CLAUDE.md's "POSIX
+/// conformance pilot" sections and `docs/POSIX_COMPLIANCE_CHECKLIST.md`) grew from its original
+/// 68-file curated subset to several hundred files, adding real content on the order of the
+/// existing BusyBox applet roster's own footprint -- the ~14 MiB of headroom left at 8192 blocks
+/// (32 MiB total, minus BusyBox's own ~18 MiB) wasn't enough. 16384 blocks (64 MiB) leaves real
+/// headroom again, not just enough to exactly fit.
+const NUM_BLOCKS: usize = 16384;
 /// Raised from 64 alongside `NUM_BLOCKS` above, same reason -- ~300 applets plus root/`hello.txt`/
 /// `big.txt`/the self-check's own `/gdtest` fixtures need comfortably more than 64 inode slots.
 /// Raised again, 512 -> 1024, once TinyCC (`third_party/tinycc`, see CLAUDE.md's TinyCC section)
@@ -376,7 +382,9 @@ const NUM_BLOCKS: usize = 8192;
 /// exactly against the real built `target/musl-sysroot`, not estimated: 217 header files (plus
 /// ~7 subdirectories) + ~9 `/usr/lib` crt/lib files + tcc's own `libtcc1.a` + 5 bundled headers +
 /// the `tcc` binary itself is ~250 new inodes, overflowing the ~180 that were free at 512.
-const MAX_INODES: usize = 1024;
+/// Raised again, 1024 -> 2048, alongside `NUM_BLOCKS` above -- the expanded POSIX pilot corpus
+/// adds several hundred new files plus one subdirectory per interface under `/posix-tests/bin/`.
+const MAX_INODES: usize = 2048;
 const DIRECT_BLOCKS: usize = 12;
 const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
 /// Sentinel for "no block"/"no indirect block" -- block numbers are plain indices into `BLOCKS`

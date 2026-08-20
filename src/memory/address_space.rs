@@ -1,10 +1,34 @@
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
-    FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame,
+    Size4KiB,
 };
 
 use crate::memory::frame_to_page_table;
+
+/// Marks a leaf page-table entry as **not** exclusively owned by the address space it's mapped
+/// into — real SysV `shmat` (`fs::sysv_shm::do_shmat`) and real fd-backed `MAP_SHARED` mmap
+/// (`process::mm::do_mmap_file_backed`) both set this on every leaf they map, since both point
+/// multiple processes' own page tables at the *same* physical frames (a real, separately-owned
+/// backing store — `SEGMENTS`' own `frames: Vec<PhysFrame>` for shm, `MMAP_FILE_CACHE` for
+/// fd-backed mmap). `free_table_level` below (`AddressSpace::teardown`'s own recursive walk) checks
+/// this on every leaf and skips freeing any that carries it — the sole mechanism that makes real
+/// per-address-space frame reclaim safe to add without also reworking either subsystem's own
+/// already-established "detach releases a reference/count, doesn't necessarily unmap" cleanup
+/// timing (see `fs::sysv_shm::detach_all_for_exit`'s own doc comment, which explicitly still never
+/// unmaps on a real process exit). Reuses `PageTableFlags::BIT_9`, one of the hardware-ignored
+/// "available for OS use" bits (9-11) — unused anywhere else in this codebase before this.
+///
+/// **Known minor gap, not fixed here**: `copy_table_level`'s own real eager-copy `fork()` path
+/// preserves a leaf's original flags (including this one) while pointing the copy at a *freshly
+/// allocated, genuinely private* frame — so a forked child's own copy of a page that was
+/// shm-attached/mmap-shared in the parent at fork time is incorrectly still marked `SHARED_LEAF`,
+/// and `teardown` will skip freeing it forever. Conservative (a small extra leak, never a false
+/// free) rather than unsafe, and a narrow edge case (only reachable when a fork happens while such
+/// a mapping is live) — left as a known imperfection rather than teaching `copy_table_level` to
+/// strip this flag on copy.
+pub const SHARED_LEAF: PageTableFlags = PageTableFlags::BIT_9;
 
 /// A separate top-level page table — a distinct virtual address space from the kernel's own.
 ///
@@ -171,6 +195,110 @@ impl AddressSpace {
     /// process's address space must not activate it from a context that depends on what it removed.
     pub unsafe fn activate(&self) {
         unsafe { Cr3::write(self.level_4_frame, Cr3Flags::empty()) };
+    }
+
+    /// Real reclaim: frees every frame this address space privately owns -- every
+    /// `USER_ACCESSIBLE` leaf (the actual ELF image/stack/heap/private-anon-mmap content) and every
+    /// `USER_ACCESSIBLE` intermediate page-table frame (PDPT/PD/PT) beneath this table, then this
+    /// address space's own level 4 frame -- back to `frame_allocator`'s real free list (see
+    /// `memory::BootInfoFrameAllocator`'s own `FrameDeallocator` impl). Closes the "no frame
+    /// deallocation anywhere" gap for the common case (ordinary process exit/`execve`); still never
+    /// frees anything genuinely *shared* across address spaces -- `free_table_level` recognizes and
+    /// skips those specifically (`SHARED_LEAF`) rather than never encountering them -- see this
+    /// method's own safety section.
+    ///
+    /// # Why this is always safe
+    ///
+    /// **Every frame this walk touches is exclusively owned by this one address space.** Two
+    /// separate guarantees combine to make that true, both already established elsewhere in this
+    /// codebase rather than invented here:
+    /// - **Every page-table *structure* frame (levels 2-4) is always freshly allocated per address
+    ///   space, never shared** -- `copy_table_level`'s own doc comment already establishes this: a
+    ///   kernel-only (non-`USER_ACCESSIBLE`) entry is the *only* thing ever aliased across address
+    ///   spaces, and this walk -- like that one -- never recurses into or touches one.
+    /// - **Every `USER_ACCESSIBLE` leaf frame not marked `SHARED_LEAF` is genuinely private.** Fork
+    ///   never shares a leaf either (a real eager copy, not COW -- same doc comment). The two real
+    ///   exceptions that *can* alias a leaf across address spaces -- SysV `shmat`
+    ///   (`fs::sysv_shm::do_shmat`) and fd-backed `MAP_SHARED` mmap
+    ///   (`process::mm::do_mmap_file_backed`) -- both mark every leaf they map with `SHARED_LEAF`
+    ///   (see that constant's own doc comment), which `free_table_level` below checks and skips.
+    ///   Deliberately *not* relying on those regions already being unmapped by the time this method
+    ///   runs -- `fs::sysv_shm::detach_all_for_exit`'s own doc comment explicitly documents that a
+    ///   real process exit never unmaps shm PTEs at all (only `nattch`-decrements), so a page-table
+    ///   walk here genuinely can still find them present; `SHARED_LEAF` is what makes that safe
+    ///   regardless of either subsystem's own cleanup-call ordering or timing.
+    ///
+    /// # Safety
+    ///
+    /// This address space's level 4 frame must **not** be the one `CR3` currently names -- freeing
+    /// a frame still backing the live page table (or still holding code/data the CPU is actively
+    /// executing/reading through it) would hand out memory that's still in use. Both real call
+    /// sites (`process::lifecycle::do_execve`'s old-address-space discard, always called *after*
+    /// `new_address_space.activate()` already switched `CR3` away; and process reaping in
+    /// `do_wait4`, which only ever reaps an already-`Zombie` process -- one that stopped running,
+    /// and thus stopped being the active `CR3`, back when it originally called `do_exit`) satisfy
+    /// this by construction, not by convention alone.
+    pub unsafe fn teardown(
+        self,
+        physical_memory_offset: VirtAddr,
+        frame_allocator: &mut impl FrameDeallocator<Size4KiB>,
+    ) {
+        // SAFETY: level_4_frame is this address space's own table, guaranteed not to be the active
+        // CR3 by this method's own safety contract -- no other code can be viewing it concurrently.
+        let table = unsafe { frame_to_page_table(self.level_4_frame, physical_memory_offset) };
+        free_table_level(table, 4, physical_memory_offset, frame_allocator);
+        // SAFETY: this exact frame is what the walk above has now fully emptied of live content --
+        // safe to return to the allocator's own free list, same as every leaf/table frame it just
+        // freed.
+        unsafe { frame_allocator.deallocate_frame(self.level_4_frame) };
+    }
+}
+
+/// Recursively walks and frees every `USER_ACCESSIBLE` frame beneath `table` at `level` (`4` =
+/// PML4 down to `1` = the leaf level -- same level numbering `copy_table_level` above uses) --
+/// the free-side mirror of that function's own copy walk. See `AddressSpace::teardown`'s own doc
+/// comment for why every frame this function frees is guaranteed to be exclusively owned by this
+/// one address space.
+fn free_table_level(
+    table: &mut PageTable,
+    level: u8,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameDeallocator<Size4KiB>,
+) {
+    for i in 0..512usize {
+        let entry = &table[i];
+        if !entry.flags().contains(PageTableFlags::PRESENT)
+            || !entry.flags().contains(PageTableFlags::USER_ACCESSIBLE)
+        {
+            // Absent, or kernel-only (and therefore shared, per this function's own doc comment) --
+            // never ours to touch.
+            continue;
+        }
+        if level == 1 {
+            // A real leaf: skip it entirely if it's marked SHARED_LEAF (see that constant's own
+            // doc comment) -- some other subsystem's own backing store still owns this exact
+            // frame, possibly still mapped into another process's page table too. Every other
+            // leaf here is exclusively this address space's own (see AddressSpace::teardown's own
+            // doc comment), safe to free directly.
+            if !entry.flags().contains(SHARED_LEAF) {
+                let frame = entry.frame().expect("present leaf entry must have a frame");
+                // SAFETY: private leaf, exclusively owned by this address space -- see
+                // AddressSpace::teardown's own doc comment.
+                unsafe { frame_allocator.deallocate_frame(frame) };
+            }
+            continue;
+        }
+        // A non-leaf USER_ACCESSIBLE entry: always this address space's own private table
+        // structure (see AddressSpace::teardown's own doc comment -- SHARED_LEAF only ever marks
+        // an actual leaf, never an intermediate table), so always safe to recurse into and free.
+        let frame = entry.frame().expect("present non-leaf entry must have a frame");
+        // SAFETY: physical_memory_offset is the bootloader's phys-memory mapping; frame is a real,
+        // live next-level table -- and, per AddressSpace::teardown's own safety contract, this
+        // whole address space is no longer the active one, so no concurrent view of it exists.
+        let child_table = unsafe { frame_to_page_table(frame, physical_memory_offset) };
+        free_table_level(child_table, level - 1, physical_memory_offset, frame_allocator);
+        // SAFETY: this now-emptied table structure frame is exclusively this address space's own.
+        unsafe { frame_allocator.deallocate_frame(frame) };
     }
 }
 

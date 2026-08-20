@@ -2,7 +2,7 @@
 
 
 
-use crate::syscall::EINVAL;
+use crate::syscall::{EINVAL, EPERM};
 use super::*;
 
 /// Real `struct rlimit` on x86_64 -- two plain `u64`s (`rlim_cur`, `rlim_max`), `RLIM_INFINITY`
@@ -111,8 +111,27 @@ const PRIO_PROCESS: u64 = 0;
 /// Real Linux's own `SCHED_RR` value -- `Process::sched_policy`'s default, matching BusyBox
 /// `chrt`'s own default policy when none of `-r`/`-f`/`-o`/`-b`/`-i` is given.
 pub(crate) const SCHED_RR_DEFAULT: i32 = 2;
+const SCHED_OTHER: i32 = 0;
 const SCHED_FIFO: i32 = 1;
 const SCHED_RR: i32 = 2;
+const SCHED_BATCH: i32 = 3;
+const SCHED_IDLE: i32 = 5;
+const SCHED_DEADLINE: i32 = 6;
+
+/// Real-Linux-matching priority range per policy (`SCHED_FIFO`/`SCHED_RR` -> `1..=99`, every other
+/// *known* policy -> `0..=0`) -- shared by `do_sched_setscheduler`'s own validation and
+/// `do_sched_get_priority_max`/`_min`, which is exactly what real POSIX/Linux use to define this
+/// range in the first place (`man 2 sched_setscheduler` documents the valid range as literally
+/// `sched_get_priority_min(policy)..=sched_get_priority_max(policy)`). Callers are expected to have
+/// already rejected an unknown policy via `is_known_sched_policy` -- this function has no opinion
+/// on that, it just describes every known policy's own range.
+fn sched_priority_range(policy: i32) -> (i32, i32) {
+    if policy == SCHED_FIFO || policy == SCHED_RR {
+        (1, 99)
+    } else {
+        (0, 0)
+    }
+}
 
 /// Real `struct sched_param` on x86_64 -- a single `int sched_priority` field (real Linux's own
 /// layout has no other members on this arch).
@@ -122,11 +141,34 @@ struct RawSchedParam {
     sched_priority: i32,
 }
 
-/// `SYS_SCHED_SETSCHEDULER`'s real logic -- stores `policy`/`param.sched_priority` verbatim, no
-/// validation beyond what `param_ptr` itself provides (real Linux would range-check `sched_priority`
-/// against `policy`'s own `sched_get_priority_min/max`, but nothing in this port's roster depends
-/// on that rejection path firing). See `Process::sched_policy`'s own doc comment for why storing
-/// this has no real RT-scheduling effect on this kernel's cooperative round-robin scheduler.
+/// Real POSIX permission rule shared by `sched_setscheduler(2)`/`sched_getscheduler(2)`/
+/// `sched_getparam(2)`: the caller must be root, or its own uid must match the target's -- same
+/// shape `process::signals::has_signal_permission` already establishes for `kill`/`sigqueue`,
+/// duplicated rather than shared across this module boundary (matches this codebase's own
+/// established precedent for this exact shape, see that function's own doc comment). Targeting
+/// self (`pid == 0`, resolved to the caller's own pid by `resolve_target_pid` before this is ever
+/// consulted) always passes trivially, since a process's own uid always equals itself.
+fn has_sched_permission(caller_uid: u32, target_uid: u32) -> bool {
+    caller_uid == 0 || caller_uid == target_uid
+}
+
+/// Real Linux's own set of *defined* scheduling policies -- `SCHED_ISO` (`4`) was reserved but
+/// never actually shipped, so `3`/`5`/`6` aren't contiguous with `0..=2`. Anything outside this set
+/// is a real `EINVAL` from `sched_setscheduler`/`sched_get_priority_max`/`_min`, not silently
+/// treated as some other policy's own range.
+fn is_known_sched_policy(policy: i32) -> bool {
+    matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE)
+}
+
+/// `SYS_SCHED_SETSCHEDULER`'s real logic. Real permission checking
+/// (`has_sched_permission`) -- found live: `sched_setscheduler/20-1.c` expects `EPERM` targeting
+/// pid `1` (root-owned) from a real non-root euid, previously unreachable since nothing here ever
+/// checked the target's uid at all. Real priority-range validation against `policy`'s own
+/// `sched_get_priority_min`/`_max` -- found live: `sched_setscheduler/19-1.c` expects `EINVAL` for
+/// an out-of-range priority, previously accepted verbatim with no validation at all. `ESRCH` (via
+/// `resolve_target_pid`) is checked first, before either of the above -- `sched_setscheduler/21-1.c`
+/// targets an already-reaped pid and must see `ESRCH` regardless of the (here, valid) priority it
+/// supplies.
 pub fn do_sched_setscheduler(
     caller_pid: Pid,
     pid: i64,
@@ -134,40 +176,116 @@ pub fn do_sched_setscheduler(
     param_ptr: u64,
 ) -> Result<u64, u64> {
     let target = resolve_target_pid(caller_pid, pid)?;
+    if !is_known_sched_policy(policy) {
+        return Err(EINVAL);
+    }
     // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
     // already has.
     let param = unsafe { *(param_ptr as *const RawSchedParam) };
     let mut table = PROCESS_TABLE.lock();
+    let caller_uid = table
+        .get(&caller_pid)
+        .expect("sched_setscheduler: caller process missing from table")
+        .uid;
     let proc = table
         .get_mut(&target)
         .expect("sched_setscheduler: target process missing from table");
+    if !has_sched_permission(caller_uid, proc.uid) {
+        return Err(EPERM);
+    }
+    let (min, max) = sched_priority_range(policy);
+    if !(min..=max).contains(&param.sched_priority) {
+        return Err(EINVAL);
+    }
     proc.sched_policy = policy;
     proc.sched_priority = param.sched_priority;
     Ok(0)
 }
 
-/// `SYS_SCHED_GETSCHEDULER`'s real logic -- echoes back the stored `Process::sched_policy`.
+/// `SYS_SCHED_GETSCHEDULER`'s real logic -- echoes back the stored `Process::sched_policy`. Real
+/// permission checking (`has_sched_permission`), same reasoning `do_sched_setscheduler`'s own doc
+/// comment gives -- closes `sched_getscheduler/7-1.c`.
 pub fn do_sched_getscheduler(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
     let target = resolve_target_pid(caller_pid, pid)?;
     let table = PROCESS_TABLE.lock();
-    Ok(table
+    let caller_uid = table
+        .get(&caller_pid)
+        .expect("sched_getscheduler: caller process missing from table")
+        .uid;
+    let proc = table
         .get(&target)
-        .expect("sched_getscheduler: target process missing from table")
-        .sched_policy as u64)
+        .expect("sched_getscheduler: target process missing from table");
+    if !has_sched_permission(caller_uid, proc.uid) {
+        return Err(EPERM);
+    }
+    Ok(proc.sched_policy as u64)
 }
 
 /// `SYS_SCHED_GETPARAM`'s real logic -- writes the stored `Process::sched_priority` back into the
-/// caller's `struct sched_param`.
+/// caller's `struct sched_param`. Real permission checking (`has_sched_permission`), same
+/// reasoning `do_sched_setscheduler`'s own doc comment gives.
 pub fn do_sched_getparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u64, u64> {
     let target = resolve_target_pid(caller_pid, pid)?;
     let table = PROCESS_TABLE.lock();
-    let sched_priority = table
+    let caller_uid = table
+        .get(&caller_pid)
+        .expect("sched_getparam: caller process missing from table")
+        .uid;
+    let proc = table
         .get(&target)
-        .expect("sched_getparam: target process missing from table")
-        .sched_priority;
+        .expect("sched_getparam: target process missing from table");
+    if !has_sched_permission(caller_uid, proc.uid) {
+        return Err(EPERM);
+    }
+    let sched_priority = proc.sched_priority;
+    drop(table);
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
     // already has.
     unsafe { (param_ptr as *mut RawSchedParam).write(RawSchedParam { sched_priority }) };
+    Ok(0)
+}
+
+/// `SYS_SCHED_RR_GET_INTERVAL` -- real Linux's own unclaimed `508` (already pre-reserved in
+/// `third_party/musl/arch/x86_64/bits/syscall.h.in`, no kernel handler existed until now). Reports
+/// this kernel's own real, honest round-robin quantum (`interrupts::PREEMPT_QUANTUM_TICKS` at
+/// `TIMER_HZ`, see "Real preemptive scheduling" in CLAUDE.md) rather than a fabricated value --
+/// every process shares the same quantum here, so this is a pure function of nothing but
+/// `TIMER_HZ`/`PREEMPT_QUANTUM_TICKS`, not `Process` state, once `resolve_target_pid` has confirmed
+/// the target is real. `ESRCH` for a nonexistent pid closes `sched_rr_get_interval/3-1.c`; the
+/// `pid == 0`-means-self / `pid == getpid()` equivalence `sched_rr_get_interval/1-1.c` checks falls
+/// straight out of `resolve_target_pid`'s own existing behavior.
+pub fn do_sched_rr_get_interval(caller_pid: Pid, pid: i64, ts_ptr: u64) -> Result<u64, u64> {
+    let _target = resolve_target_pid(caller_pid, pid)?;
+    let nsec = 1_000_000_000u64 * crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS
+        / crate::cpu::pit::TIMER_HZ as u64;
+    // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
+    // already has.
+    unsafe {
+        (ts_ptr as *mut RawTimespecForSchedRr).write(RawTimespecForSchedRr {
+            tv_sec: 0,
+            tv_nsec: nsec as i64,
+        })
+    };
+    Ok(0)
+}
+
+/// musl's own `struct timespec` on x86_64 -- duplicated here rather than shared, same "no shared
+/// crate across this internal ABI boundary" convention every other `Raw*` wire struct in this
+/// codebase already follows.
+#[repr(C)]
+struct RawTimespecForSchedRr {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// `SYS_SCHED_YIELD` -- real Linux's own unclaimed `24` (unremapped in `bits/syscall.h.in`, musl's
+/// own `sched_yield()` already calls straight through). This kernel's cooperative round-robin
+/// scheduler makes this a genuine, not fabricated, yield: `scheduler::schedule()` is the exact
+/// primitive every voluntary block in this codebase already uses to hand off the CPU, just called
+/// here with no actual wait condition -- the caller re-enqueues as `Ready` and simply waits its
+/// turn again like any other runnable process. Always succeeds, matching real POSIX.
+pub fn do_sched_yield() -> Result<u64, u64> {
+    crate::process::scheduler::schedule();
     Ok(0)
 }
 
@@ -211,22 +329,69 @@ pub fn do_sched_getaffinity(
     Ok(to_write as u64)
 }
 
+/// `SYS_FUTEX`, registered directly at real Linux's own `__NR_futex = 202` (no invented number, no
+/// musl remap needed -- same "confirmed unassigned in this ABI's own registry" reasoning
+/// `do_sched_getaffinity`'s own doc comment above already establishes). **Not real futex support**
+/// -- real futex semantics need genuine per-address cross-process wait queues, tied to this
+/// kernel's still-unstarted real-threading work (see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own
+/// "Real threading" foundational blocker) -- this is a minimal, honest *failure* stub, in the same
+/// spirit as `process::mm::do_mprotect`'s own permissive no-op: it exists only to stop a real,
+/// silent infinite-busy-loop this kernel could otherwise trigger in any real caller.
+///
+/// **Found live, not preemptively**: the expanded POSIX conformance pilot's own `sem_wait/7-1.c`
+/// (a real, single-process-reachable POSIX *unnamed* semaphore block -- distinct from the SysV
+/// `semop`-backed semaphores this kernel already implements for real, see
+/// `fs::sysv_sem`'s own module doc comment) hung the whole pilot run indefinitely, consuming 100%
+/// CPU the entire time. Root cause, traced through `third_party/musl/src/thread/__timedwait.c`:
+/// `sem_timedwait` calls `__timedwait_cp`, which issues exactly one raw `futex(FUTEX_WAIT, ...)`
+/// syscall and only treats the result as a real failure if it's `EINTR`/`ETIMEDOUT`/`ECANCELED` --
+/// any *other* value (including the `ENOSYS` this syscall number previously fell through to,
+/// unregistered) is silently folded into `0` ("spurious wake, try again"). `sem_timedwait`'s own
+/// outer loop then immediately retries `sem_trywait` -> fails again (nothing ever posts the
+/// semaphore) -> calls `__timedwait_cp` again -- a real, unbounded, tight retry loop with no actual
+/// blocking syscall or scheduler yield anywhere in it, invisible to `t0`'s own `alarm(40)` timeout
+/// mechanism only because the *forked child* where this actually happens has no timer of its own
+/// (`fork` never inherits a pending itimer/alarm -- real POSIX, and this kernel's own documented
+/// behavior) and the *parent*'s own blocking `wait4()` has this exact same "no signal-interrupt
+/// wake" gap `signals::wake_if_mq_waiting`'s own doc comment already documents fixing for `mq_*` --
+/// a real, separate, not-yet-fixed instance of that same bug class, left open here (no live pilot
+/// test currently depends on it, unlike the `mq_receive` case).
+///
+/// Returning `ETIMEDOUT` for `FUTEX_WAIT` (real Linux's own valid, unremarkable return value for a
+/// timed-out wait) is what makes `__timedwait_cp` treat this as a genuine, real failure instead of
+/// silently retrying forever -- `sem_timedwait` then correctly reports `errno = ETIMEDOUT` and
+/// returns `-1`, a clean, real, if not spec-accurate, outcome instead of an unbounded spin.
+/// `FUTEX_WAKE` (`sem_post`'s own call, via `__wake`) always succeeds -- its return value is never
+/// checked by any real caller in this musl fork, so `0` is exactly as honest as any other answer.
+/// Any other real `futex_op` (`FUTEX_CMP_REQUEUE`/`FUTEX_WAKE_OP`/...) also just succeeds -- none of
+/// them are reachable from the plain `sem_*`/(excluded) `pthread_*` call sites this ABI's own
+/// syscall table can currently be reached from.
+pub fn do_futex(op: u64) -> Result<u64, u64> {
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_PRIVATE: u64 = 128;
+    if op & !FUTEX_PRIVATE == FUTEX_WAIT {
+        return Err(crate::syscall::ETIMEDOUT);
+    }
+    Ok(0)
+}
+
 /// `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN`'s real logic -- fixed,
-/// real-Linux-matching ranges per policy (`SCHED_FIFO`/`SCHED_RR` -> `1..=99`, everything else
-/// (`SCHED_OTHER`/`SCHED_BATCH`/`SCHED_IDLE`/...) -> `0..=0`), not backed by any real scheduling
-/// class this kernel implements -- pure functions, no `Process` state involved at all.
+/// real-Linux-matching ranges per policy (`sched_priority_range`), not backed by any real
+/// scheduling class this kernel implements -- pure functions, no `Process` state involved at all.
+/// **Real `EINVAL` for an unrecognized policy** (`is_known_sched_policy`) -- found live:
+/// `sched_get_priority_max/2-1.c`/`sched_get_priority_min/2-1.c` both pass `-1` and expect `EINVAL`,
+/// previously silently treated the same as `SCHED_OTHER` (returning `0`, a real success) since
+/// nothing here ever validated the policy at all.
 pub fn do_sched_get_priority_max(policy: i32) -> Result<u64, u64> {
-    Ok(if policy == SCHED_FIFO || policy == SCHED_RR {
-        99
-    } else {
-        0
-    })
+    if !is_known_sched_policy(policy) {
+        return Err(EINVAL);
+    }
+    Ok(sched_priority_range(policy).1 as u64)
 }
 
 pub fn do_sched_get_priority_min(policy: i32) -> Result<u64, u64> {
-    Ok(if policy == SCHED_FIFO || policy == SCHED_RR {
-        1
-    } else {
-        0
-    })
+    if !is_known_sched_policy(policy) {
+        return Err(EINVAL);
+    }
+    Ok(sched_priority_range(policy).0 as u64)
 }

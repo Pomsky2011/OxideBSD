@@ -692,15 +692,15 @@ pub fn do_execve(
     // the caller's own kernel stack, is safe: the kernel half is identical no matter which address
     // space is live.
     unsafe { new_address_space.activate() };
-    {
+    let old_address_space = {
         let mut table = PROCESS_TABLE.lock();
         let me = table
             .get_mut(&caller_pid)
             .expect("execve: current process missing from table");
-        // Old AddressSpace dropped here -- its frames leak (no FrameDeallocator exists anywhere in
-        // this codebase yet, see CLAUDE.md's known-limitations list), consistent with `elf::load`/
-        // `AddressSpace::new` never freeing anything either.
-        me.address_space = new_address_space;
+        // Old AddressSpace captured here, torn down for real below (once this lock is dropped) --
+        // see AddressSpace::teardown's own doc comment for why this exact call site is safe:
+        // new_address_space.activate() above already switched CR3 away from it.
+        let old_address_space = core::mem::replace(&mut me.address_space, new_address_space);
         me.user_stack_top = initial_rsp;
         // The real jump target (interpreter's own entry when PT_INTERP loaded one, else the main
         // binary's) -- not read again for this exact pid (only a never-run process's first switch,
@@ -740,8 +740,16 @@ pub fn do_execve(
         // Real `timer_create(2)` semantics: POSIX per-process timers are disarmed and deleted
         // across execve -- see `Process::posix_timers`'s own doc comment.
         me.posix_timers = [None; MAX_POSIX_TIMERS];
-    }
-    // Real SysV shm semantics: the old address space (just dropped above) is what every prior
+        old_address_space
+    };
+    // Real reclaim: the old address space is truly unreachable now (CR3 already moved, and
+    // `me.address_space` already holds the new one) -- see AddressSpace::teardown's own doc
+    // comment for why this exact call site is safe. Real fd-backed mmap/SysV shm content the old
+    // image had live is protected from this by SHARED_LEAF (see that constant's own doc comment)
+    // regardless of whether the cleanup calls below have run yet. `phys_offset` here is the same
+    // one this function established above, still valid (it never changes at runtime).
+    with_frame_allocator(|fa| unsafe { old_address_space.teardown(phys_offset, fa) });
+    // Real SysV shm semantics: the old address space (just torn down above) is what every prior
     // shmat's own mapping actually lived in -- the new image can't see any of it, so this is a
     // real implicit detach of everything, exactly like a real process exit's own
     // detach_all_for_exit call (see that function's own doc comment) except the process survives.
@@ -807,6 +815,12 @@ pub fn do_wait4(
     let matches = |pid: Pid| target_pid == -1 || target_pid as u64 == pid;
 
     loop {
+        // Set only by the `Reported::Exited` arm below, to the just-reaped child's own address
+        // space -- real reclaim happens after this loop iteration's own `table` lock is dropped
+        // (see the real teardown call further below, and AddressSpace::teardown's own doc comment
+        // for why this exact call site -- a reaped process, necessarily not the active `CR3` since
+        // it already stopped running back when it originally called `do_exit` -- is safe).
+        let mut reaped_address_space: Option<AddressSpace> = None;
         let reported = {
             let mut table = PROCESS_TABLE.lock();
 
@@ -831,7 +845,10 @@ pub fn do_wait4(
                 });
 
             if let Some((child_pid, code)) = zombie {
-                table.remove(&child_pid);
+                let removed = table
+                    .remove(&child_pid)
+                    .expect("wait4: zombie child vanished under the same lock that found it");
+                reaped_address_space = Some(removed.address_space);
                 table
                     .get_mut(&caller_pid)
                     .unwrap()
@@ -872,6 +889,13 @@ pub fn do_wait4(
                 None
             }
         }; // table lock dropped here, before schedule() -- see table()'s own doc comment
+
+        // Real reclaim: only set by the Exited arm above, always safe here (see
+        // reaped_address_space's own doc comment).
+        if let Some(address_space) = reaped_address_space {
+            let phys_offset = memory::phys_mem_offset();
+            with_frame_allocator(|fa| unsafe { address_space.teardown(phys_offset, fa) });
+        }
 
         if let Some(reported) = reported {
             let (child_pid, status) = match reported {
@@ -962,6 +986,23 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
         Some(me) => me.state = ProcState::Zombie(code),
         None => return,
     }
+    // Real hardening, found live: `do_kill`'s cross-process `Action::Terminate` branch (a default-
+    // disposition signal killing a target this process didn't just switch away from) can target a
+    // process that's currently `Ready` and still sitting in `scheduler::READY_QUEUE` -- unlike the
+    // adjacent `Action::Stop` branch, which already dequeues first (see that branch's own comment),
+    // this path used to leave the queue entry dangling. If the caller (`do_wait4`) then reaps this
+    // exact pid before the scheduler ever pops that stale entry, `PROCESS_TABLE` no longer has it
+    // at all by the time `scheduler::activate_and_prepare` tries to switch to it -- a real panic
+    // ("pid missing from table"), not just a logic bug. Found by the expanded POSIX conformance
+    // pilot's own `sigaction/9-1.c`: its final `kill(pid, SIGHUP)` racing a child that (thanks to
+    // `select()` immediately `ENOSYS`-ing rather than truly blocking, see `process::do_futex`'s own
+    // doc comment for the identical-in-spirit `sem_wait` finding) cycles through `Ready` far more
+    // often than a real system's `select()` ever would, made this race easy to hit. Safe (and cheap)
+    // to call unconditionally here rather than gating on `state == Ready` first, unlike `Action::
+    // Stop`'s own check -- `do_exit`'s self-termination path (this function's *other* caller) is
+    // never `Ready` when it calls this (it's the one process currently `Running`), so this is a
+    // harmless no-op there; `remove_ready` itself is already a no-op for a pid that isn't queued.
+    scheduler::remove_ready(pid);
     wake_parent_if_waiting(&mut table, pid);
 }
 

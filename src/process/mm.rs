@@ -307,7 +307,14 @@ fn do_mmap_file_backed(
     };
 
     let writable = prot & PROT_WRITE != 0;
-    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    // SHARED_LEAF: these frames are owned by MMAP_FILE_CACHE (keyed by content_id, real cross-open
+    // sharing -- see that cache's own doc comment), not by this one mapping -- marks every leaf so
+    // a real address-space teardown (`memory::address_space::AddressSpace::teardown`) never frees
+    // one still cached/still live in another process's or another mapping's own page table. See
+    // `SHARED_LEAF`'s own doc comment.
+    let mut flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | memory::address_space::SHARED_LEAF;
     if writable {
         flags |= PageTableFlags::WRITABLE;
     }
@@ -450,7 +457,26 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
         return Err(EINVAL);
     }
     let page_count = len.div_ceil(4096);
-    let region_len = page_count * 4096;
+    // Real, checked arithmetic, not `page_count * 4096` / `addr + region_len - 1` -- found live by
+    // the POSIX conformance pilot's own `mmap/31-1.c`: it deliberately calls `munmap((void*)-1,
+    // ULONG_MAX)` (an *unconditional* cleanup call after an expected-to-fail `mmap()`, not even
+    // gated on that mmap having actually succeeded), and the old unchecked arithmetic panicked
+    // ("attempt to add with overflow") on exactly that input, rebooting the whole VM instead of a
+    // clean per-syscall error return -- a real hardening gap independent of the pilot itself, since
+    // any real userland program passing similarly extreme values would hit the same panic. `addr`
+    // and the computed end address are also rejected outright unless both are canonical
+    // (`VirtAddr::try_new`, not `new`, which panics the same way) -- a non-canonical `addr` is
+    // never a real prior `mmap()` result, so `EINVAL` is the correct response, not a second panic.
+    let Some(region_len) = page_count.checked_mul(4096) else {
+        return Err(EINVAL);
+    };
+    let Some(end_addr_inclusive) = addr.checked_add(region_len).and_then(|e| e.checked_sub(1))
+    else {
+        return Err(EINVAL);
+    };
+    if VirtAddr::try_new(addr).is_err() || VirtAddr::try_new(end_addr_inclusive).is_err() {
+        return Err(EINVAL);
+    }
     let phys_offset = memory::phys_mem_offset();
 
     let mut table = PROCESS_TABLE.lock();
@@ -467,7 +493,7 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     // own identical comment already establishes.
     let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr + region_len - 1));
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr_inclusive));
 
     // Real x86 hardware DIRTY-bit check, read *before* unmapping (Mapper::unmap removes the PTE
     // entirely, so this has to happen first) -- lets writeback_region below skip real work
@@ -488,6 +514,20 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
         });
 
     for page in Page::range_inclusive(start_page, end_page) {
+        // Real hardening, not just tidiness: a kernel-only (non-USER_ACCESSIBLE) mapping is always
+        // a *shared*, kernel-half PML4/PDPT/PD entry aliased into every address space by reference
+        // (see `memory::address_space::copy_table_level`'s own doc comment) -- `Mapper::unmap`
+        // would still happily remove such an entry if asked, corrupting that shared mapping for
+        // every other process, not just this one. `addr`/`len` are entirely caller-controlled with
+        // no prior validation that they ever came from a real `mmap()` return value, so this check
+        // is the only thing standing between a wild `munmap()` call and exactly that.
+        let is_user_page = matches!(
+            mapper.translate(page.start_address()),
+            TranslateResult::Mapped { flags, .. } if flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        );
+        if !is_user_page {
+            continue;
+        }
         if let Ok((_, flush)) = mapper.unmap(page) {
             flush.flush();
         }

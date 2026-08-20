@@ -41,7 +41,9 @@ Current state:
 
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
 no *kernel-mode* preemption (real ring-3/user-mode preemption exists — see "Real preemptive
-scheduling" below), no copy-on-write fork, no frame deallocation anywhere, `sys_read` on stdin is
+scheduling" below), no copy-on-write fork, no frame deallocation for module-loaded code/SysV-shm-
+or-`MAP_SHARED`-owned frames (real reclaim exists for the common case — a discarded process's own
+private address-space frames — see "POSIX conformance pilot expanded 68 → 488..." below), `sys_read` on stdin is
 non-blocking (busy-polled by userland), no general block-device-agnostic VFS/mount-table layer (a
 real ATA disk driver + oxfs mount/format persistence + a scoped bind/tmpfs mount table exist now —
 see "Real disk persistence"/"Mount table" — but only for oxfs's own fixed backing store), no IPv6,
@@ -424,9 +426,12 @@ buildable, no longer pid 1 (superseded by `hush`). Its design remains the refere
 
 ## Process abstraction, scheduler, and fork/exec/wait (`src/process/`)
 
-Dynamically allocated process table, cooperative round-robin scheduler, kernel-thread-style
-context switch between per-process kernel stacks. No preemption, no copy-on-write fork (full eager
-copy), no SMP, no frame deallocation anywhere.
+Dynamically allocated process table, cooperative round-robin scheduler (real ring-3 preemption
+layered on top later — see "Real preemptive scheduling" below), kernel-thread-style context switch
+between per-process kernel stacks. No copy-on-write fork (full eager copy), no SMP, no frame
+deallocation for module-loaded code/SysV-shm-or-`MAP_SHARED`-owned frames (real reclaim exists for
+a discarded process's own private address-space frames — see "POSIX conformance pilot expanded
+68 → 488..." below).
 
 - **Process table is `Mutex<BTreeMap<Pid, Box<Process>>>`, `Box` is load-bearing** — a
   `BTreeMap`'s internal nodes can move on insert/remove, but a `Box`'s heap allocation never does;
@@ -1987,6 +1992,179 @@ time the test's own check executed.
   pending at once (`Process::rt_queue`'s own fixed `RT_QUEUE_CAP` per RT signal, bitmask collapse
   for standard ones) — a process can't manufacture unbounded chain depth by re-raising signals from
   inside their own handlers faster than that, but this wasn't specifically stress-tested.
+
+## POSIX conformance pilot expanded 68 → 488, plus real frame reclaim and four real bugs it found (`build.rs`, `Cargo.toml`, `src/memory/`, `src/process/`, `src/fs/mqueue.rs`, `src/fs/sysv_shm.rs`, `src/cpu/interrupts.rs`, `modules/oxfs/`, `modules/posix_compat/`)
+
+Grew the Open POSIX Test Suite pilot (see "POSIX conformance pilot" sections above and
+`docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own "Verification" section) from its original curated
+68-file subset to 488, then fixed four real, independent kernel bugs the larger corpus's own real
+`fork`/`execve`/signal/IPC traffic surfaced — none of them reachable by the smaller original set.
+Final baseline: **329 PASS / 62 FAIL / 40 UNRESOLVED / 8 UNSUPPORTED / 45 UNTESTED / 3 TIMEOUT /
+1 CRASH, 488 total** (the one CRASH is `strftime/2-1.c`'s own real stack-buffer overflow — an
+upstream test bug, correctly caught by musl's stack protector and now cleanly delivered as
+`SIGSEGV`, see below — not a kernel bug).
+
+- **Corpus expansion methodology**: every non-`pthread_*`, non-`aio_*`/`lio_listio` directory under
+  `conformance/interfaces/` (real POSIX threading/AIO are tied to this project's still-unstarted
+  "Real threading" foundational blocker, see the compliance checklist) was probed — every `.c` file
+  not referencing `pthread_create`/`testfrmw.h` compiled clean against the real static `musl-gcc`
+  sysroot. Most of these directories are machine-generated per-assertion families (`gentests.pl`)
+  where `N-2.c`, `N-3.c`, ... only vary *which* signal/parameter the same assertion `N` is checked
+  against (confirmed by diffing `sigaction/8-2.c` against `8-3.c` — identical assertion, different
+  signal) — deduplicated to the lowest-numbered variant per assertion number (`sigaction` alone
+  drops from 420 candidate files to 16 this way). Files ending `-buildonly.c`/`-core-buildonly.c`
+  are also excluded — they expect a real `argv[1]` selecting a sub-case, normally supplied by the
+  suite's own multi-invocation driver script this pilot doesn't have; run with none they just
+  return `PTS_UNRESOLVED` unconditionally. See `build.rs`'s own `POSIX_TEST_PILOT_FILES` doc
+  comment for the full list of newly-covered interfaces (every basic signal-set/mask/action
+  function, POSIX per-process timers, the rest of the message-queue family, `munmap`/`shm_unlink`,
+  the `sched_*` field-accessor family, unnamed/anonymous `sem_*`, `fsync`/`killpg`, the rest of the
+  `clock_*` family, plain time-conversion libc functions, and `mlock`/`mlockall`/`munlock`/
+  `munlockall` as expected-failure controls).
+- **Real per-address-space frame reclaim, closing the "no frame deallocation anywhere" gap for the
+  common case** — not directly one of the four bugs below, but the necessary prerequisite:
+  hundreds of real `fork`+`execve`+`exit` cycles in one continuous boot (several per pilot file)
+  exhausted the old 128 MiB heap ceiling around the ~140th file, `alloc::alloc::handle_alloc_error`
+  on an 80 MiB request against an increasingly fragmented heap. Real, permanent frame reuse was
+  the actual fix (a bigger heap/RAM ceiling alone was tried first and genuinely helped, kept as
+  real headroom, but the underlying leak is now real):
+  - **`memory::BootInfoFrameAllocator` gained a real `FrameDeallocator` impl** — an intrusive,
+    singly-linked free list stored *in the freed frames themselves* (each freed frame's own first
+    8 bytes, viewed through the phys-mem-offset window, hold the previous free-list head's address,
+    or `u64::MAX` as a real "list ends here" sentinel), not a `Vec<PhysFrame>` — deliberately: this
+    allocator is constructed *before* `allocator::init_heap` (see its own doc comment's
+    already-documented chicken-and-egg trap), and only ever needs to *store* into the free list
+    well after boot (real teardown only happens during process exit) — an intrusive list is
+    unconditionally heap-free by construction rather than "safe in practice."
+  - **`memory::address_space::AddressSpace::teardown`** walks and frees every `USER_ACCESSIBLE`
+    frame beneath an about-to-be-discarded address space's own level-4 table — both leaf data
+    (ELF image/stack/heap/private-anon-mmap) and every intermediate page-table structure frame
+    (PDPT/PD/PT) — then the level-4 frame itself. Safe because every page-table *structure* frame
+    at any level is always freshly allocated per address space, never shared (`copy_table_level`'s
+    own doc comment already establishes this — a kernel-only, non-`USER_ACCESSIBLE` entry is the
+    only thing ever aliased across address spaces, and this walk never recurses into one), and
+    fork is a real eager copy, never COW, so a private leaf is never shared with a parent either.
+  - **`SHARED_LEAF`** (a repurposed hardware-ignored PTE bit, `PageTableFlags::BIT_9`) is what
+    makes this safe for the two real exceptions that *do* alias a leaf across address spaces: SysV
+    `shmat` (`fs::sysv_shm::do_shmat`) and real fd-backed `MAP_SHARED` mmap
+    (`process::mm::do_mmap_file_backed`) both mark every leaf they map with it; `teardown`'s own
+    walk checks and skips any leaf carrying it. Deliberately *not* relying on those regions being
+    already-unmapped by the time teardown runs — `fs::sysv_shm::detach_all_for_exit`'s own doc
+    comment explicitly documents that a real process exit never unmaps shm PTEs at all (only
+    `nattch`-decrements), so a page-table walk can genuinely still find them present.
+  - Wired into both real discard sites: `process::lifecycle::do_execve`'s old-address-space
+    discard (captured via `core::mem::replace` right after `new_address_space.activate()` already
+    switched `CR3` away — always safe, never the active table) and process reaping in `do_wait4`
+    (a reaped process is, by definition, not currently `Running` — it already stopped running back
+    when it called `do_exit`).
+  - Verified against the full regression suite, not just the pilot — `mmap_syscall_smoke`,
+    `sysv_shm_syscall_smoke`, `dynlink_syscall_smoke` (heavy real `PT_INTERP`/`execve` churn), and
+    `tcc_syscall_smoke` all still pass unmodified.
+  - **Also bumped, same session, real headroom not just enough to barely finish**:
+    `allocator::HEAP_SIZE_CEILING` 128 → 1024 MiB, `Cargo.toml`'s QEMU `-m` 1024 → 8192 MiB (paired,
+    same 1/8-of-RAM scaling), `modules/oxfs`'s `NUM_BLOCKS` 8192 → 16384 (32 → 64 MiB block pool —
+    the expanded pilot corpus's own embedded content alone runs ~14 MiB) and `MAX_INODES` 1024 →
+    2048 (the corpus adds ~500 new files/dirs under `/posix-tests/bin/`). `build.rs`'s own mirrored
+    `OXFS_NUM_BLOCKS`/`OXFS_MAX_INODES` constants (real disk image sizing) kept in sync, same
+    "two things that must agree, flagged rather than shared" discipline as always. `Cargo.toml`'s
+    `test-timeout` 1800 → 7200 (7x more files, real headroom for a corpus this size).
+- **Bug 1 — a ring-3 `#GP` rebooted the whole VM instead of just killing one process.** Found via
+  `strftime/2-1.c`, which has a real stack-buffer overflow (declares `char text[20]` but tells
+  `strftime` it can write up to 256 bytes — an upstream test bug, not this kernel's). Correctly
+  caught by musl's real stack-protector, whose `__stack_chk_fail` on x86 is a bare `hlt` (real,
+  portable, deliberate musl design — `a_crash()` — relying on the OS turning a privileged-
+  instruction fault into a signal). `general_protection_fault_handler` never had the ring-3 check
+  `page_fault_handler` already has; fixed by giving it the identical treatment — ring-3 `#GP` now
+  records a real `SIGSEGV` via `do_kill`'s self-signal path and redirects through
+  `process::fault_trampoline`, the same machinery "Real ring-3 fault-to-signal delivery" above
+  already established for page faults. No fault-specific signal distinction needed here the way
+  page faults split `SIGBUS`/`SIGSEGV` — real Linux maps every userland `#GP` to `SIGSEGV`
+  uniformly.
+- **Bug 2 — `mq_receive`/`mq_send`'s blocking wait had no signal-interrupt path at all.** Found via
+  `mq_receive/13-1.c`: parent blocks in a plain (non-timed) `mq_receive()` on an empty queue, child
+  sends `SIGABRT` after 2s expecting `EINTR` — instead, a permanent hang (blocking on `u64::MAX`,
+  see `BlockReason::WaitingForMqData`'s own doc comment), invisible to `t0`'s own `alarm(40)`
+  rescue since the *process* never returns from the syscall at all for that to interrupt. Fixed
+  exactly like `do_pause`/`do_nanosleep` already are: `do_mq_timedreceive`/`do_mq_timedsend` now
+  check `pending_signals & !blocked_signals != 0` before (re-)blocking and return `EINTR`, plus a
+  new `signals::wake_if_mq_waiting` hook (mirroring `wake_if_sleeping`'s exact shape) wired into
+  all three `Action::SetPending` call sites (`do_kill`, `signal_foreground_group`, `do_sigqueue`).
+- **Bug 3 — real `futex(2)` support doesn't exist, and musl's own retry logic turns that into an
+  infinite busy-loop, not a clean error.** Found via `sem_wait/7-1.c` (a real *unnamed* POSIX
+  semaphore block, distinct from the SysV `semop`-backed semaphores this kernel already implements
+  for real — see `fs::sysv_sem`) — 100% CPU, no progress, for as long as it was left running.
+  Root-caused through `third_party/musl/src/thread/__timedwait.c`: `sem_timedwait` issues exactly
+  one raw `futex(FUTEX_WAIT, ...)` syscall and only treats the result as a real failure if it's
+  `EINTR`/`ETIMEDOUT`/`ECANCELED` — any *other* value, including the `ENOSYS` this number fell
+  through to unregistered, silently folds into `0` ("spurious wake, try again"), and the outer loop
+  immediately retries forever with no actual blocking syscall or scheduler yield anywhere in it.
+  Invisible to `t0`'s own rescue alarm for the same doubled reason `sigwait/4-1.c`'s exclusion
+  already documents (`fork` never inherits a pending alarm) *plus* `wait4()`'s own missing
+  signal-interrupt-wake gap (same bug class as Bug 2, left open here — no live pilot test currently
+  needs it fixed). Fixed with a minimal, **honest failure stub**, not real futex support (that's
+  tied to the same unstarted real-threading work `docs/POSIX_COMPLIANCE_CHECKLIST.md` already
+  flags) — `process::do_futex` (`src/process/limits.rs`), registered directly at real Linux's own
+  unclaimed `__NR_futex = 202` (`modules/posix_compat`, same "confirmed unassigned in this ABI's
+  own registry" reasoning `SYS_SCHED_GETAFFINITY` already established): `FUTEX_WAIT` returns a real
+  `ETIMEDOUT` (a genuine, unremarkable Linux return value) instead of a fake `0`, which is exactly
+  what makes `__timedwait_cp` treat it as a real failure instead of retrying forever. `FUTEX_WAKE`
+  and anything else just succeeds — no real caller in this musl fork ever checks that return value.
+- **Bug 4 — a cross-process signal-default-terminate could panic the whole kernel via a stale
+  scheduler ready-queue entry.** Found via `sigaction/9-1.c`: `select(0, NULL, NULL, NULL, NULL)`
+  isn't implemented (`select`/`pselect` deliberately skipped, `poll` already covers every live
+  caller — see `docs/MISSING_POSIX_SYSCALLS.md`) and `ENOSYS`s immediately rather than truly
+  blocking, so the test's forked child cycles through `Ready` far more often than a real system's
+  `select()` ever would — Bug 3's own `futex` fix made an *unrelated* narrow race far easier to
+  hit, not the root cause itself. `do_kill`'s cross-process `Action::Terminate` branch (a
+  default-disposition signal killing a target the caller isn't currently running) called
+  `terminate_process` directly, unlike the adjacent `Action::Stop` branch right below it, which
+  already dequeues a `Ready` target from `scheduler::READY_QUEUE` first (see that branch's own
+  comment). If the target was `Ready` and queued at the exact moment the terminate fired, it
+  became `Zombie` while still queued; if its parent (`do_wait4`) reaped it before the scheduler
+  ever popped that stale entry, `PROCESS_TABLE` no longer had the pid at all by the time
+  `scheduler::activate_and_prepare` tried to switch to it — a real panic (`"pid missing from
+  table"`), not just a logic bug, taking the whole VM down. Fixed by adding the same
+  `scheduler::remove_ready(pid)` call directly into the shared `terminate_process` (unconditional,
+  not gated on `state == Ready` the way `Action::Stop`'s own check is — cheap, and `do_exit`'s own
+  self-termination call site is never `Ready` when it calls this, so it's a harmless no-op there).
+- **Two more pilot-corpus exclusions, same "structurally incompatible with this pilot's own
+  infrastructure" precedent `sigwait/4-1.c` already established** (not kernel bugs):
+  - `timer_settime/2-1.c`/`6-1.c`/`9-1.c` all `sigprocmask(SIG_BLOCK, {SIGALRM}, NULL)` before
+    their own real `sigwait()`-based test loop — blocking `SIGALRM` in-process blocks *both* the
+    signal-under-test *and* `t0`'s own outer rescue alarm, since they share one process/signal mask
+    once `t0` `execvp`s straight into the test. Confirmed hanging past a real 9+ minute ceiling.
+    `1-1.c`/`3-1.c`/`5-1.c`/`13-1.c` use `SIGALRM` too but only via a real *caught handler*, which
+    still runs and lets the test's own state machine complete normally — only the three blocking
+    ones are excluded.
+  - `shm_open/23-1.c` unconditionally forks `NPROCESS = 1000` real child processes with no
+    CPU-count scaling (unlike `sched_setparam`'s own `nb_cpu = get_ncpu()`-scaled fork loops
+    elsewhere in this corpus, harmless on this single-core kernel). Confirmed live: this test
+    genuinely times out under `t0`'s 40s alarm, real behavior for a kernel this small — but when
+    the *parent* dies to that alarm's default-`Terminate` `SIGALRM`, any children it had already
+    spawned become permanent orphans (this kernel has no init-style orphan reparenting/reaping —
+    `hush` never adopts or waits on a process it didn't itself fork), each still holding whatever
+    real `shm_open()` fd it successfully opened. `modules/oxfs`'s own deliberately-small
+    `MAX_OPEN_FILES = 8` pool permanently exhausted as a result, breaking every subsequent pilot
+    file needing to open *anything* for the rest of that run (`hush` itself started failing its own
+    `> /posix-tests/run-out.txt` redirect with a real `EMFILE`). Not a kernel fd-leak — `close_all`
+    correctly releases every fd the *parent* itself held; the real gap is orphaned *children* this
+    kernel has no mechanism to ever reap, a structural limitation, not a bug to fix here.
+- **Verification**: `cargo build`/`cargo clippy` clean throughout (no new warnings beyond the
+  existing pre-session baseline). Full regression suite re-run clean after every fix, not just at
+  the end: `fork_wait`, `uid_syscall_smoke`, `mmap_syscall_smoke`, `sysv_shm_syscall_smoke`,
+  `dynlink_syscall_smoke`, `tcc_syscall_smoke`, `session_syscall_smoke`, `mount_syscall_smoke`,
+  `sig_syscall_smoke`, `rt_signal_syscall_smoke`, `sysv_sem_syscall_smoke`, `pause_syscall_smoke`,
+  `mq_syscall_smoke`, `posix_timer_syscall_smoke`. The pilot itself needed 11 full runs to reach a
+  clean completion (each real hangs/crashes/panics found and fixed in turn, not deferred) —
+  `target/posix-pilot-logs/` holds the real, complete serial output of every run for direct
+  inspection, not just this summary's own tallies.
+- **Not covered by this pass**: root-causing *why* so many `FAIL`/`UNRESOLVED` results remain
+  (62 + 40 — some are real, already-documented honest gaps this doc's own other sections already
+  flag as expected controls — `mlock`/`clock_settime`/`clock_nanosleep`/unenforced `sched_*` fields
+  — others are newly surfaced and not yet individually triaged); `wait4()`'s own missing
+  signal-interrupt-wake gap (Bug 3's own doc comment flags this explicitly, left open); a bound on
+  how large this pilot corpus could still grow (81 non-pthread/non-aio interface directories exist
+  in the suite total, several already fully covered by this pass, some intentionally left thin).
 
 ## BusyBox gap analysis: what's needed for more applets
 

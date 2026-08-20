@@ -19,9 +19,23 @@ pub const HEAP_START: usize = 0x_4444_4444_0000;
 /// today's workload -- never shrink below this just because a boot reports little RAM.
 const HEAP_SIZE_FLOOR: usize = 4 * 1024 * 1024; // 4 MiB
 /// Ceiling: bounds one-time boot cost (mapping + zeroing heap pages) on a RAM-rich machine.
-/// Nothing in this kernel today needs anywhere near this much heap; it exists purely so
-/// `compute_heap_size` doesn't hand back an unreasonably large region on a multi-GiB host.
-const HEAP_SIZE_CEILING: usize = 128 * 1024 * 1024; // 128 MiB
+/// Raised 128 -> 1024 MiB (alongside `Cargo.toml`'s own `-m` bump, same pairing precedent
+/// `modules/oxfs`'s `NUM_BLOCKS`/`-m` bumps already established) once the expanded POSIX
+/// conformance pilot (see CLAUDE.md's "POSIX conformance pilot" sections) needed real headroom
+/// this kernel's own "no frame deallocation, no address-space reclaim after `execve`/exit anywhere"
+/// design (see this file's own module doc comment and the process-table section of CLAUDE.md)
+/// makes genuinely necessary at this corpus size: a single continuous boot now runs several hundred
+/// real `fork`+`execve`+`wait4` cycles (`sh` per test line, `t0` per test, the test binary itself),
+/// each leaking real heap-resident bookkeeping (page-table wrapper allocations, `execve`'s own
+/// `Vec<u8>` ELF-image buffer, ...) that's never reclaimed by design -- found live: the original
+/// 128 MiB ceiling (which `-m 1024`'s own 1/8 scaling already maxed out) was only enough for
+/// roughly the first ~140 of 492 pilot files before `alloc::alloc::handle_alloc_error` fired on an
+/// 80 MiB request, the linked-list allocator unable to satisfy it out of an increasingly
+/// fragmented heap. Not a fix for the underlying "never reclaim" design (out of scope -- a real
+/// fix needs actual frame/address-space reclaim work, a much larger undertaking than this pilot
+/// expansion), just enough headroom to run the current corpus with real margin, not just barely
+/// enough.
+const HEAP_SIZE_CEILING: usize = 1024 * 1024 * 1024; // 1024 MiB
 /// What fraction of total usable RAM the heap gets, before clamping to the floor/ceiling above.
 const HEAP_SIZE_DIVISOR: u64 = 8; // 1/8th of usable RAM
 

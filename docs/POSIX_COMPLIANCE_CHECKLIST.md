@@ -243,15 +243,24 @@ Everything above is preparation. The actual "certifiable" gate is running a real
 conformance test suite against a built OxideBSD image and looking at the pass/fail counts, not
 self-assessing against this checklist:
 
-- [ ] **The Open POSIX Test Suite** (originally from the Open Group/Linux Standard Base effort,
-      long-since open-sourced) — the closest free equivalent to the paid VSX-PCTS suite mentioned
-      above. Needs cross-compiling against this kernel's musl fork and a real way to run its test
-      binaries under QEMU and collect pass/fail output (this project's own `tests/*_syscall_smoke.rs`
-      pattern — spawn a real ELF through genuine `SYSCALL`/`SYSRETQ` — is the natural model, just
-      at a much larger scale: hundreds of small test binaries instead of a handful of hand-written
-      ones).
-- [ ] **A real pass/fail baseline before investing further** — running the suite *now*, against
-      today's OxideBSD, before closing any gap above, would concretely rank which of these items
-      actually matter (a suite section might already pass despite an "honest-but-unenforced" gap
-      above, or might fail for a reason not yet on this list at all). Cheaper than guessing
-      priority order from this doc alone.
+- [x] **The Open POSIX Test Suite** — running, cross-compiled against this kernel's own musl fork,
+      each file a real pre-built ELF run through `t0` (the suite's own real `alarm()`-based timeout
+      wrapper) inside a real, single continuous boot (`tests/posix_conformance_smoke.rs` +
+      `userland/posix-conformance-driver/`, driven by `modules/oxfs/src/posix_conformance.sh`'s own
+      seeded corpus/manifest — see that script's own doc comment for the full design). Not the
+      whole suite (1750 files in `conformance/interfaces/` alone, before `functional`/`stress`, and
+      real threading/AIO are out of scope until the "Real threading" blocker above is addressed) —
+      a curated, steadily-growing pilot subset, currently 488 files (grew from an initial 68-file
+      pilot; see CLAUDE.md's own "POSIX conformance pilot" sections, most recently "POSIX
+      conformance pilot expanded 68 → 488..." for the full growth history and the four real kernel
+      bugs each expansion pass has found and fixed along the way).
+- [x] **A real pass/fail baseline, current as of the 488-file pilot**: **329 PASS / 62 FAIL / 40
+      UNRESOLVED / 8 UNSUPPORTED / 45 UNTESTED / 3 TIMEOUT / 1 CRASH** (the one `CRASH` is a real
+      bug in the *test itself* — `strftime/2-1.c`'s own stack-buffer overflow, correctly caught and
+      now cleanly delivered as `SIGSEGV` rather than rebooting the VM — not a kernel gap). Confirms
+      this doc's own original premise: several `FAIL`s trace directly to already-documented
+      "honest-but-unenforced" gaps above (`mlock`/`clock_settime`/`clock_nanosleep`/unenforced
+      `sched_*` fields, included deliberately as expected-failure controls), while others are newly
+      surfaced and not yet individually triaged against this checklist's own categories — a real
+      priority-ranking pass over the current `FAIL`/`UNRESOLVED` set (not just growing the file
+      count further) is the natural next step here.

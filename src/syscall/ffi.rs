@@ -590,12 +590,33 @@ pub(crate) fn sys_sched_get_priority_min(policy: u64) -> Result<u64, u64> {
     crate::process::do_sched_get_priority_min(policy as i32)
 }
 
+/// `SYS_SCHED_RR_GET_INTERVAL` — real Linux's own unclaimed `508`, already pre-reserved in
+/// `bits/syscall.h.in` — real `sched_rr_get_interval(2)`'s exact `(pid, ts_ptr)` wire format. See
+/// `process::do_sched_rr_get_interval`'s own doc comment for the real logic.
+pub(crate) fn sys_sched_rr_get_interval(pid: u64, ts_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sched_rr_get_interval(crate::process::scheduler::current_pid(), pid as i64, ts_ptr)
+}
+
+/// `SYS_SCHED_YIELD` — real Linux's own unclaimed `24`, unremapped (musl's own `sched_yield()`
+/// already calls straight through). See `process::do_sched_yield`'s own doc comment for the real
+/// logic — a genuine, not fabricated, voluntary yield on this kernel's cooperative scheduler.
+pub(crate) fn sys_sched_yield() -> Result<u64, u64> {
+    crate::process::do_sched_yield()
+}
+
 /// `SYS_REBOOT` (`486`) — real `reboot(2)`'s exact single-`cmd`-argument wire format (musl's own
 /// `reboot.c` passes the two real magic numbers as the first two syscall args and `cmd` as the
 /// third — this ABI's 4-register width holds all three whole, no call-site patch needed). See
 /// `process::do_reboot`'s own doc comment: every success path diverges.
 pub(crate) fn sys_reboot(cmd: u64) -> Result<u64, u64> {
     crate::process::do_reboot(cmd)
+}
+
+/// `SYS_FUTEX` (real Linux's own `__NR_futex = 202`) -- real `futex(2)`'s `(uaddr, op, val, ...)`
+/// wire format; only `op` is real logic here (`addr`/`val`/`to` unused) -- see
+/// `process::do_futex`'s own doc comment for why and what this stub actually does.
+pub(crate) fn sys_futex(op: u64) -> Result<u64, u64> {
+    crate::process::do_futex(op)
 }
 
 /// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
@@ -1004,6 +1025,7 @@ pub(crate) fn sys_sysinfo(info_ptr: u64) -> Result<u64, u64> {
 
 /// musl's own `struct timespec` on x86_64 (`third_party/musl/include/alltypes.h.in`'s `STRUCT
 /// timespec` template, `time_t`/`long` both 8 bytes on this arch): two `i64`s, no padding.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct RawTimespec {
     tv_sec: i64,
@@ -1016,6 +1038,45 @@ const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
 const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+
+/// Decodes a real, dynamic per-process/per-thread `clockid_t` -- the encoding
+/// `clock_getcpuclockid(2)`'s own musl implementation produces
+/// (`third_party/musl/src/time/clock_getcpuclockid.c`: `clockid_t id = (-pid-1)*8U + 2`, matching
+/// real Linux's own `MAKE_PROCESS_CPUCLOCK`/`CPUCLOCK_PID` scheme). The wire value arrives here
+/// already sign-extended to 64 bits (musl's own `__syscall` takes `long` arguments, and a C call
+/// site passing a negative `int` widens it that way automatically) -- any negative `clockid`
+/// therefore packs a target pid into its high bits, recovered via `pid = !(id >> 3)` (arithmetic
+/// right shift, matching real Linux's own `pid_for_clock` decode exactly; the low 3 bits this
+/// discards are `clock_getcpuclockid`'s own `CPUCLOCK_*` sub-selector, meaningless here since this
+/// kernel has no real threads for `CPUCLOCK_PERTHREAD_MASK` to distinguish). A decoded pid of `0`
+/// is real Linux's own "the calling process itself" convention (`pid_for_clock`'s `upid == 0`
+/// special case) -- what `clock_getcpuclockid(0, ...)` itself produces.
+///
+/// Returns `None` for a non-negative (real standard) `clockid`, letting every caller's own `match`
+/// fall through to its ordinary `_ => Err(EINVAL)` arm for a genuinely unrecognized positive value
+/// (`clock_getres/6-1.c`/`6-2.c`, `clock_settime/17-1.c`).
+fn decode_dynamic_cpu_clock_pid(caller_pid: crate::process::Pid, clockid: u64) -> Option<crate::process::Pid> {
+    let raw = clockid as i64;
+    if raw >= 0 {
+        return None;
+    }
+    let decoded = !(raw >> 3);
+    Some(if decoded == 0 {
+        caller_pid
+    } else {
+        decoded as crate::process::Pid
+    })
+}
+
+/// `cpu_ticks` -> `(tv_sec, tv_nsec)`, shared by `sys_clock_gettime`'s `CLOCK_PROCESS_CPUTIME_ID`/
+/// `CLOCK_THREAD_CPUTIME_ID`/dynamic-clock arms and `sys_clock_getres`'s own resolution report.
+fn cpu_time_ticks_to_ts(cpu_ticks: u64) -> RawTimespec {
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    RawTimespec {
+        tv_sec: (cpu_ticks / hz) as i64,
+        tv_nsec: ((cpu_ticks % hz) * 1_000_000_000 / hz) as i64,
+    }
+}
 
 /// `SYS_CLOCK_GETTIME` (registered as `138` by `modules/clock`, continuing on from `SYS_UNAME =
 /// 137`) — matches real `clock_gettime(2)`'s exact `(clockid, timespec_ptr)` wire format, so only
@@ -1034,6 +1095,7 @@ const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 /// here, and for the real gap this closes: `clock_gettime/4-1.c`, the Open POSIX Test Suite
 /// pilot). Any other `clockid` is `EINVAL`.
 pub(crate) fn sys_clock_gettime(clockid: u64, ts_ptr: u64) -> Result<u64, u64> {
+    let caller_pid = crate::process::scheduler::current_pid();
     let ts = match clockid {
         CLOCK_REALTIME => {
             let (tv_sec, tv_nsec) = crate::cpu::rtc::unix_epoch_now_precise();
@@ -1048,23 +1110,119 @@ pub(crate) fn sys_clock_gettime(clockid: u64, ts_ptr: u64) -> Result<u64, u64> {
             }
         }
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            let pid = crate::process::scheduler::current_pid();
             let cpu_ticks = crate::process::table()
                 .lock()
-                .get(&pid)
+                .get(&caller_pid)
                 .map(|p| p.cpu_ticks)
                 .unwrap_or(0);
-            let hz = crate::cpu::pit::TIMER_HZ as u64;
-            RawTimespec {
-                tv_sec: (cpu_ticks / hz) as i64,
-                tv_nsec: ((cpu_ticks % hz) * 1_000_000_000 / hz) as i64,
-            }
+            cpu_time_ticks_to_ts(cpu_ticks)
         }
-        _ => return Err(EINVAL),
+        _ => {
+            // Real `clock_getcpuclockid(2)` support -- see `decode_dynamic_cpu_clock_pid`'s own
+            // doc comment. A decoded pid this kernel has no process for is `EINVAL`
+            // (`clock_getcpuclockid`'s own musl wrapper maps that to `ESRCH` client-side; a direct
+            // `clock_gettime` caller sees the plain `EINVAL`, matching real Linux).
+            let target_pid = decode_dynamic_cpu_clock_pid(caller_pid, clockid).ok_or(EINVAL)?;
+            let cpu_ticks = crate::process::table()
+                .lock()
+                .get(&target_pid)
+                .map(|p| p.cpu_ticks)
+                .ok_or(EINVAL)?;
+            cpu_time_ticks_to_ts(cpu_ticks)
+        }
     };
     // SAFETY: same known pointer-validation gap every other user-memory write in this file
     // already has -- ts_ptr isn't checked against the caller's actual mappings first.
     unsafe { *(ts_ptr as *mut RawTimespec) = ts };
+    Ok(0)
+}
+
+/// `SYS_CLOCK_GETRES` -- real Linux's own unclaimed `229` (confirmed against every `SYS_*`
+/// constant already registered in this ABI; musl's `bits/syscall.h.in` already carries this value
+/// unremapped, and `third_party/musl/src/time/clock_getres.c` calls straight through, so no
+/// musl-side patch was needed, just a kernel-side handler). Every clock this kernel implements
+/// ticks at a real, honest `TIMER_HZ` (`src/cpu/pit.rs`) cadence -- including the sub-second
+/// `CLOCK_REALTIME` reading `sys_clock_gettime` derives from it -- so `1_000_000_000 / TIMER_HZ`ns
+/// is the one real resolution value reported for every recognized `clockid`, standard or dynamic
+/// per-process (see `decode_dynamic_cpu_clock_pid`). `res_ptr == 0` is real POSIX-legal (the
+/// resolution query alone, `clockid` validity is still checked) so only written when non-null.
+/// Closes `clock_getres/1-1.c`/`3-1.c`/`6-1.c`/`6-2.c`/`7-1.c`/`8-1.c` and, transitively (this is
+/// the only syscall `clock_getcpuclockid(2)`'s own musl implementation issues, purely to validate
+/// the pid before handing the encoded `clockid_t` back), `clock_getcpuclockid/1-1.c`/`2-1.c`.
+pub(crate) fn sys_clock_getres(clockid: u64, res_ptr: u64) -> Result<u64, u64> {
+    let caller_pid = crate::process::scheduler::current_pid();
+    match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {}
+        _ => {
+            let target_pid = decode_dynamic_cpu_clock_pid(caller_pid, clockid).ok_or(EINVAL)?;
+            if !crate::process::table().lock().contains_key(&target_pid) {
+                return Err(EINVAL);
+            }
+        }
+    }
+    if res_ptr != 0 {
+        let hz = crate::cpu::pit::TIMER_HZ as i64;
+        // SAFETY: same known pointer-validation gap every other user-memory write in this file
+        // already has.
+        unsafe {
+            *(res_ptr as *mut RawTimespec) = RawTimespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000 / hz,
+            }
+        };
+    }
+    Ok(0)
+}
+
+/// `SYS_CLOCK_SETTIME` -- real Linux's own unclaimed `227` (same "already carried unremapped in
+/// `bits/syscall.h.in`, only a kernel-side handler was missing" story as `sys_clock_getres` above).
+///
+/// `CLOCK_REALTIME` recalibrates `cpu::rtc`'s live wall-clock offset (`rtc::set_unix_epoch`) --
+/// closes `clock_settime/1-1.c`/`4-1.c`/`5-1.c`/`7-1.c`/`8-1.c` (all previously `UNRESOLVED`
+/// purely because this syscall didn't exist, `ENOSYS`ing before ever reaching each test's own
+/// pass/fail logic) and the `helpers.h` `getBeforeTime`/`setBackTime` pair every one of them uses
+/// to restore the clock afterward. `CLOCK_MONOTONIC` is never settable (`EINVAL`, real POSIX
+/// "Monotonic Clock" requirement) -- closes `clock_settime/6-1.c`/`20-1.c`. A dynamic per-process
+/// clock (`decode_dynamic_cpu_clock_pid`) overwrites that process's own `Process::cpu_ticks`
+/// directly -- what `clock_getcpuclockid/2-1.c` needs: set one dynamic clockid decoding to the
+/// caller's own pid, then immediately read it back through a second one (`clock_getcpuclockid(0,
+/// ...)`, also decoding to the caller) and see the same value. Any other `clockid` (a
+/// positive-but-unrecognized value, or a dynamic one whose decoded pid has no live process) is
+/// `EINVAL` -- closes `clock_settime/17-1.c`. An out-of-range `tv_nsec` is `EINVAL` regardless of
+/// `clockid` (checked first) -- closes `clock_settime/19-1.c`.
+pub(crate) fn sys_clock_settime(clockid: u64, ts_ptr: u64) -> Result<u64, u64> {
+    // SAFETY: same known pointer-validation gap every other user-memory read in this file already
+    // has.
+    let ts = unsafe { *(ts_ptr as *const RawTimespec) };
+    if !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(EINVAL);
+    }
+    match clockid {
+        CLOCK_REALTIME => {
+            crate::cpu::rtc::set_unix_epoch(ts.tv_sec, ts.tv_nsec);
+            Ok(0)
+        }
+        CLOCK_MONOTONIC => Err(EINVAL),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            set_cpu_ticks(crate::process::scheduler::current_pid(), ts.tv_sec, ts.tv_nsec)
+        }
+        _ => {
+            let caller_pid = crate::process::scheduler::current_pid();
+            let target_pid = decode_dynamic_cpu_clock_pid(caller_pid, clockid).ok_or(EINVAL)?;
+            set_cpu_ticks(target_pid, ts.tv_sec, ts.tv_nsec)
+        }
+    }
+}
+
+fn set_cpu_ticks(pid: crate::process::Pid, sec: i64, nsec: i64) -> Result<u64, u64> {
+    if sec < 0 {
+        return Err(EINVAL);
+    }
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    let ticks = sec as u64 * hz + (nsec as u64 * hz) / 1_000_000_000;
+    let mut table = crate::process::table().lock();
+    let proc = table.get_mut(&pid).ok_or(EINVAL)?;
+    proc.cpu_ticks = ticks;
     Ok(0)
 }
 
@@ -1331,8 +1489,20 @@ pub(crate) extern "C" fn oxidebsd_sys_sched_get_priority_min(policy: u64) -> i64
     result_to_ffi(sys_sched_get_priority_min(policy))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_sched_rr_get_interval(pid: u64, ts_ptr: u64) -> i64 {
+    result_to_ffi(sys_sched_rr_get_interval(pid, ts_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_yield() -> i64 {
+    result_to_ffi(sys_sched_yield())
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_reboot(cmd: u64) -> i64 {
     result_to_ffi(sys_reboot(cmd))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_futex(_addr: u64, op: u64, _val: u64, _to: u64) -> i64 {
+    result_to_ffi(sys_futex(op))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {
@@ -1345,6 +1515,29 @@ pub(crate) extern "C" fn oxidebsd_sys_uname(uts_ptr: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_clock_gettime(clockid: u64, ts_ptr: u64) -> i64 {
     result_to_ffi(sys_clock_gettime(clockid, ts_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_clock_getres(clockid: u64, res_ptr: u64) -> i64 {
+    result_to_ffi(sys_clock_getres(clockid, res_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_clock_settime(clockid: u64, ts_ptr: u64) -> i64 {
+    result_to_ffi(sys_clock_settime(clockid, ts_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_clock_nanosleep(
+    clockid: u64,
+    flags: u64,
+    req_ptr: u64,
+    rem_ptr: u64,
+) -> i64 {
+    result_to_ffi(crate::process::do_clock_nanosleep(
+        crate::process::scheduler::current_pid(),
+        clockid,
+        flags,
+        req_ptr,
+        rem_ptr,
+    ))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i64 {

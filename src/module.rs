@@ -767,6 +767,15 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_clock_gettime" => {
             Some(crate::syscall::oxidebsd_sys_clock_gettime as *const () as u64)
         }
+        "oxidebsd_sys_clock_getres" => {
+            Some(crate::syscall::oxidebsd_sys_clock_getres as *const () as u64)
+        }
+        "oxidebsd_sys_clock_settime" => {
+            Some(crate::syscall::oxidebsd_sys_clock_settime as *const () as u64)
+        }
+        "oxidebsd_sys_clock_nanosleep" => {
+            Some(crate::syscall::oxidebsd_sys_clock_nanosleep as *const () as u64)
+        }
         "oxidebsd_sys_nanosleep" => {
             Some(crate::syscall::oxidebsd_sys_nanosleep as *const () as u64)
         }
@@ -845,7 +854,14 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_sched_get_priority_min" => {
             Some(crate::syscall::oxidebsd_sys_sched_get_priority_min as *const () as u64)
         }
+        "oxidebsd_sys_sched_rr_get_interval" => {
+            Some(crate::syscall::oxidebsd_sys_sched_rr_get_interval as *const () as u64)
+        }
+        "oxidebsd_sys_sched_yield" => {
+            Some(crate::syscall::oxidebsd_sys_sched_yield as *const () as u64)
+        }
         "oxidebsd_sys_reboot" => Some(crate::syscall::oxidebsd_sys_reboot as *const () as u64),
+        "oxidebsd_sys_futex" => Some(crate::syscall::oxidebsd_sys_futex as *const () as u64),
         "oxidebsd_sys_getrusage" => {
             Some(crate::syscall::oxidebsd_sys_getrusage as *const () as u64)
         }

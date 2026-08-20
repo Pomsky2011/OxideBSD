@@ -412,6 +412,16 @@ pub struct PosixTimer {
     /// Reload value in ticks for a periodic timer; `0` means one-shot -- same convention
     /// `real_timer_interval_ticks` above already uses.
     pub interval_ticks: u64,
+    /// Live wall-clock `(tv_sec, tv_nsec)` target -- `Some` only for a timer armed via
+    /// `TIMER_ABSTIME` against `CLOCK_REALTIME`, `None` otherwise (including once such a timer has
+    /// fired once -- a periodic reload falls back to `deadline`/`interval_ticks` alone, real
+    /// per-reload wall-clock tracking not needed by any real caller here). Checked by
+    /// `interrupts::timer_interrupt_handler` *instead of* `deadline` when present: a fresh
+    /// `rtc::unix_epoch_now_precise()` comparison every tick, rather than a tick count baked in
+    /// once at `timer_settime` time, is what lets a later `clock_settime(CLOCK_REALTIME, ...)`
+    /// correctly delay or hasten this timer's firing with zero extra bookkeeping on the
+    /// `clock_settime` side -- closes `clock_settime/4-1.c`.
+    pub realtime_target: Option<(i64, i64)>,
     /// `timer_getoverrun`'s backing store: how many additional expirations this timer has hit
     /// while its previous expiry's signal was still pending (undelivered) -- resets to `0` the
     /// moment a fresh (not-already-pending) expiry sets the pending bit again. A real, if

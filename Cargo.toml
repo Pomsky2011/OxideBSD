@@ -34,6 +34,8 @@ members = [
   "userland/sig-syscall-smoke",
   "userland/rt-signal-syscall-smoke",
   "userland/mmap-syscall-smoke",
+  "userland/clock-syscall-smoke",
+  "userland/sched-syscall-smoke",
   "userland/posix-conformance-driver",
   "userland/lsoxmod",
   "modules/hello",
@@ -234,20 +236,36 @@ name = "mmap_syscall_smoke"
 harness = false
 
 [[test]]
+name = "clock_syscall_smoke"
+harness = false
+
+[[test]]
+name = "sched_syscall_smoke"
+harness = false
+
+[[test]]
 name = "posix_conformance_smoke"
 harness = false
 
-# -m 1024 (was QEMU's own unstated default, ~128 MiB): modules/oxfs's own in-memory block pool
-# grew to 32 MiB once the BusyBox roster grew to ~300 applets (see CLAUDE.md's BusyBox section),
-# and -- since src/memory.rs's frame allocator never reclaims and this kernel maps every module
-# page eagerly, not on demand -- that pool is a real physical-memory commitment from the moment
+# -m 8192 (was QEMU's own unstated default, ~128 MiB, then 1024 once the BusyBox roster grew to
+# ~300 applets): modules/oxfs's own in-memory block pool grew to 32 MiB at that point (see
+# CLAUDE.md's BusyBox section), then to 64 MiB once the POSIX conformance pilot's own embedded
+# corpus grew from 68 to 492 files (see CLAUDE.md's "POSIX conformance pilot" sections) -- and --
+# since src/memory.rs's frame allocator never reclaims and this kernel maps every module page
+# eagerly, not on demand -- that pool is a real physical-memory commitment from the moment
 # modules/oxfs loads, on top of the kernel image/heap/stacks and the module's own embedded ELF
-# bytes (~18 MiB) also resident at the same time. 1024 MiB leaves generous headroom over that, and
-# scales src/allocator.rs's own RAM-proportional heap size up to its 128 MiB ceiling too -- safe to
-# do now that src/allocator.rs's init_heap and src/module.rs's map_region both map freshly
-# allocated pages with `.ignore()` instead of `.flush()` (a real, measured multi-minute boot stall
-# otherwise: this RAM bump alone, before that fix, pushed the heap to ~32,000 pages, each
-# individually `invlpg`-flushed and trapped under QEMU's software TCG emulation).
+# bytes (~18 MiB BusyBox + the pilot corpus) also resident at the same time. Bumped again, 1024 ->
+# 8192, alongside src/allocator.rs's own HEAP_SIZE_CEILING (128 -> 1024 MiB, same 1/8-of-RAM
+# scaling, see that constant's own doc comment) once running the expanded 492-file pilot corpus in
+# one continuous boot -- several hundred real `fork`+`execve`+`wait4` cycles, none of it ever
+# reclaimed by this kernel's own design -- genuinely exhausted the old 128 MiB heap ceiling around
+# the ~140th file. 8192 MiB leaves generous headroom over the whole corpus, not just enough to
+# barely finish, and scales src/allocator.rs's own RAM-proportional heap size up to its new 1024 MiB
+# ceiling too -- safe to do now that src/allocator.rs's init_heap and src/module.rs's map_region
+# both map freshly allocated pages with `.ignore()` instead of `.flush()` (a real, measured
+# multi-minute boot stall otherwise: the original 128 -> 1024 MiB RAM bump alone, before that fix,
+# pushed the heap to ~32,000 pages, each individually `invlpg`-flushed and trapped under QEMU's
+# software TCG emulation).
 [package.metadata.bootimage]
 # -accel kvm -accel tcg: neither test-args nor run-args ever requested an accelerator before, so
 # QEMU silently ran pure-software TCG the whole time -- normally fine (this kernel boots in a
@@ -282,24 +300,24 @@ test-args = [
   "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
   "-serial", "stdio",
   "-display", "none",
-  "-m", "1024",
+  "-m", "8192",
   "-nic", "user,model=rtl8139",
   "-drive", "if=none,id=oxfsdisk,format=raw,file=target/oxfs_test_disk.img",
   "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
 ]
 test-success-exit-code = 33
-# 1800 (was 300, then 900): shared across every [[test]] target (bootimage's own per-binary
-# timeout, not per-check), bumped for posix_conformance_smoke -- 69 real t0-guarded runs (each
-# individually bounded at 40s, but the sum across the whole pilot can genuinely approach a lower
-# ceiling if several tests each burn their full timeout, confirmed live: a 900s ceiling wasn't
-# enough once the pilot switched to real pre-built ELFs and started actually running every test
-# instead of crashing partway through). Harmless headroom for every faster existing test.
-test-timeout = 1800
+# 7200 (was 1800, before that 300, then 900): shared across every [[test]] target (bootimage's own
+# per-binary timeout, not per-check), bumped for posix_conformance_smoke -- 1800s was sized for the
+# pilot's original 69 real t0-guarded runs (each individually bounded at 40s); the pilot corpus grew
+# to 492 files in the same session, a ~7x increase, so the same "sum across the whole pilot can
+# genuinely approach a lower ceiling if several tests each burn their full timeout" risk that forced
+# 900 -> 1800 applies again, scaled up. Harmless headroom for every faster existing test.
+test-timeout = 7200
 run-args = [
   "-accel", "kvm",
   "-accel", "tcg",
   "-serial", "stdio",
-  "-m", "1024",
+  "-m", "8192",
   "-nic", "user,model=rtl8139",
   "-drive", "if=none,id=oxfsdisk,format=raw,file=target/oxfs_disk.img",
   "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",

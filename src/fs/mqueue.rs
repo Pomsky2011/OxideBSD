@@ -63,7 +63,7 @@ use spin::Mutex;
 
 use crate::process::{self, BlockReason, Pid, ProcState};
 use crate::process::scheduler;
-use crate::syscall::{EAGAIN, EBADF, EBUSY, EEXIST, EINVAL, EMSGSIZE, ENOENT, ETIMEDOUT};
+use crate::syscall::{EAGAIN, EBADF, EBUSY, EEXIST, EINTR, EINVAL, EMSGSIZE, ENOENT, ETIMEDOUT};
 
 const O_ACCMODE: u64 = 3;
 const O_CREAT: u64 = 0o100;
@@ -433,8 +433,16 @@ pub(crate) fn do_mq_timedsend(
                 }
                 let caller = scheduler::current_pid();
                 let mut table = process::table().lock();
-                table.get_mut(&caller).unwrap().state =
-                    ProcState::Blocked(BlockReason::WaitingForMqSpace(end.mq_id, deadline));
+                let proc = table.get_mut(&caller).unwrap();
+                // Real POSIX: a signal that will invoke a caught handler interrupts a blocking
+                // mq_send() early -- same reasoning do_mq_timedreceive's own identical check above
+                // already establishes.
+                if proc.pending_signals & !proc.blocked_signals != 0 {
+                    drop(table);
+                    drop(queues);
+                    return Err(EINTR);
+                }
+                proc.state = ProcState::Blocked(BlockReason::WaitingForMqSpace(end.mq_id, deadline));
                 drop(table);
                 drop(queues);
                 scheduler::schedule();
@@ -501,8 +509,18 @@ pub(crate) fn do_mq_timedreceive(
                 }
                 let caller = scheduler::current_pid();
                 let mut table = process::table().lock();
-                table.get_mut(&caller).unwrap().state =
-                    ProcState::Blocked(BlockReason::WaitingForMqData(end.mq_id, deadline));
+                let proc = table.get_mut(&caller).unwrap();
+                // Real POSIX: a signal that will invoke a caught handler interrupts a blocking
+                // mq_receive() early -- checked before (re-)blocking, same "avoid a lost wakeup"
+                // reasoning do_pause's/do_nanosleep's own identical check already establishes. See
+                // signals::wake_if_mq_waiting's own doc comment for why this hook is real,
+                // load-bearing plumbing here, not just a nicety.
+                if proc.pending_signals & !proc.blocked_signals != 0 {
+                    drop(table);
+                    drop(queues);
+                    return Err(EINTR);
+                }
+                proc.state = ProcState::Blocked(BlockReason::WaitingForMqData(end.mq_id, deadline));
                 drop(table);
                 drop(queues);
                 scheduler::schedule();

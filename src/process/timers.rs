@@ -313,11 +313,22 @@ fn ticks_to_timespec(ticks: u64) -> (i64, i64) {
 /// *is* "seconds since boot at `TIMER_HZ` resolution" -- exactly what `ticks()` counts -- so a
 /// requested absolute timestamp converts the same way a relative one would (`timespec_to_ticks`),
 /// just used directly as the deadline instead of added to `ticks()`. `CLOCK_REALTIME`'s domain is
-/// wall-clock time (`src/cpu/rtc.rs`'s live CMOS read, `tv_nsec` always `0`) -- converted via the
-/// delta between the requested wall-clock second and *now*, then applied against the current tick
-/// count. A target already in the past (delta `<= 0`) collapses to "fire on the very next timer
-/// IRQ" (`now_ticks`) rather than underflowing, matching real semantics for an already-elapsed
-/// absolute deadline.
+/// wall-clock time -- converted via the delta between the requested wall-clock second and *now*,
+/// then applied against the current tick count. A target already in the past (delta `<= 0`)
+/// collapses to "fire on the very next timer IRQ" (`now_ticks`) rather than underflowing, matching
+/// real semantics for an already-elapsed absolute deadline.
+///
+/// **`rtc::unix_epoch_now_precise()`, not `rtc::unix_epoch_seconds()`** -- found live via this
+/// function's own smoke test (`userland/clock-syscall-smoke`'s part 7): the latter reads the real
+/// CMOS chip directly, entirely unaffected by `rtc::set_unix_epoch`'s recalibration, so a target
+/// computed against a `clock_settime`-adjusted `CLOCK_REALTIME` reading (e.g. `clock_settime/1-1.c`'s
+/// own Nov-2002 fixture) would diff against the *real*, un-adjusted current date instead -- a
+/// wildly wrong (here, deeply negative) `delta_secs` that collapsed to "fire immediately" instead
+/// of sleeping the real requested duration. `unix_epoch_now_precise()` is the same live,
+/// settable-via-`clock_settime` clock `sys_clock_gettime`'s own `CLOCK_REALTIME` arm already reads,
+/// so this keeps every `CLOCK_REALTIME`-domain absolute deadline (`timer_settime`,
+/// `do_clock_nanosleep`) consistent with whatever `clock_gettime(CLOCK_REALTIME, ...)` itself would
+/// report at arm time.
 pub(crate) fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
     let hz = crate::cpu::pit::TIMER_HZ as u64;
     let frac_ticks = (nsec as u64 * hz).div_ceil(1_000_000_000);
@@ -325,12 +336,13 @@ pub(crate) fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
     if clockid == CLOCK_MONOTONIC {
         sec.max(0) as u64 * hz + frac_ticks
     } else {
-        let now_wall = crate::cpu::rtc::unix_epoch_seconds();
-        let delta_secs = sec - now_wall;
-        if delta_secs <= 0 {
+        let (now_wall_sec, now_wall_nsec) = crate::cpu::rtc::unix_epoch_now_precise();
+        let delta_ticks = (sec - now_wall_sec) * hz as i64
+            + (nsec - now_wall_nsec) * hz as i64 / 1_000_000_000;
+        if delta_ticks <= 0 {
             now_ticks
         } else {
-            now_ticks + delta_secs as u64 * hz + frac_ticks
+            now_ticks + delta_ticks as u64
         }
     }
 }
@@ -386,6 +398,7 @@ pub fn do_timer_create(pid: Pid, clockid: u64, evp_ptr: u64, timerid_ptr: u64) -
         signo,
         deadline: None,
         interval_ticks: 0,
+        realtime_target: None,
         overrun: 0,
     });
     drop(table);
@@ -466,12 +479,19 @@ pub fn do_timer_settime(
     if new.it_value_sec == 0 && new.it_value_nsec == 0 {
         slot.deadline = None;
         slot.interval_ticks = 0;
+        slot.realtime_target = None;
     } else if flags & TIMER_ABSTIME != 0 {
         slot.deadline = Some(abstime_to_ticks(clockid, new.it_value_sec, new.it_value_nsec));
         slot.interval_ticks = interval_ticks;
+        slot.realtime_target = if clockid == CLOCK_REALTIME {
+            Some((new.it_value_sec, new.it_value_nsec))
+        } else {
+            None
+        };
     } else {
         slot.deadline = Some(crate::cpu::interrupts::ticks() + value_ticks);
         slot.interval_ticks = interval_ticks;
+        slot.realtime_target = None;
     }
     slot.overrun = 0;
     Ok(0)
@@ -548,5 +568,113 @@ pub fn do_timer_delete(pid: Pid, timerid: u64) -> Result<u64, u64> {
         return Err(EINVAL);
     }
     *slot = None;
+    Ok(0)
+}
+
+/// `SYS_CLOCK_NANOSLEEP` -- real Linux's own unclaimed `230` (confirmed against every `SYS_*`
+/// constant already registered in this ABI, same collision-avoidance discipline the syscall-ABI
+/// section of `CLAUDE.md` requires; musl's own `bits/syscall.h.in` already carries this value
+/// unremapped, so no musl-side patch was needed either, just a kernel-side handler). musl's own
+/// `__clock_nanosleep` (`third_party/musl/src/time/clock_nanosleep.c`) only ever issues this
+/// syscall when `clk != CLOCK_REALTIME || flags != 0` -- the one case that instead short-circuits
+/// to plain `SYS_nanosleep`/`do_nanosleep` above is a relative `CLOCK_REALTIME` sleep, already
+/// handled. `clk == CLOCK_THREAD_CPUTIME_ID` never reaches here either -- that same C source
+/// returns `EINVAL` for it client-side before ever issuing a syscall.
+///
+/// `CLOCK_MONOTONIC` (relative or `TIMER_ABSTIME`) and a relative `CLOCK_REALTIME` request (only
+/// reachable by a caller bypassing musl's own wrapper) all resolve to a single, fixed
+/// `interrupts::ticks()` deadline computed once, exactly like `do_nanosleep`'s own shape --
+/// `ticks()` already *is* `CLOCK_MONOTONIC`'s domain, immune to any later `clock_settime`.
+///
+/// **`CLOCK_REALTIME` + `TIMER_ABSTIME` is the one case needing real, live wall-clock tracking,**
+/// closing `clock_nanosleep/2-1.c`/`3-1.c` (previously `ENOSYS`, since this syscall didn't exist at
+/// all) and `clock_settime/7-1.c` (a concurrent `clock_settime(CLOCK_REALTIME, ...)` from another
+/// process must retarget an in-progress wait like this one). Rather than storing a fixed tick
+/// deadline once and needing some separate mechanism to shift it later (what `PosixTimer::
+/// realtime_target` needs, since nothing re-enters that code path once armed), this function
+/// re-derives its own deadline via `abstime_to_ticks` fresh on **every** loop pass -- cheap, and
+/// self-correcting for free: if a concurrent `clock_settime` moved the real target further out
+/// than this loop's last computed (now-stale, too-early) deadline, the timer IRQ still wakes this
+/// process at that stale tick (an ordinary, harmless spurious wake, using the same plain
+/// `BlockReason::Sleeping` every other tick-deadline wait already uses -- no new variant needed),
+/// this loop's next pass recomputes a fresh, now-correct deadline from the *current* wall clock,
+/// and re-blocks. A `clock_settime` moving the target *closer* is handled directly by the same
+/// recompute, with no extra wake needed at all.
+pub fn do_clock_nanosleep(
+    pid: Pid,
+    clockid: u64,
+    flags: u64,
+    req_ptr: u64,
+    rem_ptr: u64,
+) -> Result<u64, u64> {
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return Err(EINVAL);
+    }
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(EINVAL);
+    }
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let req = unsafe { *(req_ptr as *const RawTimespec) };
+    if !(0..1_000_000_000).contains(&req.tv_nsec) {
+        return Err(EINVAL);
+    }
+    let absolute = flags & TIMER_ABSTIME != 0;
+    if !absolute && req.tv_sec < 0 {
+        return Err(EINVAL);
+    }
+
+    let hz = crate::cpu::pit::TIMER_HZ as u64;
+    let wall_clock_realtime = absolute && clockid == CLOCK_REALTIME;
+
+    let mut deadline = if absolute {
+        abstime_to_ticks(clockid, req.tv_sec, req.tv_nsec)
+    } else {
+        let whole = req.tv_sec as u64 * hz;
+        let frac = (req.tv_nsec as u64 * hz).div_ceil(1_000_000_000);
+        crate::cpu::interrupts::ticks() + whole + frac
+    };
+
+    while crate::cpu::interrupts::ticks() < deadline {
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let proc = table.get_mut(&pid).unwrap();
+            // Real POSIX: a signal that will invoke a caught handler interrupts the sleep early --
+            // same "avoid a lost wakeup" reasoning `do_nanosleep`'s own identical check already
+            // establishes.
+            if proc.pending_signals & !proc.blocked_signals != 0 {
+                let now = crate::cpu::interrupts::ticks();
+                let remaining = deadline.saturating_sub(now);
+                drop(table);
+                // Real POSIX: `rem` is only ever meaningful for a *relative* request -- an
+                // absolute-mode `clock_nanosleep` never writes it back on `EINTR` either.
+                if rem_ptr != 0 && !absolute {
+                    // SAFETY: same known pointer-validation gap as above, for a write this time.
+                    unsafe {
+                        *(rem_ptr as *mut RawTimespec) = RawTimespec {
+                            tv_sec: (remaining / hz) as i64,
+                            tv_nsec: ((remaining % hz) * 1_000_000_000 / hz) as i64,
+                        }
+                    };
+                }
+                return Err(EINTR);
+            }
+            proc.state = ProcState::Blocked(BlockReason::Sleeping(deadline));
+        } // lock dropped before schedule() -- see process::table()'s own doc comment
+        crate::process::scheduler::schedule();
+        if wall_clock_realtime {
+            deadline = abstime_to_ticks(CLOCK_REALTIME, req.tv_sec, req.tv_nsec);
+        }
+    }
+
+    if rem_ptr != 0 && !absolute {
+        // SAFETY: same known pointer-validation gap as above, for a write this time.
+        unsafe {
+            *(rem_ptr as *mut RawTimespec) = RawTimespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }
+        };
+    }
     Ok(0)
 }

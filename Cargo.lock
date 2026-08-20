@@ -75,6 +75,10 @@ name = "clock"
 version = "0.1.0"
 
 [[package]]
+name = "clock-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "const_fn"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,6 +311,10 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "sa-siginfo-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "sched-syscall-smoke"
 version = "0.1.0"
 
 [[package]]

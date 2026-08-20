@@ -195,6 +195,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
                 wake_if_paused(target, proc, sig);
                 wake_if_sigwaiting(target, proc, sig);
                 wake_if_sleeping(target, proc, sig);
+                wake_if_mq_waiting(target, proc, sig);
             }
         }
     }
@@ -292,6 +293,7 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                     wake_if_paused(pid, proc, sig);
                     wake_if_sigwaiting(pid, proc, sig);
                     wake_if_sleeping(pid, proc, sig);
+                    wake_if_mq_waiting(pid, proc, sig);
                 }
             }
         }
@@ -383,6 +385,29 @@ fn wake_if_paused(pid: Pid, proc: &mut Process, sig: u64) {
 /// early). Found live via the Open POSIX Test Suite pilot's `nanosleep/1-3.c`.
 fn wake_if_sleeping(pid: Pid, proc: &mut Process, sig: u64) {
     if let ProcState::Blocked(BlockReason::Sleeping(_)) = proc.state
+        && proc.blocked_signals & (1 << (sig - 1)) == 0
+    {
+        proc.state = ProcState::Ready;
+        scheduler::enqueue_ready(pid);
+    }
+}
+
+/// Wakes `pid` if it's blocked in `fs::mqueue::do_mq_timedreceive`/`do_mq_timedsend` and `sig`
+/// isn't currently blocked by it -- same shape `wake_if_sleeping` above already establishes, for
+/// the identical real POSIX reason: a blocking `mq_receive(3)`/`mq_send(3)` must be interrupted
+/// early by a signal that will invoke a caught handler, not wait out its own deadline (`u64::MAX`
+/// for the plain, non-timed wrapper shape -- see `BlockReason::WaitingForMqData`'s own doc comment
+/// -- meaning without this hook a plain `mq_receive()` on an empty queue could never be interrupted
+/// at all, a permanent hang, not just a missed-early-wake"). Found live, not preemptively: the
+/// expanded POSIX conformance pilot's own `mq_receive/13-1.c` hung the entire pilot run past any
+/// of `t0`'s own 40s per-test bound -- a parent blocked in a plain `mq_receive()` never woke for a
+/// child's `kill(pid, SIGABRT)`, and (since a genuinely stuck syscall blocks the whole process, not
+/// just the one call) even `t0`'s own outer `SIGALRM` had nothing to interrupt either, since
+/// `do_mq_timedreceive`'s loop only re-checks the real queue state, never a deliverable signal.
+fn wake_if_mq_waiting(pid: Pid, proc: &mut Process, sig: u64) {
+    if let ProcState::Blocked(
+        BlockReason::WaitingForMqData(_, _) | BlockReason::WaitingForMqSpace(_, _),
+    ) = proc.state
         && proc.blocked_signals & (1 << (sig - 1)) == 0
     {
         proc.state = ProcState::Ready;
@@ -1015,6 +1040,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
                 wake_if_paused(target, proc, sig);
                 wake_if_sigwaiting(target, proc, sig);
                 wake_if_sleeping(target, proc, sig);
+                wake_if_mq_waiting(target, proc, sig);
             }
         }
     }

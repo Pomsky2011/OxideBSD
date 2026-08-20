@@ -151,7 +151,10 @@ unsafe extern "C" {
     fn oxidebsd_sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask_ptr: u64) -> i64;
     fn oxidebsd_sys_sched_get_priority_max(policy: u64) -> i64;
     fn oxidebsd_sys_sched_get_priority_min(policy: u64) -> i64;
+    fn oxidebsd_sys_sched_rr_get_interval(pid: u64, ts_ptr: u64) -> i64;
+    fn oxidebsd_sys_sched_yield() -> i64;
     fn oxidebsd_sys_reboot(cmd: u64) -> i64;
+    fn oxidebsd_sys_futex(addr: u64, op: u64, val: u64, to: u64) -> i64;
     fn oxidebsd_sys_umask(new_mask: u64) -> i64;
     fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64;
     fn oxidebsd_sys_times(tms_ptr: u64) -> i64;
@@ -248,6 +251,19 @@ const SYS_SCHED_GETPARAM: u64 = 483;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_SCHED_GET_PRIORITY_MAX: u64 = 484;
 const SYS_SCHED_GET_PRIORITY_MIN: u64 = 485;
+/// OxideBSD's own invention -- already pre-reserved (with no kernel handler) in
+/// `bits/syscall.h.in` back when the rest of this `sched_*` batch first landed; only now given a
+/// real `process::do_sched_rr_get_interval` handler. See that function's own doc comment.
+const SYS_SCHED_RR_GET_INTERVAL: u64 = 508;
+/// Real x86_64 Linux's own `__NR_sched_yield` (`24`), unremapped -- musl's own `sched_yield()`
+/// already calls straight through with no argument-convention issue (a real zero-argument call).
+/// See `process::do_sched_yield`'s own doc comment.
+const SYS_SCHED_YIELD: u64 = 24;
+/// Real Linux's own `__NR_futex = 202`, used directly -- same "confirmed unassigned in this ABI's
+/// own registry" reasoning `SYS_SCHED_GETAFFINITY` above already establishes. See
+/// `process::do_futex`'s own doc comment in `src/process/limits.rs` for why this is a real, honest
+/// failure stub (not real futex support) and the live `sem_wait/7-1.c` infinite-busy-loop it closes.
+const SYS_FUTEX: u64 = 202;
 const SYS_REBOOT: u64 = 486;
 /// Continues the same 471-486 batch one past `SYS_REBOOT = 486` -- see this module's own
 /// `SYS_PRLIMIT64` doc comment for why that batch landed there instead of continuing this
@@ -439,12 +455,24 @@ extern "C" fn handle_sched_get_priority_min(policy: u64, _a1: u64, _a2: u64, _a3
     unsafe { oxidebsd_sys_sched_get_priority_min(policy) }
 }
 
+extern "C" fn handle_sched_rr_get_interval(pid: u64, ts_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_rr_get_interval(pid, ts_ptr) }
+}
+
+extern "C" fn handle_sched_yield(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_yield() }
+}
+
 /// Real `reboot(int type)`'s musl-side call site (`third_party/musl/src/linux/reboot.c`) passes
 /// the two real magic numbers as the syscall's first two arguments and `type` as the third --
 /// this handler picks `cmd` out of the third register (`argp`-equivalent position) rather than the
 /// first, matching that real wire shape instead of assuming a single-argument one.
 extern "C" fn handle_reboot(_magic1: u64, _magic2: u64, cmd: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_reboot(cmd) }
+}
+
+extern "C" fn handle_futex(addr: u64, op: u64, val: u64, to: u64) -> i64 {
+    unsafe { oxidebsd_sys_futex(addr, op, val, to) }
 }
 
 extern "C" fn handle_umask(new_mask: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
@@ -577,7 +605,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SCHED_GETAFFINITY, handle_sched_getaffinity);
         oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MAX, handle_sched_get_priority_max);
         oxidebsd_register_syscall(SYS_SCHED_GET_PRIORITY_MIN, handle_sched_get_priority_min);
+        oxidebsd_register_syscall(SYS_SCHED_RR_GET_INTERVAL, handle_sched_rr_get_interval);
+        oxidebsd_register_syscall(SYS_SCHED_YIELD, handle_sched_yield);
         oxidebsd_register_syscall(SYS_REBOOT, handle_reboot);
+        oxidebsd_register_syscall(SYS_FUTEX, handle_futex);
         oxidebsd_register_syscall(SYS_UMASK, handle_umask);
         oxidebsd_register_syscall(SYS_GETRUSAGE, handle_getrusage);
         oxidebsd_register_syscall(SYS_TIMES, handle_times);
@@ -603,7 +634,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SHMDT, handle_shmdt);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_REBOOT/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
     );
     0
 }

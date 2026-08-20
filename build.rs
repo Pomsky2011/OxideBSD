@@ -106,6 +106,8 @@ fn main() {
         "posix-conformance-driver",
         "POSIX_CONFORMANCE_DRIVER_ELF_PATH",
     );
+    build_userland_crate("clock-syscall-smoke", "CLOCK_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("sched-syscall-smoke", "SCHED_SYSCALL_SMOKE_ELF_PATH");
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -955,18 +957,55 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
 /// `modules/oxfs/src/posix_conformance.sh`'s for how they get run.
 ///
 /// **Deliberately not the whole suite** (1750 `.c` files in `conformance/interfaces/` alone,
-/// before `functional`/`stress`): this pilot exists to prove the whole pipeline -- build, run
-/// under a real timeout, classify the real POSIX result code -- works end to end, and to get a
-/// first, real (if partial) pass/fail baseline, not to be the final coverage. Picked from
-/// interfaces this session already knows the implementation status of (real handlers for
-/// `kill`/`sigqueue`/`clock_gettime`/`nanosleep`/`sigwait`/`mq_open`, real-but-anonymous-only
-/// `mmap`, and the two POSIX-named — not SysV — IPC gaps `sem_open`/`shm_open` intentionally
-/// included as expected-failure controls), restricted to files that don't reference
+/// before `functional`/`stress`): even after this list's own expansion below, this pilot is still
+/// a curated subset, not the final coverage. Restricted to files that don't reference
 /// `pthread_create`/`testfrmw.h` (real threading doesn't exist yet -- see
 /// `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own foundational-blockers list -- so a test needing it
-/// would only add noise, not signal, to this first pass). All 69 originally in this list confirmed
-/// to compile clean against real `musl-gcc` (the same toolchain that now actually builds them, see
-/// below) before being added here.
+/// would only add noise, not signal). The original 68 (kept first, unreordered) were picked from
+/// interfaces that session already knew the implementation status of (real handlers for
+/// `kill`/`sigqueue`/`clock_gettime`/`nanosleep`/`sigwait`/`mq_open`, real-but-anonymous-only
+/// `mmap`, and the two POSIX-named — not SysV — IPC gaps `sem_open`/`shm_open` intentionally
+/// included as expected-failure controls).
+///
+/// **Expanded from 68 to 488** (this session): every remaining non-pthread, non-`aio_*`/
+/// `lio_listio` (real POSIX AIO is thread-pool-backed in musl, same threading blocker) directory
+/// under `conformance/interfaces/` was probed -- every `.c` file not referencing `pthread_create`/
+/// `testfrmw.h` compiled against the real static `musl-gcc` sysroot (same toolchain
+/// `write_posix_test_manifest` below actually builds with), then deduplicated: most of these
+/// directories are machine-generated per-assertion families (`gentests.pl`) where `N-2.c`, `N-3.c`,
+/// ... only vary *which* signal/parameter the same assertion `N` is checked against (confirmed by
+/// reading `sigaction/8-2.c` vs `8-3.c` -- identical assertion, different signal) -- so only the
+/// lowest-numbered variant per assertion number is kept (`sigaction` alone drops from 420 candidate
+/// files to 16 this way). Files whose own name ends `-buildonly.c`/`-core-buildonly.c` are also
+/// excluded -- these expect a real `argv[1]` selecting which of several sub-cases to run (normally
+/// supplied by the suite's own multi-invocation driver script, which this pilot doesn't have); run
+/// with none, per `sigaddset/1-core-buildonly.c`'s own logic, they just return `PTS_UNRESOLVED`
+/// unconditionally, adding no real signal. `sigwait/4-1.c` stays excluded from every re-expansion
+/// for the same already-documented reason (its own internal `alarm(3)` call replaces `t0`'s outer
+/// timeout -- see the comment at its own list position below). New interfaces this expansion adds
+/// real coverage for: every basic signal-set/mask/action manipulation function
+/// (`sigaction`/`sigprocmask`/`sigaltstack`/`sigsuspend`/`sigtimedwait`/`sigwaitinfo`/`sigset`/
+/// `sighold`/`sigrelse`/`sigignore`/`sigpause`/`sigaddset`/`sigdelset`/`sigemptyset`/`sigfillset`/
+/// `sigismember`/`sigpending`/`signal`/`raise`), POSIX per-process timers (`timer_create`/`_delete`/
+/// `_getoverrun`/`_gettime`/`_settime`), the rest of the message-queue family (`mq_close`/
+/// `_getattr`/`_notify`/`_receive`/`_send`/`_setattr`/`_timedreceive`/`_timedsend`/`_unlink`, only
+/// `mq_open` had real coverage before), `munmap`/`shm_unlink` (only `mmap`/`shm_open` had real
+/// coverage before), the `sched_*` field-accessor family (stored/echoed, not enforced -- see
+/// `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s "honest-but-unenforced" section, so these are expected to
+/// surface real, informative gaps rather than pass outright), the unnamed/anonymous half of the
+/// `sem_*` family (`sem_init`/`_destroy`/`_wait`/`_trywait`/`_timedwait`/`_post`/`_getvalue`, plus
+/// the rest of `sem_open`/`_close`/`_unlink` beyond the original 8 files) -- included as real
+/// probes despite named POSIX semaphores being a documented threading-blocked gap, since these
+/// particular functions don't themselves require a second thread to exercise meaningfully single-
+/// process, `fsync`/`killpg` (only `kill`/`sigqueue` had real coverage before), the `clock_*` family
+/// beyond `clock_gettime` (`clock`/`clock_getcpuclockid`/`clock_getres`/`clock_nanosleep`/
+/// `clock_settime` -- all real, kernel-implemented syscalls now, see `SYS_CLOCK_GETRES`/
+/// `SYS_CLOCK_SETTIME`/`SYS_CLOCK_NANOSLEEP` in the OxideBSD tree's `modules/clock`; originally
+/// added to this pilot as expected-`ENOSYS`-failure controls before any of the three existed),
+/// plain time-conversion libc functions (`asctime`/`ctime`/`difftime`/`gmtime`/`localtime`/
+/// `mktime`/`strftime`/`time`), and `mlock`/`mlockall`/`munlock`/`munlockall` (no real handler
+/// exists for any of these -- included as expected-failure controls, same reasoning `sem_open`/
+/// `shm_open` originally used, not because this pilot expects them to pass).
 const POSIX_TEST_PILOT_FILES: &[&str] = &[
     "clock_gettime/1-1.c",
     "clock_gettime/1-2.c",
@@ -1042,6 +1081,453 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
     // to rescue the run at all -- confirmed hanging past a real 30-minute ceiling, not merely slow.
     // A real, separate finding worth its own investigation later -- not a pilot-infra problem.
     "sigwait/8-1.c",
+    "clock/1-1.c",
+    "clock/2-1.c",
+    "clock_getcpuclockid/1-1.c",
+    "clock_getcpuclockid/2-1.c",
+    "clock_getres/1-1.c",
+    "clock_getres/3-1.c",
+    "clock_getres/5-1.c",
+    "clock_getres/6-1.c",
+    "clock_getres/7-1.c",
+    "clock_getres/8-1.c",
+    "clock_nanosleep/1-1.c",
+    "clock_nanosleep/2-1.c",
+    "clock_nanosleep/3-1.c",
+    "clock_nanosleep/9-1.c",
+    "clock_nanosleep/10-1.c",
+    "clock_nanosleep/11-1.c",
+    "clock_nanosleep/13-1.c",
+    "clock_settime/1-1.c",
+    "clock_settime/4-1.c",
+    "clock_settime/5-1.c",
+    "clock_settime/6-1.c",
+    "clock_settime/7-1.c",
+    "clock_settime/8-1.c",
+    "clock_settime/17-1.c",
+    "clock_settime/19-1.c",
+    "clock_settime/20-1.c",
+    "asctime/1-1.c",
+    "ctime/1-1.c",
+    "difftime/1-1.c",
+    "gmtime/1-1.c",
+    "gmtime/2-1.c",
+    "localtime/1-1.c",
+    "mktime/1-1.c",
+    "strftime/1-1.c",
+    "strftime/2-1.c",
+    "strftime/3-1.c",
+    "time/1-1.c",
+    "fsync/4-1.c",
+    "fsync/5-1.c",
+    "fsync/7-1.c",
+    "killpg/1-1.c",
+    "killpg/2-1.c",
+    "killpg/4-1.c",
+    "killpg/5-1.c",
+    "killpg/6-1.c",
+    "killpg/8-1.c",
+    "raise/1-1.c",
+    "raise/2-1.c",
+    "raise/4-1.c",
+    "raise/6-1.c",
+    "raise/7-1.c",
+    "raise/10000-1.c",
+    "mlock/5-1.c",
+    "mlock/8-1.c",
+    "mlock/10-1.c",
+    "mlockall/3-6.c",
+    "mlockall/8-1.c",
+    "mlockall/13-1.c",
+    "munlock/7-1.c",
+    "munlock/10-1.c",
+    "munlock/11-1.c",
+    "munlockall/5-1.c",
+    "mmap/1-2.c",
+    "mmap/3-1.c",
+    "mmap/5-1.c",
+    "mmap/6-1.c",
+    "mmap/7-1.c",
+    "mmap/9-1.c",
+    "mmap/13-1.c",
+    "mmap/14-1.c",
+    "mmap/18-1.c",
+    "mmap/19-1.c",
+    "mmap/21-1.c",
+    "mmap/23-1.c",
+    "mmap/24-1.c",
+    "mmap/27-1.c",
+    "mmap/28-1.c",
+    "mmap/31-1.c",
+    "munmap/1-1.c",
+    "munmap/2-1.c",
+    "munmap/3-1.c",
+    "munmap/4-1.c",
+    "munmap/8-1.c",
+    "munmap/9-1.c",
+    "mq_open/2-1.c",
+    "mq_open/3-1.c",
+    "mq_open/4-1.c",
+    "mq_open/7-1.c",
+    "mq_open/8-1.c",
+    "mq_open/9-1.c",
+    "mq_open/17-1.c",
+    "mq_open/18-1.c",
+    "mq_open/19-1.c",
+    "mq_open/20-1.c",
+    "mq_open/21-1.c",
+    "mq_open/22-1.c",
+    "mq_open/23-1.c",
+    "mq_open/24-1.c",
+    "mq_open/25-1.c",
+    "mq_open/27-1.c",
+    "mq_open/28-1.c",
+    "mq_open/29-1.c",
+    "mq_open/30-1.c",
+    "mq_close/1-1.c",
+    "mq_close/2-1.c",
+    "mq_close/3-1.c",
+    "mq_close/4-1.c",
+    "mq_close/5-1.c",
+    "mq_getattr/2-1.c",
+    "mq_getattr/3-1.c",
+    "mq_getattr/4-1.c",
+    "mq_notify/2-1.c",
+    "mq_notify/8-1.c",
+    "mq_notify/9-1.c",
+    "mq_receive/1-1.c",
+    "mq_receive/2-1.c",
+    "mq_receive/5-1.c",
+    "mq_receive/7-1.c",
+    "mq_receive/8-1.c",
+    "mq_receive/10-1.c",
+    "mq_receive/11-1.c",
+    "mq_receive/12-1.c",
+    "mq_receive/13-1.c",
+    "mq_send/1-1.c",
+    "mq_send/2-1.c",
+    "mq_send/3-1.c",
+    "mq_send/4-1.c",
+    "mq_send/5-1.c",
+    "mq_send/6-1.c",
+    "mq_send/7-1.c",
+    "mq_send/8-1.c",
+    "mq_send/9-1.c",
+    "mq_send/10-1.c",
+    "mq_send/11-1.c",
+    "mq_send/12-1.c",
+    "mq_send/13-1.c",
+    "mq_send/14-1.c",
+    "mq_setattr/1-1.c",
+    "mq_setattr/2-1.c",
+    "mq_setattr/5-1.c",
+    "mq_timedreceive/1-1.c",
+    "mq_timedreceive/2-1.c",
+    "mq_timedreceive/5-1.c",
+    "mq_timedreceive/7-1.c",
+    "mq_timedreceive/8-1.c",
+    "mq_timedreceive/10-1.c",
+    "mq_timedreceive/11-1.c",
+    "mq_timedreceive/13-1.c",
+    "mq_timedreceive/14-1.c",
+    "mq_timedreceive/15-1.c",
+    "mq_timedreceive/17-1.c",
+    "mq_timedreceive/18-1.c",
+    "mq_timedsend/1-1.c",
+    "mq_timedsend/2-1.c",
+    "mq_timedsend/3-1.c",
+    "mq_timedsend/4-1.c",
+    "mq_timedsend/5-1.c",
+    "mq_timedsend/6-1.c",
+    "mq_timedsend/7-1.c",
+    "mq_timedsend/8-1.c",
+    "mq_timedsend/9-1.c",
+    "mq_timedsend/10-1.c",
+    "mq_timedsend/11-1.c",
+    "mq_timedsend/13-1.c",
+    "mq_timedsend/14-1.c",
+    "mq_timedsend/15-1.c",
+    "mq_timedsend/16-1.c",
+    "mq_timedsend/17-1.c",
+    "mq_timedsend/18-1.c",
+    "mq_timedsend/19-1.c",
+    "mq_timedsend/20-1.c",
+    "mq_unlink/1-1.c",
+    "mq_unlink/2-1.c",
+    "mq_unlink/7-1.c",
+    "nanosleep/3-2.c",
+    "nanosleep/5-1.c",
+    "nanosleep/6-1.c",
+    "nanosleep/7-1.c",
+    "sched_getparam/1-1.c",
+    "sched_getparam/2-1.c",
+    "sched_getparam/3-1.c",
+    "sched_getparam/4-1.c",
+    "sched_getparam/6-1.c",
+    "sched_get_priority_max/1-1.c",
+    "sched_get_priority_max/2-1.c",
+    "sched_get_priority_min/1-1.c",
+    "sched_get_priority_min/2-1.c",
+    "sched_getscheduler/1-1.c",
+    "sched_getscheduler/2-1.c",
+    "sched_getscheduler/3-1.c",
+    "sched_getscheduler/4-1.c",
+    "sched_getscheduler/5-1.c",
+    "sched_getscheduler/7-1.c",
+    "sched_rr_get_interval/1-1.c",
+    "sched_rr_get_interval/2-1.c",
+    "sched_rr_get_interval/3-1.c",
+    "sched_setparam/1-1.c",
+    "sched_setparam/2-1.c",
+    "sched_setparam/3-1.c",
+    "sched_setparam/5-1.c",
+    "sched_setparam/6-1.c",
+    "sched_setparam/7-1.c",
+    "sched_setparam/8-1.c",
+    "sched_setparam/9-1.c",
+    "sched_setparam/10-1.c",
+    "sched_setparam/12-1.c",
+    "sched_setparam/13-1.c",
+    "sched_setparam/14-1.c",
+    "sched_setparam/15-1.c",
+    "sched_setparam/16-1.c",
+    "sched_setparam/17-1.c",
+    "sched_setparam/18-1.c",
+    "sched_setparam/19-1.c",
+    "sched_setparam/22-1.c",
+    "sched_setparam/23-1.c",
+    "sched_setparam/25-1.c",
+    "sched_setparam/26-1.c",
+    "sched_setparam/27-1.c",
+    "sched_setscheduler/1-1.c",
+    "sched_setscheduler/2-1.c",
+    "sched_setscheduler/4-1.c",
+    "sched_setscheduler/5-1.c",
+    "sched_setscheduler/6-1.c",
+    "sched_setscheduler/7-1.c",
+    "sched_setscheduler/9-1.c",
+    "sched_setscheduler/10-1.c",
+    "sched_setscheduler/11-1.c",
+    "sched_setscheduler/12-1.c",
+    "sched_setscheduler/13-1.c",
+    "sched_setscheduler/14-1.c",
+    "sched_setscheduler/16-1.c",
+    "sched_setscheduler/17-1.c",
+    "sched_setscheduler/19-1.c",
+    "sched_setscheduler/20-1.c",
+    "sched_setscheduler/21-1.c",
+    "sched_yield/2-1.c",
+    "sem_close/1-1.c",
+    "sem_close/2-1.c",
+    "sem_close/3-1.c",
+    "sem_destroy/4-1.c",
+    "sem_getvalue/1-1.c",
+    "sem_getvalue/2-1.c",
+    "sem_getvalue/4-1.c",
+    "sem_getvalue/5-1.c",
+    "sem_init/1-1.c",
+    "sem_init/2-1.c",
+    "sem_init/5-1.c",
+    "sem_init/6-1.c",
+    "sem_open/4-1.c",
+    "sem_open/5-1.c",
+    "sem_open/6-1.c",
+    "sem_post/1-1.c",
+    "sem_post/2-1.c",
+    "sem_post/4-1.c",
+    "sem_post/5-1.c",
+    "sem_post/6-1.c",
+    "sem_post/8-1.c",
+    "sem_timedwait/1-1.c",
+    "sem_timedwait/2-1.c",
+    "sem_timedwait/3-1.c",
+    "sem_timedwait/4-1.c",
+    "sem_timedwait/6-1.c",
+    "sem_timedwait/7-1.c",
+    "sem_timedwait/9-1.c",
+    "sem_timedwait/10-1.c",
+    "sem_timedwait/11-1.c",
+    "sem_unlink/1-1.c",
+    "sem_unlink/2-1.c",
+    "sem_unlink/4-1.c",
+    "sem_wait/1-1.c",
+    "sem_wait/3-1.c",
+    "sem_wait/5-1.c",
+    "sem_wait/7-1.c",
+    "sem_wait/11-1.c",
+    "sem_wait/12-1.c",
+    "shm_open/2-1.c",
+    "shm_open/3-1.c",
+    "shm_open/5-1.c",
+    "shm_open/6-1.c",
+    "shm_open/7-1.c",
+    "shm_open/8-1.c",
+    "shm_open/9-1.c",
+    "shm_open/17-1.c",
+    "shm_open/18-1.c",
+    "shm_open/19-1.c",
+    "shm_open/20-1.c",
+    "shm_open/21-1.c",
+    "shm_open/22-1.c",
+    // shm_open/23-1.c deliberately excluded: unconditionally forks `NPROCESS = 1000` real child
+    // processes (no CPU-count scaling -- unlike sched_setparam's own `nb_cpu = get_ncpu()`-scaled
+    // fork loops elsewhere in this corpus, harmless here since this kernel's single-core
+    // `get_ncpu()` always returns 1). Confirmed live: this test genuinely times out under `t0`'s
+    // 40s alarm (real POSIX behavior on a kernel this small -- not a bug in the fork/exec path
+    // itself), but when the *parent* dies to that alarm's default-Terminate `SIGALRM`, any children
+    // it had already spawned before the timeout become permanent orphans -- this kernel has no
+    // init-style orphan reparenting/reaping (`hush` never adopts or waits on a process it didn't
+    // itself fork), so they simply keep running forever, each still holding whatever real
+    // `shm_open()` fd it successfully opened. `modules/oxfs`'s own `MAX_OPEN_FILES = 8` pool
+    // (deliberately small -- see that constant's own doc comment) permanently exhausts as a result,
+    // breaking every subsequent test in the corpus that needs to open *anything* (confirmed: `hush`
+    // itself starts failing its own `> /posix-tests/run-out.txt` redirect with a real `EMFILE`
+    // immediately after this file, for the rest of the run). Not a kernel fd-leak -- `close_all`
+    // correctly releases every fd the *parent* process itself held; the leak is real orphaned
+    // *child* processes this kernel has no mechanism to ever reap.
+    "shm_open/24-1.c",
+    "shm_open/25-1.c",
+    "shm_open/26-1.c",
+    "shm_open/27-1.c",
+    "shm_open/28-1.c",
+    "shm_open/29-1.c",
+    "shm_open/32-1.c",
+    "shm_open/34-1.c",
+    "shm_open/36-1.c",
+    "shm_open/37-1.c",
+    "shm_open/38-1.c",
+    "shm_open/39-1.c",
+    "shm_open/41-1.c",
+    "shm_open/42-1.c",
+    "shm_unlink/1-1.c",
+    "shm_unlink/2-1.c",
+    "shm_unlink/3-1.c",
+    "shm_unlink/5-1.c",
+    "shm_unlink/6-1.c",
+    "shm_unlink/8-1.c",
+    "shm_unlink/9-1.c",
+    "shm_unlink/10-1.c",
+    "shm_unlink/11-1.c",
+    "sigaction/1-1.c",
+    "sigaction/2-1.c",
+    "sigaction/3-1.c",
+    "sigaction/4-1.c",
+    "sigaction/6-1.c",
+    "sigaction/8-1.c",
+    "sigaction/9-1.c",
+    "sigaction/10-1.c",
+    "sigaction/11-1.c",
+    "sigaction/12-1.c",
+    "sigaction/13-1.c",
+    "sigaction/17-1.c",
+    "sigaction/21-1.c",
+    "sigaction/22-1.c",
+    "sigaction/25-1.c",
+    "sigaction/28-1.c",
+    "sigaddset/1-3.c",
+    "sigaddset/2-1.c",
+    "sigaltstack/1-1.c",
+    "sigaltstack/2-1.c",
+    "sigaltstack/3-1.c",
+    "sigaltstack/5-1.c",
+    "sigaltstack/6-1.c",
+    "sigaltstack/7-1.c",
+    "sigaltstack/8-1.c",
+    "sigaltstack/9-1.c",
+    "sigaltstack/10-1.c",
+    "sigaltstack/11-1.c",
+    "sigaltstack/12-1.c",
+    "sigdelset/1-3.c",
+    "sigdelset/2-1.c",
+    "sigemptyset/1-1.c",
+    "sigemptyset/2-1.c",
+    "sigfillset/1-1.c",
+    "sigfillset/2-1.c",
+    "sighold/1-1.c",
+    "sighold/2-1.c",
+    "sigignore/1-1.c",
+    "sigignore/4-1.c",
+    "sigignore/6-1.c",
+    "sigismember/3-1.c",
+    "sigismember/4-1.c",
+    "signal/1-1.c",
+    "signal/2-1.c",
+    "signal/3-1.c",
+    "signal/5-1.c",
+    "signal/6-1.c",
+    "signal/7-1.c",
+    "sigpause/4-1.c",
+    "sigpending/1-1.c",
+    "sigpending/2-1.c",
+    "sigprocmask/4-1.c",
+    "sigprocmask/5-1.c",
+    "sigprocmask/6-1.c",
+    "sigprocmask/7-1.c",
+    "sigprocmask/8-1.c",
+    "sigprocmask/9-1.c",
+    "sigprocmask/10-1.c",
+    "sigprocmask/12-1.c",
+    "sigprocmask/15-1.c",
+    "sigrelse/1-1.c",
+    "sigrelse/2-1.c",
+    "sigset/1-1.c",
+    "sigset/2-1.c",
+    "sigset/3-1.c",
+    "sigset/4-1.c",
+    "sigset/5-1.c",
+    "sigset/6-1.c",
+    "sigset/7-1.c",
+    "sigset/8-1.c",
+    "sigset/9-1.c",
+    "sigset/10-1.c",
+    "sigsuspend/1-1.c",
+    "sigsuspend/3-1.c",
+    "sigsuspend/4-1.c",
+    "sigsuspend/6-1.c",
+    "sigtimedwait/1-1.c",
+    "sigtimedwait/2-1.c",
+    "sigtimedwait/4-1.c",
+    "sigtimedwait/5-1.c",
+    "sigtimedwait/6-1.c",
+    "sigwaitinfo/1-1.c",
+    "sigwaitinfo/2-1.c",
+    "sigwaitinfo/3-1.c",
+    "sigwaitinfo/5-1.c",
+    "sigwaitinfo/6-1.c",
+    "sigwaitinfo/7-1.c",
+    "sigwaitinfo/8-1.c",
+    "sigwaitinfo/9-1.c",
+    "timer_create/1-1.c",
+    "timer_create/3-1.c",
+    "timer_create/7-1.c",
+    "timer_create/8-1.c",
+    "timer_create/9-1.c",
+    "timer_create/10-1.c",
+    "timer_create/11-1.c",
+    "timer_create/16-1.c",
+    "timer_delete/1-1.c",
+    "timer_getoverrun/1-1.c",
+    "timer_getoverrun/2-1.c",
+    "timer_getoverrun/3-1.c",
+    "timer_gettime/1-1.c",
+    "timer_gettime/2-1.c",
+    "timer_gettime/3-1.c",
+    "timer_settime/1-1.c",
+    // timer_settime/2-1.c, 6-1.c, 9-1.c deliberately excluded: all three `sigprocmask(SIG_BLOCK,
+    // {SIGALRM}, NULL)` before their own real `sigwait()`-based test loop -- the exact same
+    // t0-defeating pattern `sigwait/4-1.c` is already excluded for above (see that entry's own
+    // comment): blocking SIGALRM in-process blocks *both* the test's own signal-under-test *and*
+    // `t0`'s own outer `alarm(40)` rescue mechanism, since they share one process/signal mask once
+    // `t0` `execvp`s straight into the test binary. Confirmed hanging past a real 9+ minute ceiling
+    // (`timer_settime/2-1.c` specifically) -- not merely slow. `1-1.c`/`3-1.c`/`5-1.c`/`13-1.c`
+    // use `SIGALRM` too but only via a real *caught handler* (`sigaction`), never `sigprocmask`
+    // block -- a caught handler still runs and lets the test's own state machine complete
+    // normally, so `t0`'s rescue alarm is never actually needed for those; only the three
+    // blocking ones create a genuine, unbounded hang risk. `8-1.c` uses `SIGCONT`, unrelated.
+    "timer_settime/3-1.c",
+    "timer_settime/5-1.c",
+    "timer_settime/8-1.c",
+    "timer_settime/13-1.c",
 ];
 
 /// Generates `target/generated/posix_test_manifest.rs` (same `include!`-a-generated-file idiom
@@ -1069,10 +1555,17 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
 /// pilot.)
 ///
 /// Each pilot file gets a unique fixed load address (`POSIX_TEST_LOAD_BASE` + index *
-/// `POSIX_TEST_LOAD_STEP`, `0xcf40000`.., 68 entries fit comfortably below BusyBox's own applet
-/// range's ceiling well above and `module::MODULE_VA_BASE` far above) -- same "every userland
-/// binary gets a real, non-overlapping fixed base" discipline every other embedded ELF in this
-/// codebase already follows. `t0` (the suite's own real timeout-wrapper utility, see
+/// `POSIX_TEST_LOAD_STEP`, `0xa800000`.., 704 slots fit before `module::MODULE_VA_BASE`
+/// (`0x10000000`) -- comfortable headroom over the 488 currently in `POSIX_TEST_PILOT_FILES` for
+/// further growth. Moved down from the original `0xcf40000`/`0x40000`-step layout (which only had
+/// room for ~195 entries in the same gap) when this list grew past 68 -- `POSIX_TEST_LOAD_STEP`
+/// dropped to `0x20000` at the same time (real headroom over every candidate file's own real size,
+/// confirmed against the largest actually observed, ~76 KiB) to fit more entries per byte of VA
+/// space. `0xa800000` itself sits comfortably above `tcc`'s own `0xa280000` load (`build_tinycc`'s
+/// own comment) plus its real ~1.1 MiB size, not just past the BusyBox applet range's own ceiling
+/// (`0xa240000`) tcc's base was originally chosen relative to -- same "every userland binary gets a
+/// real, non-overlapping fixed base" discipline every other embedded ELF in this codebase already
+/// follows. `t0` (the suite's own real timeout-wrapper utility, see
 /// `posix_conformance.sh`'s own doc comment for why a real `alarm()`-based wrapper matters on a
 /// kernel with no preemption) is cross-compiled the same way, at its own fixed base just below the
 /// pilot range. Embeds each compiled ELF's real bytes at `bin/<relative-path-with-.c-extension>`
@@ -1082,9 +1575,9 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
 /// and writes out a plain-text `manifest.txt` (one relative path per line) generated from the same
 /// list, so the seeded corpus and the runner script's own iteration list can never drift apart.
 fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> PathBuf {
-    const POSIX_TEST_LOAD_BASE: u64 = 0xcf40000;
-    const POSIX_TEST_LOAD_STEP: u64 = 0x40000;
-    const T0_LOAD_BASE: u64 = 0xcf00000;
+    const POSIX_TEST_LOAD_BASE: u64 = 0xa800000;
+    const POSIX_TEST_LOAD_STEP: u64 = 0x20000;
+    const T0_LOAD_BASE: u64 = 0xa780000;
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let out_dir = Path::new(manifest_dir).join("target/generated");
@@ -1594,8 +2087,8 @@ fn write_fat32_image(
 /// already accepts elsewhere (e.g. `Cargo.toml`'s `test-success-exit-code` vs. `src/qemu.rs`'s
 /// `QemuExitCode`).
 const OXFS_BLOCK_SIZE: u64 = 4096;
-const OXFS_NUM_BLOCKS: u64 = 8192;
-const OXFS_MAX_INODES: u64 = 1024;
+const OXFS_NUM_BLOCKS: u64 = 16384;
+const OXFS_MAX_INODES: u64 = 2048;
 const OXFS_INODE_STRIDE: u64 = 128;
 /// 1 superblock + inode-table blocks (`OXFS_MAX_INODES` inodes at `OXFS_INODE_STRIDE` bytes each,
 /// rounded up to a whole block) + 1 block-used bitmap -- computed from the same real inputs

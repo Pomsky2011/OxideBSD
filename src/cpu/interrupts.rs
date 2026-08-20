@@ -174,10 +174,40 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
     reboot();
 }
 
+/// Ring-3 `#GP`s get the same fault-to-signal treatment `page_fault_handler` below already
+/// documents in full (see that function's own doc comment for the trampoline mechanism and why a
+/// direct handler call isn't possible from an `extern "x86-interrupt" fn`) -- found live, not
+/// preemptively: the expanded POSIX conformance pilot's own `strftime/2-1.c` has a real stack-
+/// buffer overflow (an upstream test bug -- it declares `char text[20]` but passes `256` as
+/// `strftime`'s own max-length argument), correctly caught by musl's stack-protector, whose
+/// `__stack_chk_fail` on this target is a bare `hlt; ret` (`hlt` is a privileged, ring-0-only
+/// instruction) -- executing it from ring 3 raises exactly this fault. Before this fix, *any*
+/// ring-3 `#GP` (a real stack-smashing catch, a bad segment reference, any other privileged-
+/// instruction misuse) rebooted the whole VM instead of just terminating the one offending
+/// process, a real robustness gap independent of this one test file. No fault-specific signal
+/// distinction is needed the way `page_fault_handler`'s `SIGBUS`-vs-`SIGSEGV` split is: real Linux
+/// maps every userland `#GP` to `SIGSEGV` uniformly, so this does too.
 extern "x86-interrupt" fn general_protection_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
+    if interrupted_ring3 {
+        let pid = crate::process::scheduler::current_pid();
+        if pid != 0 {
+            // Self-signal: always just records the pending bit -- see page_fault_handler's own
+            // identical call for why this is sound from interrupt context.
+            let _ = crate::process::do_kill(pid, pid as i64, crate::process::SIGSEGV as i64);
+            // SAFETY: see page_fault_handler's own identical redirect.
+            unsafe {
+                stack_frame.as_mut().update(|f| {
+                    f.instruction_pointer =
+                        VirtAddr::new(crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA);
+                });
+            }
+            return;
+        }
+    }
     serial_println!(
         "EXCEPTION: GENERAL PROTECTION FAULT (error code: {:#x})\n{:#?}",
         error_code,
@@ -260,7 +290,7 @@ extern "x86-interrupt" fn double_fault_handler(
 /// preempted — `4` ticks = 40ms, a fairly conventional interactive quantum (in the same ballpark
 /// as classic Linux's old `HZ=100` default). Only ever consulted for a process actually caught
 /// running ring-3 (user-mode) code — see `timer_interrupt_handler`'s own doc comment.
-const PREEMPT_QUANTUM_TICKS: u64 = 4;
+pub(crate) const PREEMPT_QUANTUM_TICKS: u64 = 4;
 
 /// Real preemption lives here: on top of the tick/sleeper-wake bookkeeping this handler has always
 /// done, it now also decides whether to force a reschedule.
@@ -397,9 +427,19 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             // pending from a previous, undelivered expiry increments `overrun` instead of getting
             // lost silently.
             for slot in proc.posix_timers.iter_mut().flatten() {
-                if let Some(deadline) = slot.deadline
-                    && now >= deadline
-                {
+                // A live wall-clock comparison, not the (possibly stale) tick-domain `deadline`,
+                // for a timer armed via `TIMER_ABSTIME` against `CLOCK_REALTIME` -- see
+                // `PosixTimer::realtime_target`'s own doc comment for why this is what lets a
+                // later `clock_settime(CLOCK_REALTIME, ...)` correctly retarget an already-armed
+                // timer with zero extra bookkeeping on the `clock_settime` side.
+                let fired = if let Some(target) = slot.realtime_target {
+                    crate::cpu::rtc::unix_epoch_now_precise() >= target
+                } else if let Some(deadline) = slot.deadline {
+                    now >= deadline
+                } else {
+                    false
+                };
+                if fired {
                     if slot.signo != 0 {
                         let bit = 1 << (slot.signo - 1);
                         if proc.pending_signals & bit != 0 {
@@ -409,6 +449,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                             proc.pending_signals |= bit;
                         }
                     }
+                    // Only the *first* expiry of an abstime-armed `CLOCK_REALTIME` timer needs
+                    // real wall-clock precision -- a periodic reload falls back to plain
+                    // tick-domain `interval_ticks`, same simplification `PosixTimer::
+                    // realtime_target`'s own doc comment already flags.
+                    slot.realtime_target = None;
                     slot.deadline = if slot.interval_ticks > 0 {
                         Some(now + slot.interval_ticks)
                     } else {

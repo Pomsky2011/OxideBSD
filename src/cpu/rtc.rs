@@ -93,13 +93,26 @@ pub fn unix_epoch_seconds() -> i64 {
     days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64
 }
 
-/// Real, calibrated-once mapping between `interrupts::ticks()` and this chip's own wall-clock
-/// reading -- see `unix_epoch_now_precise`'s own doc comment for why a single calibration point
-/// beats reading the RTC fresh on every call once real sub-second precision is needed. `spin::Once`,
-/// not a plain `static mut` -- this is genuinely lazy (first real caller wins), and nothing here
-/// needs the `gdt.rs`/`module.rs` "write must be observable through an exported function" dead-
-/// store gotcha's workaround (a `Once` read is itself the exported access).
-static REALTIME_BASE_TICKS: spin::Once<i64> = spin::Once::new();
+/// Real, calibrated mapping between `interrupts::ticks()` and this chip's own wall-clock reading --
+/// see `unix_epoch_now_precise`'s own doc comment for why a single calibration point beats reading
+/// the RTC fresh on every call once real sub-second precision is needed. `spin::Mutex<Option<i64>>`,
+/// not `spin::Once` -- lazily calibrated on first read same as before, but now also **re**-
+/// calibrated by `set_unix_epoch` (real `clock_settime(CLOCK_REALTIME, ...)` support, see that
+/// function's own doc comment), which a one-shot `Once` can't express.
+static REALTIME_BASE_TICKS: spin::Mutex<Option<i64>> = spin::Mutex::new(None);
+
+fn realtime_base_ticks() -> i64 {
+    let mut guard = REALTIME_BASE_TICKS.lock();
+    match *guard {
+        Some(base) => base,
+        None => {
+            let hz = crate::cpu::pit::TIMER_HZ as i64;
+            let base = unix_epoch_seconds() * hz - crate::cpu::interrupts::ticks() as i64;
+            *guard = Some(base);
+            base
+        }
+    }
+}
 
 /// Real, sub-second-precision wall-clock time, as `(tv_sec, tv_nsec)` -- unlike
 /// `unix_epoch_seconds` above (kept as-is, still used by SysV IPC's own `stime`/`rtime`/`ctime`,
@@ -124,8 +137,25 @@ static REALTIME_BASE_TICKS: spin::Once<i64> = spin::Once::new();
 /// time, rather than on every read (a real improvement, not just a wash).
 pub fn unix_epoch_now_precise() -> (i64, i64) {
     let hz = crate::cpu::pit::TIMER_HZ as i64;
-    let base = *REALTIME_BASE_TICKS
-        .call_once(|| unix_epoch_seconds() * hz - crate::cpu::interrupts::ticks() as i64);
+    let base = realtime_base_ticks();
     let total_ticks = crate::cpu::interrupts::ticks() as i64 + base;
     (total_ticks / hz, (total_ticks % hz) * 1_000_000_000 / hz)
+}
+
+/// Real `clock_settime(CLOCK_REALTIME, ...)` support -- recalibrates the base so a later
+/// `unix_epoch_now_precise()` reads back `(sec, nsec)` immediately (real `clock_gettime`
+/// round-trips). Closes the Open POSIX Test Suite pilot's `clock_settime/1-1.c` et al.
+///
+/// Nothing else needs an explicit nudge when this runs: `process::timers::do_clock_nanosleep`
+/// recomputes its own absolute `CLOCK_REALTIME` deadline fresh on every loop pass (see that
+/// function's own doc comment for why a stale deadline there just means one extra, harmless
+/// wake-recheck cycle rather than a bug), and `PosixTimer::realtime_target` makes
+/// `interrupts::timer_interrupt_handler`'s own per-tick scan compare against a live wall-clock
+/// reading instead of a tick count baked in at arm time -- both real, live re-derivations rather
+/// than a cached value this function would otherwise have to hunt down and shift.
+pub fn set_unix_epoch(sec: i64, nsec: i64) {
+    let hz = crate::cpu::pit::TIMER_HZ as i64;
+    let now_ticks = crate::cpu::interrupts::ticks() as i64;
+    let target_total_ticks = sec * hz + (nsec * hz) / 1_000_000_000;
+    *REALTIME_BASE_TICKS.lock() = Some(target_total_ticks - now_ticks);
 }
