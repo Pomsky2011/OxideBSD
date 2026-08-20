@@ -115,8 +115,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         pending_signals: 0,
         blocked_signals: 0,
         sigactions: [SigAction::DEFAULT; (SIGRTMAX + 1) as usize],
-        signal_saved_frame: None,
-        signal_saved_blocked: 0,
+        signal_stack: Vec::new(),
         altstack: AltStack::default(),
         priority: 0,
         pgid,
@@ -241,8 +240,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_sid,
         parent_blocked_signals,
         parent_sigactions,
-        parent_signal_saved_frame,
-        parent_signal_saved_blocked,
+        parent_signal_stack,
         parent_altstack,
         parent_comm,
         parent_cmdline,
@@ -274,13 +272,13 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             parent.sid,
             // Real fork() semantics: signal disposition and the blocked-signal mask are
             // inherited; pending signals are not (the child starts with an empty pending set —
-            // see the child's own construction below). signal_saved_frame/signal_saved_blocked
-            // are inherited too, in case the parent forked from inside a handler — the child gets
-            // its own independent copy of that same in-progress-handler bookkeeping.
+            // see the child's own construction below). signal_stack is inherited too, in case the
+            // parent forked from inside one or more handlers — the child gets its own independent
+            // copy of that same in-progress-handler bookkeeping (each entry is plain data, no
+            // pointers into the parent's own address space beyond what `saved` already carries).
             parent.blocked_signals,
             parent.sigactions,
-            parent.signal_saved_frame,
-            parent.signal_saved_blocked,
+            parent.signal_stack.clone(),
             // Real fork() semantics: the alt stack's own address stays valid in the child (the
             // whole address space is duplicated) -- see AltStack's own doc comment.
             parent.altstack,
@@ -331,8 +329,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         pending_signals: 0,
         blocked_signals: parent_blocked_signals,
         sigactions: parent_sigactions,
-        signal_saved_frame: parent_signal_saved_frame,
-        signal_saved_blocked: parent_signal_saved_blocked,
+        signal_stack: parent_signal_stack,
         altstack: parent_altstack,
         priority: 0,
         pgid: parent_pgid,

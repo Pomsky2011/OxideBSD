@@ -4,7 +4,7 @@
 //! "Implemented this session" section).
 //!
 //! No existing test exercised a real handler-invocation round trip at all before this one --
-//! `Process::signal_saved_frame`'s own doc comment used to note only `kill.elf $$`-style
+//! `Process::signal_stack`'s own doc comment used to note only `kill.elf $$`-style
 //! default-terminate delivery had ever been boot-verified. This one installs a real `SA_SIGINFO`
 //! handler for `SIGUSR1`, `tkill`s itself, and checks (from inside the handler, into global
 //! statics -- safe on this single-threaded, non-preemptive kernel) that `signum`/`siginfo_t`/

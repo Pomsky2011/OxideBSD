@@ -277,8 +277,8 @@ unsafe extern "C" {
 // `copy_frame_for_fork`/`redirect_frame`/`current_frame` below cross that boundary, deliberately
 // narrow.
 //
-// `Clone`/`Copy`: lets `process::Process` hold a `signal_saved_frame: Option<SyscallFrame>`
-// snapshot (moved/copied by value, never needing field access outside this module) for signal
+// `Clone`/`Copy`: lets `process::Process` hold a `signal_stack: Vec<SignalStackFrame>` of these
+// snapshots (moved/copied by value, never needing field access outside this module) for signal
 // delivery/`sigreturn` -- see `deliver_pending_signal`/`do_sigreturn` below.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -443,19 +443,35 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     deliver_pending_signal(frame);
 }
 
-/// Restores `*frame` from this process's own `Process::signal_saved_frame` (see
-/// `deliver_pending_signal` below), byte for byte -- including `rax`/`r11`'s carry-flag bit, which
-/// is exactly why this bypasses `syscall_dispatch`'s normal `Ok`/`Err` rewrite instead of being a
-/// registered handler returning a plain `Result` like every other syscall. If nothing is actually
-/// stashed (a spurious/duplicate call -- the trampoline this codebase installs only ever calls
-/// this once, right after a real handler returns, so this should never happen in practice, but
-/// nothing about a syscall number is trustworthy input), fails the call directly here (the normal
-/// error-signaling convention, just applied by hand since the usual `dispatch()`/`Result` path
-/// isn't reached for this number at all).
+/// Pops one entry off this process's own `Process::signal_stack` (see
+/// `deliver_pending_signal` below) and restores `*frame` from it, byte for byte -- including
+/// `rax`/`r11`'s carry-flag bit, which is exactly why this bypasses `syscall_dispatch`'s normal
+/// `Ok`/`Err` rewrite instead of being a registered handler returning a plain `Result` like every
+/// other syscall. If nothing is actually stashed (a spurious/duplicate call -- the trampoline this
+/// codebase installs only ever calls this once, right after a real handler returns, so this should
+/// never happen in practice, but nothing about a syscall number is trustworthy input), fails the
+/// call directly here (the normal error-signaling convention, just applied by hand since the usual
+/// `dispatch()`/`Result` path isn't reached for this number at all).
+///
+/// **The real signal-stack chain**: after restoring `*frame` to whatever this entry says should
+/// run next, this re-checks for a further deliverable signal (`deliver_pending_signal`) *before*
+/// ever letting that restored state actually resume as real userspace execution. If another signal
+/// is deliverable right now -- more instances still queued behind the one the handler that just
+/// `sigreturn`ed was invoked for, or a different signal that only became unblocked once this
+/// handler's own extra `blocked_signals` bits were lifted -- it redirects `*frame` into that next
+/// handler instead, pushing a fresh `signal_stack` entry on top (`stash_signal_context`). Only once
+/// a `sigreturn` finds genuinely nothing else deliverable does the popped state actually resume.
+/// This is what closes the previously-documented "only one snapshot, not a real signal stack" gap:
+/// several already-queued signal instances unblocked by a single `sigprocmask`/`sigrelse` call now
+/// all get delivered (real handler invocation, not just a bitmask flip) before the unblocking call
+/// itself is ever observed to return to its own caller.
 fn do_sigreturn(frame: &mut SyscallFrame) {
     let pid = crate::process::scheduler::current_pid();
     match crate::process::take_signal_saved_frame(pid) {
-        Some(saved) => *frame = saved,
+        Some(saved) => {
+            *frame = saved;
+            deliver_pending_signal(frame);
+        }
         None => {
             frame.rax = EINVAL;
             frame.r11 |= CARRY_FLAG;
@@ -545,10 +561,10 @@ const _: () = assert!(core::mem::size_of::<RawUcontext>() == 936);
 /// itself can too, for that one case (it just never reaches its own tail).
 /// `SigDisposition::Handler` rewrites `*frame` in place so the *next* thing this process's own
 /// `sysretq` resumes into is the handler, not whatever userspace code the syscall originally
-/// interrupted -- the interrupted state is snapshotted into `Process::signal_saved_frame` first
-/// (see `process::stash_signal_context`), restored later by `do_sigreturn` once the handler
-/// itself returns (via the trampoline `sa_restorer` names -- musl's own `__restore_rt`, patched to
-/// call `SYS_SIGRETURN` -- see `bits/syscall.h.in`'s own comment on the musl fork).
+/// interrupted -- the interrupted state is snapshotted onto `Process::signal_stack` first (see
+/// `process::stash_signal_context`), restored later by `do_sigreturn` once the handler itself
+/// returns (via the trampoline `sa_restorer` names -- musl's own `__restore_rt`, patched to call
+/// `SYS_SIGRETURN` -- see `bits/syscall.h.in`'s own comment on the musl fork).
 ///
 /// **`SA_SIGINFO` is supported**: when the installed action has that flag set, the handler is
 /// invoked as a real 3-argument `void (*)(int, siginfo_t *, void *)` -- `rsi`/`rdx` point at a
@@ -560,16 +576,17 @@ const _: () = assert!(core::mem::size_of::<RawUcontext>() == 936);
 /// is still invoked the plain 1-argument way (`rdi = signum` only, `rsi`/`rdx` zeroed), matching
 /// real Unix's own distinction between the two handler shapes.
 ///
-/// One known, deliberate simplification remains:
-/// - **`Process::signal_saved_frame` holds exactly one snapshot, not a real signal stack.** If a
-///   *second*, different (unblocked) signal becomes deliverable while already inside a handler --
-///   e.g. the handler itself issues a syscall, and that syscall's own tail finds another pending
-///   signal -- this overwrites the first snapshot rather than nesting it, so the eventual
-///   `sigreturn` from the *inner* handler restores into the *outer* handler's own interrupted
-///   state, not back to the original pre-signal program -- a real correctness gap for nested
-///   delivery specifically (single, non-nested signal handling was the only case exercised so
-///   far: `kill.elf $$`-style default-terminate delivery, not a live handler-invocation round
-///   trip -- see CLAUDE.md's own note on what was and wasn't boot-verified for this feature).
+/// **Real signal-stack chaining, not just one snapshot**: this function is called from two places
+/// -- `syscall_dispatch`'s own tail (the normal "about to resume real userspace" check) and
+/// `do_sigreturn`, right after it pops and restores a `signal_stack` entry, *before* treating that
+/// restored state as final. If a `Handler` delivery is found the second way, it pushes a fresh
+/// entry on top instead of resuming, so a chain of N deliverable signals (e.g. several more
+/// already-queued instances of an RT signal a single `sigprocmask` call just unblocked) plays out
+/// as N real handler invocations -- each one's own `sigreturn` triggering the next -- before the
+/// original interrupted userspace code is ever actually resumed. This closes what used to be a
+/// documented gap here (a single `Option<SyscallFrame>` snapshot that a second deliverable signal
+/// during handler execution would silently clobber instead of nesting into) -- see
+/// `Process::signal_stack`'s own doc comment for the data-structure side of this fix.
 fn deliver_pending_signal(frame: &mut SyscallFrame) {
     let pid = crate::process::scheduler::current_pid();
     if pid == 0 {

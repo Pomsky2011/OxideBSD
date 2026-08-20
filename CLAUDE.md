@@ -799,9 +799,11 @@ Real signal numbers (`SIGHUP=1`...`SIGSYS=31`, no realtime signals).
 
 - `Process::sigactions: [SigAction; 32]` (real `SIG_DFL=0`/`SIG_IGN=1`) plus `pending_signals`/
   `blocked_signals` bitmasks, `pending_siginfo: [QueuedSigInfo; 32]` (real per-signal sender
-  `pid`/`uid`/`si_code`/`sigqueue` value — see below), and one `signal_saved_frame` snapshot (not a
-  real signal stack — a second signal during handler execution overwrites the snapshot rather than
-  nesting; known gap).
+  `pid`/`uid`/`si_code`/`sigqueue` value — see below), and a real `signal_stack: Vec<
+  SignalStackFrame>` — a genuine signal stack, not a single snapshot: a second signal becoming
+  deliverable while a handler is already running pushes a further entry and chains into another
+  handler invocation instead of clobbering the first (see "Real signal-stack chaining" below for
+  the fix and what it closed).
 - Delivery happens once, at the tail of `syscall_dispatch`. `sigreturn` bypasses the normal
   `Ok`/`Err` carry-flag rewrite entirely (must restore an arbitrary saved `CF`) — the one syscall
   number not registered in `SYSCALL_TABLE` at all.
@@ -1555,12 +1557,13 @@ sections for the complete per-item write-up.
   wire format, no musl call-site patch needed — musl's own `sigaltstack()` wrapper already filters
   a caller-supplied `SS_ONSTACK` bit and an undersized `ss_size` client-side before ever issuing
   the syscall (same "only reachable via X" precedent `getrandom`/`getentropy()` already has).
-- **No signal is ever actually delivered on this stack** — `SA_ONSTACK` still isn't honored by
-  `deliver_pending_signal` (`src/syscall/mod.rs`), matching `modules/signal`'s own already-
-  documented "no real signal stack" gap (a second signal during handler execution still overwrites
-  `signal_saved_frame` rather than nesting — a real `sigaltstack` doesn't fix that by itself).
-  `SS_ONSTACK` is therefore always reported unset on read-back, an honest reflection of what this
-  kernel actually does rather than a fabricated "yes, active" answer.
+- **No signal is ever actually delivered at this stack's own address** — `SA_ONSTACK` still isn't
+  honored by `deliver_pending_signal` (`src/syscall/mod.rs`), which always builds a handler's frame
+  off the interrupted context's live `user_rsp` regardless. This is now a distinct gap from real
+  handler *nesting*, which is fixed — see "Real signal-stack chaining" below — a real `sigaltstack`
+  doesn't fix `SA_ONSTACK` by itself either way. `SS_ONSTACK` is therefore always reported unset on
+  read-back, an honest reflection of what this kernel actually does rather than a fabricated "yes,
+  active" answer.
 - **Copied by `fork`** (a real `fork()` duplicates the whole address space, so the alt stack's own
   address stays valid in the child); **reset to disabled by `execve`** (the old program's address
   is meaningless in the new image, same reasoning `Process::fs_base` already uses).
@@ -1730,16 +1733,15 @@ Closes the Open POSIX Test Suite pilot's own "Real-time signal queuing" architec
   enforcement, including a forked, uid-dropped child). Pilot moved 40P/16F/8U/4UT → 52P/9F/3U/4UT
   across both passes (`sigqueue/1-1,2-1,2-2,3-1,5-1,6-1,7-1,11-1,12-1.c`, `sigwait/2-1.c`, and
   `kill/2-2,3-1.c` all UNRESOLVED/FAIL → PASS).
-- **A real, separate, pre-existing gap surfaced by the RT work, not caused by it, and not fixed
-  here**: `deliver_pending_signal` only ever delivers **one** signal per completed syscall (no real
-  signal stack to chain further handler redirects within one return path — see the Signal handling
-  module section's own "no nesting" gap above). Real POSIX code that unblocks several already-queued
-  RT instances in a single call (`sighold()`/one `sigrelse()`, then immediately checking a counter)
-  only ever sees one delivered — `sigqueue/4-1.c` (real FAIL) and `sigqueue/8-1.c` (UNRESOLVED) both
-  hit this, confirmed not a queuing bug (`rt-signal-syscall-smoke`'s own part 1 passes the identical
-  scenario only because it explicitly works around this with extra pump syscalls). Fixing it
-  generally needs a real signal-stack/handler-chaining design — a separate, larger architectural
-  decision, not attempted.
+- **A real, separate, pre-existing gap surfaced by the RT work, not caused by it — since fixed, see
+  "Real signal-stack chaining" below**: `deliver_pending_signal` used to only ever deliver **one**
+  signal per completed syscall (no real signal stack to chain further handler redirects within one
+  return path). Real POSIX code that unblocks several already-queued RT instances in a single call
+  (`sighold()`/one `sigrelse()`, then immediately checking a counter) only ever saw one delivered —
+  `sigqueue/4-1.c` (real FAIL) and `sigqueue/8-1.c` (UNRESOLVED) both hit this, confirmed not a
+  queuing bug (`rt-signal-syscall-smoke`'s own part 1 originally passed the identical scenario only
+  by explicitly working around this with extra pump syscalls, since removed now that the real fix
+  makes them unnecessary).
 
 ## Real ring-3 fault-to-signal delivery, and two mmap fixes (`src/cpu/interrupts.rs`, `src/process/fault_trampoline.rs`, `src/process/mm.rs`, `modules/oxfs/`)
 
@@ -1912,6 +1914,79 @@ three more real, independent gaps, closing `nanosleep/1-1.c`/`1-3.c`/`2-1.c`,
   timer/clock machinery) and the broader fd/exec-touching suite (`needs_syscall_smoke`,
   `needs_syscall2_smoke`, `mount_syscall_smoke`, `uid_syscall_smoke`,
   `oxfs_persistence_syscall_smoke`, `access_syscall_smoke`, `fork_wait`) — all still pass.
+
+## Real signal-stack chaining, closing the pilot's last 2 (`src/process/mod.rs`, `src/process/signals.rs`, `src/syscall/mod.rs`)
+
+Closes the "one signal per completed syscall" gap the RT-signal-queuing and mmap/fault-delivery
+sections above both flagged and left unfixed — the pilot's remaining `1F/2U` (`sigqueue/4-1.c`
+FAIL, `sigqueue/8-1.c` UNRESOLVED). Both tests `sighold()` (block) `SIGRTMIN`, `sigqueue()` it 5
+times (all genuinely queued — RT queuing already worked), then `sigrelse()` (unblock, one single
+`sigprocmask` syscall) and immediately check that the handler ran all 5 times, with **no syscall
+in between** the unblock and the check. `deliver_pending_signal` only ever delivered one signal
+per completed syscall, so only the first of the 5 already-queued instances was ever running by the
+time the test's own check executed.
+
+- **`Process::signal_saved_frame: Option<SyscallFrame>` + a separate `signal_saved_blocked: u64`
+  became a real stack**: `Process::signal_stack: Vec<SignalStackFrame>` (`SignalStackFrame { saved:
+  SyscallFrame, blocked_before: u64 }`, `src/process/mod.rs`). `stash_signal_context` now pushes an
+  entry per `Handler`-disposition delivery instead of overwriting a single slot; `take_signal_saved_
+  frame` (`sigreturn`'s own logic) pops exactly one. Copied (`.clone()`, a `Vec` of `Copy` structs)
+  by `fork`, same "child gets its own independent copy of in-progress-handler bookkeeping" reasoning
+  the old single-slot field already had; untouched by `execve`, also unchanged from before (the old
+  program's own in-progress handler state is meaningless post-exec, but nothing ever reads it once
+  the new image is running either, so leaving it stale is harmless).
+- **The actual chaining mechanism**: `do_sigreturn` (`src/syscall/mod.rs`) used to be a hard early
+  return — restore the one saved frame, done, bypassing `syscall_dispatch`'s normal
+  `deliver_pending_signal` tail entirely. It now calls `deliver_pending_signal(frame)` itself,
+  immediately after popping and restoring an entry, *before* treating that restored state as final.
+  If another signal is deliverable right now (another already-queued instance of the signal whose
+  handler just returned, or a different signal that only became unblocked once this handler's own
+  extra `blocked_signals` bits were lifted by the pop), `deliver_pending_signal` redirects `*frame`
+  into that next handler instead — pushing a fresh `signal_stack` entry on top, exactly like the
+  first delivery did. Only once a `sigreturn` finds genuinely nothing else deliverable does the
+  popped state actually resume as real userspace execution. Concretely, for the two failing tests:
+  the unblocking `sigprocmask` syscall's own tail delivers instance 1 (pushing the post-`sigprocmask`
+  return state); handler 1 runs and `sigreturn`s; that `sigreturn` finds instance 2 still queued and
+  chains into handler 2 instead of resuming; this repeats through all 5 instances; only the 5th
+  `sigreturn` finds the queue empty and actually resumes execution right after `sigprocmask`
+  returned — with the handler already having run 5 times by then. No new primitive, no recursion
+  (`do_sigreturn` and `deliver_pending_signal` are two flat function calls, not mutually recursive
+  through the call stack) — just `Process::signal_stack` growing and shrinking on the kernel heap
+  across what's now potentially several real `SYSCALL`/`SYSRETQ` round trips per original syscall
+  return, each one a genuine trip through a real userspace handler.
+- **`set_signal_saved_blocked_override`** (the `do_sigsuspend`-wakeup-into-a-caught-handler special
+  case — see the Signal handling module section) now overrides the *top* `signal_stack` entry's
+  `blocked_before` field (`.last_mut()`) instead of a single struct field — it's always called
+  immediately after `stash_signal_context` pushed that exact entry, so the target is unambiguous.
+- **Same fix, no special-casing needed, for the general "second signal during handler execution"
+  gap** the Signal handling module section used to flag separately (a second signal becoming
+  deliverable while a handler from a *different* signal is still running, not just multiple
+  instances of the same RT signal) — that was always the same single-slot-vs-stack problem under a
+  different trigger, and falls out of this fix for free: `deliver_pending_signal` is called from
+  both `syscall_dispatch`'s own tail and now `do_sigreturn`, so any deliverable signal found at
+  either call site chains the same way, regardless of whether it's the same signal number repeating
+  or a genuinely different one.
+- **Verified**: pilot moved 61P/1F/2U/4UT (this doc's own prior baseline) →
+  **64P/0F/0U/4UT/0TIMEOUT/0CRASH, 68 total** — `sigqueue/4-1.c`/`8-1.c` both flip to real PASS,
+  zero regressions elsewhere (checked via the automated `tests/posix_conformance_smoke.rs` +
+  `userland/posix-conformance-driver/`, not a manual QEMU run — this pilot has been fully
+  automated since that driver crate landed, superseding the interactive
+  `sh /posix_conformance.sh` path `modules/oxfs/src/posix_conformance.sh`'s own doc comment still
+  describes as the only way to run it). `userland/rt-signal-syscall-smoke/`'s own part 1/3 no
+  longer need the explicit multi-syscall "pump" workaround they originally shipped with (removed) —
+  the check right after the unblocking `sigprocmask` call, with zero syscalls in between, now
+  passes directly, proving the chain happens within that one call's own tail rather than needing
+  extra syscalls to keep draining it. `cargo build`/`cargo clippy` clean (no new warnings beyond
+  three pre-existing ones unrelated to this change). Full existing signal-touching suite re-run
+  clean: `rt_signal_syscall_smoke`, `sig_syscall_smoke`, `sa_siginfo_syscall_smoke`,
+  `sigsuspend_syscall_smoke`, `sigaltstack_syscall_smoke`, `pause_syscall_smoke`,
+  `mmap_syscall_smoke` (exercises the fault-to-signal `Terminate` path through the same
+  `deliver_pending_signal`), `fork_wait`.
+- **Not covered by this pass**: a bound on `signal_stack`'s own depth. Real POSIX doesn't bound
+  nesting depth either, and genuine growth is already bounded by how many signal instances can be
+  pending at once (`Process::rt_queue`'s own fixed `RT_QUEUE_CAP` per RT signal, bitmask collapse
+  for standard ones) — a process can't manufacture unbounded chain depth by re-raising signals from
+  inside their own handlers faster than that, but this wasn't specifically stress-tested.
 
 ## BusyBox gap analysis: what's needed for more applets
 

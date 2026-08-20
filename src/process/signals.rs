@@ -511,11 +511,14 @@ pub(crate) fn restore_blocked_signals(pid: Pid, mask: u64) {
 /// wakeup that resolved to a real caught handler. Real POSIX semantics restore `sigsuspend`'s
 /// *original* pre-call mask once the handler returns, not the temporary one `do_sigsuspend`
 /// swapped in for the wait itself (already folded into the handler's own `mask_to_add` via
-/// `stash_signal_context`'s normal path, which this call runs immediately after).
+/// `stash_signal_context`'s normal path, which this call runs immediately before -- so the entry
+/// being overridden is always the one `signal_stack` just gained).
 pub(crate) fn set_signal_saved_blocked_override(pid: Pid, mask: u64) {
     let mut table = PROCESS_TABLE.lock();
-    if let Some(proc) = table.get_mut(&pid) {
-        proc.signal_saved_blocked = mask;
+    if let Some(proc) = table.get_mut(&pid)
+        && let Some(top) = proc.signal_stack.last_mut()
+    {
+        top.blocked_before = mask;
     }
 }
 
@@ -735,33 +738,41 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
 /// Snapshots `saved` (the frame the interrupted syscall was about to resume into) and grows
 /// `blocked_signals` by `mask_to_add` for the handler's own duration — called by
 /// `deliver_pending_signal` right before it redirects the live frame into the handler itself.
-/// `take_signal_saved_frame` (below) is this operation's inverse, run by `sigreturn`. Returns the
-/// *pre*-mutation `blocked_signals` (the mask the interrupted program was actually running under)
-/// — `deliver_pending_signal`'s own `SA_SIGINFO` path uses this for the constructed `ucontext_t`'s
-/// `uc_sigmask`, matching real Linux's own "the mask in effect just before the handler was
-/// entered" semantics.
+/// Pushes onto `Process::signal_stack` rather than overwriting a single slot, so a second (or
+/// third, ...) delivery while one or more handlers are already running (chained, still before
+/// userspace ever resumes) stacks cleanly instead of clobbering an in-progress one — see that
+/// field's own doc comment. `take_signal_saved_frame` (below) is this operation's inverse (one pop
+/// per `sigreturn`). Returns the *pre*-mutation `blocked_signals` (the mask the interrupted
+/// program was actually running under) — `deliver_pending_signal`'s own `SA_SIGINFO` path uses
+/// this for the constructed `ucontext_t`'s `uc_sigmask`, matching real Linux's own "the mask in
+/// effect just before the handler was entered" semantics.
 pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u64) -> u64 {
     let mut table = PROCESS_TABLE.lock();
     let Some(proc) = table.get_mut(&pid) else {
         return 0;
     };
     let old_mask = proc.blocked_signals;
-    proc.signal_saved_blocked = old_mask;
     proc.blocked_signals |= mask_to_add;
-    proc.signal_saved_frame = Some(saved);
+    proc.signal_stack.push(SignalStackFrame {
+        saved,
+        blocked_before: old_mask,
+    });
     old_mask
 }
 
 /// `sigreturn`'s real logic (`src/syscall.rs`'s `do_sigreturn` — kept here, not there, since it
-/// only needs `Process`/table access, not `SyscallFrame` field access). Takes (removes) the
-/// snapshot `stash_signal_context` stored and restores `blocked_signals` to what it was before the
-/// handler was entered. `None` if nothing was actually stashed (a spurious call).
+/// only needs `Process`/table access, not `SyscallFrame` field access). Pops the top entry
+/// `stash_signal_context` pushed and restores `blocked_signals` to what it was before that entry's
+/// own handler was entered. `None` if the stack is empty (a spurious call). `do_sigreturn` itself
+/// re-checks for a further deliverable signal right after this returns — see that function's own
+/// doc comment — which is what turns a chain of `stash_signal_context` pushes into a real,
+/// POSIX-shaped succession of handler invocations before userspace ever actually resumes.
 pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<SyscallFrame> {
     let mut table = PROCESS_TABLE.lock();
     let proc = table.get_mut(&pid)?;
-    let saved = proc.signal_saved_frame.take()?;
-    proc.blocked_signals = proc.signal_saved_blocked;
-    Some(saved)
+    let entry = proc.signal_stack.pop()?;
+    proc.blocked_signals = entry.blocked_before;
+    Some(entry.saved)
 }
 
 /// Real relative-timeout conversion for `sigtimedwait` -- the same whole-second/sub-second tick

@@ -1,13 +1,17 @@
 //! Real-`SYSCALL` smoke test for real-time signal queuing (`SIGRTMIN..=SIGRTMAX`, `35..=64`) --
 //! `src/process/signals.rs`'s `record_pending`/`take_deliverable_signal`/`do_sigtimedwait` RT
 //! branches, and the extended `do_kill`/`do_sigqueue`/`sys_sigaction` range checks. Closes the
-//! Open POSIX Test Suite pilot's own `sigqueue/1-1,4-1,5-1,6-1,7-1.c` + `sigwait/2-1.c`
-//! UNRESOLVED cluster (see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own "Real-time signal queuing"
-//! blocker) -- those all fail before their real assertion is ever reached, since every real
-//! signal number they use (`SIGRTMIN`) used to be flatly rejected by this ABI's `1..=31`-only
-//! range checks. This test doesn't re-run the vendored suite itself (that stays manual-QEMU-only,
-//! see `modules/oxfs/src/posix_conformance.sh`), it exercises the same underlying kernel behavior
-//! those tests depend on through a dedicated, automated, real-`SYSCALL` scenario.
+//! Open POSIX Test Suite pilot's own `sigqueue/1-1,5-1,6-1,7-1.c` + `sigwait/2-1.c` UNRESOLVED
+//! cluster (see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own "Real-time signal queuing" blocker) --
+//! those all fail before their real assertion is ever reached, since every real signal number
+//! they use (`SIGRTMIN`) used to be flatly rejected by this ABI's `1..=31`-only range checks.
+//! `sigqueue/4-1.c`/`8-1.c` needed a second, separate fix on top (real signal-stack chaining --
+//! see `src/syscall/mod.rs`'s `deliver_pending_signal`/`do_sigreturn`), landed later; parts 1/3
+//! below originally worked around that gap with an explicit multi-syscall "pump" and now don't
+//! need to. This test doesn't re-run the vendored suite itself (that stays automated via
+//! `tests/posix_conformance_smoke.rs` + `userland/posix-conformance-driver/`, not this crate), it
+//! exercises the same underlying kernel behavior those tests depend on through a dedicated,
+//! automated, real-`SYSCALL` scenario.
 //!
 //! **No musl involved** -- bare `#![no_std]` binary with its own hand-rolled `syscall()` helper
 //! and minimal `sigreturn_trampoline`, same convention `userland/sig-syscall-smoke/` established.
@@ -15,7 +19,10 @@
 //! Five parts, all driven from `tests/rt_signal_syscall_smoke.rs` spawning this as pid 1:
 //! 1. `sigqueue/4-1.c`'s own scenario: `SIGRTMIN` blocked, queued 5 times, handler runs 0 times
 //!    while still blocked, then all 5 times once unblocked -- proves multiple instances don't
-//!    collapse into one the way a standard signal already does.
+//!    collapse into one the way a standard signal already does, and (checked immediately after
+//!    the unblocking `sigprocmask` call returns, no extra syscalls in between) that all 5 real
+//!    handler invocations happen via the unblocking call's own signal-stack chain, matching what
+//!    `sigqueue/4-1.c` itself actually checks.
 //! 2. Real per-signal `EAGAIN` once `RT_QUEUE_CAP` is exceeded, then a real full drain via
 //!    `sigtimedwait` (which bypasses handler invocation/disposition entirely, so no handler needs
 //!    to be installed for this signal at all) confirming every queued value comes back in order,
@@ -249,16 +256,6 @@ fn getpid() -> u64 {
     unsafe { syscall(SYS_GETPID, 0, 0, 0) }.unwrap_or(0)
 }
 
-/// Pumps `n` harmless no-op syscalls -- `deliver_pending_signal` runs once at the tail of *every*
-/// completed syscall and delivers at most one signal per call, so draining several already-
-/// deliverable queued instances via real handler invocation (parts 1/3) needs one syscall per
-/// instance, not just the syscall that did the unblocking.
-fn pump(n: u32) {
-    for _ in 0..n {
-        let _ = getpid();
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     write_bytes(b"rt-signal-syscall-smoke: starting\n");
@@ -290,12 +287,15 @@ pub extern "C" fn _start() -> ! {
         sigprocmask(SIG_UNBLOCK, 1 << (SIGRTMIN - 1)).is_ok(),
         "sigprocmask(SIG_UNBLOCK, SIGRTMIN) failed"
     );
-    pump(5);
+    // No pump of extra syscalls needed here: real signal-stack chaining means the unblocking
+    // sigprocmask call itself delivers every already-queued instance (via its own tail, then each
+    // handler's own sigreturn re-checking for the next one) before ever returning to this code --
+    // see `deliver_pending_signal`/`do_sigreturn` in `src/syscall/mod.rs`.
     check!(
         ORDER_LEN.load(Ordering::SeqCst) == 5,
         "not all 5 queued SIGRTMIN instances were delivered -- real-time signals collapsed like a standard one"
     );
-    write_bytes(b"rt-signal-syscall-smoke: part 1 (5 queued instances, 5 real deliveries) OK\n");
+    write_bytes(b"rt-signal-syscall-smoke: part 1 (5 queued instances, 5 real deliveries, no pump needed) OK\n");
 
     // --- Part 2: real EAGAIN past RT_QUEUE_CAP, then a real full drain via sigtimedwait (which
     // bypasses handler invocation/disposition entirely -- no handler needed for this signal). ---
@@ -349,7 +349,7 @@ pub extern "C" fn _start() -> ! {
         sigprocmask(SIG_UNBLOCK, (1 << (sig_lo - 1)) | (1 << (sig_hi - 1))).is_ok(),
         "sigprocmask(SIG_UNBLOCK, sig_lo|sig_hi) failed"
     );
-    pump(2);
+    // Same real chaining as part 1 -- no pump needed.
     check!(
         ORDER_LEN.load(Ordering::SeqCst) == start_idx + 2,
         "sig_lo/sig_hi weren't both delivered"

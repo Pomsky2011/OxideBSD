@@ -63,20 +63,31 @@ if this becomes real future work rather than just a tracking exercise.
       real per-signal `EAGAIN` past `RT_QUEUE_CAP`, lowest-signal-number-first delivery order,
       partial-drain pending-bit semantics) and by re-running the Open POSIX Test Suite pilot: flips
       `sigqueue/1-1,5-1,6-1,7-1.c` and `sigwait/2-1.c` from UNRESOLVED to real PASS.
-      **A real, separate, pre-existing gap this surfaced for the first time** (not a bug in the
-      queuing work above — confirmed by `tests/rt_signal_syscall_smoke.rs`'s own part 1, which
-      passes the identical scenario using an explicit multi-syscall "pump" workaround):
-      `deliver_pending_signal` (`src/syscall/mod.rs`) only ever delivers **one** signal per
-      completed syscall, by design (redirecting the live frame into a handler once; no real signal
-      stack exists to chain further redirects within the same return path — see the Signal
-      handling module section's own "a second signal during handler execution overwrites
-      `signal_saved_frame` rather than nesting" gap). Real POSIX code that unblocks several
-      already-queued RT instances in one call (`sigqueue/4-1.c`/`8-1.c`: `sigrelse()` once, then
-      immediately expects all 5 queued instances already delivered) only sees one delivered before
-      it checks — genuinely fails/goes UNRESOLVED (that pilot run: `sigqueue/4-1.c` FAIL,
-      `sigqueue/8-1.c` UNRESOLVED, both for this exact reason). Fixing this generally needs a real
-      signal-stack/handler-chaining mechanism, a separate architectural decision from RT queuing
-      itself — not attempted here.
+      **A real, separate, pre-existing gap this surfaced for the first time, since fixed** (not a
+      bug in the queuing work above — confirmed by `tests/rt_signal_syscall_smoke.rs`'s own part 1,
+      which originally passed the identical scenario only via an explicit multi-syscall "pump"
+      workaround, since removed): `deliver_pending_signal` (`src/syscall/mod.rs`) used to deliver
+      only **one** signal per completed syscall, by design (redirecting the live frame into a
+      handler once; no real signal stack existed to chain further redirects within the same return
+      path). Real POSIX code that unblocks several already-queued RT instances in one call
+      (`sigqueue/4-1.c`/`8-1.c`: `sigrelse()` once, then immediately expects all 5 queued instances
+      already delivered) only saw one delivered before it checked — genuinely failed/went
+      UNRESOLVED (that pilot run: `sigqueue/4-1.c` FAIL, `sigqueue/8-1.c` UNRESOLVED, both for this
+      exact reason). **Fixed with a real signal stack**: `Process::signal_saved_frame: Option<
+      SyscallFrame>` (a single snapshot) became `Process::signal_stack: Vec<SignalStackFrame>` (a
+      real stack, `src/process/mod.rs`); `stash_signal_context` pushes an entry per delivery instead
+      of overwriting one; `do_sigreturn` (`src/syscall/mod.rs`) now re-checks for a further
+      deliverable signal immediately after popping and restoring an entry, and if one exists,
+      chains straight into another handler invocation (pushing a fresh entry) instead of ever
+      letting the popped state resume as real userspace execution. This closes the gap generally,
+      not just for RT signals: any sequence of deliverable signals now plays out as N real handler
+      invocations, each one's own `sigreturn` triggering the next, before the originally-interrupted
+      code resumes. Flips `sigqueue/4-1.c` FAIL and `sigqueue/8-1.c` UNRESOLVED to real PASS with no
+      other pilot regressions. Verified via the full automated pilot
+      (`tests/posix_conformance_smoke.rs` + `userland/posix-conformance-driver/`, not manual) and
+      `tests/rt_signal_syscall_smoke.rs`'s part 1/3 (now pump-free, proving the chain happens within
+      the unblocking `sigprocmask` call's own tail) plus every other signal-touching smoke test
+      (`sig`/`sa_siginfo`/`sigsuspend`/`sigaltstack`/`pause`/`mmap`/`fork_wait`).
       **A follow-up pass fixed a second real gap the pilot's remaining `sigqueue`/`kill` FAILs
       converged on**: real `kill(2)`/`sigqueue(2)` permission checking, plus `sigqueue`'s own real
       `sig == 0` null-signal existence(+permission)-only convention (previously always `EINVAL`,
@@ -86,8 +97,17 @@ if this becomes real future work rather than just a tracking exercise.
       `signal_foreground_group`'s own process-group broadcast; no pilot test needs it, and real
       POSIX's own per-member partial-success rule there is meaningfully more complex). Flips
       `kill/2-2,3-1.c` and `sigqueue/2-1,2-2,3-1,11-1,12-1.c` from FAIL to real PASS — pilot moved
-      45P/16F/3U/4UT → 52P/9F/3U/4UT. Verified via `sig-syscall-smoke`'s new part 8 (real
-      `ESRCH`/`EPERM` enforcement, including a forked, uid-dropped child).
+      45P/16F/3U/4UT → 52P/9F/3U/4UT, and (combined with several later, separately-landed fixes —
+      see CLAUDE.md's own "Real ring-3 fault-to-signal delivery"/"Three more pilot fixes" sections —
+      plus this signal-stack fix) now stands at **64P/0F/0U/4UT/0TIMEOUT/0CRASH, 68 total**: every
+      pilot interface passes; the remaining 4 (`mq_open/10-1,14-1.c`, `shm_open/10-1,12-1.c`) are
+      the suite's own self-declared UNTESTED — each one's own `main()` prints why and returns
+      `PTS_UNTESTED` unconditionally, before ever calling anything this kernel implements (real
+      multi-user/multi-group permission testing `mq_open/10-1.c` says it can't do in this
+      environment; unspecified file-offset behavior `shm_open/10-1.c` declines to check at all) —
+      not a kernel gap this pilot subset can close by implementing anything further. Verified via
+      `sig-syscall-smoke`'s new part 8 (real `ESRCH`/`EPERM` enforcement, including a forked,
+      uid-dropped child).
 - [x] **File-backed `mmap`**: done — corrected from an earlier draft of this doc, which said
       `do_mmap` took no fd/offset argument at all; that was true when this row was first written
       but real `MAP_SHARED` fd-backed mapping landed since (see CLAUDE.md's "Real /tmp, /dev/shm,

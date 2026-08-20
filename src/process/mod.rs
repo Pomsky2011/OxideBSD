@@ -350,12 +350,13 @@ pub const SS_DISABLE: i32 = 2;
 
 /// Backing store for `SYS_SIGALTSTACK` (`do_sigaltstack`, `src/process/signals.rs`) — real POSIX
 /// per-process alternate-signal-stack bookkeeping. **Bookkeeping only**: no signal is ever
-/// actually delivered on this stack — `SA_ONSTACK` isn't honored by `deliver_pending_signal`
-/// (`src/syscall/mod.rs`), matching `modules/signal`'s own already-documented "no real signal
-/// stack" gap (a second signal during handler execution still overwrites `signal_saved_frame`
-/// rather than nesting; a real `sigaltstack` doesn't fix that by itself, see
-/// `docs/MISSING_POSIX_SYSCALLS.md`). Since this kernel never actually executes a handler on the
-/// alt stack, `SS_ONSTACK` is always reported as unset on read-back — an honest reflection of
+/// actually delivered at this stack's own *address* — `SA_ONSTACK` isn't honored by
+/// `deliver_pending_signal` (`src/syscall/mod.rs`), which always builds a handler's frame off the
+/// interrupted context's live `user_rsp` regardless of what this struct says (see
+/// `docs/MISSING_POSIX_SYSCALLS.md`). This is now a distinct gap from real handler *nesting*,
+/// which is fixed — see `Process::signal_stack`'s own doc comment — a real `sigaltstack` doesn't
+/// fix `SA_ONSTACK` by itself either way. Since this kernel never actually executes a handler on
+/// the alt stack, `SS_ONSTACK` is always reported as unset on read-back — an honest reflection of
 /// what actually happens, not a fabricated "yes, active" answer. `Default` is the real POSIX
 /// startup state: no alternate stack established (`flags = SS_DISABLE`).
 ///
@@ -534,6 +535,20 @@ impl Drop for KernelStack {
 // a `Mutex<BTreeMap<Pid, Box<Process>>>` static, which requires `Process` (and transitively this
 // raw-pointer-holding field) to be `Send` for `Mutex<..>` to be `Sync`.
 unsafe impl Send for KernelStack {}
+
+/// One entry of `Process::signal_stack` — see that field's own doc comment for the real
+/// signal-stack design this backs.
+#[derive(Clone, Copy)]
+pub(crate) struct SignalStackFrame {
+    /// The interrupted context to resume into once this entry is popped (`sigreturn`) — either
+    /// the original pre-signal userspace state, or (for a chained delivery) the state the *next
+    /// outer* handler was itself about to resume into.
+    pub(crate) saved: SyscallFrame,
+    /// `blocked_signals`'s value from just before this entry's own handler was entered —
+    /// restored by `take_signal_saved_frame` alongside `saved` above.
+    pub(crate) blocked_before: u64,
+}
+
 pub struct Process {
     pub pid: Pid,
     pub parent: Option<Pid>,
@@ -600,14 +615,19 @@ pub struct Process {
     pub blocked_signals: u64,
     /// Indexed `1..=64` (index `0`, and `32..=34`, unused) — see `SigAction`'s own doc comment.
     pub sigactions: [SigAction; (SIGRTMAX + 1) as usize],
-    /// The interrupted context a `Handler`-disposition delivery snapshotted, restored verbatim by
-    /// `sigreturn` (`take_signal_saved_frame`) once the handler itself returns. `None` whenever
-    /// this process isn't currently inside a signal handler.
-    pub(crate) signal_saved_frame: Option<SyscallFrame>,
-    /// `blocked_signals`'s value from just before the handler above was entered — restored
-    /// alongside `signal_saved_frame` on `sigreturn`. Meaningless while `signal_saved_frame` is
-    /// `None`.
-    pub signal_saved_blocked: u64,
+    /// A real signal stack, not a single snapshot: each `Handler`-disposition delivery pushes one
+    /// entry (`stash_signal_context`), and each `sigreturn` (`take_signal_saved_frame`) pops
+    /// exactly one, restoring its `saved` frame and `blocked_before` mask. Empty whenever this
+    /// process isn't currently inside any signal handler. A second signal becoming deliverable
+    /// while one or more handlers are already running (e.g. several more instances of an
+    /// already-queued RT signal, or a different signal unblocked mid-chain) pushes a further
+    /// entry and chains straight into another handler invocation instead of resuming user code —
+    /// see `src/syscall/mod.rs`'s `deliver_pending_signal`/`do_sigreturn` for how the chain is
+    /// driven. Real POSIX doesn't bound nesting depth either; this only ever grows as large as
+    /// the number of signal instances genuinely pending at once, itself bounded by
+    /// `Process::rt_queue`'s own fixed capacity for RT signals and the bitmask collapse for
+    /// standard ones.
+    pub(crate) signal_stack: Vec<SignalStackFrame>,
     /// `SYS_SIGALTSTACK`'s backing store — see `AltStack`'s own doc comment for the real
     /// bookkeeping-only semantics and fork/execve treatment.
     pub altstack: AltStack,
