@@ -41,16 +41,22 @@ if this becomes real future work rather than just a tracking exercise.
 
 - [ ] **Real threading**: `pthread_create`/`_join`/`_detach`, `pthread_mutex_*`/`_cond_*`/
       `_rwlock_*`/`_barrier_*`/`_spin_*`, backing `clone(2)`/`futex(2)`/`set_robust_list(2)`.
-      **Why:** POSIX.1-2008 folded threads into the base spec's conformance surface — a real
-      conformance test suite exercises them, not just the legacy `_POSIX_THREADS`-optional framing
-      Issue 6 used. Also the direct prerequisite for named POSIX semaphores, POSIX shared memory,
-      POSIX AIO (musl backs `aio_*` with a userspace thread pool), and real `dlopen`. **Blocked
-      on:** this kernel's single-core, no-preemption, single-global-`fs_base`-per-context-switch
-      design has no notion of two live threads sharing one address space at all yet — see
-      CLAUDE.md's musl-port section on `IA32_FS_BASE`. The two existing hand-written asm stubs
-      (`src/thread/x86_64/clone.s`, `__unmapself.s`) already hardcode raw Linux numbers directly
-      (same bypass-the-remap-table bug class already fixed once for `vfork.s`) — dead code until
-      this is attempted, a real landmine if threading work starts without re-patching them first.
+      **In progress** — see `[[project_real_threading_for_aio]]` memory for full status: phase 1
+      (`clone.s`/`__unmapself.s`'s own raw-Linux-number bypass bug fixed, `SYS_CLONE = 555`
+      reserved), phase 2 (`Process::tgid` + real `getpid()`/`gettid()` split), and phase 3 (real
+      `futex(2)` `FUTEX_WAIT`/`FUTEX_WAKE`, `process::do_futex`) are all done — unnamed POSIX
+      semaphores (`sem_init`/`sem_wait`/`sem_post`/...) already work for real today as a result
+      (verified: 3 real pilot FAILs flipped to PASS, zero regressions). **Still blocked on:** real
+      thread creation itself (`clone(2)`'s own handler, still unregistered) and, underneath that,
+      shared/refcounted `AddressSpace` — this kernel's single-core, no-preemption,
+      single-global-`fs_base`-per-context-switch design has no notion of two live threads sharing
+      one address space at all yet, and that work directly collides with the already-landed real
+      frame-reclaim machinery (`AddressSpace::teardown` currently assumes sole ownership) — see
+      CLAUDE.md's musl-port section on `IA32_FS_BASE` and its frame-reclaim section. **Why:**
+      POSIX.1-2008 folded threads into the base spec's conformance surface — a real conformance
+      test suite exercises them, not just the legacy `_POSIX_THREADS`-optional framing Issue 6
+      used. Also the direct prerequisite for named POSIX semaphores, POSIX shared memory, POSIX
+      AIO (musl backs `aio_*` with a userspace thread pool), and real `dlopen`.
 - [x] **Real-time signal queuing**: done. `SIGRTMIN..=SIGRTMAX` (`35..=64`, matching musl's own
       `sigrtmin.c`/`sigrtmax.c`; `32..=34` stay permanently unclaimed, matching real glibc/musl
       convention) now validate through `do_kill`/`do_sigqueue`/`sys_sigaction`, and
@@ -152,8 +158,14 @@ if this becomes real future work rather than just a tracking exercise.
       `src/fs/pipe.rs`'s existing blocking-buffer machinery, opened via a real path instead of
       `pipe(2)`'s anonymous fd pair.
 - [ ] **Named POSIX semaphores** (`sem_open`/`sem_close`/`sem_unlink`) and **POSIX shared memory**
-      (`shm_open`/`shm_unlink`) — blocked on real threading above (unnamed semaphores are
-      futex-backed; named ones additionally want a `/dev/shm`-style `open`+`mmap` path). SysV
+      (`shm_open`/`shm_unlink`) — **unnamed semaphores are no longer blocked** (real
+      `sem_init`/`sem_wait`/`sem_post`/... work today, see "Real threading" above); named ones
+      remain blocked on two things, not one: a `/dev/shm`-style `open`+`mmap` path (plausible reuse
+      of the already-real fd-backed `MAP_SHARED` mmap, see CLAUDE.md), *and* real cross-process
+      `FUTEX_WAKE` — `process::do_futex`'s own wake scan is deliberately scoped to the waker's own
+      `tgid` (see that function's own doc comment for why address-only keying would be unsafe with
+      no ASLR), so a named semaphore shared between two genuinely different processes wouldn't
+      actually wake across them yet even with the mmap path solved. SysV
       shared memory/semaphores already exist and are *not* a substitute — POSIX treats the two
       IPC families as genuinely separate optional interfaces.
 - [ ] **POSIX AIO** (`aio_read`/`_write`/`_fsync`/`_error`/`_return`/`_cancel`/`_suspend`,
