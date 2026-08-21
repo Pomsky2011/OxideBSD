@@ -155,6 +155,10 @@ unsafe extern "C" {
     fn oxidebsd_sys_sched_yield() -> i64;
     fn oxidebsd_sys_reboot(cmd: u64) -> i64;
     fn oxidebsd_sys_futex(addr: u64, op: u64, val: u64, to: u64) -> i64;
+    fn oxidebsd_sys_mlock(addr: u64, len: u64) -> i64;
+    fn oxidebsd_sys_munlock(addr: u64, len: u64) -> i64;
+    fn oxidebsd_sys_mlockall(flags: u64) -> i64;
+    fn oxidebsd_sys_munlockall() -> i64;
     fn oxidebsd_sys_umask(new_mask: u64) -> i64;
     fn oxidebsd_sys_getrusage(who: u64, rusage_ptr: u64) -> i64;
     fn oxidebsd_sys_times(tms_ptr: u64) -> i64;
@@ -264,6 +268,20 @@ const SYS_SCHED_YIELD: u64 = 24;
 /// `process::do_futex`'s own doc comment in `src/process/limits.rs` for why this is a real, honest
 /// failure stub (not real futex support) and the live `sem_wait/7-1.c` infinite-busy-loop it closes.
 const SYS_FUTEX: u64 = 202;
+/// Real Linux's own `__NR_mlock`/`__NR_munlock`/`__NR_mlockall`/`__NR_munlockall` are `149`-`152`,
+/// but those slots are already claimed by this ABI's own live `SYS_SOCKETPAIR`/
+/// `SYS_SET_TID_ADDRESS`/`SYS_FCNTL`/`SYS_SHUTDOWN` — `third_party/musl/arch/x86_64/bits/
+/// syscall.h.in` (the `oxidebsd` branch) was already patched in a prior collision-avoidance sweep
+/// to move them here (`509`-`512`), continuing the same `493+` block `docs/
+/// MISSING_POSIX_SYSCALLS.md`'s own collision table documents — but no kernel-side handler was ever
+/// registered at the new numbers, so every real caller (including the POSIX conformance pilot's own
+/// `mlock`/`munlock`/`mlockall`/`munlockall` test files) hit a clean `ENOSYS` until now. See
+/// `process::mm::do_mlock`'s own doc comment for why these are honest, range-checked no-op
+/// successes rather than real memory locking.
+const SYS_MLOCK: u64 = 509;
+const SYS_MUNLOCK: u64 = 510;
+const SYS_MLOCKALL: u64 = 511;
+const SYS_MUNLOCKALL: u64 = 512;
 const SYS_REBOOT: u64 = 486;
 /// Continues the same 471-486 batch one past `SYS_REBOOT = 486` -- see this module's own
 /// `SYS_PRLIMIT64` doc comment for why that batch landed there instead of continuing this
@@ -475,6 +493,22 @@ extern "C" fn handle_futex(addr: u64, op: u64, val: u64, to: u64) -> i64 {
     unsafe { oxidebsd_sys_futex(addr, op, val, to) }
 }
 
+extern "C" fn handle_mlock(addr: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_mlock(addr, len) }
+}
+
+extern "C" fn handle_munlock(addr: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_munlock(addr, len) }
+}
+
+extern "C" fn handle_mlockall(flags: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_mlockall(flags) }
+}
+
+extern "C" fn handle_munlockall(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_munlockall() }
+}
+
 extern "C" fn handle_umask(new_mask: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_umask(new_mask) }
 }
@@ -609,6 +643,10 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SCHED_YIELD, handle_sched_yield);
         oxidebsd_register_syscall(SYS_REBOOT, handle_reboot);
         oxidebsd_register_syscall(SYS_FUTEX, handle_futex);
+        oxidebsd_register_syscall(SYS_MLOCK, handle_mlock);
+        oxidebsd_register_syscall(SYS_MUNLOCK, handle_munlock);
+        oxidebsd_register_syscall(SYS_MLOCKALL, handle_mlockall);
+        oxidebsd_register_syscall(SYS_MUNLOCKALL, handle_munlockall);
         oxidebsd_register_syscall(SYS_UMASK, handle_umask);
         oxidebsd_register_syscall(SYS_GETRUSAGE, handle_getrusage);
         oxidebsd_register_syscall(SYS_TIMES, handle_times);
@@ -634,7 +672,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SHMDT, handle_shmdt);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_MLOCK/SYS_MUNLOCK/SYS_MLOCKALL/SYS_MUNLOCKALL/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
     );
     0
 }

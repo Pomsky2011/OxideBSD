@@ -38,6 +38,15 @@
 //! `fread()`/`fgets()` call goes through `readv`, not `read`, whenever the `FILE*` has real
 //! internal buffering (`third_party/musl/src/stdio/__stdio_read.c`). Real logic (`src/syscall.rs`'s
 //! `sys_readv`) is kernel-resident, same reasoning as `sys_writev` above.
+//!
+//! `SYS_MSYNC = 26` is real x86_64 Linux's own `__NR_msync`, unremapped -- confirmed unclaimed
+//! anywhere in this ABI's own registry, and `third_party/musl/src/mman/msync.c` already targets it
+//! directly with no argument-convention issue (a real 3-argument `(addr, len, flags)` call fits
+//! this ABI's register width exactly). Lives here, next to `SYS_MMAP`/`SYS_MUNMAP`/`SYS_MPROTECT`
+//! above, same "core mmap-family syscall" reasoning. Real logic (`process::mm::do_msync`) flushes a
+//! live fd-backed `MAP_SHARED` region back to its file on demand -- see that function's own doc
+//! comment for why this went from a structural non-issue to a genuine gap once real fd-backed
+//! `MAP_SHARED` mmap landed.
 #![no_std]
 
 unsafe extern "C" {
@@ -57,6 +66,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_munmap(addr: u64, len: u64) -> i64;
     fn oxidebsd_sys_brk(addr: u64) -> i64;
     fn oxidebsd_sys_mprotect(addr: u64, len: u64, prot: u64) -> i64;
+    fn oxidebsd_sys_msync(addr: u64, len: u64, flags: u64) -> i64;
     fn oxidebsd_sys_set_fs_base(base: u64) -> i64;
     fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
     fn oxidebsd_sys_set_tid_address(tidptr: u64) -> i64;
@@ -86,6 +96,7 @@ const SYS_READV: u64 = 153;
 /// dynamic linker's own RELRO-protection step needs this at the same "core, every real program
 /// eventually calls it" tier once dynamic linking exists at all.
 const SYS_MPROTECT: u64 = 492;
+const SYS_MSYNC: u64 = 26;
 
 extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
@@ -144,6 +155,10 @@ extern "C" fn handle_mprotect(addr: u64, len: u64, prot: u64, _arg3: u64) -> i64
     unsafe { oxidebsd_sys_mprotect(addr, len, prot) }
 }
 
+extern "C" fn handle_msync(addr: u64, len: u64, flags: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_msync(addr, len, flags) }
+}
+
 extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_writev(fd, iov_ptr, iovcnt) }
 }
@@ -171,6 +186,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MUNMAP, handle_munmap);
         oxidebsd_register_syscall(SYS_BRK, handle_brk);
         oxidebsd_register_syscall(SYS_MPROTECT, handle_mprotect);
+        oxidebsd_register_syscall(SYS_MSYNC, handle_msync);
         oxidebsd_register_syscall(SYS_SET_FS_BASE, handle_set_fs_base);
         oxidebsd_register_syscall(SYS_WRITEV, handle_writev);
         oxidebsd_register_syscall(SYS_SET_TID_ADDRESS, handle_set_tid_address);

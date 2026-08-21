@@ -545,6 +545,47 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// `SYS_MSYNC`'s real logic — real Linux value `26`, unremapped (see `writeback_region`'s own doc
+/// comment for why this used to be a structural non-issue: mmap was always anonymous/private).
+/// Flushes a live fd-backed `MAP_SHARED` region back to its real underlying file on demand — the
+/// same `writeback_region` `do_munmap`/exit cleanup already call, just invoked mid-mapping instead
+/// of at teardown. `addr` must be page-aligned (real POSIX `EINVAL` otherwise — unlike
+/// `mlock`/`munlock` below, `msync(2)` actually documents this requirement) and must fall inside a
+/// still-live mapping in the caller's own `mmap_file_regions` (`ENOMEM` otherwise, matching real
+/// Linux's own "address doesn't correspond to a mapping" error). `MS_ASYNC`/`MS_SYNC` aren't
+/// distinguished — no async I/O queue exists to differentiate them, so both just flush
+/// synchronously before returning, same honesty tier `fsync`'s own doc comment already sets;
+/// `MS_INVALIDATE` is a no-op — this kernel has no separate page-cache copy to invalidate,
+/// `MAP_SHARED` here already shares `MMAP_FILE_CACHE`'s own live frames directly. `len` isn't
+/// range-checked against the region's own extent — every real caller in this kernel's own call
+/// graph flushes a whole mapping at once (the shape `msync(addr, real_len, ...)` always takes), and
+/// `writeback_region` itself only ever writes the region's real content regardless.
+pub fn do_msync(caller_pid: Pid, addr: u64, len: u64, flags: u64) -> Result<u64, u64> {
+    const MS_ASYNC: u64 = 1;
+    const MS_INVALIDATE: u64 = 2;
+    const MS_SYNC: u64 = 4;
+    let _ = len;
+    if !addr.is_multiple_of(4096) || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 {
+        return Err(EINVAL);
+    }
+    if flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 {
+        return Err(EINVAL);
+    }
+
+    let phys_offset = memory::phys_mem_offset();
+    let table = PROCESS_TABLE.lock();
+    let me = table
+        .get(&caller_pid)
+        .expect("msync: current process missing from table");
+    let region = me
+        .mmap_file_regions
+        .iter()
+        .find(|r| addr >= r.va_start && addr < r.va_start + r.npages * 4096)
+        .ok_or(ENOMEM)?;
+    writeback_region(region, phys_offset);
+    Ok(0)
+}
+
 /// Real cleanup for every fd-backed mapping a process still had live at exit/`execve` — writes
 /// back and releases each one's `MMAP_FILE_CACHE` reference, the same way an explicit `munmap`
 /// would, since neither event ever calls `do_munmap` itself. Called from
@@ -580,6 +621,79 @@ pub fn cleanup_mmap_file_regions_for_exit(pid: Pid) {
 /// enforcement is future work, once something actually depends on W^X being real.
 pub fn do_mprotect(addr: u64, len: u64, prot: u64) -> Result<u64, u64> {
     let _ = (addr, len, prot);
+    Ok(0)
+}
+
+/// True only if every page in `[addr, addr+len)` is currently mapped in `caller_pid`'s own address
+/// space — the one real check `do_mlock`/`do_munlock` below actually perform, matching real Linux's
+/// own `ENOMEM` ("address range doesn't correspond to mapped pages") for both calls. Read-only
+/// (`Translate`, not `Mapper::map_to`/`unmap`) — this never changes what's mapped, only reports on
+/// it.
+fn range_fully_mapped(caller_pid: Pid, addr: u64, len: u64) -> bool {
+    let Some(end_inclusive) = addr.checked_add(len).and_then(|e| e.checked_sub(1)) else {
+        return false;
+    };
+    if VirtAddr::try_new(addr).is_err() || VirtAddr::try_new(end_inclusive).is_err() {
+        return false;
+    }
+    let phys_offset = memory::phys_mem_offset();
+    let table = PROCESS_TABLE.lock();
+    let Some(me) = table.get(&caller_pid) else {
+        return false;
+    };
+    // SAFETY: me.address_space is the currently active address space -- same reasoning do_mmap's
+    // own identical comment already establishes; read-only here, no mutation.
+    let mapper = unsafe { me.address_space.mapper(phys_offset) };
+    let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_inclusive));
+    Page::range_inclusive(start_page, end_page)
+        .all(|page| matches!(mapper.translate(page.start_address()), TranslateResult::Mapped { .. }))
+}
+
+/// `SYS_MLOCK`/`SYS_MUNLOCK`'s real logic — real Linux values `509`/`510` (moved off the real
+/// `149`/`150` slots, which collide with this ABI's own live `SYS_SOCKETPAIR`/`SYS_SET_TID_ADDRESS`
+/// — see `docs/MISSING_POSIX_SYSCALLS.md`'s own collision table). Deliberately a no-op success
+/// beyond the range check below: this kernel never pages anything out (no swap, no reclaim of any
+/// kind anywhere), so "lock this page so it can't be swapped" is a no-op by construction, not a
+/// missing capability — same honesty tier `do_mprotect` above already establishes. Still performs
+/// the one real, cheap check both real `mlock(2)`/`munlock(2)` document: `ENOMEM` if the requested
+/// range isn't entirely mapped (`range_fully_mapped`) — a genuine correctness bound even though
+/// nothing is actually locked. `len == 0` always succeeds trivially (matches real Linux).
+pub fn do_mlock(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    if range_fully_mapped(caller_pid, addr, len) {
+        Ok(0)
+    } else {
+        Err(ENOMEM)
+    }
+}
+
+/// See `do_mlock`'s own doc comment — `munlock(2)` documents the identical `ENOMEM` range
+/// requirement, and there's no real per-page locked state anywhere in this kernel to actually
+/// clear, so the two share one implementation.
+pub fn do_munlock(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
+    do_mlock(caller_pid, addr, len)
+}
+
+/// `SYS_MLOCKALL`/`SYS_MUNLOCKALL`'s real logic — real Linux values `511`/`512`, moved off `151`/
+/// `152` for the same `SYS_FCNTL`/`SYS_SHUTDOWN` collision reasons `do_mlock` documents. `mlockall`
+/// validates `flags` is a real, nonzero combination of `MCL_CURRENT`/`MCL_FUTURE`/`MCL_ONFAULT`
+/// (real Linux `EINVAL` otherwise — at least one of `MCL_CURRENT`/`MCL_FUTURE` is required) before
+/// the same unenforced no-op success `do_mlock` above documents. `munlockall` takes no arguments and
+/// always succeeds.
+pub fn do_mlockall(flags: u64) -> Result<u64, u64> {
+    const MCL_CURRENT: u64 = 1;
+    const MCL_FUTURE: u64 = 2;
+    const MCL_ONFAULT: u64 = 4;
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
+        return Err(EINVAL);
+    }
+    Ok(0)
+}
+
+pub fn do_munlockall() -> Result<u64, u64> {
     Ok(0)
 }
 

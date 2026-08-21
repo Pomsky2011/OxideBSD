@@ -707,6 +707,13 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_munmap" => Some(crate::syscall::oxidebsd_sys_munmap as *const () as u64),
         "oxidebsd_sys_brk" => Some(crate::syscall::oxidebsd_sys_brk as *const () as u64),
         "oxidebsd_sys_mprotect" => Some(crate::syscall::oxidebsd_sys_mprotect as *const () as u64),
+        "oxidebsd_sys_msync" => Some(crate::syscall::oxidebsd_sys_msync as *const () as u64),
+        "oxidebsd_sys_mlock" => Some(crate::syscall::oxidebsd_sys_mlock as *const () as u64),
+        "oxidebsd_sys_munlock" => Some(crate::syscall::oxidebsd_sys_munlock as *const () as u64),
+        "oxidebsd_sys_mlockall" => Some(crate::syscall::oxidebsd_sys_mlockall as *const () as u64),
+        "oxidebsd_sys_munlockall" => {
+            Some(crate::syscall::oxidebsd_sys_munlockall as *const () as u64)
+        }
         "oxidebsd_sys_set_fs_base" => {
             Some(crate::syscall::oxidebsd_sys_set_fs_base as *const () as u64)
         }

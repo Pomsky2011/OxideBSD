@@ -1913,6 +1913,39 @@ pub(crate) extern "C" fn oxidebsd_sys_mprotect(addr: u64, len: u64, prot: u64) -
     result_to_ffi(crate::process::do_mprotect(addr, len, prot))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_msync(addr: u64, len: u64, flags: u64) -> i64 {
+    result_to_ffi(crate::process::do_msync(
+        crate::process::scheduler::current_pid(),
+        addr,
+        len,
+        flags,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mlock(addr: u64, len: u64) -> i64 {
+    result_to_ffi(crate::process::do_mlock(
+        crate::process::scheduler::current_pid(),
+        addr,
+        len,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_munlock(addr: u64, len: u64) -> i64 {
+    result_to_ffi(crate::process::do_munlock(
+        crate::process::scheduler::current_pid(),
+        addr,
+        len,
+    ))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_mlockall(flags: u64) -> i64 {
+    result_to_ffi(crate::process::do_mlockall(flags))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_munlockall() -> i64 {
+    result_to_ffi(crate::process::do_munlockall())
+}
+
 pub(crate) extern "C" fn oxidebsd_sys_getpid() -> i64 {
     crate::process::do_getpid() as i64
 }
