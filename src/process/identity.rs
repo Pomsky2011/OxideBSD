@@ -6,8 +6,16 @@ use crate::process::scheduler;
 use crate::syscall::{EINVAL, EPERM, ESRCH};
 use super::*;
 
+/// Real `getpid()` returns the caller's **thread-group id**, not its raw schedulable pid — see
+/// `Process::tgid`'s own doc comment. Identical today (no real thread creation exists yet), but
+/// this is the one line that needs to already be correct before `clone(2)` lands, so a
+/// `CLONE_THREAD` child's `getpid()` reports its parent's pid, not its own.
 pub fn do_getpid() -> u64 {
-    scheduler::current_pid()
+    let table = table().lock();
+    table
+        .get(&scheduler::current_pid())
+        .map(|p| p.tgid)
+        .unwrap_or_else(scheduler::current_pid)
 }
 
 /// `0` for a process with no parent (pid 1 itself), matching real `getppid()`'s convention for

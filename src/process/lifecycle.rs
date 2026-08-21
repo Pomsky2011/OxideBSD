@@ -99,6 +99,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
 
     let process = Process {
         pid,
+        // pid 1's own thread group of one -- see Process::tgid's own doc comment.
+        tgid: pid,
         parent,
         children: Vec::new(),
         state: ProcState::Ready,
@@ -313,6 +315,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
 
     let child = Process {
         pid: child_pid,
+        // A forked child is a real POSIX process, not a thread -- its own tgid, never the
+        // parent's. See Process::tgid's own doc comment.
+        tgid: child_pid,
         parent: Some(caller_pid),
         children: Vec::new(),
         state: ProcState::Ready,

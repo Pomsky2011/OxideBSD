@@ -561,6 +561,18 @@ pub(crate) struct SignalStackFrame {
 
 pub struct Process {
     pub pid: Pid,
+    /// The real POSIX thread-group id: `getpid()` returns this, not `pid` directly. Equal to
+    /// `pid` for every process today — this kernel has no real thread creation yet (`CLONE_THREAD`
+    /// is unimplemented, see `docs/MISSING_POSIX_SYSCALLS.md`'s `pthread_create` row), so every
+    /// schedulable entity is still its own thread group of one. `spawn`/`fork` both set this to the
+    /// process's own freshly allocated `pid` (a forked child is a real POSIX *process*, not a
+    /// thread — it gets its own tgid, never inherits the parent's); `execve` leaves it untouched
+    /// (real `execve()` doesn't change the caller's pid or tgid). Once a real `clone(2)` handler
+    /// exists, a `CLONE_THREAD` child will inherit the parent's `tgid` here instead of getting a
+    /// fresh one — the one line this field exists to make possible. `gettid()` needs no kernel
+    /// change to go with this: it already returns the real per-thread `pid` via
+    /// `sys_set_tid_address`'s existing return value, cached client-side in musl's own TCB.
+    pub tgid: Pid,
     pub parent: Option<Pid>,
     pub children: Vec<Pid>,
     pub state: ProcState,
