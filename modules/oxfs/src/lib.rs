@@ -5709,6 +5709,16 @@ fn format_fresh_filesystem() -> bool {
         include_bytes!(env!("OXFS_DYNLINK_SMOKE_ELF_PATH")),
     );
 
+    // "Real threading" phases 1-5's own finish line -- a genuine, unmodified musl
+    // pthread_create()/pthread_join() round trip (`userland/pthread-smoke/main.c`'s own doc
+    // comment has the full scenario), driven by `tests/pthread_syscall_smoke.rs` via a real
+    // `fork`+`execve` of this path, exactly like `dynlink-smoke.elf` above.
+    ok &= seed_file(
+        root,
+        b"pthread-smoke.elf",
+        include_bytes!(env!("OXFS_PTHREAD_SMOKE_ELF_PATH")),
+    );
+
     // A real fixture for exercising the compiler end to end (`tcc -static -o hello.elf hello.c`,
     // by hand at the hush prompt or via `tests/tcc_syscall_smoke.rs`) -- a real `printf`, not a
     // bare `return`, so it exercises musl's stdio/writev path, not just process exit.

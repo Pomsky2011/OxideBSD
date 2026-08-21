@@ -303,9 +303,12 @@ pub(crate) struct SyscallFrame {
 
 /// The in-flight syscall's own `SyscallFrame`, valid only between `syscall_dispatch` storing it
 /// and returning. `SyscallHandler`'s `(u64, u64, u64) -> i64` signature can't carry a frame
-/// pointer, but `sys_fork`/`sys_execve` (`src/process.rs`) both need raw access to the live frame
-/// (fork copies it into the child's own kernel stack; execve overwrites `rip`/`rsp` in place) —
-/// this is a narrow, explicit exception for those two, not a signature change for every syscall.
+/// pointer, but `sys_fork`/`sys_execve`/`process::lifecycle::do_clone` all need raw access to the
+/// live frame (fork copies it into the child's own kernel stack; execve overwrites `rip`/`rsp` in
+/// place; `do_clone` does the same as fork, plus reads `r8` for `tls` — the one real `clone(2)`
+/// argument that doesn't fit this ABI's normal 4-register `dispatch()` path, see `frame_tls`'s own
+/// doc comment) — a narrow, explicit exception for these three, not a signature change for every
+/// syscall.
 /// Plain `AtomicPtr`, not a lock: this is single-core and `SYSFMASK` clears `RFLAGS::INTERRUPT_FLAG`
 /// on every `SYSCALL` entry, so nothing can preempt a syscall in progress to observe a
 /// half-updated value (same reasoning `src/console/stdin.rs`'s ring buffer doc comment already
@@ -344,6 +347,44 @@ pub(crate) unsafe fn copy_frame_for_fork(dst: *mut SyscallFrame, src: *const Sys
         (*dst).rax = 0;
         (*dst).r11 &= !CARRY_FLAG;
     }
+}
+
+/// `copy_frame_for_fork`'s sibling for real `clone(2)`/`CLONE_THREAD` (`process::lifecycle::
+/// do_clone`) — identical body, plus one extra override: `user_rsp` comes from the real `newsp`
+/// argument the caller passed to `clone(2)`, not copied from the parent (a cloned thread starts on
+/// its own, caller-supplied stack, unlike `fork`'s child, which keeps running on a byte-for-byte
+/// copy of the parent's own stack).
+///
+/// # Safety
+///
+/// Same contract as `copy_frame_for_fork`: `dst` must point at `size_of::<SyscallFrame>()`
+/// writable bytes; `src` must point at a valid, fully-initialized `SyscallFrame`.
+pub(crate) unsafe fn copy_frame_for_clone(
+    dst: *mut SyscallFrame,
+    src: *const SyscallFrame,
+    new_user_rsp: u64,
+) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, 1);
+        (*dst).rax = 0;
+        (*dst).r11 &= !CARRY_FLAG;
+        (*dst).user_rsp = new_user_rsp;
+    }
+}
+
+/// Reads `r8` out of a raw `SyscallFrame` — `do_clone`'s real `tls` argument (`CLONE_SETTLS`)
+/// lands there (see `clone.s`'s own register shuffle, `third_party/musl/src/thread/x86_64/
+/// clone.s`), one register past what this ABI's normal 4-argument `dispatch()` path threads
+/// through (`rdi`/`rsi`/`rdx`/`r10`) — so, like `sys_fork`/`sys_execve` needing the whole frame to
+/// seed/redirect it, `do_clone` needs this one extra field via the same raw-frame-access route
+/// (`current_frame()`) rather than a 5th `dispatch()` argument that doesn't exist.
+///
+/// # Safety
+///
+/// `frame` must point at the currently in-flight syscall's live frame (i.e. `current_frame()`'s
+/// return value, called from within that same syscall's handling).
+pub(crate) unsafe fn frame_tls(frame: *const SyscallFrame) -> u64 {
+    unsafe { (*frame).r8 }
 }
 
 /// Redirects the live syscall frame at `frame` to resume execution at `rip` on `rsp` instead of

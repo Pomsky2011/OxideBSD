@@ -42,6 +42,7 @@
 //! against a lock this code is still holding, because it isn't holding any.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
@@ -68,6 +69,22 @@ pub fn current_pid() -> Pid {
     CURRENT_PID.load(Ordering::Relaxed)
 }
 
+/// The calling process's real POSIX thread-group id (`Process::tgid`) — what `fs::fd` (`CLONE_FILES`
+/// sharing) and `process::identity::do_getpid` both actually want, distinct from `current_pid()`'s
+/// raw schedulable pid once real `clone(2)`-created threads exist. Factors out the same
+/// `table().get(&pid).map(|p| p.tgid)` lookup `identity::do_getpid` and `limits::do_futex` each
+/// already duplicated on their own. Falls back to `current_pid()` itself if the table lookup ever
+/// fails (mirrors `do_getpid`'s own fallback) — should only happen transiently, e.g. mid-construction
+/// before a fresh `Process` is inserted.
+pub fn current_tgid() -> Pid {
+    let pid = current_pid();
+    process::table()
+        .lock()
+        .get(&pid)
+        .map(|p| p.tgid)
+        .unwrap_or(pid)
+}
+
 pub fn enqueue_ready(pid: Pid) {
     READY_QUEUE.lock().push_back(pid);
 }
@@ -82,6 +99,40 @@ pub fn remove_ready(pid: Pid) {
     READY_QUEUE.lock().retain(|&p| p != pid);
 }
 
+/// Non-leader `CLONE_THREAD` children queued for real removal by `process::lifecycle::
+/// terminate_process` -- see that function's own doc comment for why it can't just remove its own
+/// `Process` entry directly (it's still running on that exact entry's own `KernelStack` at the
+/// point it decides to exit). Drained by `reap_pending_threads` below, called at the top of every
+/// `schedule()` -- by the time *any* call to `schedule()` other than the one a queued pid made to
+/// exit itself runs, `CURRENT_PID` has necessarily moved on, so that pid's own stack is
+/// guaranteed no longer live.
+static PENDING_THREAD_REAPS: Mutex<Vec<Pid>> = Mutex::new(Vec::new());
+
+pub(crate) fn queue_thread_reap(pid: Pid) {
+    PENDING_THREAD_REAPS.lock().push(pid);
+}
+
+/// Removes every queued pid's real `Process` entry -- except one that still equals
+/// `current_pid()`, which means this is the exact same `schedule()` call that pid's own `do_exit`
+/// made to switch away from itself (still running on its own about-to-be-freed `KernelStack`,
+/// mid-switch) -- left queued for a later call, once some other process's own turn confirms
+/// `current_pid()` has genuinely moved on. See `PENDING_THREAD_REAPS`'s own doc comment.
+fn reap_pending_threads() {
+    let mut pending = PENDING_THREAD_REAPS.lock();
+    if pending.is_empty() {
+        return;
+    }
+    let cur = current_pid();
+    pending.retain(|&pid| {
+        if pid == cur {
+            true
+        } else {
+            process::table().lock().remove(&pid);
+            false
+        }
+    });
+}
+
 /// Voluntarily gives up the CPU. If the caller is still `Ready` or `Running` (i.e. it didn't just
 /// block or exit), it's re-enqueued so it gets another turn later — a caller that transitioned to
 /// `Blocked`/`Zombie` just before calling this is deliberately *not* re-enqueued, which is how
@@ -91,6 +142,8 @@ pub fn remove_ready(pid: Pid) {
 /// that means "a later event woke it back to `Ready` and the scheduler picked it again."
 pub fn schedule() {
     without_interrupts(|| {
+        reap_pending_threads();
+
         let prev_pid = current_pid();
         let has_prev = prev_pid != 0;
 

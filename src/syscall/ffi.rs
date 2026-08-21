@@ -216,7 +216,9 @@ pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
     let Some(real_fd) = crate::fs::fd::real_fd_of(fd) else {
         return Err(EBADF);
     };
-    let pid = crate::process::scheduler::current_pid();
+    // Tgid, not raw pid -- CLOEXEC (like TABLE itself) is scoped by thread group, real CLONE_FILES
+    // sharing -- see `crate::fs::fd`'s own module doc comment.
+    let pid = crate::process::scheduler::current_tgid();
     match cmd {
         F_GETFL => Ok(if crate::fs::fd::is_nonblocking(real_fd) {
             O_NONBLOCK
@@ -1826,6 +1828,14 @@ pub(crate) extern "C" fn oxidebsd_sys_shmdt(shmaddr: u64, _a1: u64, _a2: u64, _a
 /// `alloc`.
 pub(crate) extern "C" fn oxidebsd_sys_fork() -> i64 {
     result_to_ffi(crate::process::do_fork_from_current())
+}
+
+/// `SYS_CLONE = 555`'s FFI adapter over `do_clone` -- `ctid` (the real `clone(2)` 4th argument,
+/// carried in `r10`) really is used: real `CLONE_CHILD_CLEARTID` support, see `Process::
+/// clear_child_tid`'s own doc comment for what it's actually for (not `pthread_join`, which needs
+/// no kernel help at all).
+pub(crate) extern "C" fn oxidebsd_sys_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> i64 {
+    result_to_ffi(crate::process::do_clone(flags, newsp, ptid, ctid))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_wait4(

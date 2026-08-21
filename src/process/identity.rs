@@ -11,11 +11,7 @@ use super::*;
 /// this is the one line that needs to already be correct before `clone(2)` lands, so a
 /// `CLONE_THREAD` child's `getpid()` reports its parent's pid, not its own.
 pub fn do_getpid() -> u64 {
-    let table = table().lock();
-    table
-        .get(&scheduler::current_pid())
-        .map(|p| p.tgid)
-        .unwrap_or_else(scheduler::current_pid)
+    scheduler::current_tgid()
 }
 
 /// `0` for a process with no parent (pid 1 itself), matching real `getppid()`'s convention for
@@ -111,7 +107,7 @@ pub fn do_getuid(caller_pid: Pid) -> u64 {
     PROCESS_TABLE
         .lock()
         .get(&caller_pid)
-        .map(|p| p.uid as u64)
+        .map(|p| p.shared.lock().uid as u64)
         .unwrap_or(0)
 }
 
@@ -120,7 +116,7 @@ pub fn do_getgid(caller_pid: Pid) -> u64 {
     PROCESS_TABLE
         .lock()
         .get(&caller_pid)
-        .map(|p| p.gid as u64)
+        .map(|p| p.shared.lock().gid as u64)
         .unwrap_or(0)
 }
 
@@ -131,14 +127,15 @@ pub fn do_getgid(caller_pid: Pid) -> u64 {
 /// Any other target is `EPERM`. No saved-set-uid/real-vs-effective distinction to update beyond the
 /// single `uid` field itself (see `Process::uid`'s own doc comment).
 pub fn do_setuid(caller_pid: Pid, uid: u32) -> Result<u64, u64> {
-    let mut table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.lock();
     let proc = table
-        .get_mut(&caller_pid)
+        .get(&caller_pid)
         .expect("setuid: current process missing from table");
-    if proc.uid != 0 && uid != proc.uid {
+    let mut shared = proc.shared.lock();
+    if shared.uid != 0 && uid != shared.uid {
         return Err(EPERM);
     }
-    proc.uid = uid;
+    shared.uid = uid;
     Ok(0)
 }
 
@@ -146,14 +143,15 @@ pub fn do_setuid(caller_pid: Pid, uid: u32) -> Result<u64, u64> {
 /// own `uid` (real `setgid()` is likewise a root-only privilege, not gated on the caller's current
 /// `gid`).
 pub fn do_setgid(caller_pid: Pid, gid: u32) -> Result<u64, u64> {
-    let mut table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.lock();
     let proc = table
-        .get_mut(&caller_pid)
+        .get(&caller_pid)
         .expect("setgid: current process missing from table");
-    if proc.uid != 0 && gid != proc.gid {
+    let mut shared = proc.shared.lock();
+    if shared.uid != 0 && gid != shared.gid {
         return Err(EPERM);
     }
-    proc.gid = gid;
+    shared.gid = gid;
     Ok(0)
 }
 
@@ -178,17 +176,18 @@ pub fn do_setgid(caller_pid: Pid, gid: u32) -> Result<u64, u64> {
 /// field, matching `seteuid()`'s own real-world purpose (change what governs future permission
 /// checks) even though a real three-way split isn't tracked.
 pub fn do_setresuid(caller_pid: Pid, ruid: i64, euid: i64, suid: i64) -> Result<u64, u64> {
-    let mut table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.lock();
     let proc = table
-        .get_mut(&caller_pid)
+        .get(&caller_pid)
         .expect("setresuid: current process missing from table");
+    let mut shared = proc.shared.lock();
     for requested in [ruid, euid, suid] {
-        if requested != -1 && proc.uid != 0 && requested as u32 != proc.uid {
+        if requested != -1 && shared.uid != 0 && requested as u32 != shared.uid {
             return Err(EPERM);
         }
     }
     if let Some(target) = [euid, ruid, suid].into_iter().find(|&v| v != -1) {
-        proc.uid = target as u32;
+        shared.uid = target as u32;
     }
     Ok(0)
 }
@@ -231,7 +230,7 @@ pub fn do_setgroups(caller_pid: Pid, _count: u64, _list_ptr: u64) -> Result<u64,
     let proc = table
         .get(&caller_pid)
         .expect("setgroups: current process missing from table");
-    if proc.uid != 0 {
+    if proc.shared.lock().uid != 0 {
         return Err(EPERM);
     }
     Ok(0)

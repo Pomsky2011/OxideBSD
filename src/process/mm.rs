@@ -351,7 +351,7 @@ fn do_mmap_file_backed(
     }
 
     *MMAP_FILE_REFCOUNT.lock().entry(content_id).or_insert(0) += 1;
-    me.mmap_file_regions.push(MmapFileRegion {
+    me.shared.lock().mmap_file_regions.push(MmapFileRegion {
         va_start: base,
         npages: page_count,
         mapped_pages: covered_pages,
@@ -374,7 +374,7 @@ pub fn signal_for_user_fault(caller_pid: Pid, addr: u64) -> u64 {
     let Some(me) = table.get(&caller_pid) else {
         return crate::process::SIGSEGV;
     };
-    let in_reserved_tail = me.mmap_file_regions.iter().any(|r| {
+    let in_reserved_tail = me.shared.lock().mmap_file_regions.iter().any(|r| {
         let backed_end = r.va_start + r.mapped_pages * 4096;
         let reserved_end = r.va_start + r.npages * 4096;
         addr >= backed_end && addr < reserved_end
@@ -479,12 +479,14 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     }
     let phys_offset = memory::phys_mem_offset();
 
-    let mut table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.lock();
     let me = table
-        .get_mut(&caller_pid)
+        .get(&caller_pid)
         .expect("munmap: current process missing from table");
 
     let file_region_idx = me
+        .shared
+        .lock()
         .mmap_file_regions
         .iter()
         .position(|r| r.va_start == addr);
@@ -534,7 +536,7 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     }
 
     if let Some(idx) = file_region_idx {
-        let region = me.mmap_file_regions.remove(idx);
+        let region = me.shared.lock().mmap_file_regions.remove(idx);
         drop(table);
         if any_dirty {
             writeback_region(&region, phys_offset);
@@ -577,7 +579,8 @@ pub fn do_msync(caller_pid: Pid, addr: u64, len: u64, flags: u64) -> Result<u64,
     let me = table
         .get(&caller_pid)
         .expect("msync: current process missing from table");
-    let region = me
+    let shared = me.shared.lock();
+    let region = shared
         .mmap_file_regions
         .iter()
         .find(|r| addr >= r.va_start && addr < r.va_start + r.npages * 4096)
@@ -595,11 +598,11 @@ pub fn do_msync(caller_pid: Pid, addr: u64, len: u64, flags: u64) -> Result<u64,
 /// into it, just became unreachable, matching real Linux's own implicit-unmap-on-execve).
 pub fn cleanup_mmap_file_regions_for_exit(pid: Pid) {
     let regions = {
-        let mut table = PROCESS_TABLE.lock();
-        let Some(me) = table.get_mut(&pid) else {
+        let table = PROCESS_TABLE.lock();
+        let Some(me) = table.get(&pid) else {
             return;
         };
-        core::mem::take(&mut me.mmap_file_regions)
+        core::mem::take(&mut me.shared.lock().mmap_file_regions)
     };
     if regions.is_empty() {
         return;
@@ -703,28 +706,29 @@ const BRK_REGION_CEILING: u64 = 0x_1000_0000;
 /// `SYS_BRK`'s real logic. `addr == 0` queries the current value without changing it (the
 /// convention every real `sbrk(0)` already relies on). Shrinking just lowers the stored value —
 /// no unmap, same no-reclaim simplification `do_munmap` above documents. Growing maps freshly
-/// zeroed pages from the first not-yet-mapped page onward: `me.brk` isn't necessarily page-aligned
+/// zeroed pages from the first not-yet-mapped page onward: `brk` isn't necessarily page-aligned
 /// (a previous grow may have stopped mid-page), so the *page containing* the old value is already
 /// mapped and must be skipped, not re-mapped (`Mapper::map_to` fails on an already-present page).
 pub fn do_brk(caller_pid: Pid, addr: u64) -> Result<u64, u64> {
     let phys_offset = memory::phys_mem_offset();
-    let mut table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.lock();
     let me = table
-        .get_mut(&caller_pid)
+        .get(&caller_pid)
         .expect("brk: current process missing from table");
+    let mut shared = me.shared.lock();
 
     if addr == 0 {
-        return Ok(me.brk.as_u64());
+        return Ok(shared.brk.as_u64());
     }
-    if addr <= me.brk.as_u64() {
-        me.brk = VirtAddr::new(addr);
+    if addr <= shared.brk.as_u64() {
+        shared.brk = VirtAddr::new(addr);
         return Ok(addr);
     }
     if addr > BRK_REGION_CEILING {
         return Err(ENOMEM);
     }
 
-    let old_top = me.brk.as_u64();
+    let old_top = shared.brk.as_u64();
     let new_top = addr;
     let map_start = old_top.div_ceil(4096) * 4096;
     if new_top > map_start {
@@ -758,6 +762,6 @@ pub fn do_brk(caller_pid: Pid, addr: u64) -> Result<u64, u64> {
         })?;
     }
 
-    me.brk = VirtAddr::new(new_top);
+    shared.brk = VirtAddr::new(new_top);
     Ok(new_top)
 }

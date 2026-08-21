@@ -71,6 +71,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
     fn oxidebsd_sys_set_tid_address(tidptr: u64) -> i64;
     fn oxidebsd_sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
+    fn oxidebsd_sys_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> i64;
 }
 
 const SYS_EXIT: u64 = 1;
@@ -97,6 +98,10 @@ const SYS_READV: u64 = 153;
 /// eventually calls it" tier once dynamic linking exists at all.
 const SYS_MPROTECT: u64 = 492;
 const SYS_MSYNC: u64 = 26;
+/// Already reserved since "Real threading phase 1" (`third_party/musl/src/thread/x86_64/clone.s`'s
+/// own hardcoded `mov $555,%eax` -- see `docs/MISSING_POSIX_SYSCALLS.md`) -- this is the real
+/// handler registration that number was always waiting for, not a fresh pick.
+const SYS_CLONE: u64 = 555;
 
 extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
@@ -147,6 +152,13 @@ extern "C" fn handle_brk(addr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_brk(addr) }
 }
 
+/// Real `clone.s`'s own register shuffle puts `flags`/`newsp`/`ptid` into this ABI's normal
+/// `rdi`/`rsi`/`rdx` and `ctid` into `r10` -- `tls` (in `r8`) doesn't fit and is read kernel-side
+/// off the raw frame instead, see `oxidebsd_sys_clone`'s own doc comment.
+extern "C" fn handle_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> i64 {
+    unsafe { oxidebsd_sys_clone(flags, newsp, ptid, ctid) }
+}
+
 extern "C" fn handle_set_fs_base(base: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_set_fs_base(base) }
 }
@@ -178,6 +190,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_READ, handle_read);
         oxidebsd_register_syscall(SYS_WRITE, handle_write);
         oxidebsd_register_syscall(SYS_FORK, handle_fork);
+        oxidebsd_register_syscall(SYS_CLONE, handle_clone);
         oxidebsd_register_syscall(SYS_WAIT4, handle_wait4);
         oxidebsd_register_syscall(SYS_EXECVE, handle_execve);
         oxidebsd_register_syscall(SYS_GETPID, handle_getpid);

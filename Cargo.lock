@@ -79,6 +79,10 @@ name = "clock-syscall-smoke"
 version = "0.1.0"
 
 [[package]]
+name = "clone-syscall-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "const_fn"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,6 +297,10 @@ version = "0.1.0"
 
 [[package]]
 name = "proc-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "pthread-syscall-smoke"
 version = "0.1.0"
 
 [[package]]

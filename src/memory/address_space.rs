@@ -1,3 +1,5 @@
+use alloc::sync::Arc;
+
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
@@ -39,8 +41,13 @@ pub const SHARED_LEAF: PageTableFlags = PageTableFlags::BIT_9;
 /// reachable no matter which address space is active, since interrupt/exception handlers run in
 /// the *kernel's* context regardless of what was running when they fired. Only entries this
 /// address space adds later (e.g. a loaded ELF's segments) are actually new and private to it.
+///
+/// `level_4_frame` is `Arc`-wrapped so real `clone(2)`/`CLONE_VM` threads can genuinely share one
+/// address space (`share()` below) rather than each getting their own eager copy the way `fork()`
+/// does — `Clone` on this whole type is just an `Arc::clone` refcount bump, safe and cheap.
+#[derive(Clone)]
 pub struct AddressSpace {
-    level_4_frame: PhysFrame,
+    level_4_frame: Arc<PhysFrame>,
 }
 
 impl AddressSpace {
@@ -77,7 +84,7 @@ impl AddressSpace {
         *new_table = active_table.clone();
 
         AddressSpace {
-            level_4_frame: new_frame,
+            level_4_frame: Arc::new(new_frame),
         }
     }
 
@@ -166,7 +173,18 @@ impl AddressSpace {
         );
 
         AddressSpace {
-            level_4_frame: new_frame,
+            level_4_frame: Arc::new(new_frame),
+        }
+    }
+
+    /// Returns a new `AddressSpace` handle sharing the exact same underlying level 4 table (an
+    /// `Arc::clone` refcount bump, no new frame, no copying) — real `clone(2)`'s `CLONE_VM`
+    /// semantics (`process::lifecycle::do_clone`), distinct from `fork`'s eager private copy
+    /// above. A write through either handle's own mapping is genuinely visible through the other,
+    /// since both ultimately point `CR3`/`mapper()` at the identical physical level 4 frame.
+    pub(crate) fn share(&self) -> AddressSpace {
+        AddressSpace {
+            level_4_frame: Arc::clone(&self.level_4_frame),
         }
     }
 
@@ -181,7 +199,7 @@ impl AddressSpace {
     /// address space's level 4 table.
     pub unsafe fn mapper(&self, physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
         let level_4_table =
-            unsafe { frame_to_page_table(self.level_4_frame, physical_memory_offset) };
+            unsafe { frame_to_page_table(*self.level_4_frame, physical_memory_offset) };
         unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
     }
 
@@ -194,7 +212,7 @@ impl AddressSpace {
     /// construction for a freshly-`new`'d one, but code that later removes kernel entries from a
     /// process's address space must not activate it from a context that depends on what it removed.
     pub unsafe fn activate(&self) {
-        unsafe { Cr3::write(self.level_4_frame, Cr3Flags::empty()) };
+        unsafe { Cr3::write(*self.level_4_frame, Cr3Flags::empty()) };
     }
 
     /// Real reclaim: frees every frame this address space privately owns -- every
@@ -238,19 +256,34 @@ impl AddressSpace {
     /// `do_wait4`, which only ever reaps an already-`Zombie` process -- one that stopped running,
     /// and thus stopped being the active `CR3`, back when it originally called `do_exit`) satisfy
     /// this by construction, not by convention alone.
+    ///
+    /// **Real `clone(2)`/`CLONE_VM` threads (`share()` above) share this exact `Arc`.** If any
+    /// other `Process`/`AddressSpace` handle still holds a clone of it, this whole free walk would
+    /// be unsound -- it assumes exclusive ownership of every frame it touches (see "Why this is
+    /// always safe" above), an assumption that only holds for the *last* surviving handle. So this
+    /// checks `Arc::strong_count` first and, if anything else is still sharing it, does nothing at
+    /// all beyond dropping `self`'s own reference -- the real free walk only ever runs once, when
+    /// whichever thread tears down last gets here and finds itself alone.
     pub unsafe fn teardown(
         self,
         physical_memory_offset: VirtAddr,
         frame_allocator: &mut impl FrameDeallocator<Size4KiB>,
     ) {
+        if Arc::strong_count(&self.level_4_frame) > 1 {
+            // Still shared with at least one other thread in the same address space -- just drop
+            // our own reference (implicit, `self` goes out of scope here) and leave the real walk
+            // for whichever handle tears down last.
+            return;
+        }
         // SAFETY: level_4_frame is this address space's own table, guaranteed not to be the active
         // CR3 by this method's own safety contract -- no other code can be viewing it concurrently.
-        let table = unsafe { frame_to_page_table(self.level_4_frame, physical_memory_offset) };
+        // strong_count == 1, confirmed just above, so no sibling AddressSpace handle exists either.
+        let table = unsafe { frame_to_page_table(*self.level_4_frame, physical_memory_offset) };
         free_table_level(table, 4, physical_memory_offset, frame_allocator);
         // SAFETY: this exact frame is what the walk above has now fully emptied of live content --
         // safe to return to the allocator's own free list, same as every leaf/table frame it just
         // freed.
-        unsafe { frame_allocator.deallocate_frame(self.level_4_frame) };
+        unsafe { frame_allocator.deallocate_frame(*self.level_4_frame) };
     }
 }
 

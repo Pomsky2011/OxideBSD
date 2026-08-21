@@ -107,12 +107,13 @@ pub fn do_getpriority(caller_pid: Pid, which: u64, who: i64) -> Result<u64, u64>
 /// own doc comment for why this needed to be real per-process state rather than a stub, and why
 /// it's stored/returned honestly without actually being consulted anywhere oxfs creates a file.
 pub fn do_umask(caller_pid: Pid, new_mask: u32) -> Result<u64, u64> {
-    let mut table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.lock();
     let proc = table
-        .get_mut(&caller_pid)
+        .get(&caller_pid)
         .expect("umask: current process missing from table");
-    let old_mask = proc.umask;
-    proc.umask = new_mask & 0o777;
+    let mut shared = proc.shared.lock();
+    let old_mask = shared.umask;
+    shared.umask = new_mask & 0o777;
     Ok(old_mask as u64)
 }
 
@@ -196,11 +197,13 @@ pub fn do_sched_setscheduler(
     let caller_uid = table
         .get(&caller_pid)
         .expect("sched_setscheduler: caller process missing from table")
+        .shared
+        .lock()
         .uid;
     let proc = table
         .get_mut(&target)
         .expect("sched_setscheduler: target process missing from table");
-    if !has_sched_permission(caller_uid, proc.uid) {
+    if !has_sched_permission(caller_uid, proc.shared.lock().uid) {
         return Err(EPERM);
     }
     let (min, max) = sched_priority_range(policy);
@@ -221,11 +224,13 @@ pub fn do_sched_getscheduler(caller_pid: Pid, pid: i64) -> Result<u64, u64> {
     let caller_uid = table
         .get(&caller_pid)
         .expect("sched_getscheduler: caller process missing from table")
+        .shared
+        .lock()
         .uid;
     let proc = table
         .get(&target)
         .expect("sched_getscheduler: target process missing from table");
-    if !has_sched_permission(caller_uid, proc.uid) {
+    if !has_sched_permission(caller_uid, proc.shared.lock().uid) {
         return Err(EPERM);
     }
     Ok(proc.sched_policy as u64)
@@ -240,11 +245,13 @@ pub fn do_sched_getparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u6
     let caller_uid = table
         .get(&caller_pid)
         .expect("sched_getparam: caller process missing from table")
+        .shared
+        .lock()
         .uid;
     let proc = table
         .get(&target)
         .expect("sched_getparam: target process missing from table");
-    if !has_sched_permission(caller_uid, proc.uid) {
+    if !has_sched_permission(caller_uid, proc.shared.lock().uid) {
         return Err(EPERM);
     }
     let sched_priority = proc.sched_priority;
@@ -467,25 +474,35 @@ pub fn do_futex(pid: Pid, addr: u64, op: u64, val: u64, to: u64) -> Result<u64, 
             let table = PROCESS_TABLE.lock();
             table.get(&pid).map(|p| p.tgid).unwrap_or(pid)
         };
-        let mut woken = 0u64;
-        let mut table = PROCESS_TABLE.lock();
-        for (&waiter_pid, proc) in table.iter_mut() {
-            if woken >= val {
-                break;
-            }
-            if let ProcState::Blocked(BlockReason::WaitingForFutex(wtgid, waddr, _)) = proc.state
-                && wtgid == waker_tgid
-                && waddr == addr
-            {
-                proc.state = ProcState::Ready;
-                crate::process::scheduler::enqueue_ready(waiter_pid);
-                woken += 1;
-            }
-        }
-        return Ok(woken);
+        return Ok(wake_futex(waker_tgid, addr, val));
     }
 
     Ok(0)
+}
+
+/// The real `FUTEX_WAKE` scan (`do_futex`'s own branch above), factored out so
+/// `process::lifecycle::terminate_process`'s own real `CLONE_CHILD_CLEARTID` handling (a genuine
+/// kernel-driven futex wake at a real, unmodified musl-issued `clone(2)`'s `ctid` address, at real
+/// task-exit time -- see that function's own doc comment) can reuse the exact same primitive
+/// rather than duplicating this scan. `tgid`-scoped, same reasoning `BlockReason::WaitingForFutex`'s
+/// own doc comment already gives.
+pub(crate) fn wake_futex(tgid: Pid, addr: u64, max_waiters: u64) -> u64 {
+    let mut woken = 0u64;
+    let mut table = PROCESS_TABLE.lock();
+    for (&waiter_pid, proc) in table.iter_mut() {
+        if woken >= max_waiters {
+            break;
+        }
+        if let ProcState::Blocked(BlockReason::WaitingForFutex(wtgid, waddr, _)) = proc.state
+            && wtgid == tgid
+            && waddr == addr
+        {
+            proc.state = ProcState::Ready;
+            crate::process::scheduler::enqueue_ready(waiter_pid);
+            woken += 1;
+        }
+    }
+    woken
 }
 
 /// `SYS_SCHED_GET_PRIORITY_MAX`/`SYS_SCHED_GET_PRIORITY_MIN`'s real logic -- fixed,

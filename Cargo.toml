@@ -36,6 +36,8 @@ members = [
   "userland/mmap-syscall-smoke",
   "userland/clock-syscall-smoke",
   "userland/sched-syscall-smoke",
+  "userland/clone-syscall-smoke",
+  "userland/pthread-syscall-smoke",
   "userland/posix-conformance-driver",
   "userland/lsoxmod",
   "modules/hello",
@@ -241,6 +243,14 @@ harness = false
 
 [[test]]
 name = "sched_syscall_smoke"
+harness = false
+
+[[test]]
+name = "clone_syscall_smoke"
+harness = false
+
+[[test]]
+name = "pthread_syscall_smoke"
 harness = false
 
 [[test]]

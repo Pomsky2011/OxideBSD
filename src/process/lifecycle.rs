@@ -110,10 +110,17 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         rsp,
         entry_point: entry,
         user_stack_top: initial_rsp,
-        brk: VirtAddr::new(elf.highest_loaded_address()),
+        shared: Arc::new(Mutex::new(ThreadGroupShared {
+            cwd: 0,
+            root_inode: 0,
+            umask: 0o022,
+            uid: 0,
+            gid: 0,
+            brk: VirtAddr::new(elf.highest_loaded_address()),
+            mmap_file_regions: Vec::new(),
+        })),
         fs_base: 0,
-        cwd: 0,
-        root_inode: 0,
+        clear_child_tid: 0,
         pending_signals: 0,
         blocked_signals: 0,
         sigactions: [SigAction::DEFAULT; (SIGRTMAX + 1) as usize],
@@ -128,20 +135,17 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         real_timer_interval_ticks: 0,
         posix_timers: [None; MAX_POSIX_TIMERS],
         // No login mechanism exists -- pid 1 (and every process descending from it) starts as
-        // root, same reasoning as Process::uid's own doc comment.
-        uid: 0,
-        gid: 0,
+        // root, same reasoning as ThreadGroupShared::uid's own doc comment (via Process::shared
+        // above).
         rlimits: [(u64::MAX, u64::MAX); 16],
         nice: 0,
         sched_policy: SCHED_RR_DEFAULT,
         sched_priority: 0,
-        umask: 0o022,
         stop_notify_pending: false,
         cont_notify_pending: false,
         sigsuspend_restore_mask: None,
         sysv_sem_undo: Vec::new(),
         sysv_shm_attach: Vec::new(),
-        mmap_file_regions: Vec::new(),
         pending_siginfo: [QueuedSigInfo::default(); 32],
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: crate::cpu::fpu::clean_state(),
@@ -234,10 +238,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
     let child_pid = alloc_pid();
     let (
         child_address_space,
-        parent_brk,
+        child_shared,
         parent_fs_base,
-        parent_cwd,
-        parent_root_inode,
         parent_pgid,
         parent_sid,
         parent_blocked_signals,
@@ -246,13 +248,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_altstack,
         parent_comm,
         parent_cmdline,
-        parent_uid,
-        parent_gid,
         parent_rlimits,
         parent_nice,
         parent_sched_policy,
         parent_sched_priority,
-        parent_umask,
         parent_fpu_state,
     ) = {
         let mut table = PROCESS_TABLE.lock();
@@ -264,12 +263,29 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // with its own CR3 still live.
         let child_address_space =
             with_frame_allocator(|fa| parent.address_space.fork(phys_offset, fa));
+        // Real fork() semantics for the now-`ThreadGroupShared` fields: cwd/root_inode/umask/
+        // uid/gid/brk are all copied (a forked child is a real POSIX *process*, gets its own
+        // independent ThreadGroupShared, never Arc::clone's the parent's -- that's do_clone's own
+        // CLONE_THREAD-only behavior); mmap_file_regions is never inherited by fork regardless
+        // (see MmapFileRegion's own doc comment -- this kernel's fork is a full eager copy, not
+        // COW, so a child's page-table entries at these VAs already point at freshly-copied
+        // private frames no matter what this list remembers).
+        let child_shared = {
+            let parent_shared = parent.shared.lock();
+            Arc::new(Mutex::new(ThreadGroupShared {
+                cwd: parent_shared.cwd,
+                root_inode: parent_shared.root_inode,
+                umask: parent_shared.umask,
+                uid: parent_shared.uid,
+                gid: parent_shared.gid,
+                brk: parent_shared.brk,
+                mmap_file_regions: Vec::new(),
+            }))
+        };
         (
             child_address_space,
-            parent.brk,
+            child_shared,
             parent.fs_base,
-            parent.cwd,
-            parent.root_inode,
             parent.pgid,
             parent.sid,
             // Real fork() semantics: signal disposition and the blocked-signal mask are
@@ -288,17 +304,12 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             // own -- same reasoning as brk/fs_base/cwd above.
             parent.comm.clone(),
             parent.cmdline.clone(),
-            // Real fork() semantics: uid/gid are copied, same as cwd/pgid/brk -- see
-            // Process::uid's own doc comment.
-            parent.uid,
-            parent.gid,
             // Real POSIX rlimit/nice/scheduling-attribute/fork semantics: all four are copied,
             // same as uid/gid/pgid -- see Process::rlimits's own doc comment.
             parent.rlimits,
             parent.nice,
             parent.sched_policy,
             parent.sched_priority,
-            parent.umask,
             // Real fork() semantics: the child's own FPU/SSE register state starts as an exact
             // copy of the parent's live state at the moment of the fork() call (the parent's own
             // in-flight computation, if any, is a real thing the child should see too) -- same
@@ -327,10 +338,11 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         rsp,
         entry_point: VirtAddr::zero(),
         user_stack_top: VirtAddr::zero(),
-        brk: parent_brk,
+        shared: child_shared,
         fs_base: parent_fs_base,
-        cwd: parent_cwd,
-        root_inode: parent_root_inode,
+        // Not inherited -- a forked child was never itself the target of a clone(2) call, see
+        // Process::clear_child_tid's own doc comment.
+        clear_child_tid: 0,
         pending_signals: 0,
         blocked_signals: parent_blocked_signals,
         sigactions: parent_sigactions,
@@ -348,13 +360,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited either -- see `Process::posix_timers`'s own doc comment (real
         // `timer_create(2)` semantics: not inherited across `fork`).
         posix_timers: [None; MAX_POSIX_TIMERS],
-        uid: parent_uid,
-        gid: parent_gid,
         rlimits: parent_rlimits,
         nice: parent_nice,
         sched_policy: parent_sched_policy,
         sched_priority: parent_sched_priority,
-        umask: parent_umask,
         // A forked child is never born stopped, and hasn't just resumed from anything -- real
         // POSIX fork() semantics, same "starts fresh" story as real_timer_deadline above.
         stop_notify_pending: false,
@@ -366,8 +375,6 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited either -- see this field's own doc comment (tied to this kernel's own
         // "no copy-on-write fork" limitation, not an independent design choice).
         sysv_shm_attach: Vec::new(),
-        // Not inherited -- same reasoning, see this field's own doc comment on Process.
-        mmap_file_regions: Vec::new(),
         // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
         // for a forked child too, so there's nothing meaningful to carry over).
         pending_siginfo: [QueuedSigInfo::default(); 32],
@@ -385,12 +392,226 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         table.insert(child_pid, Box::new(child));
     }
     // Real fork() semantics: the child gets its own independently-closable copy of every fd the
-    // parent has open, not a shared view of the parent's own table entries -- see
-    // crate::fs::fd::fork_inherit's own doc comment for why this specifically matters for pipes.
-    crate::fs::fd::fork_inherit(caller_pid, child_pid);
+    // parent's own thread group currently has open, not a shared view of those table entries --
+    // see crate::fs::fd::fork_inherit's own doc comment for why this specifically matters for
+    // pipes. Sourced from the caller's tgid, not raw caller_pid -- the fd table is tgid-scoped
+    // (real CLONE_FILES sharing) -- though the two are identical until a real `clone(2)`-created
+    // thread can fork. child_pid is used unchanged as the destination key: a forked child is
+    // always its own fresh thread group of one (Process::tgid == its own pid), never inheriting
+    // the parent's tgid.
+    crate::fs::fd::fork_inherit(scheduler::current_tgid(), child_pid);
     scheduler::enqueue_ready(child_pid);
     Ok(child_pid)
 }
+
+/// Real `clone(2)`'s own bit values (`third_party/musl/include/sched.h`, unremapped -- real Linux's
+/// own numbers, confirmed against `pthread_create.c`'s real call site). `do_clone` below only ever
+/// accepts the *exact* combination real `pthread_create` issues -- see that function's own doc
+/// comment for why a flag-by-flag general implementation isn't attempted.
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_DETACHED: u64 = 0x0040_0000;
+const PTHREAD_CLONE_FLAGS: u64 = CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_DETACHED;
+
+/// `SYS_CLONE`'s real logic -- real `pthread_create()`'s own kernel-facing half. `pthread_join`
+/// itself needs no kernel support: it's pure userspace futex logic against the child's own
+/// `detach_state`, already fully backed by phase 3's real `futex(2)` once both threads share a
+/// `tgid`. **But real `CLONE_CHILD_CLEARTID` support genuinely is needed anyway** -- found live,
+/// not predicted: real musl's own `pthread_create.c` sets `ctid` to `&__thread_list_lock`, and
+/// `__pthread_exit`'s own comment explains why that lock's release is deliberately routed through
+/// this exact kernel mechanism rather than a plain userspace unlock (the change must not become
+/// visible to other threads until *after* the exiting thread's real `SYS_exit`, which only a real
+/// kernel-driven clear-and-wake at true task-exit time can guarantee) -- see `Process::
+/// clear_child_tid`'s own doc comment for the full story, and `terminate_process` below for where
+/// the real write-zero-and-wake actually happens. Only the *exact* flag combination real
+/// `pthread_create` issues is accepted (`PTHREAD_CLONE_FLAGS` above) -- `EINVAL` otherwise, same
+/// "support the one real shape a live caller needs" discipline `do_mmap`/`mount`/`msgrcv` already
+/// established; a real general-purpose `clone(2)` (arbitrary flag subsets, `vfork`-shaped calls,
+/// process-creating `clone` without `CLONE_THREAD`, ...) is out of scope.
+///
+/// `newsp`/`ptid`/`ctid` arrive through the normal 4-argument `dispatch()` path (`rdi`/`rsi`/`rdx`/
+/// `r10`, real `clone.s`'s own register shuffle) alongside `flags`. `tls` (in `r8`) doesn't fit
+/// this ABI's 4-register convention at all, so it's read directly off the live frame (`syscall::
+/// frame_tls`) -- the same raw-frame-access route `sys_fork`/`sys_execve` already use, needed here
+/// regardless since `do_clone` also needs the whole raw parent frame to seed the child's own
+/// initial state.
+///
+/// **The real `CLONE_THREAD` sharing**: `address_space` = `parent.address_space.share()` (an
+/// `Arc::clone` of the level 4 table, `memory::address_space::AddressSpace::share`'s own doc
+/// comment) -- a write through either thread's own mapping is genuinely visible through the
+/// other's, real `CLONE_VM`. `shared` = `Arc::clone(&parent.shared)` -- the new thread sees (and
+/// can mutate) the exact same `cwd`/`root_inode`/`umask`/`uid`/`gid`/`brk`/`mmap_file_regions` the
+/// caller does, real `CLONE_FS`/(the uid/gid/umask half of what a real process shares). `tgid` is
+/// the caller's own, not a fresh allocation (real `CLONE_THREAD`: `getpid()` reports the same
+/// value from every thread in the group -- see `Process::tgid`'s own doc comment, written for
+/// exactly this line). `crate::fs::fd::fork_inherit` below (despite the name -- the same function
+/// `do_fork_from_current` already uses) copies the caller's *current* fd table into the child's
+/// own tgid-keyed slot, real `CLONE_FILES`: from that point on both tgids alias the exact same
+/// `real_fd`s (see `crate::fs::fd`'s own module doc comment on `real_fd`+refcounting).
+///
+/// Everything else mirrors `do_fork_from_current`'s own field-by-field policy for state that isn't
+/// now-shared: kernel stack and FPU state fresh/copied the same way; signal mask/`sigactions`
+/// copied (real `CLONE_SIGHAND`); `pending_signals`/`signal_stack`/`altstack`/itimers/posix-timers
+/// start empty/disarmed, same as a forked child; `rlimits`/`nice`/`sched_policy`/`sched_priority`
+/// copied. **Not added to the caller's own `children` list, and never wait4-reapable** -- a real
+/// `CLONE_THREAD` child is never an independent `wait4` target (`pthread_join` doesn't go through
+/// `wait4` at all -- see this function's own doc comment above); `process::lifecycle::
+/// terminate_process`'s own tgid-aware exit handling (a later addition, see its own doc comment)
+/// is what actually reaps a non-leader thread instead.
+pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64> {
+    if flags != PTHREAD_CLONE_FLAGS {
+        return Err(EINVAL);
+    }
+    let caller_pid = scheduler::current_pid();
+    let parent_frame = syscall::current_frame() as *const SyscallFrame;
+    // SAFETY: parent_frame is this exact syscall's own live frame (do_clone is only ever reached
+    // through dispatch(SYS_CLONE, ...), called from syscall_dispatch, which set CURRENT_FRAME to
+    // it just before) -- the same precondition do_fork_from_current's identical read already
+    // relies on.
+    let tls = unsafe { syscall::frame_tls(parent_frame) };
+
+    let child_pid = alloc_pid();
+    let (
+        child_address_space,
+        child_shared,
+        tgid,
+        parent_field,
+        parent_pgid,
+        parent_sid,
+        parent_blocked_signals,
+        parent_sigactions,
+        parent_signal_stack,
+        parent_altstack,
+        parent_comm,
+        parent_cmdline,
+        parent_rlimits,
+        parent_nice,
+        parent_sched_policy,
+        parent_sched_priority,
+        parent_fpu_state,
+    ) = {
+        let table = PROCESS_TABLE.lock();
+        let caller = table
+            .get(&caller_pid)
+            .expect("clone: current process missing from table");
+        (
+            // Real CLONE_VM: an Arc::clone of the exact same level 4 table, not a fresh copy --
+            // see AddressSpace::share's own doc comment.
+            caller.address_space.share(),
+            // Real CLONE_THREAD sharing: the new thread gets the exact same
+            // cwd/root_inode/umask/uid/gid/brk/mmap_file_regions Arc, not its own copy -- see
+            // ThreadGroupShared's own doc comment.
+            Arc::clone(&caller.shared),
+            // Real CLONE_THREAD: getpid() reports the same value from every thread sharing this
+            // tgid -- see Process::tgid's own doc comment.
+            caller.tgid,
+            caller.parent,
+            caller.pgid,
+            caller.sid,
+            caller.blocked_signals,
+            caller.sigactions,
+            caller.signal_stack.clone(),
+            caller.altstack,
+            caller.comm.clone(),
+            caller.cmdline.clone(),
+            caller.rlimits,
+            caller.nice,
+            caller.sched_policy,
+            caller.sched_priority,
+            caller.fpu_state,
+        )
+    };
+
+    let kernel_stack = KernelStack::new();
+    let kernel_stack_top = kernel_stack.top();
+    // SAFETY: parent_frame is valid per the same reasoning as the frame_tls read above; newsp is
+    // the caller's own real clone(2) argument, already validated to be a real user-space stack
+    // pointer by musl's own __clone asm before this syscall is ever issued.
+    let rsp = unsafe { crate::process::context_switch::seed_clone_frame(kernel_stack_top, parent_frame, newsp) };
+
+    let child = Process {
+        pid: child_pid,
+        tgid,
+        parent: parent_field,
+        children: Vec::new(),
+        state: ProcState::Ready,
+        address_space: child_address_space,
+        kernel_stack,
+        kernel_stack_top,
+        rsp,
+        entry_point: VirtAddr::zero(),
+        user_stack_top: VirtAddr::zero(),
+        shared: child_shared,
+        // Real CLONE_SETTLS: this thread's own IA32_FS_BASE, distinct from every sibling's --
+        // never copied from the caller (see Process::fs_base's own doc comment).
+        fs_base: tls,
+        // Real CLONE_CHILD_CLEARTID -- see Process::clear_child_tid's own doc comment.
+        clear_child_tid: ctid,
+        pending_signals: 0,
+        blocked_signals: parent_blocked_signals,
+        sigactions: parent_sigactions,
+        signal_stack: parent_signal_stack,
+        altstack: parent_altstack,
+        priority: 0,
+        pgid: parent_pgid,
+        sid: parent_sid,
+        comm: parent_comm,
+        cmdline: parent_cmdline,
+        // Not inherited -- same "starts fresh" policy do_fork_from_current's own construction
+        // already establishes for these two fields.
+        real_timer_deadline: None,
+        real_timer_interval_ticks: 0,
+        posix_timers: [None; MAX_POSIX_TIMERS],
+        rlimits: parent_rlimits,
+        nice: parent_nice,
+        sched_policy: parent_sched_policy,
+        sched_priority: parent_sched_priority,
+        stop_notify_pending: false,
+        cont_notify_pending: false,
+        sigsuspend_restore_mask: None,
+        sysv_sem_undo: Vec::new(),
+        sysv_shm_attach: Vec::new(),
+        pending_siginfo: [QueuedSigInfo::default(); 32],
+        rt_queue: core::array::from_fn(|_| Vec::new()),
+        fpu_state: parent_fpu_state,
+        cpu_ticks: 0,
+    };
+
+    {
+        let mut table = PROCESS_TABLE.lock();
+        // Deliberately not pushed into caller's own `children` -- see this function's own doc
+        // comment on why a CLONE_THREAD child is never an independent wait4 target.
+        table.insert(child_pid, Box::new(child));
+    }
+    // Real CLONE_FILES: unlike do_fork_from_current, no explicit fs::fd::fork_inherit call is
+    // needed here at all -- the child's own tgid is the same as the caller's (set above), and
+    // crate::fs::fd's own table is keyed by tgid, not raw pid, so every fd lookup the child ever
+    // makes (via scheduler::current_tgid()) already resolves to the exact same entries the caller
+    // sees, real aliasing, not a copy -- see crate::fs::fd's own module doc comment.
+    // Real CLONE_PARENT_SETTID: writes the child's real pid back through the caller's own
+    // pointer -- same "no pointer validation" convention every other user-memory write in this
+    // codebase already has.
+    unsafe { (ptid as *mut u64).write(child_pid) };
+    scheduler::enqueue_ready(child_pid);
+    Ok(child_pid)
+}
+
 /// `sys_execve`'s real logic. Reuses `syscall::dispatch` directly to drive an internal
 /// open/read-loop/close against whatever `path_ptr`/`path_len` (the caller's own user-space
 /// pointer, still valid since the caller's address space is what's currently active) names —
@@ -713,7 +934,7 @@ pub fn do_execve(
         // running and jumps immediately via redirect_frame below), kept in sync anyway since it's
         // the honest answer to "where does this process's AddressSpace currently expect to run".
         me.entry_point = jump_entry;
-        me.brk = VirtAddr::new(elf.highest_loaded_address());
+        me.shared.lock().brk = VirtAddr::new(elf.highest_loaded_address());
         // effective_path is whichever path actually got loaded as the real ELF above -- the
         // caller's own original path_bytes when there was no `#!` to follow, or the final
         // interpreter in a shebang chain otherwise. Matches real Linux: `/proc/[pid]/comm` names
@@ -766,7 +987,10 @@ pub fn do_execve(
     mm::cleanup_mmap_file_regions_for_exit(caller_pid);
     // Real close-on-exec: any fd this process marked FD_CLOEXEC (fcntl(F_SETFD)/open(O_CLOEXEC),
     // see `crate::fs::fd::CLOEXEC`'s own doc comment) doesn't survive into the new program image.
-    crate::fs::fd::close_cloexec(caller_pid);
+    // Keyed by tgid, not caller_pid directly -- see `crate::fs::fd`'s own module doc comment on
+    // why the fd/CLOEXEC tables are tgid-scoped -- though the two are identical until a real
+    // `clone(2)`-created thread can execve.
+    crate::fs::fd::close_cloexec(scheduler::current_tgid());
 
     let frame = syscall::current_frame();
     // SAFETY: frame is this exact syscall's own live frame -- do_execve is only ever reached via
@@ -961,10 +1185,84 @@ pub fn do_exit(caller_pid: Pid, code: i32) -> ! {
 /// caller` always means "not the one currently executing") must not, since the calling process
 /// itself is still running and hasn't blocked or exited.
 pub(crate) fn terminate_process(pid: Pid, code: i32) {
-    // Real exit() semantics: every fd this process still has open gets closed automatically.
-    // Genuinely load-bearing, not just tidiness -- see crate::fs::fd::close_all's own doc comment for
-    // why a leaked fd here can leave a pipe's reader blocked forever.
-    crate::fs::fd::close_all(pid);
+    // Real CLONE_THREAD semantics: only the whole thread group ever generates a wait4-visible
+    // zombie, not each individual thread (a real pthread_join never goes through wait4 at all --
+    // see process::lifecycle::do_clone's own doc comment). A plain scan for any *other* live
+    // PROCESS_TABLE entry sharing this exiting process's own tgid, same cost/style as
+    // process::limits::do_futex's own FUTEX_WAKE scan.
+    let tgid = {
+        let table = PROCESS_TABLE.lock();
+        match table.get(&pid) {
+            Some(me) => me.tgid,
+            None => return,
+        }
+    };
+    // Real CLONE_CHILD_CLEARTID (`do_clone`'s own `ctid` argument) -- writes real `0` to the real
+    // clear-tid address and wakes up to 1 real futex waiter there, matching real Linux's own
+    // task-exit behavior exactly. Must run here, at real per-thread exit time (applies to *every*
+    // exiting thread, leader or not -- a real Linux `child_tid` clear is per-task, independent of
+    // whether this happens to also be the whole thread group's last member), not sooner: real
+    // musl's own `__tl_lock`/`__thread_list_lock` mechanism (`third_party/musl/src/thread/
+    // pthread_create.c`) depends on this firing only after the exiting thread has genuinely
+    // committed to exit -- found live chasing a real `pthread_join` hang, see `Process::
+    // clear_child_tid`'s own doc comment for the full story.
+    let clear_child_tid = {
+        let table = PROCESS_TABLE.lock();
+        table.get(&pid).map(|p| p.clear_child_tid).unwrap_or(0)
+    };
+    if clear_child_tid != 0 {
+        // SAFETY: same known pointer-validation gap every other user-memory write in this
+        // codebase already has -- real musl always supplies a real address here
+        // (&__thread_list_lock), never attacker-controlled in any live caller.
+        unsafe { (clear_child_tid as *mut u32).write(0) };
+        wake_futex(tgid, clear_child_tid, 1);
+    }
+    let other_thread_alive = {
+        let table = PROCESS_TABLE.lock();
+        table.iter().any(|(&other_pid, other)| {
+            other_pid != pid && other.tgid == tgid && !matches!(other.state, ProcState::Zombie(_))
+        })
+    };
+    if other_thread_alive {
+        // A non-leader thread exiting while siblings remain. **Can't remove this Process entry
+        // right here** -- this function is running on *this exact thread's own kernel stack*,
+        // still, and `do_exit`'s caller is about to call `scheduler::schedule()`, which needs the
+        // outgoing process's own table entry to still exist (to check its state, save its live
+        // FPU state, and get a pointer to its own `rsp` field -- see `scheduler::schedule`'s own
+        // body). Dropping the entry now would deallocate this thread's own `KernelStack` while
+        // still executing on it, and would panic `schedule()`'s own table lookup regardless.
+        //
+        // So: mark it `Zombie` (the same "don't re-enqueue, entry still exists" state a real
+        // wait4-reapable process uses, satisfying every one of `schedule()`'s own requirements
+        // unmodified) but skip `wake_parent_if_waiting` -- a real CLONE_THREAD child is never an
+        // independent wait4 target (see `do_clone`'s own doc comment), so no parent is ever
+        // watching for this state change. Real removal -- which is what actually drops this
+        // thread's own `KernelStack` and decrements its Arc-shared `address_space`/`shared`
+        // fields' refcounts (a real, refcounted release, not a leak -- see `AddressSpace::
+        // teardown`'s own `Arc::strong_count` gate and `ThreadGroupShared`'s own doc comment) --
+        // is deferred to `scheduler::queue_thread_reap`, which only actually runs once some
+        // *other*, still-running process confirms (via `current_pid()`) that execution has
+        // genuinely moved off this stack.
+        //
+        // Deliberately skips close_all/sysv-undo/sysv-detach/mmap-cleanup below -- those only
+        // make sense once the whole thread group is gone (see each call's own reasoning right
+        // below, in the branch that actually runs them).
+        let mut table = PROCESS_TABLE.lock();
+        if let Some(me) = table.get_mut(&pid) {
+            me.state = ProcState::Zombie(code);
+        }
+        scheduler::remove_ready(pid);
+        drop(table);
+        scheduler::queue_thread_reap(pid);
+        return;
+    }
+    // Real exit() semantics: every fd this thread group still has open gets closed automatically.
+    // Genuinely load-bearing, not just tidiness -- see crate::fs::fd::close_all's own doc comment
+    // for why a leaked fd here can leave a pipe's reader blocked forever. Keyed by `tgid`, not
+    // `pid` -- the fd table is tgid-scoped (real CLONE_FILES sharing, see crate::fs::fd's own
+    // module doc comment) -- the two are identical unless the tgid's own leader already exited
+    // and a still-running clone(2)-created sibling is the one reaching this branch last.
+    crate::fs::fd::close_all(tgid);
     // Real SysV SEM_UNDO semantics: every accumulated adjustment this process ever recorded gets
     // applied (added back) on termination -- see `Process::sysv_sem_undo`'s own doc comment. Must
     // run *before* `PROCESS_TABLE` is locked below: `apply_undo_for_exit` takes that same lock
@@ -1096,7 +1394,11 @@ pub(crate) extern "C" fn oxidebsd_get_cwd() -> u64 {
     if pid == 0 {
         return BOOT_CWD.load(Ordering::Relaxed);
     }
-    table().lock().get(&pid).map(|p| p.cwd).unwrap_or(0)
+    table()
+        .lock()
+        .get(&pid)
+        .map(|p| p.shared.lock().cwd)
+        .unwrap_or(0)
 }
 
 pub(crate) extern "C" fn oxidebsd_set_cwd(inode: u64) {
@@ -1105,8 +1407,8 @@ pub(crate) extern "C" fn oxidebsd_set_cwd(inode: u64) {
         BOOT_CWD.store(inode, Ordering::Relaxed);
         return;
     }
-    if let Some(p) = table().lock().get_mut(&pid) {
-        p.cwd = inode;
+    if let Some(p) = table().lock().get(&pid) {
+        p.shared.lock().cwd = inode;
     }
 }
 
@@ -1123,7 +1425,11 @@ pub(crate) extern "C" fn oxidebsd_get_root() -> u64 {
     if pid == 0 {
         return BOOT_ROOT.load(Ordering::Relaxed);
     }
-    table().lock().get(&pid).map(|p| p.root_inode).unwrap_or(0)
+    table()
+        .lock()
+        .get(&pid)
+        .map(|p| p.shared.lock().root_inode)
+        .unwrap_or(0)
 }
 
 pub(crate) extern "C" fn oxidebsd_set_root(inode: u64) {
@@ -1132,8 +1438,8 @@ pub(crate) extern "C" fn oxidebsd_set_root(inode: u64) {
         BOOT_ROOT.store(inode, Ordering::Relaxed);
         return;
     }
-    if let Some(p) = table().lock().get_mut(&pid) {
-        p.root_inode = inode;
+    if let Some(p) = table().lock().get(&pid) {
+        p.shared.lock().root_inode = inode;
     }
 }
 /// The landing point for a never-run process's very first switch-in

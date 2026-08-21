@@ -86,7 +86,7 @@ pub(crate) extern "C" fn oxidebsd_proc_stat_line(pid: u64, buf_ptr: *mut u8, buf
     };
     let ppid = proc.parent.unwrap_or(0);
     let pgid = proc.pgid;
-    let brk = proc.brk.as_u64();
+    let brk = proc.shared.lock().brk.as_u64();
     let blocked = proc.blocked_signals;
 
     let mut out = Vec::new();

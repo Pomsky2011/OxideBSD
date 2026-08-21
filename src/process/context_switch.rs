@@ -139,6 +139,50 @@ pub(crate) unsafe fn seed_fork_frame(
     switch_frame_addr
 }
 
+/// `seed_fork_frame`'s sibling for real `clone(2)`/`CLONE_THREAD` (`process::lifecycle::
+/// do_clone`) — identical shape (the child's first switch-in also lands in
+/// `fork_trampoline_asm`, resuming as if returning from the same syscall the parent made, with
+/// `rax = 0`), except the copied frame's `user_rsp` is overridden to the real `newsp` argument
+/// (`syscall::copy_frame_for_clone`, not `copy_frame_for_fork`) — a cloned thread starts running on
+/// its own caller-supplied stack, not a copy of the parent's.
+///
+/// # Safety
+///
+/// `parent_frame` must point at a valid, fully-initialized `SyscallFrame` (i.e. the caller's own
+/// `syscall::current_frame()`, called from within `do_clone`'s own handling).
+pub(crate) unsafe fn seed_clone_frame(
+    kernel_stack_top: VirtAddr,
+    parent_frame: *const SyscallFrame,
+    new_user_rsp: u64,
+) -> u64 {
+    let syscall_frame_addr = kernel_stack_top.as_u64() - size_of::<SyscallFrame>() as u64;
+    // SAFETY: syscall_frame_addr points at size_of::<SyscallFrame>() freshly allocated, unused
+    // bytes at the top of this (otherwise-untouched) kernel stack; parent_frame is valid per this
+    // function's own safety contract.
+    unsafe {
+        crate::syscall::copy_frame_for_clone(
+            syscall_frame_addr as *mut SyscallFrame,
+            parent_frame,
+            new_user_rsp,
+        );
+    }
+
+    let switch_frame_addr = syscall_frame_addr - size_of::<SwitchFrame>() as u64;
+    let frame = SwitchFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbx: 0,
+        rbp: 0,
+        return_address: fork_trampoline_asm as *const () as u64,
+    };
+    // SAFETY: switch_frame_addr sits directly below the just-written SyscallFrame, still within
+    // this fresh kernel stack.
+    unsafe { core::ptr::write(switch_frame_addr as *mut SwitchFrame, frame) };
+    switch_frame_addr
+}
+
 global_asm!(
     ".global switch_context",
     "switch_context:",

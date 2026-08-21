@@ -107,7 +107,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         }
         let table = PROCESS_TABLE.lock();
         return match table.get(&target) {
-            Some(proc) if has_signal_permission(caller_uid, proc.uid) => Ok(0), // zombie counts too -- still "exists" until reaped
+            Some(proc) if has_signal_permission(caller_uid, proc.shared.lock().uid) => Ok(0), // zombie counts too -- still "exists" until reaped
             Some(_) => Err(EPERM),
             None => Err(ESRCH),
         };
@@ -138,7 +138,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         // doc comment already establishes for every other function here).
         let mut table = PROCESS_TABLE.lock();
         let proc = table.get(&target).ok_or(ESRCH)?;
-        if !has_signal_permission(caller_uid, proc.uid) {
+        if !has_signal_permission(caller_uid, proc.shared.lock().uid) {
             return Err(EPERM);
         }
         if matches!(proc.state, ProcState::Zombie(_)) {
@@ -977,7 +977,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
         }
         let table = PROCESS_TABLE.lock();
         return match table.get(&target) {
-            Some(proc) if has_signal_permission(caller_uid, proc.uid) => Ok(0),
+            Some(proc) if has_signal_permission(caller_uid, proc.shared.lock().uid) => Ok(0),
             Some(_) => Err(EPERM),
             None => Err(ESRCH),
         };
@@ -1008,7 +1008,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
     let action = {
         let mut table = PROCESS_TABLE.lock();
         let proc = table.get(&target).ok_or(ESRCH)?;
-        if !has_signal_permission(caller_uid, proc.uid) {
+        if !has_signal_permission(caller_uid, proc.shared.lock().uid) {
             return Err(EPERM);
         }
         if matches!(proc.state, ProcState::Zombie(_)) {

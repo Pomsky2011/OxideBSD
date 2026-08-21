@@ -108,6 +108,11 @@ fn main() {
     );
     build_userland_crate("clock-syscall-smoke", "CLOCK_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("sched-syscall-smoke", "SCHED_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("clone-syscall-smoke", "CLONE_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate(
+        "pthread-syscall-smoke",
+        "PTHREAD_SYSCALL_SMOKE_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -133,6 +138,10 @@ fn main() {
     let musl_smoke_elf_path = build_musl_smoke(&musl_sysroot);
     let musl_smoke_elf = std::fs::read(&musl_smoke_elf_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", musl_smoke_elf_path.display()));
+
+    // "Real threading" phases 1-5's own finish line -- see userland/pthread-smoke/main.c's own
+    // doc comment.
+    let pthread_smoke_elf_path = build_pthread_smoke(&musl_sysroot);
 
     // TinyCC: OxideBSD's first on-target C compiler -- see CLAUDE.md's TinyCC section and
     // `build_tinycc`'s own doc comment. The `tcc` binary itself is embedded into oxfs's `/bin`
@@ -247,6 +256,10 @@ fn main() {
             ring3_smoke_elf_path.to_str().unwrap(),
         ),
         ("OXFS_MUSL_ELF_PATH", musl_smoke_elf_path.to_str().unwrap()),
+        (
+            "OXFS_PTHREAD_SMOKE_ELF_PATH",
+            pthread_smoke_elf_path.to_str().unwrap(),
+        ),
         ("OXFS_LSOXMOD_ELF_PATH", lsoxmod_elf_path.to_str().unwrap()),
         ("OXFS_TCC_ELF_PATH", tcc_elf_path.to_str().unwrap()),
         (
@@ -428,6 +441,39 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("failed to run musl-gcc for musl-smoke: {e}"));
     if !status.success() {
         panic!("building musl-smoke failed: {status}");
+    }
+    out
+}
+
+/// "Real threading" phases 1-5's own finish line -- see `userland/pthread-smoke/main.c`'s own doc
+/// comment for the scenario. Same `build_musl_smoke` recipe, one slot further along
+/// (`0x4100000`, clear of `musl-smoke`'s `0x40c0000`) -- this binary is `fork`+`execve`'d fresh by
+/// `userland/pthread-syscall-smoke/`, never co-resident with any other fixed-base image (unlike
+/// `build_dynlink_smoke`'s own interpreter-coexistence case), so it only needs to stay clear of the
+/// kernel's own image/heap/phys-mem window, not any other userland crate specifically.
+fn build_pthread_smoke(sysroot: &Path) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest_dir).join("userland/pthread-smoke/main.c");
+    let target_dir = Path::new(manifest_dir).join("target/pthread-smoke");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/pthread-smoke");
+    let out = target_dir.join("pthread-smoke");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let musl_gcc = sysroot.join("bin/musl-gcc");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg("-pthread")
+        .arg("-Wl,-Ttext-segment=0x4100000")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for pthread-smoke: {e}"));
+    if !status.success() {
+        panic!("building pthread-smoke failed: {status}");
     }
     out
 }

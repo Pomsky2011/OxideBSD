@@ -13,6 +13,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -581,6 +582,33 @@ pub(crate) struct SignalStackFrame {
     pub(crate) blocked_before: u64,
 }
 
+/// State genuinely shared by every thread in a real POSIX thread group (`CLONE_THREAD`), once
+/// `process::lifecycle::do_clone` exists — moved out of `Process` itself specifically so that a
+/// write from one thread (e.g. `chdir`, `brk`, a new `mmap`) is immediately visible to every
+/// sibling sharing the same `Arc<Mutex<..>>`, not just a copy sitting in that one thread's own
+/// `Process`. `mmap_file_regions` in particular *must* live here, not just conventionally should:
+/// once `AddressSpace::share` (`src/memory/address_space.rs`) makes the underlying page-table
+/// mappings genuinely shared across threads, letting each thread keep its own divergent
+/// `mmap_file_regions` bookkeeping would cause double-writeback/stale-`munmap` bugs against the
+/// one real shared mapping.
+///
+/// Every process today is still its own thread group of one — `spawn`/`fork` both build a fresh
+/// `Arc::new(Mutex::new(..))` here, so nothing changes behavior until `do_clone` (which instead
+/// does `Arc::clone(&parent.shared)`) lands.
+///
+/// **Lock-ordering rule**: always lock `PROCESS_TABLE` first if both locks are needed, this
+/// `Mutex` second — and never hold this lock across `scheduler::schedule()`. Same discipline
+/// `PROCESS_TABLE` itself already follows.
+pub struct ThreadGroupShared {
+    pub cwd: u64,
+    pub root_inode: u64,
+    pub umask: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub brk: VirtAddr,
+    pub mmap_file_regions: Vec<mm::MmapFileRegion>,
+}
+
 pub struct Process {
     pub pid: Pid,
     /// The real POSIX thread-group id: `getpid()` returns this, not `pid` directly. Equal to
@@ -612,9 +640,13 @@ pub struct Process {
     /// bare top of the mapped stack region (`process::USER_STACK_TOP`). Handed straight to
     /// `usermode::jump_to_usermode`/`syscall::redirect_frame` as the stack pointer.
     pub user_stack_top: VirtAddr,
-    /// The current top of this process's `SYS_BRK`-managed heap region — see `do_brk`. Starts at
-    /// the loaded ELF's `Elf::highest_loaded_address()` (page-aligned), grows/shrinks from there.
-    pub brk: VirtAddr,
+    /// Real `CLONE_THREAD`-shared state: `cwd`, `root_inode`, `umask`, `uid`, `gid`, `brk`, and
+    /// `mmap_file_regions` — see `ThreadGroupShared`'s own doc comment for why these seven moved
+    /// out of `Process` itself and into one `Arc<Mutex<..>>` every thread in a real thread group
+    /// shares. Every process today is still its own thread group of one (`spawn`/`fork` both build
+    /// a fresh, independent `Arc` here), so this is purely a storage-location change until
+    /// `process::lifecycle::do_clone` starts sharing it via `Arc::clone`.
+    pub shared: Arc<Mutex<ThreadGroupShared>>,
     /// This process's own `IA32_FS_BASE` value (see `SYS_SET_FS_BASE`), restored into the real MSR
     /// on every context switch into this process (`scheduler::activate_and_prepare`) — `IA32_FS_BASE`
     /// is a single global MSR, not something `context_switch::switch_context` saves/restores the
@@ -631,23 +663,25 @@ pub struct Process {
     /// `0` for a freshly spawned/`execve`'d process (no TLS set up yet); a forked child inherits the
     /// parent's live value (real `fork()` semantics — TLS state is copied, not reset).
     pub fs_base: u64,
-    /// This process's current-working-directory, as an opaque inode number `modules/oxfs` (not the
-    /// kernel) assigns meaning to — the kernel never interprets it, just persists/restores it per
-    /// process on `fork`/`spawn` exactly like `brk`/`fs_base` already do. `0` is oxfs's own root
-    /// inode number, which conveniently doubles as "unset" for a freshly spawned process. Fixes the
-    /// "one, kernel-wide current directory" limitation `modules/fat32` had (see CLAUDE.md) — now
-    /// that real processes exist, cwd is genuinely per-process. `do_execve` deliberately leaves
-    /// this untouched (real `execve()` preserves the caller's cwd, unlike `fs_base`, which an
-    /// exec'd program's own TLS layout makes meaningless to keep).
-    pub cwd: u64,
-    /// This process's own root directory (`SYS_CHROOT`) -- same "opaque inode number `modules/oxfs`
-    /// assigns meaning to, kernel just persists/restores it" shape as `cwd` immediately above,
-    /// right down to `0` doubling as both oxfs's real root inode number *and* "never chrooted".
-    /// Copied by `fork` (real `chroot(2)` semantics: a forked child stays confined to whatever root
-    /// its parent already had); left untouched by `execve` (real `chroot(2)` persists across
-    /// `exec` too -- unlike `fs_base`, there's no reason a new program's own layout would make this
-    /// meaningless to keep).
-    pub root_inode: u64,
+    /// Real `CLONE_CHILD_CLEARTID` support (`process::lifecycle::do_clone`'s own `ctid` argument)
+    /// — `0` doubles as "never set", same convention `cwd`/`root_inode` already use. Real musl
+    /// `pthread_create()` sets this to `&__thread_list_lock`, not (as the name might suggest) a
+    /// `tid`-reporting mechanism `pthread_join` itself needs — `pthread_join`'s own real
+    /// completion signal is pure userspace futex logic against `detach_state`, no kernel help
+    /// needed there at all. What genuinely *does* need this: `__pthread_exit`'s own comment in
+    /// `third_party/musl/src/thread/pthread_create.c` explains that `__thread_list_lock`'s release
+    /// is deliberately never visible until *after* the exiting thread's real `SYS_exit` — done via
+    /// this exact real Linux kernel mechanism, not a plain userspace unlock — found live: an
+    /// earlier version of `do_clone` read and discarded `ctid` entirely (this ABI's own planning
+    /// notes had concluded, incorrectly, that no `clone(2)`-created thread ever depends on
+    /// `CLONE_CHILD_CLEARTID` — true for `pthread_join`'s own mechanism, false for `__tl_lock`'s).
+    /// `process::lifecycle::terminate_process` is where the real write-zero-and-wake actually
+    /// happens, at real per-thread exit time — see that function's own doc comment. Not copied by
+    /// `fork` (a forked child was never itself the target of a `clone(2)` call); untouched by
+    /// `execve` (irrelevant to what `do_clone` set it to, but harmless either way since only
+    /// `terminate_process`'s own exit-time check ever reads it, and a real `execve()`'d image was
+    /// never itself created via `clone(2)` either).
+    pub clear_child_tid: u64,
     /// Bitmask, bit `N-1` = signal `N` is pending delivery. Set by `do_kill`; drained by
     /// `take_deliverable_signal` (called once, at the tail of every completed syscall — see
     /// `src/syscall.rs`'s `deliver_pending_signal`).
@@ -728,16 +762,6 @@ pub struct Process {
     /// a POSIX timer's whole purpose, notifying the very program that created it, means nothing to
     /// the new image.
     pub posix_timers: [Option<PosixTimer>; MAX_POSIX_TIMERS],
-    /// Real uid/gid — no distinct saved/effective pair, since this kernel has no setuid-bit
-    /// `execve` support to ever make them diverge (see `do_execve`'s own doc comment: it never
-    /// touches these fields at all, matching real `execve()`'s "preserved unless the setuid/setgid
-    /// bit is set" semantics collapsing to plain preservation when that bit can never be set).
-    /// `SYS_GETEUID`/`SYS_GETEGID` just echo these same fields back. `0` (root) at `spawn` — this
-    /// kernel has no login mechanism, so pid 1 (and everything downstream) starts as root, matching
-    /// a real single-user embedded/init system more than a real multi-user boot. Copied by `fork`
-    /// (real `fork()` semantics, same as `cwd`/`pgid`/`brk`).
-    pub uid: u32,
-    pub gid: u32,
     /// `SYS_PRLIMIT64`'s backing store -- one `(rlim_cur, rlim_max)` pair per real `RLIMIT_*`
     /// resource (`RLIM_NLIMITS = 16` on real Linux), `u64::MAX` (`RLIM_INFINITY`) in every slot by
     /// default. Copied by `fork` (real POSIX rlimit/fork semantics, same as `uid`/`gid`/`pgid`);
@@ -759,17 +783,6 @@ pub struct Process {
     /// of a real `struct sched_param`, `0` by default. Same "stored, not enforced" tier as
     /// `sched_policy` above. Copied by `fork`; preserved by `execve`.
     pub sched_priority: i32,
-    /// `SYS_UMASK`'s backing store — real POSIX `umask()` always succeeds and returns the
-    /// *previous* mask, so this has to be real per-process state, not a pure function. `0o022`
-    /// (the standard real Unix default) rather than `0`, since a plausible ambient value matters
-    /// here in a way it doesn't for `nice`/`sched_policy`: BusyBox's `libbb/parse_mode.c` reads it
-    /// back via `umask(0)`/`umask(old)` to compute symbolic mode changes (`chmod +x`, ...) — found
-    /// live testing `chmod +x` on a real script, before this field existed, computing garbage from
-    /// the `ENOSYS` this ABI used to return for the then-unmapped `umask(2)` syscall (see
-    /// `third_party/musl/arch/x86_64/bits/syscall.h.in`'s own `__NR_umask` comment). Same
-    /// "stored, not enforced" tier as `rlimits`/`nice`/`sched_policy` otherwise — oxfs doesn't
-    /// consult this anywhere it creates a new inode. Copied by `fork`; preserved by `execve`.
-    pub umask: u32,
     /// Set when this process transitions into `ProcState::Stopped` (real `SIGSTOP`/`SIGTSTP`),
     /// cleared once a parent's `wait4(WUNTRACED)` observes it — the real POSIX "report a stop
     /// once" contract. Also cleared the moment a `SIGCONT` resumes this process (a deliberate
@@ -817,12 +830,6 @@ pub struct Process {
     /// unreachable): matches real Linux, where `execve(2)` destroying the old address space is
     /// itself a real implicit detach of everything that was attached to it.
     pub sysv_shm_attach: Vec<(u64, i32)>,
-    /// Real fd-backed `MAP_SHARED` mappings still live in this process's own address space (see
-    /// `mm::MmapFileRegion`'s own doc comment) — one entry per successful `mmap(fd >= 0, ...)`,
-    /// removed by a matching `munmap` or by exit/`execve` cleanup (`mm::
-    /// cleanup_mmap_file_regions_for_exit`). **Not inherited by `fork`** — same documented
-    /// simplification, and the same underlying reason, as `sysv_shm_attach` immediately above.
-    pub mmap_file_regions: Vec<mm::MmapFileRegion>,
     /// Real per-standard-signal-number sender identity/payload, indexed `1..=31` same as
     /// `sigactions` (index `0` unused) -- see `QueuedSigInfo`'s own doc comment. Not copied by
     /// `fork` (a forked child starts with `pending_signals == 0` too, so there's nothing

@@ -5,12 +5,12 @@
 //! `sys_read`/`sys_write` delegate to this registry unconditionally, for *every* fd, including
 //! 0/1/2 (see below) — no fd is special-cased in `sys_read`/`sys_write` itself.
 //!
-//! **Scoped per-process (`(Pid, fd)`), not a single flat table keyed by fd alone** — the table
-//! used to be exactly that (a real, deliberate simplification, documented as a known limitation:
-//! "two unrelated process trees allocating fds independently would collide"), but that turned out
-//! to be more than a hypothetical collision risk once `sh` (BusyBox's `hush`) actually built a real
-//! pipeline (`cmd1 | cmd2`): `pipe(2)` creates two fds in the shell process, which then forks twice
-//! and each child `dup2`s one end onto its own stdin/stdout and closes its own copy of the
+//! **Scoped per-*thread-group* (`(tgid, fd)`), not a single flat table keyed by fd alone** — the
+//! table used to be exactly that (a real, deliberate simplification, documented as a known
+//! limitation: "two unrelated process trees allocating fds independently would collide"), but that
+//! turned out to be more than a hypothetical collision risk once `sh` (BusyBox's `hush`) actually
+//! built a real pipeline (`cmd1 | cmd2`): `pipe(2)` creates two fds in the shell process, which
+//! then forks twice and each child `dup2`s one end onto its own stdin/stdout and closes its own copy of the
 //! originals. With a single flat table, the *parent* closing its own copy of a pipe fd (completely
 //! ordinary, expected shell behavior — the parent doesn't need the pipe once both children have it)
 //! tore the entry down globally, out from under children that still needed it via `dup2`, and a
@@ -156,7 +156,7 @@ pub(crate) fn is_cloexec(pid: u64, fd: u64) -> bool {
 /// indirectly, through functions like this one). `modules/oxfs`'s own `oxfs_open` is the one real
 /// caller today, right after a successful real `O_CLOEXEC` open.
 pub(crate) extern "C" fn oxidebsd_set_fd_cloexec(fd: u64, on: u64) -> i64 {
-    set_cloexec(scheduler::current_pid(), fd, on != 0);
+    set_cloexec(scheduler::current_tgid(), fd, on != 0);
     0
 }
 
@@ -193,7 +193,7 @@ pub(crate) extern "C" fn oxidebsd_register_fd_ops(
     write: FdReadWrite,
     close: FdClose,
 ) -> i32 {
-    register(scheduler::current_pid(), fd, read, write, close, no_content_id);
+    register(scheduler::current_tgid(), fd, read, write, close, no_content_id);
     0
 }
 
@@ -208,7 +208,7 @@ pub(crate) extern "C" fn oxidebsd_register_fd_ops_with_content_id(
     close: FdClose,
     content_id: FdContentId,
 ) -> i32 {
-    register(scheduler::current_pid(), fd, read, write, close, content_id);
+    register(scheduler::current_tgid(), fd, read, write, close, content_id);
     0
 }
 
@@ -245,7 +245,7 @@ fn register(
 /// directly to exercise EOF/EPIPE-on-close without loading a real close-registering module
 /// (`modules/oxfs`'s `SYS_CLOSE` handler is the only other caller).
 pub extern "C" fn oxidebsd_close_fd(fd: u64) -> i32 {
-    if close_one(scheduler::current_pid(), fd) {
+    if close_one(scheduler::current_tgid(), fd) {
         0
     } else {
         -1
@@ -326,7 +326,7 @@ pub(crate) fn fork_inherit(parent: u64, child: u64) {
 /// another alias — in this process or any other — still references it), then `newfd` becomes a
 /// fresh alias of `oldfd`'s own `real_fd`.
 pub(crate) fn dup2(oldfd: u64, newfd: u64) -> Result<u64, ()> {
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_tgid();
     if oldfd == newfd {
         return if TABLE.lock().contains_key(&(pid, oldfd)) {
             Ok(newfd)
@@ -360,7 +360,7 @@ pub(crate) fn dup2(oldfd: u64, newfd: u64) -> Result<u64, ()> {
 /// exact thing turning on real interactive mode was for. See CLAUDE.md's "Interactive shell"
 /// section for the full trace of why `fcntl` itself doesn't need implementing for this to work.
 pub(crate) fn dup(oldfd: u64) -> Result<u64, ()> {
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_tgid();
     let old_ops = *TABLE.lock().get(&(pid, oldfd)).ok_or(())?;
     let newfd = oxidebsd_alloc_fd();
     TABLE.lock().insert(
@@ -391,7 +391,7 @@ pub(crate) fn dup(oldfd: u64) -> Result<u64, ()> {
 /// covers every one of them without touching each callback individually, since `sys_read`/
 /// `sys_write` (`src/syscall.rs`) route every fd through these two functions unconditionally.
 pub(crate) fn read(fd: u64, ptr: u64, len: u64) -> Option<i64> {
-    let ops = *TABLE.lock().get(&(scheduler::current_pid(), fd))?;
+    let ops = *TABLE.lock().get(&(scheduler::current_tgid(), fd))?;
     if len == 0 {
         return Some(0);
     }
@@ -399,7 +399,7 @@ pub(crate) fn read(fd: u64, ptr: u64, len: u64) -> Option<i64> {
 }
 
 pub(crate) fn write(fd: u64, ptr: u64, len: u64) -> Option<i64> {
-    let ops = *TABLE.lock().get(&(scheduler::current_pid(), fd))?;
+    let ops = *TABLE.lock().get(&(scheduler::current_tgid(), fd))?;
     if len == 0 {
         return Some(0);
     }
@@ -416,7 +416,7 @@ pub(crate) fn write(fd: u64, ptr: u64, len: u64) -> Option<i64> {
 pub(crate) fn real_fd_of(fd: u64) -> Option<u64> {
     TABLE
         .lock()
-        .get(&(scheduler::current_pid(), fd))
+        .get(&(scheduler::current_tgid(), fd))
         .map(|ops| ops.real_fd)
 }
 
@@ -426,7 +426,7 @@ pub(crate) fn real_fd_of(fd: u64) -> Option<u64> {
 /// decide whether a real fd-backed `MAP_SHARED` mapping is even possible, and to key its own
 /// cross-open shared-frame cache. `None` covers both "no such fd" and "not identifiable right now."
 pub(crate) fn content_id_of(fd: u64) -> Option<u64> {
-    let ops = *TABLE.lock().get(&(scheduler::current_pid(), fd))?;
+    let ops = *TABLE.lock().get(&(scheduler::current_tgid(), fd))?;
     let id = (ops.content_id)(ops.real_fd);
     if id < 0 { None } else { Some(id as u64) }
 }
@@ -507,13 +507,22 @@ pub(crate) extern "C" fn oxidebsd_real_fd_of(fd: u64) -> i64 {
 /// The `index`-th fd number (this *process's own* numbering, not `real_fd`) currently open for
 /// `pid`, ascending, `-1` once `index` is past the end -- mirrors `process::oxidebsd_proc_pid_at`'s
 /// identical "loop until -1" shape, for `modules/oxfs`'s own `/proc/<pid>/fd/` directory listing.
-/// `TABLE`'s key is `(pid, fd)`, a plain tuple `Ord` (lexicographic: `pid` first, `fd` second), so a
-/// bounded range scan over just this `pid`'s own slice is enough -- no separate per-pid index
+/// `TABLE`'s key is `(tgid, fd)`, not `(pid, fd)`, since real `CLONE_FILES` threads share one fd
+/// table -- `pid` here is an arbitrary real Linux-style target from a `/proc/<pid>/fd/` path, not
+/// necessarily the calling thread's own, so it's resolved to its owning thread group's `tgid`
+/// first (same lookup `scheduler::current_tgid()` does for the *calling* process, just against an
+/// arbitrary target instead). A plain tuple `Ord` (lexicographic: `tgid` first, `fd` second), so a
+/// bounded range scan over just that `tgid`'s own slice is enough -- no separate per-pid index
 /// needed.
 pub(crate) extern "C" fn oxidebsd_fd_at(pid: u64, index: u64) -> i64 {
+    let tgid = crate::process::table()
+        .lock()
+        .get(&pid)
+        .map(|p| p.tgid)
+        .unwrap_or(pid);
     TABLE
         .lock()
-        .range((pid, 0)..(pid.saturating_add(1), 0))
+        .range((tgid, 0)..(tgid.saturating_add(1), 0))
         .nth(index as usize)
         .map(|(&(_, fd), _)| fd as i64)
         .unwrap_or(-1)
