@@ -393,6 +393,23 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 crate::process::scheduler::enqueue_ready(pid);
             }
 
+            // Real `FUTEX_WAIT` deadline expiry (`process::do_futex`) -- same dual-wake shape
+            // `WaitingForSpecificSignal`/`WaitingForSemOp` just above already establish; `u64::MAX`
+            // (a null `to`, the plain "wait forever" case) never realistically matches `now`.
+            // `do_futex`'s own post-wake check re-verifies the real deadline fresh, same
+            // discipline `Sleeping` establishes -- this scan only needs to flip `state` back to
+            // `Ready` so that check gets a chance to run at all.
+            if let crate::process::ProcState::Blocked(crate::process::BlockReason::WaitingForFutex(
+                _,
+                _,
+                deadline,
+            )) = proc.state
+                && now >= deadline
+            {
+                proc.state = crate::process::ProcState::Ready;
+                crate::process::scheduler::enqueue_ready(pid);
+            }
+
             // `SYS_SETITIMER`'s `ITIMER_REAL` expiry (also backs real `alarm()`, a thin musl-side
             // wrapper around it -- see `process::do_setitimer`'s own doc comment). Just sets the
             // pending bit, the same simple, already-established pattern `process::do_kill`'s own
@@ -430,6 +447,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 crate::process::signals::wake_if_sigwaiting(pid, proc, crate::process::SIGALRM);
                 crate::process::signals::wake_if_sleeping(pid, proc, crate::process::SIGALRM);
                 crate::process::signals::wake_if_mq_waiting(pid, proc, crate::process::SIGALRM);
+                crate::process::signals::wake_if_futex_waiting(pid, proc, crate::process::SIGALRM);
             }
 
             // `SYS_TIMER_CREATE`'s own per-timer expiry (`Process::posix_timers`, batch items
@@ -493,6 +511,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                     crate::process::signals::wake_if_sigwaiting(pid, proc, signo);
                     crate::process::signals::wake_if_sleeping(pid, proc, signo);
                     crate::process::signals::wake_if_mq_waiting(pid, proc, signo);
+                    crate::process::signals::wake_if_futex_waiting(pid, proc, signo);
                 }
             }
         }

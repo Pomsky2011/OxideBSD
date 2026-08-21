@@ -612,11 +612,12 @@ pub(crate) fn sys_reboot(cmd: u64) -> Result<u64, u64> {
     crate::process::do_reboot(cmd)
 }
 
-/// `SYS_FUTEX` (real Linux's own `__NR_futex = 202`) -- real `futex(2)`'s `(uaddr, op, val, ...)`
-/// wire format; only `op` is real logic here (`addr`/`val`/`to` unused) -- see
-/// `process::do_futex`'s own doc comment for why and what this stub actually does.
-pub(crate) fn sys_futex(op: u64) -> Result<u64, u64> {
-    crate::process::do_futex(op)
+/// `SYS_FUTEX` (real Linux's own `__NR_futex = 202`) -- real `futex(2)`'s `(uaddr, op, val, to)`
+/// wire format, already exactly this ABI's 4 real registers (`__futex4_cp`, musl's own call site,
+/// never issues more than these 4 args) -- no register-packing trick needed. See
+/// `process::do_futex`'s own doc comment for the real `FUTEX_WAIT`/`FUTEX_WAKE` logic.
+pub(crate) fn sys_futex(addr: u64, op: u64, val: u64, to: u64) -> Result<u64, u64> {
+    crate::process::do_futex(crate::process::scheduler::current_pid(), addr, op, val, to)
 }
 
 /// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
@@ -1501,8 +1502,8 @@ pub(crate) extern "C" fn oxidebsd_sys_reboot(cmd: u64) -> i64 {
     result_to_ffi(sys_reboot(cmd))
 }
 
-pub(crate) extern "C" fn oxidebsd_sys_futex(_addr: u64, op: u64, _val: u64, _to: u64) -> i64 {
-    result_to_ffi(sys_futex(op))
+pub(crate) extern "C" fn oxidebsd_sys_futex(addr: u64, op: u64, val: u64, to: u64) -> i64 {
+    result_to_ffi(sys_futex(addr, op, val, to))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {

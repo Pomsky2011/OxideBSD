@@ -2,8 +2,18 @@
 
 
 
-use crate::syscall::{EINVAL, EPERM};
+use crate::syscall::{EAGAIN, EINTR, EINVAL, EPERM, ETIMEDOUT};
 use super::*;
+
+/// musl's own `struct timespec` on x86_64 -- see `src/syscall/ffi.rs`'s/`src/process/timers.rs`'s
+/// own `RawTimespec` (duplicated here rather than shared, same "no shared crate across this
+/// internal ABI boundary" convention every other copy already follows).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
 
 /// Real `struct rlimit` on x86_64 -- two plain `u64`s (`rlim_cur`, `rlim_max`), `RLIM_INFINITY`
 /// wire-compatible with `u64::MAX` (musl's own `getrlimit.c`/`setrlimit.c` already special-case
@@ -331,47 +341,150 @@ pub fn do_sched_getaffinity(
 
 /// `SYS_FUTEX`, registered directly at real Linux's own `__NR_futex = 202` (no invented number, no
 /// musl remap needed -- same "confirmed unassigned in this ABI's own registry" reasoning
-/// `do_sched_getaffinity`'s own doc comment above already establishes). **Not real futex support**
-/// -- real futex semantics need genuine per-address cross-process wait queues, tied to this
-/// kernel's still-unstarted real-threading work (see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own
-/// "Real threading" foundational blocker) -- this is a minimal, honest *failure* stub, in the same
-/// spirit as `process::mm::do_mprotect`'s own permissive no-op: it exists only to stop a real,
-/// silent infinite-busy-loop this kernel could otherwise trigger in any real caller.
+/// `do_sched_getaffinity`'s own doc comment above already establishes). Phase 3 of the real
+/// threading work behind real POSIX AIO (see `[[project_real_threading_for_aio]]` memory / the
+/// prior two sessions' `clone.s`/`__unmapself.s` fix and `Process::tgid` split) -- a genuinely
+/// real `FUTEX_WAIT`/`FUTEX_WAKE`, not the earlier honest-failure stub this replaces.
 ///
-/// **Found live, not preemptively**: the expanded POSIX conformance pilot's own `sem_wait/7-1.c`
-/// (a real, single-process-reachable POSIX *unnamed* semaphore block -- distinct from the SysV
-/// `semop`-backed semaphores this kernel already implements for real, see
-/// `fs::sysv_sem`'s own module doc comment) hung the whole pilot run indefinitely, consuming 100%
-/// CPU the entire time. Root cause, traced through `third_party/musl/src/thread/__timedwait.c`:
-/// `sem_timedwait` calls `__timedwait_cp`, which issues exactly one raw `futex(FUTEX_WAIT, ...)`
-/// syscall and only treats the result as a real failure if it's `EINTR`/`ETIMEDOUT`/`ECANCELED` --
-/// any *other* value (including the `ENOSYS` this syscall number previously fell through to,
-/// unregistered) is silently folded into `0` ("spurious wake, try again"). `sem_timedwait`'s own
-/// outer loop then immediately retries `sem_trywait` -> fails again (nothing ever posts the
-/// semaphore) -> calls `__timedwait_cp` again -- a real, unbounded, tight retry loop with no actual
-/// blocking syscall or scheduler yield anywhere in it, invisible to `t0`'s own `alarm(40)` timeout
-/// mechanism only because the *forked child* where this actually happens has no timer of its own
-/// (`fork` never inherits a pending itimer/alarm -- real POSIX, and this kernel's own documented
-/// behavior) and the *parent*'s own blocking `wait4()` has this exact same "no signal-interrupt
-/// wake" gap `signals::wake_if_mq_waiting`'s own doc comment already documents fixing for `mq_*` --
-/// a real, separate, not-yet-fixed instance of that same bug class, left open here (no live pilot
-/// test currently depends on it, unlike the `mq_receive` case).
+/// **Was previously a deliberate stub** (`FUTEX_WAIT` always returned an immediate `ETIMEDOUT`,
+/// `FUTEX_WAKE` always a no-op success) to stop a real, silent infinite-busy-loop
+/// (`third_party/musl/src/thread/__timedwait.c`'s `sem_timedwait`/`__timedwait_cp` folds any
+/// syscall return other than `EINTR`/`ETIMEDOUT`/`ECANCELED` into "spurious wake, try again" and
+/// retries with no actual blocking or scheduler yield -- an unregistered/`ENOSYS`'d futex used to
+/// hang the whole POSIX conformance pilot). **That stub's own doc comment claimed
+/// `sem_wait/7-1.c` was "currently PASS" and load-bearing -- confirmed false by direct trace
+/// through the test's own source (`third_party/posixtestsuite/conformance/interfaces/sem_wait/
+/// 7-1.c`) and the archived pilot logs (`target/posix-pilot-logs/`): it was, and until this
+/// change remained, a real, confirmed `FAIL`** (the test wants a genuinely blocked `sem_wait` in a
+/// forked child to observe real `EINTR` after the parent sends `SIGABRT` with a caught handler
+/// installed -- an immediate `ETIMEDOUT` makes the child observe the wrong errno and exit
+/// `CHILDFAIL`, which this test's own confusingly-inverted parent-side `WEXITSTATUS` check turns
+/// into an overall `FAIL`, not the `PASS` the prior doc comment assumed). This correction matters
+/// for scoping this change: there was no passing test to protect, only a real, if narrow, avenue
+/// to fix a genuinely failing one.
 ///
-/// Returning `ETIMEDOUT` for `FUTEX_WAIT` (real Linux's own valid, unremarkable return value for a
-/// timed-out wait) is what makes `__timedwait_cp` treat this as a genuine, real failure instead of
-/// silently retrying forever -- `sem_timedwait` then correctly reports `errno = ETIMEDOUT` and
-/// returns `-1`, a clean, real, if not spec-accurate, outcome instead of an unbounded spin.
-/// `FUTEX_WAKE` (`sem_post`'s own call, via `__wake`) always succeeds -- its return value is never
-/// checked by any real caller in this musl fork, so `0` is exactly as honest as any other answer.
-/// Any other real `futex_op` (`FUTEX_CMP_REQUEUE`/`FUTEX_WAKE_OP`/...) also just succeeds -- none of
-/// them are reachable from the plain `sem_*`/(excluded) `pthread_*` call sites this ABI's own
+/// **Verified safe against every pilot test that can reach this function** before writing it, not
+/// just after (`sem_wait/{1,3,5,7,11,12}-1.c`, `sem_timedwait/{1,2,3,4,6,7,9,10,11}-1.c` --
+/// `fork/1-1.c` calls `sem_timedwait` too but only after a real `pthread_create`, so it's excluded
+/// from the pilot corpus regardless): every test that currently passes either never reaches this
+/// function at all (`sem_trywait`'s atomic compare-and-swap fast path never issues a syscall, and
+/// several tests only ever exercise that), or reaches it with a deadline real blocking resolves
+/// within single-digit real seconds (well inside `t0`'s own 40s per-test alarm) -- see this
+/// change's own session notes for the full per-test trace. `sem_wait/7-1.c`/`sem_timedwait/9-1.c`
+/// (the direct EINTR-after-signal analogs) and `sem_timedwait/10-1.c` (a real elapsed-wall-time
+/// precision check, the same class of fix `nanosleep`'s own sub-second `CLOCK_REALTIME` work
+/// already established) are expected to flip `FAIL` -> `PASS`.
+///
+/// **Real `FUTEX_WAIT`**: atomically compares the real 32-bit word at `addr` against `val` (real
+/// futex words are always `int`, not this ABI's usual 64-bit register width -- matches musl's own
+/// `sem_t.__val[0]` usage) -- a mismatch is `EAGAIN` immediately, no block, matching real Linux
+/// (the caller raced a concurrent poster and should just retry). A real `to` (relative, not
+/// absolute -- confirmed via `__timedwait_cp`'s own `to.tv_sec = at->tv_sec - now.tv_sec`
+/// conversion before ever calling `__futex4_cp`) converts to an absolute tick deadline the same
+/// way `do_nanosleep` already does; a null `to` is `u64::MAX`, the same "no timeout" sentinel
+/// `WaitingForMqData`/`WaitingForSemOp` already establish. Blocks via `BlockReason::
+/// WaitingForFutex(tgid, addr, deadline)` -- see that variant's own doc comment for why `tgid`,
+/// not raw `pid`, is the correctness-required scope. Checks for a deliverable signal before ever
+/// blocking (avoiding a lost wakeup, same discipline every blocking primitive here already
+/// follows) and once more after waking, in that priority order, then a deadline check -- **and
+/// then, if neither, a plain success**: unlike every other blocking primitive in this codebase,
+/// this deliberately does **not** loop and re-verify its own condition (the futex word's value)
+/// after waking. That's not an oversight -- see `BlockReason::WaitingForFutex`'s own doc comment:
+/// real `FUTEX_WAIT` permits genuinely spurious wakeups by spec, and every real caller (musl's own
+/// `sem_timedwait`) already re-verifies via its own userspace retry loop before ever trusting a
+/// zero return. Re-verifying here too would be redundant, not more correct, and would depart from
+/// what a real Linux kernel's own `futex_wait` actually does.
+///
+/// **Real `FUTEX_WAKE`**: scans `process::table()` for every process genuinely `Blocked` on
+/// `WaitingForFutex` with a matching `tgid` (the *waker's* own tgid -- real futex wake, like wait,
+/// is scoped to addresses meaningful within the caller's own address space) and the exact same
+/// `addr`, flips up to `val` of them back to `Ready` (real Linux's own "max waiters to wake" `val`
+/// argument -- `sem_post`'s own call, via `__wake`, passes a small fixed count), and returns the
+/// real number actually woken (musl's own `__wake` never checks this return value, so `0` would
+/// have been just as honest, but a real count costs nothing extra and is a genuinely correct
+/// primitive, not a shortcut).
+///
+/// Any other real `futex_op` (`FUTEX_CMP_REQUEUE`/`FUTEX_WAKE_OP`/...) still just succeeds -- none
+/// of them are reachable from the plain `sem_*`/(excluded) `pthread_*` call sites this ABI's own
 /// syscall table can currently be reached from.
-pub fn do_futex(op: u64) -> Result<u64, u64> {
+pub fn do_futex(pid: Pid, addr: u64, op: u64, val: u64, to: u64) -> Result<u64, u64> {
     const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
     const FUTEX_PRIVATE: u64 = 128;
-    if op & !FUTEX_PRIVATE == FUTEX_WAIT {
-        return Err(crate::syscall::ETIMEDOUT);
+    let base_op = op & !FUTEX_PRIVATE;
+
+    if base_op == FUTEX_WAIT {
+        // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+        // already has -- a bad `addr` page-faults, handled safely by the real ring-3
+        // fault-to-signal delivery machinery (see CLAUDE.md's "Real ring-3 fault-to-signal
+        // delivery" section), not a soundness hole.
+        let current = unsafe { *(addr as *const u32) };
+        if current != val as u32 {
+            return Err(EAGAIN);
+        }
+
+        let deadline = if to == 0 {
+            u64::MAX
+        } else {
+            // SAFETY: same gap as above, for `to` instead of `addr`.
+            let ts = unsafe { *(to as *const RawTimespec) };
+            if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+                return Err(EINVAL);
+            }
+            let hz = crate::cpu::pit::TIMER_HZ as u64;
+            let whole_second_ticks = ts.tv_sec as u64 * hz;
+            let sub_second_ticks = (ts.tv_nsec as u64 * hz).div_ceil(1_000_000_000);
+            crate::cpu::interrupts::ticks() + whole_second_ticks + sub_second_ticks
+        };
+        if crate::cpu::interrupts::ticks() >= deadline {
+            return Err(ETIMEDOUT);
+        }
+
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let proc = table.get_mut(&pid).unwrap();
+            if proc.pending_signals & !proc.blocked_signals != 0 {
+                return Err(EINTR);
+            }
+            let tgid = proc.tgid;
+            proc.state = ProcState::Blocked(BlockReason::WaitingForFutex(tgid, addr, deadline));
+        } // lock dropped before schedule() -- see process::table()'s own doc comment
+        crate::process::scheduler::schedule();
+
+        let table = PROCESS_TABLE.lock();
+        let proc = table.get(&pid).unwrap();
+        if proc.pending_signals & !proc.blocked_signals != 0 {
+            return Err(EINTR);
+        }
+        if crate::cpu::interrupts::ticks() >= deadline {
+            return Err(ETIMEDOUT);
+        }
+        return Ok(0);
     }
+
+    if base_op == FUTEX_WAKE {
+        let waker_tgid = {
+            let table = PROCESS_TABLE.lock();
+            table.get(&pid).map(|p| p.tgid).unwrap_or(pid)
+        };
+        let mut woken = 0u64;
+        let mut table = PROCESS_TABLE.lock();
+        for (&waiter_pid, proc) in table.iter_mut() {
+            if woken >= val {
+                break;
+            }
+            if let ProcState::Blocked(BlockReason::WaitingForFutex(wtgid, waddr, _)) = proc.state
+                && wtgid == waker_tgid
+                && waddr == addr
+            {
+                proc.state = ProcState::Ready;
+                crate::process::scheduler::enqueue_ready(waiter_pid);
+                woken += 1;
+            }
+        }
+        return Ok(woken);
+    }
+
     Ok(0)
 }
 

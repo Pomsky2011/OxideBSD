@@ -196,6 +196,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
                 wake_if_sigwaiting(target, proc, sig);
                 wake_if_sleeping(target, proc, sig);
                 wake_if_mq_waiting(target, proc, sig);
+                wake_if_futex_waiting(target, proc, sig);
             }
         }
     }
@@ -294,6 +295,7 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                     wake_if_sigwaiting(pid, proc, sig);
                     wake_if_sleeping(pid, proc, sig);
                     wake_if_mq_waiting(pid, proc, sig);
+                    wake_if_futex_waiting(pid, proc, sig);
                 }
             }
         }
@@ -408,6 +410,22 @@ pub(crate) fn wake_if_mq_waiting(pid: Pid, proc: &mut Process, sig: u64) {
     if let ProcState::Blocked(
         BlockReason::WaitingForMqData(_, _) | BlockReason::WaitingForMqSpace(_, _),
     ) = proc.state
+        && proc.blocked_signals & (1 << (sig - 1)) == 0
+    {
+        proc.state = ProcState::Ready;
+        scheduler::enqueue_ready(pid);
+    }
+}
+
+/// Wakes `pid` if it's blocked in `process::do_futex`'s real `FUTEX_WAIT` and `sig` isn't
+/// currently blocked by it -- same shape `wake_if_sleeping`/`wake_if_mq_waiting` above already
+/// establish, for the identical real POSIX reason: a blocking `FUTEX_WAIT` (reached via
+/// `sem_timedwait`'s own real futex call) must be interrupted early by a signal that will invoke a
+/// caught handler, not wait out its own deadline (`u64::MAX` for the plain, no-timeout case --
+/// see `BlockReason::WaitingForFutex`'s own doc comment). `do_futex`'s own post-wake check re-
+/// verifies deliverability fresh, same discipline every blocking primitive here already follows.
+pub(crate) fn wake_if_futex_waiting(pid: Pid, proc: &mut Process, sig: u64) {
+    if let ProcState::Blocked(BlockReason::WaitingForFutex(_, _, _)) = proc.state
         && proc.blocked_signals & (1 << (sig - 1)) == 0
     {
         proc.state = ProcState::Ready;
@@ -1041,6 +1059,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
                 wake_if_sigwaiting(target, proc, sig);
                 wake_if_sleeping(target, proc, sig);
                 wake_if_mq_waiting(target, proc, sig);
+                wake_if_futex_waiting(target, proc, sig);
             }
         }
     }

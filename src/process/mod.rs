@@ -197,6 +197,28 @@ pub enum BlockReason {
     /// timer_interrupt_handler`'s own deadline scan; `do_sigtimedwait`'s own loop always re-checks
     /// `pending_signals & wait_set` fresh after waking, never trusts the wake reason alone.
     WaitingForSpecificSignal(u64, u64),
+    /// Blocked in `process::do_futex`'s real `FUTEX_WAIT`. Fields: `(tgid, addr, deadline)`.
+    /// **Scoped by the caller's own `tgid`, not raw `pid`** (see `Process::tgid`'s own doc
+    /// comment) -- required for real correctness *today*, not just future-proofing: this kernel
+    /// has no ASLR, so two entirely unrelated processes routinely share the exact same virtual
+    /// address (e.g. every process's stack sits at the same fixed `USER_STACK_TOP`) -- keying by
+    /// address alone would let one process's `FUTEX_WAKE` spuriously wake a totally unrelated
+    /// process's wait. `tgid` also happens to be exactly the right scope for when real
+    /// `CLONE_THREAD`/shared-address-space support lands (a futex address is only meaningful
+    /// within one shared address space, i.e. one thread group) -- no rework needed then, this
+    /// already keys on the right thing, it just always equals the caller's own `pid` until
+    /// `clone(2)` exists. `deadline` is the same `u64::MAX`-sentinel "no timeout" convention
+    /// `WaitingForMqData`/`WaitingForSemOp` already establish (a null `to` pointer, matching real
+    /// `FUTEX_WAIT`'s own "wait forever" case). Woken by a matching `FUTEX_WAKE` (`do_futex`'s own
+    /// wake path, same "syscall handler reaches directly into `process::table()`" shape every
+    /// other cross-process wake here already uses), by `interrupts::timer_interrupt_handler`'s own
+    /// deadline scan, or by `wake_if_futex_waiting` (a deliverable signal). **Deliberately does
+    /// *not* re-check the underlying futex word's value on wake** -- real `FUTEX_WAIT` permits
+    /// genuinely spurious wakeups by spec (man `futex(2)`: "a wake-up can occur for other reasons
+    /// as well"), and every real caller already re-verifies via its own userspace retry loop
+    /// (`sem_timedwait`'s own `while (sem_trywait(sem))`, see `process::do_futex`'s own doc
+    /// comment) -- re-checking here too would just be redundant, not more correct.
+    WaitingForFutex(Pid, u64, u64),
 }
 /// Real signal numbers (Linux/BSD-shared low range) -- the classic, standard `1..=31` range;
 /// real-time signals (`SIGRTMIN..=SIGRTMAX`, `35..=64`) are handled separately, see `SIGRTMIN`'s
