@@ -180,6 +180,13 @@ fn is_known_sched_policy(policy: i32) -> bool {
 /// `resolve_target_pid`) is checked first, before either of the above -- `sched_setscheduler/21-1.c`
 /// targets an already-reaped pid and must see `ESRCH` regardless of the (here, valid) priority it
 /// supplies.
+///
+/// **Real POSIX return value on success is the *former* scheduling policy, not `0`** (`man 2
+/// sched_setscheduler`: "Upon successful completion, the previous scheduling policy of the
+/// specified thread shall be returned") -- found live: `sched_setscheduler/16-1.c` explicitly
+/// checks `result == old_policy`, and always failed against the old unconditional `Ok(0)` whenever
+/// `old_policy != 0` (i.e. any policy other than `SCHED_OTHER`, which is exactly what this
+/// codebase's own `SCHED_RR_DEFAULT` spawn-time default guarantees on every fresh process).
 pub fn do_sched_setscheduler(
     caller_pid: Pid,
     pid: i64,
@@ -210,7 +217,46 @@ pub fn do_sched_setscheduler(
     if !(min..=max).contains(&param.sched_priority) {
         return Err(EINVAL);
     }
+    let old_policy = proc.sched_policy;
     proc.sched_policy = policy;
+    proc.sched_priority = param.sched_priority;
+    Ok(old_policy as u64)
+}
+
+/// `SYS_SCHED_SETPARAM`'s real logic -- upstream musl permanently stubs `sched_setparam(2)` to
+/// `ENOSYS` (`third_party/musl/src/sched/sched_setparam.c`), unlike `sched_getparam`/
+/// `sched_setscheduler`, which were already un-stubbed to real syscalls -- found live: every
+/// `sched_setparam/*.c` conformance test FAILs/UNRESOLVEDs/UNTESTEDs on that `ENOSYS` regardless of
+/// what this handler does, since musl's own wrapper never issues the syscall at all. Fixed
+/// symmetrically: `sched_setparam.c` now issues a real `syscall(SYS_sched_setparam, pid, param)`
+/// (the wire format needed no repacking, matching its two siblings), and this is the real handler
+/// it now reaches. Same shape as `do_sched_setscheduler` but leaves `Process::sched_policy`
+/// untouched -- real POSIX `sched_setparam(2)` only ever sets `sched_priority`, validated against
+/// the *target's own current policy*'s range (`sched_setparam/25-1.c`'s real `EINVAL` for an
+/// out-of-range priority), not a caller-supplied one. Real `ESRCH`/`EPERM` via the same
+/// `resolve_target_pid`/`has_sched_permission` calls `do_sched_setscheduler` already established.
+pub fn do_sched_setparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u64, u64> {
+    let target = resolve_target_pid(caller_pid, pid)?;
+    // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
+    // already has.
+    let param = unsafe { *(param_ptr as *const RawSchedParam) };
+    let mut table = PROCESS_TABLE.lock();
+    let caller_uid = table
+        .get(&caller_pid)
+        .expect("sched_setparam: caller process missing from table")
+        .shared
+        .lock()
+        .uid;
+    let proc = table
+        .get_mut(&target)
+        .expect("sched_setparam: target process missing from table");
+    if !has_sched_permission(caller_uid, proc.shared.lock().uid) {
+        return Err(EPERM);
+    }
+    let (min, max) = sched_priority_range(proc.sched_policy);
+    if !(min..=max).contains(&param.sched_priority) {
+        return Err(EINVAL);
+    }
     proc.sched_priority = param.sched_priority;
     Ok(0)
 }

@@ -847,6 +847,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_sched_setscheduler" => {
             Some(crate::syscall::oxidebsd_sys_sched_setscheduler as *const () as u64)
         }
+        "oxidebsd_sys_sched_setparam" => {
+            Some(crate::syscall::oxidebsd_sys_sched_setparam as *const () as u64)
+        }
         "oxidebsd_sys_sched_getscheduler" => {
             Some(crate::syscall::oxidebsd_sys_sched_getscheduler as *const () as u64)
         }

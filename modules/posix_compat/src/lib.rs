@@ -146,6 +146,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_setpriority(which: u64, who: u64, prio: u64) -> i64;
     fn oxidebsd_sys_getpriority(which: u64, who: u64) -> i64;
     fn oxidebsd_sys_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64) -> i64;
+    fn oxidebsd_sys_sched_setparam(pid: u64, param_ptr: u64) -> i64;
     fn oxidebsd_sys_sched_getscheduler(pid: u64) -> i64;
     fn oxidebsd_sys_sched_getparam(pid: u64, param_ptr: u64) -> i64;
     fn oxidebsd_sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask_ptr: u64) -> i64;
@@ -247,6 +248,13 @@ const SYS_GETPRIORITY: u64 = 480;
 const SYS_SCHED_SETSCHEDULER: u64 = 481;
 const SYS_SCHED_GETSCHEDULER: u64 = 482;
 const SYS_SCHED_GETPARAM: u64 = 483;
+/// Real x86_64 Linux's own `__NR_sched_setparam` (`142`) is already claimed by this ABI's own
+/// `SYS_SENDTO` -- `third_party/musl/arch/x86_64/bits/syscall.h.in` already remapped
+/// `__NR_sched_setparam` to `507` (an unclaimed real-Linux value past this ABI's own highest
+/// invented number), but no kernel handler was ever registered at it -- musl's own
+/// `sched_setparam(2)` wrapper was left permanently stubbed to `ENOSYS`, so the remap was
+/// unreachable dead code until now. See `process::do_sched_setparam`'s own doc comment.
+const SYS_SCHED_SETPARAM: u64 = 507;
 /// Real Linux's own `__NR_sched_getaffinity = 204`, used directly rather than continuing this
 /// module's `478`-`491` invented batch -- confirmed unassigned anywhere in this ABI's own registry
 /// before landing here (same reverse-direction check as always: no invented number already claims
@@ -448,6 +456,10 @@ extern "C" fn handle_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64, _
     unsafe { oxidebsd_sys_sched_setscheduler(pid, policy, param_ptr) }
 }
 
+extern "C" fn handle_sched_setparam(pid: u64, param_ptr: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_sched_setparam(pid, param_ptr) }
+}
+
 extern "C" fn handle_sched_getscheduler(pid: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     unsafe { oxidebsd_sys_sched_getscheduler(pid) }
 }
@@ -634,6 +646,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SETPRIORITY, handle_setpriority);
         oxidebsd_register_syscall(SYS_GETPRIORITY, handle_getpriority);
         oxidebsd_register_syscall(SYS_SCHED_SETSCHEDULER, handle_sched_setscheduler);
+        oxidebsd_register_syscall(SYS_SCHED_SETPARAM, handle_sched_setparam);
         oxidebsd_register_syscall(SYS_SCHED_GETSCHEDULER, handle_sched_getscheduler);
         oxidebsd_register_syscall(SYS_SCHED_GETPARAM, handle_sched_getparam);
         oxidebsd_register_syscall(SYS_SCHED_GETAFFINITY, handle_sched_getaffinity);
@@ -672,7 +685,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SHMDT, handle_shmdt);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_MLOCK/SYS_MUNLOCK/SYS_MLOCKALL/SYS_MUNLOCKALL/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_SETPARAM/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_MLOCK/SYS_MUNLOCK/SYS_MLOCKALL/SYS_MUNLOCKALL/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
     );
     0
 }

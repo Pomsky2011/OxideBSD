@@ -559,6 +559,13 @@ pub(crate) fn sys_sched_setscheduler(pid: u64, policy: u64, param_ptr: u64) -> R
     )
 }
 
+/// `SYS_SCHED_SETPARAM` (`507`) — real `sched_setparam(2)`'s exact `(pid, param_ptr)` wire format.
+/// See `process::do_sched_setparam`'s own doc comment for why this was missing until now (musl's
+/// own wrapper was permanently stubbed to `ENOSYS`, so no caller ever reached a kernel handler).
+pub(crate) fn sys_sched_setparam(pid: u64, param_ptr: u64) -> Result<u64, u64> {
+    crate::process::do_sched_setparam(crate::process::scheduler::current_pid(), pid as i64, param_ptr)
+}
+
 /// `SYS_SCHED_GETSCHEDULER` (`482`) — real `sched_getscheduler(2)`'s exact `(pid)` wire format.
 pub(crate) fn sys_sched_getscheduler(pid: u64) -> Result<u64, u64> {
     crate::process::do_sched_getscheduler(crate::process::scheduler::current_pid(), pid as i64)
@@ -1466,6 +1473,10 @@ pub(crate) extern "C" fn oxidebsd_sys_sched_setscheduler(
     param_ptr: u64,
 ) -> i64 {
     result_to_ffi(sys_sched_setscheduler(pid, policy, param_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_sched_setparam(pid: u64, param_ptr: u64) -> i64 {
+    result_to_ffi(sys_sched_setparam(pid, param_ptr))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_sched_getscheduler(pid: u64) -> i64 {
