@@ -351,7 +351,7 @@ fn record_pending(
 /// `do_sigqueue`), the same shape `wake_if_paused` below already establishes for `do_pause`/
 /// `do_sigsuspend`. Spurious wakes aren't possible: `do_sigtimedwait`'s own loop re-checks
 /// `pending_signals & wait_set` fresh after waking regardless of why it woke.
-fn wake_if_sigwaiting(pid: Pid, proc: &mut Process, sig: u64) {
+pub(crate) fn wake_if_sigwaiting(pid: Pid, proc: &mut Process, sig: u64) {
     if let ProcState::Blocked(BlockReason::WaitingForSpecificSignal(wait_set, _)) = proc.state
         && wait_set & (1 << (sig - 1)) != 0
     {
@@ -367,7 +367,7 @@ fn wake_if_sigwaiting(pid: Pid, proc: &mut Process, sig: u64) {
 /// `Action::Terminate`/`Action::Stop` don't need this hook at all). Spurious wakes aren't possible
 /// here (unlike `wake_parent_if_waiting`'s `WUNTRACED`/`WCONTINUED` case) since this is the exact
 /// condition `do_pause`'s own loop re-checks after waking anyway.
-fn wake_if_paused(pid: Pid, proc: &mut Process, sig: u64) {
+pub(crate) fn wake_if_paused(pid: Pid, proc: &mut Process, sig: u64) {
     if proc.state == ProcState::Blocked(BlockReason::WaitingForSignal)
         && proc.blocked_signals & (1 << (sig - 1)) == 0
     {
@@ -383,7 +383,7 @@ fn wake_if_paused(pid: Pid, proc: &mut Process, sig: u64) {
 /// leave it waiting out the full deadline regardless -- `do_nanosleep`'s own loop only re-checks
 /// deliverability right before each re-block, so without this hook nothing would ever notice
 /// early). Found live via the Open POSIX Test Suite pilot's `nanosleep/1-3.c`.
-fn wake_if_sleeping(pid: Pid, proc: &mut Process, sig: u64) {
+pub(crate) fn wake_if_sleeping(pid: Pid, proc: &mut Process, sig: u64) {
     if let ProcState::Blocked(BlockReason::Sleeping(_)) = proc.state
         && proc.blocked_signals & (1 << (sig - 1)) == 0
     {
@@ -404,7 +404,7 @@ fn wake_if_sleeping(pid: Pid, proc: &mut Process, sig: u64) {
 /// child's `kill(pid, SIGABRT)`, and (since a genuinely stuck syscall blocks the whole process, not
 /// just the one call) even `t0`'s own outer `SIGALRM` had nothing to interrupt either, since
 /// `do_mq_timedreceive`'s loop only re-checks the real queue state, never a deliverable signal.
-fn wake_if_mq_waiting(pid: Pid, proc: &mut Process, sig: u64) {
+pub(crate) fn wake_if_mq_waiting(pid: Pid, proc: &mut Process, sig: u64) {
     if let ProcState::Blocked(
         BlockReason::WaitingForMqData(_, _) | BlockReason::WaitingForMqSpace(_, _),
     ) = proc.state

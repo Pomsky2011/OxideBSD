@@ -2166,6 +2166,45 @@ upstream test bug, correctly caught by musl's stack protector and now cleanly de
   how large this pilot corpus could still grow (81 non-pthread/non-aio interface directories exist
   in the suite total, several already fully covered by this pass, some intentionally left thin).
 
+## A real timer-signal wake bug, closing a fifth kernel bug the pilot found (`src/cpu/interrupts.rs`, `src/process/signals.rs`)
+
+Found live re-running the 488-file pilot after `clock_settime(2)` (the section above) started
+actually succeeding for the first time — the pilot's own archived logs (`target/posix-pilot-logs/`)
+all predate that piece landing, so this exact code path had never been exercised end-to-end before.
+`clock_settime/4-1.c` hung the whole pilot permanently, past any of `t0`'s own 40s per-test rescue
+bound.
+
+- **Root cause**: `interrupts::timer_interrupt_handler`'s two real-signal-expiry sites —
+  `real_timer_deadline` (backs `alarm()`/`setitimer(ITIMER_REAL)`) and the `Process::posix_timers`
+  per-slot loop (backs `timer_create`/`timer_settime`) — only ever set the target's
+  `pending_signals` bit directly. Neither one called any of the four `wake_if_*` hooks
+  (`wake_if_paused`/`wake_if_sigwaiting`/`wake_if_sleeping`/`wake_if_mq_waiting`, `src/process/
+  signals.rs`) that every *other* signal-delivery path (`do_kill`'s and `signal_foreground_group`'s
+  own `Action::SetPending` arms, `do_sigqueue`) already wires in right after setting that same bit.
+  A process genuinely `Blocked` in `pause()`/`nanosleep()`/`sigwait()`/a plain `mq_receive()`
+  waiting specifically for a timer-delivered signal was therefore never re-enqueued — a permanent
+  hang, not just a missed-early-wake. `clock_settime/4-1.c` hits this directly: it arms a
+  `timer_create`+`timer_settime(TIMER_ABSTIME)` timer for `SIGALRM`, then `sigwait()`s for it.
+- **Fix**: made all four `wake_if_*` hooks `pub(crate)` (`src/process/signals.rs`) and called them
+  from both expiry sites in `interrupts.rs` right after a signal newly becomes pending — the same
+  shape `do_kill`'s own `Action::SetPending` arm already establishes. The `posix_timers` loop needed
+  restructuring from `for slot in proc.posix_timers.iter_mut().flatten()` to an index-based loop:
+  calling a `wake_if_*` hook needs `&mut Process` (the whole struct), which can't coexist with
+  `slot`'s own live sub-borrow of `proc.posix_timers[i]` even though the two touch disjoint fields —
+  the just-set signal number is carried past the end of `slot`'s borrow in a local, and the wake
+  hooks are called from a separate statement once that borrow has ended.
+- **Verified**: re-ran the full 488-file pilot in a fresh, isolated test-QEMU instance (the disk-
+  backed interactive session that first hit the hang was left untouched). Zero hangs, same one
+  known `strftime/2-1.c` crash (a real, pre-existing upstream test bug, unrelated — see the section
+  above), `clock_settime/4-1.c` itself flips to real PASS. The fix wasn't narrowly scoped to that one
+  test — it's the same missing-wake-hook shape for *every* test combining a timer-delivered signal
+  with a blocking wait, so a broad swath of `sigwait`/`sigtimedwait`/`pause`/`nanosleep`/
+  `mq_receive` tests gated on `alarm`/`setitimer`/`timer_create` flipped too. Baseline moved
+  329P/62F/40U/8US/45UT/3TO/1CR → **373P/36F/22U/8US/45UT/3TO/1CR, 488 total**. `cargo build`/
+  `cargo clippy` clean (only the same 3 pre-existing, unrelated warnings).
+- **Not covered by this pass**: the remaining 36 FAIL/22 UNRESOLVED haven't been individually
+  triaged — same open item the section above already flagged, just a smaller remaining set now.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a

@@ -418,6 +418,18 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 } else {
                     None
                 };
+                // A process genuinely `Blocked` (`pause`/`nanosleep`/`sigwait`/a plain `mq_receive`)
+                // waiting specifically on this signal must be woken here, or it hangs forever --
+                // this expiry only sets the pending bit, unlike `do_kill`'s own `Action::SetPending`
+                // arm, whose callers already wire these same four hooks in. Safe to call
+                // unconditionally: each hook only fires if `proc`'s own state actually matches its
+                // one relevant `BlockReason`, a no-op otherwise. Found live via
+                // `clock_settime/4-1.c` (a real `alarm()`-shaped `SIGALRM` expiry while the target
+                // sits in `sigwait()`) permanently hanging the POSIX conformance pilot.
+                crate::process::signals::wake_if_paused(pid, proc, crate::process::SIGALRM);
+                crate::process::signals::wake_if_sigwaiting(pid, proc, crate::process::SIGALRM);
+                crate::process::signals::wake_if_sleeping(pid, proc, crate::process::SIGALRM);
+                crate::process::signals::wake_if_mq_waiting(pid, proc, crate::process::SIGALRM);
             }
 
             // `SYS_TIMER_CREATE`'s own per-timer expiry (`Process::posix_timers`, batch items
@@ -426,7 +438,15 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             // reasoning), plus a real `timer_getoverrun` count: an expiry whose signal is *still*
             // pending from a previous, undelivered expiry increments `overrun` instead of getting
             // lost silently.
-            for slot in proc.posix_timers.iter_mut().flatten() {
+            for i in 0..proc.posix_timers.len() {
+                // `newly_signaled` carries a just-set signal number past the end of `slot`'s own
+                // borrow (of `proc.posix_timers[i]`, not all of `proc`) -- calling the wake hooks
+                // below needs `&mut Process` (the whole struct), which can't coexist with a live
+                // sub-borrow from array indexing, even though the two touch disjoint fields.
+                let mut newly_signaled = None;
+                let Some(slot) = proc.posix_timers[i].as_mut() else {
+                    continue;
+                };
                 // A live wall-clock comparison, not the (possibly stale) tick-domain `deadline`,
                 // for a timer armed via `TIMER_ABSTIME` against `CLOCK_REALTIME` -- see
                 // `PosixTimer::realtime_target`'s own doc comment for why this is what lets a
@@ -447,6 +467,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                         } else {
                             slot.overrun = 0;
                             proc.pending_signals |= bit;
+                            newly_signaled = Some(slot.signo);
                         }
                     }
                     // Only the *first* expiry of an abstime-armed `CLOCK_REALTIME` timer needs
@@ -459,6 +480,19 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                     } else {
                         None
                     };
+                }
+                // `slot`'s own borrow of `proc.posix_timers[i]` ends here -- only now can `proc`
+                // be reborrowed whole for the wake hooks below. Same hang this section's own
+                // `real_timer_deadline` sibling above just got fixed for, via a real POSIX timer
+                // instead of `alarm()`/`setitimer()` -- a process sitting in `pause`/`nanosleep`/
+                // `sigwait`/a plain `mq_receive` waiting on a `timer_create`-armed signal (e.g.
+                // `clock_settime/4-1.c`'s own `sigwait()` for a `TIMER_ABSTIME` timer) would
+                // otherwise never wake once this loop merely set the pending bit.
+                if let Some(signo) = newly_signaled {
+                    crate::process::signals::wake_if_paused(pid, proc, signo);
+                    crate::process::signals::wake_if_sigwaiting(pid, proc, signo);
+                    crate::process::signals::wake_if_sleeping(pid, proc, signo);
+                    crate::process::signals::wake_if_mq_waiting(pid, proc, signo);
                 }
             }
         }
