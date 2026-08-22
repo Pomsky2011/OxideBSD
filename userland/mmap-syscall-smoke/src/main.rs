@@ -75,6 +75,15 @@ const PROT_READ_WRITE: u64 = 0x1 | 0x2;
 const SIGBUS: u64 = 7;
 const SIGSEGV: u64 = 11;
 
+/// Real `mmap(2)` flag bits, matching `third_party/musl/include/sys/mman.h` -- now real on the
+/// wire (`process::mm::do_mmap`'s own doc comment), packed into the unused high bits of the `prot`
+/// register (`mmap_call` below), not a spare argument this ABI doesn't have room for.
+const MAP_SHARED: u64 = 0x01;
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const EBADF: u64 = 9;
+const EINVAL: u64 = 22;
+
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
     unsafe { syscall4(number, arg0, arg1, arg2, 0) }
@@ -165,10 +174,16 @@ fn open_create(path: &[u8]) -> Result<u64, u64> {
     }
 }
 
+/// `packed_prot` = real `prot` (low 8 bits) | real `flags` (shifted left 8) -- see
+/// `src/syscall/ffi.rs`'s own `oxidebsd_sys_mmap` doc comment for this exact wire format. `packed`
+/// = `(off << 32) | (fd as u32)`; off is always 0 for every real caller in this port.
+fn mmap_call(addr_hint: u64, fd: u64, len: u64, flags: u64) -> Result<u64, u64> {
+    let packed_prot = PROT_READ_WRITE | (flags << 8);
+    unsafe { syscall4(SYS_MMAP, addr_hint, len, packed_prot, fd) }
+}
+
 fn mmap_shared(fd: u64, len: u64) -> Result<u64, u64> {
-    // packed = (off << 32) | (fd as u32) -- see src/syscall/ffi.rs's own oxidebsd_sys_mmap doc
-    // comment for this exact wire format; off is always 0 for every real caller in this port.
-    unsafe { syscall4(SYS_MMAP, 0, len, PROT_READ_WRITE, fd) }
+    mmap_call(0, fd, len, MAP_SHARED)
 }
 
 fn wait4(pid: u64) -> Result<(u64, i32), u64> {
@@ -441,6 +456,98 @@ pub extern "C" fn _start() -> ! {
         "mmap-syscall-smoke: part 5 (mmap of zero-content file)",
         |status| wtermsig(status) == Some(SIGBUS as i32),
     );
+
+    // --- Part 6: real EBADF for a non-anonymous request against an invalid fd (`mmap/19-1.c`) ---
+    // `fd == -1` (the real, recognizable `0xffff_ffff` wire pattern) with `MAP_SHARED` and no
+    // `MAP_ANON` -- previously silently treated as an anonymous mapping (flags never reached the
+    // kernel at all); now a real `EBADF`, matching real POSIX.
+    check!(
+        mmap_call(0, 0xffff_ffff, 4096, MAP_SHARED) == Err(EBADF),
+        "part 6: expected EBADF for MAP_SHARED against an invalid fd"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 6 (EBADF on invalid fd) OK\n");
+
+    // --- Part 7: real EINVAL when neither MAP_SHARED nor MAP_PRIVATE is set (`mmap/9-1.c`/
+    // `mmap/21-1.c`) -- checked before the fd validity check above, so this fires even against the
+    // same invalid fd part 6 used.
+    check!(
+        mmap_call(0, 0xffff_ffff, 4096, 0) == Err(EINVAL),
+        "part 7: expected EINVAL when neither MAP_SHARED nor MAP_PRIVATE is set"
+    );
+    check!(
+        mmap_call(0, 0xffff_ffff, 4096, MAP_SHARED | MAP_PRIVATE) == Err(EINVAL),
+        "part 7: expected EINVAL when both MAP_SHARED and MAP_PRIVATE are set"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 7 (EINVAL on invalid flags) OK\n");
+
+    // --- Part 8: real MAP_FIXED "replace" semantics (`mmap/3-1.c`) -- mmap file A, then mmap file
+    // B MAP_FIXED at exactly the address the first mmap returned; the second call must return that
+    // same address, and a read through it must see file B's content, not file A's.
+    let path_fixed_a = b"/tmp/mmap-smoke-fixed-a\0";
+    let fd_fixed_a = open_create(path_fixed_a).expect("part 8: open(A) failed");
+    let buf_a = [b'a'; 4096];
+    unsafe {
+        syscall(SYS_WRITE, fd_fixed_a, buf_a.as_ptr() as u64, buf_a.len() as u64)
+            .expect("part 8: write(A) failed");
+    }
+    let pa = mmap_shared(fd_fixed_a, 4096).expect("part 8: mmap(A) failed");
+
+    let path_fixed_b = b"/tmp/mmap-smoke-fixed-b\0";
+    let fd_fixed_b = open_create(path_fixed_b).expect("part 8: open(B) failed");
+    let buf_b = [b'b'; 4096];
+    unsafe {
+        syscall(SYS_WRITE, fd_fixed_b, buf_b.as_ptr() as u64, buf_b.len() as u64)
+            .expect("part 8: write(B) failed");
+    }
+    let pa2 = mmap_call(pa, fd_fixed_b, 4096, MAP_SHARED | MAP_FIXED)
+        .expect("part 8: MAP_FIXED mmap(B) failed");
+    check!(pa2 == pa, "part 8: MAP_FIXED did not return the requested address");
+    unsafe {
+        check!(
+            core::ptr::read_volatile(pa2 as *const u8) == b'b',
+            "part 8: MAP_FIXED did not replace the previous mapping's content"
+        );
+    }
+    check!(
+        unsafe { syscall(SYS_MUNMAP, pa2, 4096, 0) }.is_ok(),
+        "part 8: munmap failed"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 8 (MAP_FIXED replace) OK\n");
+
+    // --- Part 9: real MAP_PRIVATE discard-on-unmap (`munmap/4-1.c`) -- a write through a
+    // MAP_PRIVATE mapping must never reach the underlying file, unlike MAP_SHARED.
+    let path_private = b"/tmp/mmap-smoke-private\0";
+    let fd_private = open_create(path_private).expect("part 9: open failed");
+    let buf_orig = [b'a'; 1024];
+    unsafe {
+        syscall(
+            SYS_WRITE,
+            fd_private,
+            buf_orig.as_ptr() as u64,
+            buf_orig.len() as u64,
+        )
+        .expect("part 9: write failed");
+    }
+    let pa3 = mmap_call(0, fd_private, 1024, MAP_PRIVATE).expect("part 9: mmap failed");
+    unsafe {
+        core::ptr::write_volatile(pa3 as *mut u8, b'b');
+    }
+    check!(
+        unsafe { syscall(SYS_MUNMAP, pa3, 1024, 0) }.is_ok(),
+        "part 9: munmap failed"
+    );
+    let pa4 = mmap_call(0, fd_private, 1024, MAP_PRIVATE).expect("part 9: second mmap failed");
+    unsafe {
+        check!(
+            core::ptr::read_volatile(pa4 as *const u8) == b'a',
+            "part 9: MAP_PRIVATE write leaked back into the file"
+        );
+    }
+    check!(
+        unsafe { syscall(SYS_MUNMAP, pa4, 1024, 0) }.is_ok(),
+        "part 9: second munmap failed"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 9 (MAP_PRIVATE discard) OK\n");
 
     write_bytes(b"mmap-syscall-smoke: all parts passed\n");
     test_exit(true);

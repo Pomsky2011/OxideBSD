@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
-use crate::syscall::{EINVAL, ENODEV, ENOMEM};
+use crate::syscall::{EBADF, EINVAL, ENODEV, ENOMEM};
 use super::*;
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
@@ -35,6 +35,18 @@ static NEXT_MMAP_PAGE: Mutex<u64> = Mutex::new(MMAP_REGION_BASE);
 /// protection enforcement) — this only gates the *software* write-back decision, not hardware
 /// access.
 const PROT_WRITE: u64 = 0x2;
+
+/// Real `flags` bits `SYS_MMAP` understands, unpacked from `oxidebsd_sys_mmap`'s own `packed_prot`
+/// register (see that function's own doc comment for the wire format) — matches musl's own real
+/// `<sys/mman.h>` values exactly, not invented here: musl's patched `__mmap()` packs its real,
+/// caller-supplied `flags` argument verbatim (just shifted), so there's no reason to number these
+/// any differently. Only these four are ever consulted; anything else (`MAP_NORESERVE`,
+/// `MAP_POPULATE`, `MAP_STACK`, ...) rides along in the packed value but is silently ignored, same
+/// tier as `prot`'s own unenforced bits.
+const MAP_SHARED: u64 = 0x01;
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANON: u64 = 0x20;
 
 /// Real, cross-open shared physical-frame cache for fd-backed `MAP_SHARED` mappings — keyed by
 /// `crate::fs::fd::content_id_of`'s real inode identity, not by `real_fd`/pid. **This is what
@@ -106,39 +118,108 @@ pub struct MmapFileRegion {
     mapped_pages: u64,
     content_id: u64,
     writable: bool,
+    /// `true` for a real `MAP_SHARED` mapping (cross-open cache-backed, real writeback on
+    /// `munmap`/`msync`/exit — the original, only behavior this kernel had before real `MAP_PRIVATE`
+    /// support existed). `false` for a real `MAP_PRIVATE` mapping: still registered here so the
+    /// same MPR `SIGBUS`-on-reserved-tail machinery (`signal_for_user_fault` below) covers it too,
+    /// but its own frames are a fresh, never-cached, never-shared copy (see `do_mmap_file_backed`'s
+    /// own doc comment) — `writeback_region` and `release_mmap_file_ref` both no-op for one of
+    /// these, real POSIX "modifications... discarded" `MAP_PRIVATE` semantics.
+    shared: bool,
 }
 
 /// `SYS_MMAP`'s real logic — OxideBSD's own invention, not modeled on any real OS's `mmap` (see
-/// `src/syscall.rs`'s module doc comment). `addr_hint` is still ignored (OxideBSD always chooses
-/// the address itself, matching `src/module.rs`'s own loader). `fd`/`off` are real now — decoded
-/// by the caller (`src/syscall/ffi.rs`'s `oxidebsd_sys_mmap`) from the one spare ABI register this
-/// syscall has room for (see that function's own doc comment for the packed wire format and why
-/// `flags` itself was dropped rather than threaded through: every real caller in this kernel's own
-/// call graph distinguishes anonymous vs. file-backed purely by `fd == -1` vs. `fd >= 0`, matching
-/// musl's own convention, so there's nothing real `flags` bits would add here). `fd == -1`: the
-/// original anonymous+private, always-zero-filled, bump-allocated behavior, unchanged. `fd >= 0`:
-/// real fd-backed `MAP_SHARED` — see `do_mmap_file_backed`.
-pub fn do_mmap(caller_pid: Pid, addr_hint: u64, len: u64, prot: u64, fd: i32, off: u32) -> Result<u64, u64> {
-    let _ = addr_hint;
+/// `src/syscall.rs`'s module doc comment). `flags` is real now too, decoded by the caller
+/// (`src/syscall/ffi.rs`'s `oxidebsd_sys_mmap`) from the same packed register `prot` rides in — see
+/// that function's own doc comment for the wire format. Real POSIX validation this now performs
+/// that it didn't before `flags` existed on the wire: exactly one of `MAP_SHARED`/`MAP_PRIVATE`
+/// must be set (`EINVAL` otherwise — covers both "neither" and "both", the same clause real
+/// `mmap(2)` documents), and a non-anonymous request (`MAP_ANON` unset) needs a real, non-negative
+/// `fd` (`EBADF` otherwise — previously any `fd < 0` silently became an anonymous mapping
+/// regardless of what `flags` actually said, since `flags` never reached the kernel at all). `fd`
+/// is ignored once `MAP_ANON` is set, matching real POSIX (callers conventionally still pass `-1`,
+/// but nothing requires it). `MAP_FIXED` is real too now: `addr_hint` must be page-aligned
+/// (`EINVAL` otherwise) and is honored as the mapping's actual address rather than always
+/// bump-allocating a fresh one — see the `fixed_base` handling below for the real "replace any
+/// previous mapping" semantics real POSIX documents for it.
+pub fn do_mmap(
+    caller_pid: Pid,
+    addr_hint: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: i32,
+    off: u32,
+) -> Result<u64, u64> {
     if len == 0 {
         return Err(EINVAL);
     }
-    let page_count = len.div_ceil(4096);
-    let region_len = page_count * 4096;
+    let shared = flags & MAP_SHARED != 0;
+    let private = flags & MAP_PRIVATE != 0;
+    if shared == private {
+        // Neither bit set, or both -- real POSIX EINVAL either way.
+        return Err(EINVAL);
+    }
+    let anon = flags & MAP_ANON != 0;
+    let fixed = flags & MAP_FIXED != 0;
+    if !anon && fd < 0 {
+        return Err(EBADF);
+    }
+    let effective_fd = if anon { -1 } else { fd };
 
-    if fd >= 0 {
-        return do_mmap_file_backed(caller_pid, fd as u64, off, page_count, prot);
+    let page_count = len.div_ceil(4096);
+    let region_len = page_count.checked_mul(4096).ok_or(ENOMEM)?;
+
+    // Real MAP_FIXED: `addr_hint` becomes the mapping's actual address (not just a discarded hint,
+    // the every-other-case behavior below), page-alignment-validated up front (real POSIX EINVAL),
+    // and whatever whole pages it lands on get unmapped first -- "the mapping established by
+    // mmap() shall replace any previous mappings for those whole pages containing any part of the
+    // address space of the process starting at pa and continuing for len bytes". Reuses
+    // `do_munmap` wholesale rather than duplicating its unmap/writeback/refcount-release logic --
+    // that function is already safe and idempotent against a range with nothing mapped in it (see
+    // its own doc comment), and already does exactly the real cleanup a displaced fd-backed region
+    // needs.
+    let fixed_base = if fixed {
+        if !addr_hint.is_multiple_of(4096) {
+            return Err(EINVAL);
+        }
+        let end_inclusive = addr_hint
+            .checked_add(region_len)
+            .and_then(|e| e.checked_sub(1))
+            .ok_or(EINVAL)?;
+        if VirtAddr::try_new(addr_hint).is_err() || VirtAddr::try_new(end_inclusive).is_err() {
+            return Err(EINVAL);
+        }
+        let _ = do_munmap(caller_pid, addr_hint, region_len);
+        Some(addr_hint)
+    } else {
+        None
+    };
+
+    if effective_fd >= 0 {
+        return do_mmap_file_backed(
+            caller_pid,
+            effective_fd as u64,
+            off,
+            page_count,
+            prot,
+            private,
+            fixed_base,
+        );
     }
 
-    let base = {
-        let mut next = NEXT_MMAP_PAGE.lock();
-        let base = *next;
-        let end = base.checked_add(region_len).ok_or(ENOMEM)?;
-        if end > MMAP_REGION_CEILING {
-            return Err(ENOMEM);
+    let base = match fixed_base {
+        Some(base) => base,
+        None => {
+            let mut next = NEXT_MMAP_PAGE.lock();
+            let base = *next;
+            let end = base.checked_add(region_len).ok_or(ENOMEM)?;
+            if end > MMAP_REGION_CEILING {
+                return Err(ENOMEM);
+            }
+            *next = end;
+            base
         }
-        *next = end;
-        base
     };
 
     let phys_offset = memory::phys_mem_offset();
@@ -183,13 +264,11 @@ pub fn do_mmap(caller_pid: Pid, addr_hint: u64, len: u64, prot: u64, fd: i32, of
     Ok(base)
 }
 
-/// Real fd-backed `MAP_SHARED` — `do_mmap`'s `fd >= 0` case. Scoped deliberately: `off != 0` is an
-/// honest `EINVAL` rather than silently mapping from offset `0` instead — none of this kernel's
-/// own real callers (BusyBox, TinyCC-compiled programs, the POSIX conformance pilot) ever request
-/// a nonzero offset. Always behaves as `MAP_SHARED` regardless of what the caller actually
-/// requested (`MAP_PRIVATE`'s copy-on-write semantics would need real per-page fault tracking this
-/// kernel has none of) — a deliberate, documented simplification, not yet hit by any real caller
-/// requesting `MAP_PRIVATE` against a real fd.
+/// Real fd-backed mapping — `do_mmap`'s `fd >= 0` case, now honoring the caller's real
+/// `MAP_SHARED`/`MAP_PRIVATE` choice (`private`) instead of always behaving as `MAP_SHARED`. Scoped
+/// deliberately: `off != 0` is an honest `EINVAL` rather than silently mapping from offset `0`
+/// instead — none of this kernel's own real callers (BusyBox, TinyCC-compiled programs, the POSIX
+/// conformance pilot) ever request a nonzero offset.
 ///
 /// **Content population/writeback goes through `crate::fs::fd::content_read`/`content_write`
 /// (keyed by `content_id`, a real inode number), not any fd's own read/write callbacks** — found
@@ -200,12 +279,18 @@ pub fn do_mmap(caller_pid: Pid, addr_hint: u64, len: u64, prot: u64, fd: i32, of
 /// callback silently populated nothing for every real test that exercises this. Content-by-
 /// identity sidesteps that, and (unlike a fd's own stream position, which `write()`/`fstat()`
 /// calls before `mmap()` already moved forward) always reads from real offset `0`.
+///
+/// `fixed_base`, when set, is a real `MAP_FIXED` address (already alignment/canonical-validated,
+/// and already had `do_mmap`'s own `do_munmap` pre-clear run against it) — used directly instead of
+/// bump-allocating a fresh VA.
 fn do_mmap_file_backed(
     caller_pid: Pid,
     fd: u64,
     off: u32,
     page_count: u64,
     prot: u64,
+    private: bool,
+    fixed_base: Option<u64>,
 ) -> Result<u64, u64> {
     if off != 0 {
         return Err(EINVAL);
@@ -219,10 +304,45 @@ fn do_mmap_file_backed(
     // zero-padding partial page -- ever get backed by a real frame. Anything past that, up to the
     // caller's own requested `page_count`, is deliberately left unmapped so a reference there
     // real-faults instead of silently succeeding against a zero-filled page; `signal_for_user_fault`
-    // below is what turns that fault into a real `SIGBUS` rather than a reboot.
+    // below is what turns that fault into a real `SIGBUS` rather than a reboot. Applies to both
+    // MAP_SHARED and MAP_PRIVATE alike -- real POSIX MPR doesn't distinguish the two.
     let covered_pages = real_size.div_ceil(4096).min(page_count);
 
-    let frames: Vec<PhysFrame<Size4KiB>> = {
+    let frames: Vec<PhysFrame<Size4KiB>> = if private {
+        // Real MAP_PRIVATE: a fresh copy, populated once from the object's own real content but
+        // never entered into MMAP_FILE_CACHE -- a second, independent MAP_PRIVATE of the same file
+        // (by this or any other process) must never see this mapping's own writes, and this
+        // mapping must never see another's. This kernel gets that "for free" by copying eagerly at
+        // mmap() time instead of lazily copying-on-write at fault time, the same design choice
+        // `fork` already makes elsewhere. Never written back either -- see `writeback_region`'s own
+        // `shared` check below.
+        let new_frames = with_frame_allocator(|fa| -> Result<Vec<PhysFrame<Size4KiB>>, u64> {
+            let mut new_frames = Vec::with_capacity(covered_pages as usize);
+            for _ in 0..covered_pages {
+                let frame = fa.allocate_frame().ok_or(ENOMEM)?;
+                let frame_ptr = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+                unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
+                new_frames.push(frame);
+            }
+            Ok(new_frames)
+        })?;
+        let covered_len = covered_pages * 4096;
+        let read_len = real_size.min(covered_len);
+        if read_len > 0 {
+            let mut staging = alloc::vec![0u8; read_len as usize];
+            let n =
+                crate::fs::fd::content_read(content_id, 0, staging.as_mut_ptr() as u64, read_len);
+            if n > 0 {
+                staging.truncate(n as usize);
+                for (i, chunk) in staging.chunks(4096).enumerate() {
+                    let frame_ptr =
+                        (phys_offset + new_frames[i].start_address().as_u64()).as_mut_ptr::<u8>();
+                    unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_ptr, chunk.len()) };
+                }
+            }
+        }
+        new_frames
+    } else {
         let mut cache = MMAP_FILE_CACHE.lock();
         let existing_len = cache.get(&content_id).map(Vec::len).unwrap_or(0) as u64;
         if existing_len < covered_pages {
@@ -295,26 +415,32 @@ fn do_mmap_file_backed(
     };
 
     let region_len = page_count * 4096;
-    let base = {
-        let mut next = NEXT_MMAP_PAGE.lock();
-        let base = *next;
-        let end = next
-            .checked_add(region_len)
-            .filter(|&e| e <= MMAP_REGION_CEILING)
-            .ok_or(ENOMEM)?;
-        *next = end;
-        base
+    let base = match fixed_base {
+        Some(base) => base,
+        None => {
+            let mut next = NEXT_MMAP_PAGE.lock();
+            let base = *next;
+            let end = next
+                .checked_add(region_len)
+                .filter(|&e| e <= MMAP_REGION_CEILING)
+                .ok_or(ENOMEM)?;
+            *next = end;
+            base
+        }
     };
 
     let writable = prot & PROT_WRITE != 0;
-    // SHARED_LEAF: these frames are owned by MMAP_FILE_CACHE (keyed by content_id, real cross-open
-    // sharing -- see that cache's own doc comment), not by this one mapping -- marks every leaf so
-    // a real address-space teardown (`memory::address_space::AddressSpace::teardown`) never frees
-    // one still cached/still live in another process's or another mapping's own page table. See
-    // `SHARED_LEAF`'s own doc comment.
-    let mut flags = PageTableFlags::PRESENT
-        | PageTableFlags::USER_ACCESSIBLE
-        | memory::address_space::SHARED_LEAF;
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if !private {
+        // SHARED_LEAF: these frames are owned by MMAP_FILE_CACHE (keyed by content_id, real
+        // cross-open sharing -- see that cache's own doc comment), not by this one mapping -- marks
+        // every leaf so a real address-space teardown (`memory::address_space::AddressSpace::
+        // teardown`) never frees one still cached/still live in another process's or another
+        // mapping's own page table. See `SHARED_LEAF`'s own doc comment. A private mapping's own
+        // frames are never shared this way, so they're left unmarked and get freed like any other
+        // private leaf (matches every other private-anon-mmap/heap/stack frame already does).
+        flags |= memory::address_space::SHARED_LEAF;
+    }
     if writable {
         flags |= PageTableFlags::WRITABLE;
     }
@@ -336,9 +462,12 @@ fn do_mmap_file_backed(
             Page::<Size4KiB>::containing_address(VirtAddr::new(base + covered_pages * 4096 - 1));
         with_frame_allocator(|fa| -> Result<(), u64> {
             for (page, frame) in Page::range_inclusive(start_page, end_page).zip(frames.iter()) {
-                // SAFETY: `frame` is one of MMAP_FILE_CACHE's own real backing frames (never reused
-                // for anything else -- this kernel has no frame-deallocation path), and `page` falls
-                // in this process's own, freshly bump-allocated mmap region.
+                // SAFETY: `frame` is either one of MMAP_FILE_CACHE's own real backing frames (a
+                // shared mapping, never reused for anything else) or a fresh, exclusively-owned
+                // private frame (a private mapping, allocated just above) -- either way this
+                // kernel has no frame-deallocation path for it to have gone stale, and `page` falls
+                // in this process's own, freshly bump-allocated (or MAP_FIXED-validated) mmap
+                // region.
                 unsafe {
                     mapper
                         .map_to(page, *frame, flags, fa)
@@ -350,13 +479,16 @@ fn do_mmap_file_backed(
         })?;
     }
 
-    *MMAP_FILE_REFCOUNT.lock().entry(content_id).or_insert(0) += 1;
+    if !private {
+        *MMAP_FILE_REFCOUNT.lock().entry(content_id).or_insert(0) += 1;
+    }
     me.shared.lock().mmap_file_regions.push(MmapFileRegion {
         va_start: base,
         npages: page_count,
         mapped_pages: covered_pages,
         content_id,
         writable,
+        shared: !private,
     });
 
     Ok(base)
@@ -405,7 +537,7 @@ pub fn signal_for_user_fault(caller_pid: Pid, addr: u64) -> u64 {
 /// model always replaces a file's whole content in one shot (see `modules/oxfs`'s `OpenFile::Write`
 /// doc comment), so a redundant write-back just re-commits the same bytes.
 fn writeback_region(region: &MmapFileRegion, phys_offset: VirtAddr) {
-    if !region.writable {
+    if !region.shared || !region.writable {
         return;
     }
     let current_size = crate::fs::fd::content_size(region.content_id).max(0) as u64;
@@ -454,6 +586,11 @@ fn writeback_region(region: &MmapFileRegion, phys_offset: VirtAddr) {
 /// artificially kept open past the caller's own `close()`".
 pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
     if len == 0 {
+        return Err(EINVAL);
+    }
+    // Real POSIX: "the implementation shall require that addr be a multiple of the page size" --
+    // `munmap/3-1.c` in the conformance pilot exercises this directly.
+    if !addr.is_multiple_of(4096) {
         return Err(EINVAL);
     }
     let page_count = len.div_ceil(4096);
@@ -541,7 +678,13 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
         if any_dirty {
             writeback_region(&region, phys_offset);
         }
-        release_mmap_file_ref(region.content_id);
+        // A private region was never entered into MMAP_FILE_CACHE/MMAP_FILE_REFCOUNT in the first
+        // place (see do_mmap_file_backed's own doc comment) -- releasing a reference for it would
+        // either be a no-op (nothing shared this content_id yet) or, worse, wrongly decrement a
+        // real shared mapping's own refcount if one happens to exist for the same file.
+        if region.shared {
+            release_mmap_file_ref(region.content_id);
+        }
     }
 
     Ok(0)
@@ -610,7 +753,11 @@ pub fn cleanup_mmap_file_regions_for_exit(pid: Pid) {
     let phys_offset = memory::phys_mem_offset();
     for region in &regions {
         writeback_region(region, phys_offset);
-        release_mmap_file_ref(region.content_id);
+        // See do_munmap's own identical guard -- a private region was never counted in
+        // MMAP_FILE_REFCOUNT to begin with.
+        if region.shared {
+            release_mmap_file_ref(region.content_id);
+        }
     }
 }
 

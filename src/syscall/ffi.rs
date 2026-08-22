@@ -1896,21 +1896,34 @@ pub(crate) extern "C" fn oxidebsd_sys_execve(
 }
 
 /// `packed` carries real `fd`/`off` — the one spare ABI register `SYS_MMAP` has room for (this
-/// call already spends `addr_hint`/`len`/`prot` on its first three registers), packed by
+/// call already spends `addr_hint`/`len`/a packed `prot` on its first three registers), packed by
 /// `third_party/musl/src/mman/mmap.c`'s own patched `__mmap()` since real `mmap(2)`'s 6-arg shape
 /// can't fit this ABI's 4-register width otherwise. Low 32 bits: real `fd` (`-1`, i.e.
 /// `0xffff_ffff`, for an anonymous mapping — musl's own convention, not invented here). High 32
 /// bits: real `off` (always `0` for every real caller in this kernel's own call graph — see
 /// `process::mm::do_mmap_file_backed`'s own doc comment for why a nonzero value is an honest
-/// `EINVAL` rather than silently supported).
-pub(crate) extern "C" fn oxidebsd_sys_mmap(addr_hint: u64, len: u64, prot: u64, packed: u64) -> i64 {
+/// `EINVAL` rather than silently supported). The third register (`packed_prot`) additionally
+/// carries real `flags` in its own unused high bits — see `process::mm::do_mmap`'s own doc comment
+/// for why `flags` needed a real wire path (`MAP_FIXED`/`MAP_SHARED`/`MAP_PRIVATE`/`MAP_ANON`
+/// validation, not just the old `fd == -1` guess) and `mmap.c`'s own patch comment for how it's
+/// packed: low 8 bits real `prot` (only ever 3 meaningful bits — `PROT_READ`/`WRITE`/`EXEC`), the
+/// rest real `flags` shifted left by 8.
+pub(crate) extern "C" fn oxidebsd_sys_mmap(
+    addr_hint: u64,
+    len: u64,
+    packed_prot: u64,
+    packed: u64,
+) -> i64 {
     let fd = (packed as u32) as i32;
     let off = (packed >> 32) as u32;
+    let prot = packed_prot & 0xff;
+    let flags = packed_prot >> 8;
     result_to_ffi(crate::process::do_mmap(
         crate::process::scheduler::current_pid(),
         addr_hint,
         len,
         prot,
+        flags,
         fd,
         off,
     ))
