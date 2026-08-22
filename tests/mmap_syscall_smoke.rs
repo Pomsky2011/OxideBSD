@@ -1,10 +1,14 @@
-//! Boots the full kernel, loads `native_abi` (fork/wait4/exit/open/close/write/mmap/munmap's own
-//! syscall registration path), `signal` (`SYS_SIGACTION`/`SYS_SIGRETURN`, plus the real
-//! ring-3-page-fault-to-signal delivery this test's own parts 2-4 exercise), and `oxfs`
-//! (`SYS_OPEN`/`SYS_CLOSE`/`SYS_UNLINK`/`SYS_FTRUNCATE`, real `/tmp`), then spawns
+//! Boots the full kernel, loads `native_abi` (fork/wait4/exit/open/close/write/mmap/munmap/msync's
+//! own syscall registration path), `posix_compat` (`SYS_MLOCKALL`/`SYS_PRLIMIT64`, part 10's
+//! `mlockall(MCL_FUTURE)`/`RLIMIT_MEMLOCK` scenario), `clock` (`SYS_NANOSLEEP`, part 11's real
+//! mtime/ctime scenario), `signal` (`SYS_SIGACTION`/`SYS_SIGRETURN`, plus the real
+//! ring-3-page-fault-to-signal delivery parts 2-4 exercise), and `oxfs`
+//! (`SYS_OPEN`/`SYS_CLOSE`/`SYS_UNLINK`/`SYS_FTRUNCATE`/`SYS_FSTAT`, real `/tmp`), then spawns
 //! `userland/mmap-syscall-smoke/` as pid 1 -- see that crate's own module doc comment for the full
-//! four-part scenario (the `mmap/12-1.c` unlink-before-first-commit fix, plus three real
-//! fault-to-signal-delivery scenarios closing `mmap/11-2.c`/`11-3.c`).
+//! scenario list (the `mmap/12-1.c` unlink-before-first-commit fix, three real
+//! fault-to-signal-delivery scenarios closing `mmap/11-2.c`/`11-3.c`, and the real `MAP_FIXED`/
+//! `MAP_PRIVATE`/`EBADF`/`EINVAL`/`mlockall`/mtime-ctime scenarios closing `mmap/3-1.c`, `9-1.c`,
+//! `14-1.c`, `18-1.c`, `19-1.c`, `21-1.c`, `munmap/3-1.c`, `munmap/4-1.c`).
 //!
 //! Same `SYS_TEST_EXIT` convention `tests/fork_wait.rs` established: `scheduler::start`/
 //! `process::do_exit` never return control to this file's own `main`, so the child reports
@@ -57,6 +61,34 @@ fn main(boot_info: &'static BootInfo) -> ! {
         &mut frame_allocator,
     )
     .unwrap_or_else(|e| panic!("failed to load the native_abi module: {e:?}"));
+
+    // Populates SYS_MLOCKALL/SYS_PRLIMIT64 -- part 10's real mlockall(MCL_FUTURE)/RLIMIT_MEMLOCK
+    // scenario.
+    const POSIX_COMPAT_MOD: &[u8] = include_bytes!(env!("POSIX_COMPAT_MOD_PATH"));
+    const POSIX_COMPAT_PANIC_SYMBOL: &str = env!("POSIX_COMPAT_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "posix_compat",
+        POSIX_COMPAT_MOD,
+        POSIX_COMPAT_PANIC_SYMBOL,
+        false,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
+
+    // Populates SYS_NANOSLEEP -- part 11's own real mtime/ctime scenario needs a real elapsed
+    // second between the two fstat() calls.
+    const CLOCK_MOD: &[u8] = include_bytes!(env!("CLOCK_MOD_PATH"));
+    const CLOCK_MOD_PANIC_SYMBOL: &str = env!("CLOCK_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "clock",
+        CLOCK_MOD,
+        CLOCK_MOD_PANIC_SYMBOL,
+        false,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the clock module: {e:?}"));
 
     // Populates SYS_SIGACTION/SYS_SIGRETURN -- part 2's own real handler-invocation scenario.
     const SIGNAL_MOD: &[u8] = include_bytes!(env!("SIGNAL_MOD_PATH"));

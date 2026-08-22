@@ -118,6 +118,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
             gid: 0,
             brk: VirtAddr::new(elf.highest_loaded_address()),
             mmap_file_regions: Vec::new(),
+            mlockall_future: false,
+            locked_bytes: 0,
         })),
         fs_base: 0,
         clear_child_tid: 0,
@@ -281,6 +283,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
                 gid: parent_shared.gid,
                 brk: parent_shared.brk,
                 mmap_file_regions: Vec::new(),
+                // Not inherited -- see ThreadGroupShared::mlockall_future's own doc comment (real
+                // POSIX mlockall()/fork() semantics).
+                mlockall_future: false,
+                locked_bytes: 0,
             }))
         };
         (
@@ -939,7 +945,14 @@ pub fn do_execve(
         // running and jumps immediately via redirect_frame below), kept in sync anyway since it's
         // the honest answer to "where does this process's AddressSpace currently expect to run".
         me.entry_point = jump_entry;
-        me.shared.lock().brk = VirtAddr::new(elf.highest_loaded_address());
+        {
+            let mut shared = me.shared.lock();
+            shared.brk = VirtAddr::new(elf.highest_loaded_address());
+            // Real POSIX: memory locks (including a prior mlockall(MCL_FUTURE)) are automatically
+            // removed on execve(2) -- see ThreadGroupShared::mlockall_future's own doc comment.
+            shared.mlockall_future = false;
+            shared.locked_bytes = 0;
+        }
         // effective_path is whichever path actually got loaded as the real ELF above -- the
         // caller's own original path_bytes when there was no `#!` to follow, or the final
         // interpreter in a shebang chain otherwise. Matches real Linux: `/proc/[pid]/comm` names

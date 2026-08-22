@@ -58,6 +58,11 @@ const SYS_SIGACTION: u64 = 117;
 /// rather than going through a shared macro.
 const SYS_SIGRETURN: u64 = 119;
 const SYS_FTRUNCATE: u64 = 473;
+const SYS_PRLIMIT64: u64 = 478;
+const SYS_MLOCKALL: u64 = 511;
+const SYS_FSTAT: u64 = 126;
+const SYS_MSYNC: u64 = 26;
+const SYS_NANOSLEEP: u64 = 139;
 /// Not a real syscall number anything else in this codebase registers -- `tests/
 /// mmap_syscall_smoke.rs` registers this one directly against a test-only handler, same convention
 /// every other real-`SYSCALL` smoke test in this codebase uses.
@@ -83,6 +88,7 @@ const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const EBADF: u64 = 9;
 const EINVAL: u64 = 22;
+const EAGAIN: u64 = 11;
 
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
@@ -148,6 +154,47 @@ struct RawSigAction {
     mask: u64,
 }
 
+/// Matches `src/process/limits.rs`'s own `RawRlimit` wire format exactly (`(rlim_cur, rlim_max)`).
+#[repr(C)]
+struct RawRlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+/// Matches `modules/oxfs`'s own `MuslStat` wire format exactly (`third_party/musl`'s real x86_64
+/// `struct stat`) -- only the fields part 11 actually reads are commented, the rest exist purely to
+/// keep every later field at the right byte offset.
+#[repr(C)]
+struct RawStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime_sec: i64,
+    st_atime_nsec: i64,
+    st_mtime_sec: i64,
+    st_mtime_nsec: i64,
+    st_ctime_sec: i64,
+    st_ctime_nsec: i64,
+    __unused: [i64; 3],
+}
+
+const _: () = assert!(core::mem::size_of::<RawStat>() == 144);
+
+/// Matches `src/process/timers.rs`'s own `RawTimespec`/real `struct timespec` wire format exactly.
+#[repr(C)]
+struct RawTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 /// This crate's own minimal `__restore_rt` equivalent -- installed as `sigaction`'s own
 /// `restorer` field (a real, valid function pointer sigaction itself doesn't reject), even though
 /// part 2's own handler never actually reaches it (see this file's own module doc comment).
@@ -184,6 +231,24 @@ fn mmap_call(addr_hint: u64, fd: u64, len: u64, flags: u64) -> Result<u64, u64> 
 
 fn mmap_shared(fd: u64, len: u64) -> Result<u64, u64> {
     mmap_call(0, fd, len, MAP_SHARED)
+}
+
+fn fstat(fd: u64) -> Result<RawStat, u64> {
+    // SAFETY: RawStat is a plain-integer #[repr(C)] struct -- an all-zero bit pattern is valid for
+    // every field, and oxfs_fstat immediately overwrites the whole thing via write_unaligned.
+    let mut stat: RawStat = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+    unsafe { syscall(SYS_FSTAT, fd, &mut stat as *mut RawStat as u64, 0) }?;
+    Ok(stat)
+}
+
+fn sleep_1s() {
+    let ts = RawTimespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    unsafe {
+        let _ = syscall(SYS_NANOSLEEP, &ts as *const RawTimespec as u64, 0, 0);
+    }
 }
 
 fn wait4(pid: u64) -> Result<(u64, i32), u64> {
@@ -548,6 +613,82 @@ pub extern "C" fn _start() -> ! {
         "part 9: second munmap failed"
     );
     write_bytes(b"mmap-syscall-smoke: part 9 (MAP_PRIVATE discard) OK\n");
+
+    // --- Part 10: real mlockall(MCL_FUTURE) + RLIMIT_MEMLOCK enforcement (`mmap/18-1.c`) -- a
+    // mapping larger than the process's own remaining locked-byte budget must fail EAGAIN rather
+    // than silently mapping (and silently *not* actually locking).
+    const MCL_FUTURE: u64 = 2;
+    const RLIMIT_MEMLOCK: u64 = 8;
+    check!(
+        unsafe { syscall(SYS_MLOCKALL, MCL_FUTURE, 0, 0) }.is_ok(),
+        "part 10: mlockall(MCL_FUTURE) failed"
+    );
+    let rlim = RawRlimit {
+        rlim_cur: 512 * 1024,
+        rlim_max: u64::MAX,
+    };
+    check!(
+        unsafe {
+            syscall4(
+                SYS_PRLIMIT64,
+                0,
+                RLIMIT_MEMLOCK,
+                &rlim as *const RawRlimit as u64,
+                0,
+            )
+        }
+        .is_ok(),
+        "part 10: setrlimit(RLIMIT_MEMLOCK) failed"
+    );
+    let path_lock = b"/tmp/mmap-smoke-lock\0";
+    let fd_lock = open_create(path_lock).expect("part 10: open failed");
+    check!(
+        unsafe { syscall(SYS_FTRUNCATE, fd_lock, 1024, 0) }.is_ok(),
+        "part 10: ftruncate failed"
+    );
+    check!(
+        mmap_call(0, fd_lock, 1024 * 1024, MAP_SHARED) == Err(EAGAIN),
+        "part 10: expected EAGAIN mapping past RLIMIT_MEMLOCK under mlockall(MCL_FUTURE)"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 10 (mlockall(MCL_FUTURE) EAGAIN) OK\n");
+
+    // --- Part 11: real st_mtime/st_ctime updates through a write via mmap + msync (`mmap/14-1.c`)
+    // -- previously always-0 placeholders (no clock/RTC source existed when oxfs's stat path was
+    // first written).
+    let path_time = b"/tmp/mmap-smoke-time\0";
+    let fd_time = open_create(path_time).expect("part 11: open failed");
+    let content = [b'a'; 64];
+    unsafe {
+        syscall(SYS_WRITE, fd_time, content.as_ptr() as u64, content.len() as u64)
+            .expect("part 11: write failed");
+    }
+    let stat1 = fstat(fd_time).expect("part 11: fstat 1 failed");
+    // Whole-second RTC precision -- without a real elapsed second, mtime2 could legitimately equal
+    // mtime1 even with the fix correctly in place.
+    sleep_1s();
+    let pa5 = mmap_shared(fd_time, 64).expect("part 11: mmap failed");
+    unsafe {
+        core::ptr::write_volatile(pa5 as *mut u8, b'b');
+    }
+    const MS_SYNC: u64 = 4;
+    check!(
+        unsafe { syscall(SYS_MSYNC, pa5, 64, MS_SYNC) }.is_ok(),
+        "part 11: msync failed"
+    );
+    let stat2 = fstat(fd_time).expect("part 11: fstat 2 failed");
+    check!(
+        stat2.st_mtime_sec != stat1.st_mtime_sec,
+        "part 11: st_mtime was not updated after a write through mmap"
+    );
+    check!(
+        stat2.st_ctime_sec != stat1.st_ctime_sec,
+        "part 11: st_ctime was not updated after a write through mmap"
+    );
+    check!(
+        unsafe { syscall(SYS_MUNMAP, pa5, 64, 0) }.is_ok(),
+        "part 11: munmap failed"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 11 (real mtime/ctime via mmap) OK\n");
 
     write_bytes(b"mmap-syscall-smoke: all parts passed\n");
     test_exit(true);

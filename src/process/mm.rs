@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
-use crate::syscall::{EBADF, EINVAL, ENODEV, ENOMEM};
+use crate::syscall::{EAGAIN, EBADF, EINVAL, ENODEV, ENOMEM};
 use super::*;
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
@@ -47,6 +47,14 @@ const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANON: u64 = 0x20;
+
+/// Real Linux's own `RLIMIT_MEMLOCK` index into `Process::rlimits` -- `8` on every arch this
+/// kernel's own `x86_64` target shares numbering with (see `third_party/musl/include/sys/
+/// resource.h`). The one `RLIMIT_*` resource `do_mmap` actually enforces, and only for the one
+/// real trigger POSIX documents for it (`mlockall(MCL_FUTURE)`'s own auto-lock-on-map contract,
+/// see the `auto_lock` handling below) -- every other `RLIMIT_*` stays the same honest
+/// stored-but-unenforced tier `Process::rlimits`'s own doc comment already establishes.
+const RLIMIT_MEMLOCK: u64 = 8;
 
 /// Real, cross-open shared physical-frame cache for fd-backed `MAP_SHARED` mappings — keyed by
 /// `crate::fs::fd::content_id_of`'s real inode identity, not by `real_fd`/pid. **This is what
@@ -196,8 +204,31 @@ pub fn do_mmap(
         None
     };
 
-    if effective_fd >= 0 {
-        return do_mmap_file_backed(
+    // Real `mlockall(MCL_FUTURE)` + `RLIMIT_MEMLOCK` enforcement (`mmap/18-1.c`): decided up front,
+    // before actually establishing the mapping -- a process that called `mlockall(MCL_FUTURE)`
+    // implicitly locks every future mapping, and if that would push its own total locked bytes
+    // past `RLIMIT_MEMLOCK`, real POSIX has the whole `mmap()` fail `EAGAIN` rather than partially
+    // mapping. `mlockall_future`/`locked_bytes` live on `ThreadGroupShared`, not `Process`, since
+    // real memory locks are a property of the address space, not the individual thread -- see
+    // that struct's own doc comment; a `CLONE_THREAD` sibling shares this state automatically via
+    // the same `Arc` `mmap_file_regions` already does.
+    let auto_lock = {
+        let table = PROCESS_TABLE.lock();
+        let me = table
+            .get(&caller_pid)
+            .expect("mmap: current process missing from table");
+        let shared = me.shared.lock();
+        if shared.mlockall_future {
+            let (rlim_cur, _) = me.rlimits[RLIMIT_MEMLOCK as usize];
+            if shared.locked_bytes.saturating_add(region_len) > rlim_cur {
+                return Err(EAGAIN);
+            }
+        }
+        shared.mlockall_future
+    };
+
+    let result = if effective_fd >= 0 {
+        do_mmap_file_backed(
             caller_pid,
             effective_fd as u64,
             off,
@@ -205,9 +236,27 @@ pub fn do_mmap(
             prot,
             private,
             fixed_base,
-        );
+        )
+    } else {
+        do_mmap_anon(caller_pid, fixed_base, region_len)
+    };
+
+    if auto_lock && result.is_ok() {
+        let table = PROCESS_TABLE.lock();
+        if let Some(me) = table.get(&caller_pid) {
+            me.shared.lock().locked_bytes += region_len;
+        }
     }
 
+    result
+}
+
+/// The anonymous-mapping half of `do_mmap` (`fd < 0`, i.e. `MAP_ANON`) -- split out so `do_mmap`
+/// itself can apply the real `mlockall(MCL_FUTURE)` accounting uniformly across both this and
+/// `do_mmap_file_backed` without duplicating it in each. `fixed_base`, when set, is a real
+/// `MAP_FIXED` address (already alignment/canonical-validated, and already had `do_mmap`'s own
+/// `do_munmap` pre-clear run against it); otherwise a fresh VA is bump-allocated as before.
+fn do_mmap_anon(caller_pid: Pid, fixed_base: Option<u64>, region_len: u64) -> Result<u64, u64> {
     let base = match fixed_base {
         Some(base) => base,
         None => {
@@ -830,20 +879,38 @@ pub fn do_munlock(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
 /// `SYS_MLOCKALL`/`SYS_MUNLOCKALL`'s real logic — real Linux values `511`/`512`, moved off `151`/
 /// `152` for the same `SYS_FCNTL`/`SYS_SHUTDOWN` collision reasons `do_mlock` documents. `mlockall`
 /// validates `flags` is a real, nonzero combination of `MCL_CURRENT`/`MCL_FUTURE`/`MCL_ONFAULT`
-/// (real Linux `EINVAL` otherwise — at least one of `MCL_CURRENT`/`MCL_FUTURE` is required) before
-/// the same unenforced no-op success `do_mlock` above documents. `munlockall` takes no arguments and
-/// always succeeds.
-pub fn do_mlockall(flags: u64) -> Result<u64, u64> {
+/// (real Linux `EINVAL` otherwise — at least one of `MCL_CURRENT`/`MCL_FUTURE` is required); beyond
+/// that, `MCL_CURRENT`/`MCL_ONFAULT` stay the same unenforced no-op tier `do_mlock` above documents
+/// (no already-mapped-page locking or fault-time locking exists to make real). `MCL_FUTURE` is real
+/// now, though: it flips `ThreadGroupShared::mlockall_future`, which `do_mmap` consults on every
+/// later mapping — see that field's own doc comment. `munlockall` clears both `mlockall_future` and
+/// the accumulated `locked_bytes` (real POSIX: `munlockall()` unlocks everything and cancels a
+/// prior `MCL_FUTURE`) and otherwise always succeeds.
+pub fn do_mlockall(caller_pid: Pid, flags: u64) -> Result<u64, u64> {
     const MCL_CURRENT: u64 = 1;
     const MCL_FUTURE: u64 = 2;
     const MCL_ONFAULT: u64 = 4;
     if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
         return Err(EINVAL);
     }
+    if flags & MCL_FUTURE != 0 {
+        let table = PROCESS_TABLE.lock();
+        let me = table
+            .get(&caller_pid)
+            .expect("mlockall: current process missing from table");
+        me.shared.lock().mlockall_future = true;
+    }
     Ok(0)
 }
 
-pub fn do_munlockall() -> Result<u64, u64> {
+pub fn do_munlockall(caller_pid: Pid) -> Result<u64, u64> {
+    let table = PROCESS_TABLE.lock();
+    let me = table
+        .get(&caller_pid)
+        .expect("munlockall: current process missing from table");
+    let mut shared = me.shared.lock();
+    shared.mlockall_future = false;
+    shared.locked_bytes = 0;
     Ok(0)
 }
 

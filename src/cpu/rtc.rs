@@ -93,6 +93,15 @@ pub fn unix_epoch_seconds() -> i64 {
     days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64
 }
 
+/// Exposed to `modules/oxfs` (see `src/module.rs`'s `resolve_external_symbol`) for real
+/// `st_mtime`/`st_ctime` tracking (`write_inode_data`/`resize_inode_data`) -- a relocated module
+/// can't call kernel functions directly, only through this hand-curated symbol table, the same
+/// shape `oxidebsd_current_uid`/`_gid` already established for identity. Whole-second precision,
+/// same tier `crate::fs::sysv_msg`'s own real `stime`/`rtime`/`ctime` already uses.
+pub(crate) extern "C" fn oxidebsd_unix_time() -> i64 {
+    unix_epoch_seconds()
+}
+
 /// Real, calibrated mapping between `interrupts::ticks()` and this chip's own wall-clock reading --
 /// see `unix_epoch_now_precise`'s own doc comment for why a single calibration point beats reading
 /// the RTC fresh on every call once real sub-second precision is needed. `spin::Mutex<Option<i64>>`,

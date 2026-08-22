@@ -117,6 +117,10 @@ unsafe extern "C" {
     fn oxidebsd_random_bytes(ptr: u64, len: u64) -> i64;
     fn oxidebsd_current_uid() -> u64;
     fn oxidebsd_current_gid() -> u64;
+    /// Real Unix epoch seconds, whole-second precision -- see `src/cpu/rtc.rs`'s own doc comment
+    /// on `oxidebsd_unix_time`. Backs real `st_mtime`/`st_ctime` (`write_inode_data`/
+    /// `resize_inode_data`).
+    fn oxidebsd_unix_time() -> i64;
     /// `1`/`0` -- whether `src/ata.rs`'s fixed data-disk channel/drive responded to `IDENTIFY` at
     /// boot. `false` (`0`) means every mutation stays purely in-memory this boot, same as before
     /// this pass existed at all -- see `module_init`'s own doc comment.
@@ -567,6 +571,22 @@ struct Inode {
     /// `true` for a character device, `false` for a block device -- only meaningful for
     /// `InodeKind::Device`.
     device_char: bool,
+    /// Real, whole-second Unix epoch `st_mtime`/`st_ctime` (`oxidebsd_unix_time`, see that
+    /// import's own doc comment) -- previously both hardcoded `0` in `write_stat` (no clock/RTC
+    /// source existed at the time). `write_inode_data`/`resize_inode_data` are this filesystem's
+    /// only two real content-mutation choke points (every write -- a plain `write()`'s deferred
+    /// commit, `fsync`/`close`, and a real fd-backed `MAP_SHARED` mapping's own `msync`/`munmap`/
+    /// exit writeback via `oxfs_inode_content_write` -- ultimately goes through one of them), so
+    /// bumping both there covers every real write path uniformly, mmap included (`mmap/14-1.c` in
+    /// the POSIX conformance pilot). Real POSIX ties `st_mtime`/`st_ctime` to slightly different
+    /// events (`st_ctime` also updates on a pure metadata change like `chmod`/`chown`, with no
+    /// content write at all) -- not implemented here, a separate, narrower gap than what this field
+    /// closes: nothing in this port's roster checks `st_ctime` after a metadata-only change. Real
+    /// `st_atime` (content *read*) stays the honest `0` placeholder it always was -- no test or
+    /// real caller in this port needs it, and every `content_read` call becoming a write-through
+    /// touch would be real, if narrow, overhead for zero known benefit.
+    mtime: i64,
+    ctime: i64,
 }
 
 impl Inode {
@@ -581,9 +601,12 @@ impl Inode {
         nlink: 0,
         rdev: 0,
         device_char: false,
+        mtime: 0,
+        ctime: 0,
     };
 
     fn new(kind: InodeKind) -> Inode {
+        let now = unsafe { oxidebsd_unix_time() };
         Inode {
             kind,
             size: 0,
@@ -595,6 +618,8 @@ impl Inode {
             nlink: 1,
             rdev: 0,
             device_char: false,
+            mtime: now,
+            ctime: now,
         }
     }
 }
@@ -865,6 +890,9 @@ fn write_inode_data(inode_num: u32, content: &[u8]) -> bool {
     }
     let mut inode = read_inode(inode_num);
     inode.size = content.len() as u32;
+    let now = unsafe { oxidebsd_unix_time() };
+    inode.mtime = now;
+    inode.ctime = now;
     write_inode(inode_num, inode);
     true
 }
@@ -900,6 +928,9 @@ fn resize_inode_data(inode_num: u32, new_size: usize) -> bool {
     }
     let mut inode = read_inode(inode_num);
     inode.size = new_size as u32;
+    let now = unsafe { oxidebsd_unix_time() };
+    inode.mtime = now;
+    inode.ctime = now;
     write_inode(inode_num, inode);
     true
 }
@@ -992,11 +1023,12 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
         st_size: size,
         st_blksize: BLOCK_SIZE as i64,
         st_blocks: (size + 511) / 512,
+        // Real atime doesn't exist -- see Inode::mtime's own doc comment for why.
         st_atime_sec: 0,
         st_atime_nsec: 0,
-        st_mtime_sec: 0,
+        st_mtime_sec: inode.mtime,
         st_mtime_nsec: 0,
-        st_ctime_sec: 0,
+        st_ctime_sec: inode.ctime,
         st_ctime_nsec: 0,
         __unused: [0; 3],
     };
@@ -4519,7 +4551,11 @@ fn pack_inode(inode: &Inode, out: &mut [u8]) {
     out[rdev_off..rdev_off + 4].copy_from_slice(&inode.rdev.to_le_bytes());
     let device_char_off = rdev_off + 4;
     out[device_char_off] = inode.device_char as u8;
-    for b in &mut out[device_char_off + 1..] {
+    let mtime_off = device_char_off + 1;
+    out[mtime_off..mtime_off + 8].copy_from_slice(&inode.mtime.to_le_bytes());
+    let ctime_off = mtime_off + 8;
+    out[ctime_off..ctime_off + 8].copy_from_slice(&inode.ctime.to_le_bytes());
+    for b in &mut out[ctime_off + 8..] {
         *b = 0;
     }
 }
@@ -4573,6 +4609,10 @@ fn unpack_inode(data: &[u8]) -> Inode {
     ]);
     let device_char_off = rdev_off + 4;
     let device_char = data[device_char_off] != 0;
+    let mtime_off = device_char_off + 1;
+    let mtime = i64::from_le_bytes(data[mtime_off..mtime_off + 8].try_into().unwrap());
+    let ctime_off = mtime_off + 8;
+    let ctime = i64::from_le_bytes(data[ctime_off..ctime_off + 8].try_into().unwrap());
     Inode {
         kind,
         size,
@@ -4584,6 +4624,8 @@ fn unpack_inode(data: &[u8]) -> Inode {
         nlink,
         rdev,
         device_char,
+        mtime,
+        ctime,
     }
 }
 

@@ -1974,11 +1974,16 @@ pub(crate) extern "C" fn oxidebsd_sys_munlock(addr: u64, len: u64) -> i64 {
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_mlockall(flags: u64) -> i64 {
-    result_to_ffi(crate::process::do_mlockall(flags))
+    result_to_ffi(crate::process::do_mlockall(
+        crate::process::scheduler::current_pid(),
+        flags,
+    ))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_munlockall() -> i64 {
-    result_to_ffi(crate::process::do_munlockall())
+    result_to_ffi(crate::process::do_munlockall(
+        crate::process::scheduler::current_pid(),
+    ))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_getpid() -> i64 {

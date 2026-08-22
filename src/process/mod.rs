@@ -646,6 +646,25 @@ pub struct ThreadGroupShared {
     pub gid: u32,
     pub brk: VirtAddr,
     pub mmap_file_regions: Vec<mm::MmapFileRegion>,
+    /// Real `mlockall(MCL_FUTURE)` state (`process::mm::do_mlockall`/`do_mmap`) — `true` once this
+    /// address space has called `mlockall(MCL_FUTURE)`, making every later `mmap()` implicitly
+    /// locked (subject to `RLIMIT_MEMLOCK`, see `process::mm::do_mmap`'s own `auto_lock` handling).
+    /// Lives here, not on `Process`, because real memory locks are a property of the address
+    /// space, not the individual thread — a `CLONE_THREAD` sibling shares this state automatically
+    /// via the same `Arc` `mmap_file_regions` already does. **Not inherited by `fork`** (a forked
+    /// child gets its own fresh `ThreadGroupShared`, real POSIX: `mlockall()`'s `MCL_FUTURE`
+    /// setting is not inherited across `fork(2)`); **cleared by `execve`** (`do_execve` resets it
+    /// explicitly, real POSIX: memory locks are automatically removed on `execve(2)`).
+    pub mlockall_future: bool,
+    /// Real running total of bytes this address space has locked via the `mlockall_future`
+    /// auto-lock path above — what `RLIMIT_MEMLOCK` is actually checked against. **Deliberately
+    /// scoped to just that one trigger**: an explicit `mlock`/`munlock` call doesn't add to or
+    /// subtract from this counter (`process::mm::do_mlock`'s own doc comment already documents
+    /// that real per-page locked-state tracking doesn't exist here) — no real caller in this
+    /// kernel's own call graph needs `RLIMIT_MEMLOCK` enforced against an explicit `mlock()`, only
+    /// against `mlockall(MCL_FUTURE)`'s own implicit one. Same fork/execve treatment as
+    /// `mlockall_future` above.
+    pub locked_bytes: u64,
 }
 
 pub struct Process {
