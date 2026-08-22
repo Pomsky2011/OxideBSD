@@ -84,7 +84,9 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
         (timeout_ms >= 0).then(|| crate::cpu::tsc::now() + crate::cpu::tsc::ms_to_cycles(timeout_ms as u64));
 
     loop {
-        poll(); // drain the NIC / run the protocol stack once per pass, same as recvfrom's self-poll
+        if nfds > 0 {
+            poll(); // drain the NIC / run the protocol stack once per pass, same as recvfrom's self-poll
+        }
         let mut ready_count: i64 = 0;
         for entry in entries.iter_mut() {
             entry.revents = 0;
@@ -118,6 +120,20 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
         // advance a tick-based deadline's own check either, no NMI under normal operation). See
         // `ipv4::resolve_with_retry`'s own doc comment for the fuller explanation and the same
         // fix, applied there for the identical reason.
-        core::hint::spin_loop();
+        //
+        // **`nfds == 0` (no fd involved, "poll used as a portable sleep" idiom) is a real, separate
+        // livelock risk if given `timeout_ms == -1` (block forever)**: nothing here checks
+        // `pending_signals` at all, so on this single-core kernel a caller in exactly that shape
+        // would spin forever with no possible escape -- starving every *other* process too,
+        // including whichever one might otherwise deliver a signal, since a bare CPU hint never
+        // actually yields. No pilot caller currently reaches this exact shape, but `n > 0`'s real
+        // fd-readiness case must keep spinning (yielding here would stop this process from ever
+        // pumping the NIC again for a connection nothing else services -- see this function's own
+        // doc comment).
+        if nfds == 0 {
+            crate::process::scheduler::schedule();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
