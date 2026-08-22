@@ -155,6 +155,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
             proc.stop_notify_pending = false; // see Process::stop_notify_pending's own doc comment
             proc.pending_signals &= !((1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)));
             scheduler::enqueue_ready(target);
+            notify_parent_sigchld(&mut table, target, CLD_CONTINUED, SIGCONT);
         }
         let proc = table.get(&target).unwrap();
         match proc.sigactions[sig as usize].handler {
@@ -186,6 +187,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
                 proc.stop_notify_pending = true;
                 proc.pending_signals &= !(1 << (SIGCONT - 1));
                 wake_parent_if_waiting(&mut table, target);
+                notify_parent_sigchld(&mut table, target, CLD_STOPPED, sig);
             }
         }
         Action::SetPending => {
@@ -244,6 +246,7 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                     proc.stop_notify_pending = false; // see Process::stop_notify_pending's own doc comment
                     proc.pending_signals &= !((1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)));
                     scheduler::enqueue_ready(pid);
+                    notify_parent_sigchld(&mut table, pid, CLD_CONTINUED, SIGCONT);
                 }
             }
         }
@@ -281,6 +284,7 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                     proc.stop_notify_pending = true;
                     proc.pending_signals &= !(1 << (SIGCONT - 1));
                     wake_parent_if_waiting(&mut table, pid);
+                    notify_parent_sigchld(&mut table, pid, CLD_STOPPED, sig);
                 }
             }
             Action::SetPending => {
@@ -431,6 +435,58 @@ pub(crate) fn wake_if_futex_waiting(pid: Pid, proc: &mut Process, sig: u64) {
         proc.state = ProcState::Ready;
         scheduler::enqueue_ready(pid);
     }
+}
+
+/// Real POSIX `SIGCHLD` generation on a child's exit/stop/continue -- this kernel used to never
+/// deliver a real `SIGCHLD` to a parent at all (see `lifecycle.rs`'s own `CONFIG_HUSH_FAST`
+/// comment, previously the only place this gap was flagged). Found live: `sigaction/10-1.c`
+/// installs a real `SA_SIGINFO` `SIGCHLD` handler and spins (a tight, `select()`-`ENOSYS`'d
+/// busy-loop, not `wait4`) waiting for `si_code == CLD_STOPPED` before ever sending the matching
+/// `SIGCONT` -- with no real signal ever delivered, the child stayed `Stopped` forever and became a
+/// permanent, unreapable orphan once `t0`'s own alarm killed the parent, wedging the rest of the
+/// pilot run.
+///
+/// Called from every real child-state-transition point this kernel already tracks via
+/// `wake_parent_if_waiting`'s own wait4-wake duty (`terminate_process`/`do_stop_self` in
+/// `lifecycle.rs`, and the `Action::Stop`/`SIGCONT`-resume pre-dispatch steps in `do_kill`/
+/// `signal_foreground_group`/`do_sigqueue` above) -- real POSIX generates `SIGCHLD` at exactly
+/// those same three transitions (exit, stop, continue), so this always fires alongside (never
+/// instead of) the existing wait4 wake.
+///
+/// `code`/`status` follow real `CLD_*`/`si_status` conventions: `CLD_EXITED` (`status` = the exit
+/// code), `CLD_KILLED` (`status` = the terminating signal number), `CLD_STOPPED`/`CLD_CONTINUED`
+/// (`status` = the stopping/continuing signal number). Reuses `QueuedSigInfo::value`'s low 32 bits
+/// as `si_status` -- real musl's own `siginfo_t` unions `si_status` at the exact same offset as
+/// `si_value` (`third_party/musl/include/signal.h`'s `__sigchld`/`si_value` union), so no new
+/// `RawSiginfo` field was needed.
+///
+/// Unconditional -- `SA_NOCLDSTOP`/`SA_NOCLDWAIT` aren't tracked by `Process::sigactions` and no
+/// live caller needs the suppression. Harmless for a parent that never installed a real handler:
+/// `SIGCHLD`'s own default disposition already stays `Ignore` (see `default_disposition`), so
+/// nothing observable happens beyond the same harmless `wait4`/`pause`/etc. wake this function's
+/// own `wake_if_*` calls already produce for every other signal.
+pub(crate) fn notify_parent_sigchld(
+    table: &mut BTreeMap<Pid, Box<Process>>,
+    child_pid: Pid,
+    code: i32,
+    status: u64,
+) {
+    let Some(parent_pid) = table.get(&child_pid).and_then(|p| p.parent) else {
+        return;
+    };
+    let child_uid = table
+        .get(&child_pid)
+        .map(|p| p.shared.lock().uid)
+        .unwrap_or(0);
+    let Some(parent) = table.get_mut(&parent_pid) else {
+        return;
+    };
+    let _ = record_pending(parent, SIGCHLD, code, child_pid, child_uid, status);
+    wake_if_paused(parent_pid, parent, SIGCHLD);
+    wake_if_sigwaiting(parent_pid, parent, SIGCHLD);
+    wake_if_sleeping(parent_pid, parent, SIGCHLD);
+    wake_if_mq_waiting(parent_pid, parent, SIGCHLD);
+    wake_if_futex_waiting(parent_pid, parent, SIGCHLD);
 }
 
 /// `SYS_PAUSE`'s real logic (`529`, item 4 of `docs/MISSING_POSIX_SYSCALLS.md`'s own 28-syscall
@@ -1023,6 +1079,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
             proc.stop_notify_pending = false;
             proc.pending_signals &= !((1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)));
             scheduler::enqueue_ready(target);
+            notify_parent_sigchld(&mut table, target, CLD_CONTINUED, SIGCONT);
         }
         let proc = table.get(&target).unwrap();
         match proc.sigactions[sig as usize].handler {
@@ -1049,6 +1106,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
                 proc.stop_notify_pending = true;
                 proc.pending_signals &= !(1 << (SIGCONT - 1));
                 wake_parent_if_waiting(&mut table, target);
+                notify_parent_sigchld(&mut table, target, CLD_STOPPED, sig);
             }
         }
         Action::SetPending => {

@@ -1023,11 +1023,15 @@ enum Reported {
 /// child matching `target_pid` at all, `ECHILD`. If nothing reportable exists yet and `options`
 /// includes real `WNOHANG`, returns `0` immediately rather than blocking -- load-bearing, not just
 /// a nice-to-have: `hush`'s own `checkjobs()` (background job-status polling, run throughout its
-/// interactive main loop) always passes `WUNTRACED | WNOHANG`, and this kernel never delivers a
-/// real `SIGCHLD` to a parent at all (nothing `do_kill`'s it anywhere), so `hush`'s own
-/// `CONFIG_HUSH_FAST` short-circuit (skip the real syscall unless a `SIGCHLD` counter changed) is
-/// silently permanently active for that call today -- without a real `WNOHANG`, any call that ever
-/// did reach the real syscall with a still-running child would block the entire interactive shell.
+/// interactive main loop) always passes `WUNTRACED | WNOHANG`, and without a real `WNOHANG`, any
+/// call that reached the real syscall with a still-running child would block the entire
+/// interactive shell. **This used to be true unconditionally**, since this kernel never delivered a
+/// real `SIGCHLD` to a parent at all -- `hush`'s own `CONFIG_HUSH_FAST` short-circuit (skip the
+/// real syscall unless a `SIGCHLD` counter changed) was silently permanently active, since that
+/// counter could never move. Real `SIGCHLD` generation now exists (`signals::
+/// notify_parent_sigchld`, called from every real exit/stop/continue transition), so `hush`'s own
+/// counter genuinely increments now and `CONFIG_HUSH_FAST` behaves as actually designed -- `WNOHANG`
+/// is still load-bearing for the calls that do go through, just no longer masking *every* call.
 /// Otherwise blocks (`ProcState::Blocked`) and calls `scheduler::schedule()`, which only returns
 /// once something (`do_exit`/the real stop/continue transitions in `process::signals`/
 /// `do_stop_self`) wakes the parent — at which point the loop re-checks from the top, since a
@@ -1307,6 +1311,16 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
     // harmless no-op there; `remove_ready` itself is already a no-op for a pid that isn't queued.
     scheduler::remove_ready(pid);
     wake_parent_if_waiting(&mut table, pid);
+    // Real POSIX SIGCHLD generation -- see notify_parent_sigchld's own doc comment. `code` is
+    // already real wait(2)-encoded: WIFEXITED (low 7 bits zero) means CLD_EXITED with the real
+    // exit code in bits 8-15; otherwise this was a signal-terminated exit (CLD_KILLED), with the
+    // real terminating signal number in the low 7 bits -- the same encoding WEXITSTATUS/WTERMSIG
+    // already decode elsewhere in this codebase.
+    if code & 0x7f == 0 {
+        notify_parent_sigchld(&mut table, pid, CLD_EXITED, ((code >> 8) & 0xff) as u64);
+    } else {
+        notify_parent_sigchld(&mut table, pid, CLD_KILLED, (code & 0x7f) as u64);
+    }
 }
 
 /// Wakes `child_pid`'s parent if it's blocked in `wait4` waiting on this child (or on any child) --
@@ -1353,6 +1367,7 @@ pub(crate) fn do_stop_self(pid: Pid, signum: u64) {
         me.state = ProcState::Stopped(signum);
         me.stop_notify_pending = true;
         wake_parent_if_waiting(&mut table, pid);
+        notify_parent_sigchld(&mut table, pid, CLD_STOPPED, signum);
     } // table lock dropped before schedule() -- see table()'s own doc comment
     scheduler::schedule();
 }
