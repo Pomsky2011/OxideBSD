@@ -84,7 +84,9 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
         (timeout_ms >= 0).then(|| crate::tsc::now() + crate::tsc::ms_to_cycles(timeout_ms as u64));
 
     loop {
-        poll(); // drain the NIC / run the protocol stack once per pass, same as recvfrom's self-poll
+        if nfds > 0 {
+            poll(); // drain the NIC / run the protocol stack once per pass, same as recvfrom's self-poll
+        }
         let mut ready_count: i64 = 0;
         for entry in entries.iter_mut() {
             entry.revents = 0;
@@ -118,6 +120,22 @@ pub extern "C" fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) ->
         // advance a tick-based deadline's own check either, no NMI under normal operation). See
         // `ipv4::resolve_with_retry`'s own doc comment for the fuller explanation and the same
         // fix, applied there for the identical reason.
-        core::hint::spin_loop();
+        //
+        // **`nfds == 0` (no fd involved, "poll used as a portable sleep" idiom) is a real,
+        // separate livelock risk if given `timeout_ms == -1` (block forever)**: a bare CPU hint
+        // never actually yields, so on this single-core kernel a caller in exactly that shape
+        // would spin forever monopolizing the CPU -- starving every *other* process too, including
+        // whichever one might otherwise need to run to make progress toward this one ever
+        // unblocking. Found live on `master` (0.2.0-dev) via `sigaction/9-1.c`'s `select(0, NULL,
+        // NULL, NULL, NULL)` (this branch has no `select()` of its own, only `poll()`, but the
+        // exact same bug shape applies here) -- ported back since it's a real, load-bearing
+        // correctness fix, not new functionality. `n > 0`'s real fd-readiness case must keep
+        // spinning (yielding there would stop this process from ever pumping the NIC again for a
+        // connection nothing else services -- see this function's own doc comment).
+        if nfds == 0 {
+            crate::scheduler::schedule();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
