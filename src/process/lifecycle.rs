@@ -142,7 +142,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         // above).
         rlimits: [(u64::MAX, u64::MAX); 16],
         nice: 0,
-        sched_policy: SCHED_RR_DEFAULT,
+        sched_policy: SCHED_DEFAULT,
         sched_priority: 0,
         stop_notify_pending: false,
         cont_notify_pending: false,

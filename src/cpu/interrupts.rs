@@ -470,10 +470,21 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 // `PosixTimer::realtime_target`'s own doc comment for why this is what lets a
                 // later `clock_settime(CLOCK_REALTIME, ...)` correctly retarget an already-armed
                 // timer with zero extra bookkeeping on the `clock_settime` side.
+                // `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` timers compare against
+                // `proc.cpu_ticks` (real per-process CPU time), not wall-clock `now` -- a direct
+                // field read, not a call to `timers::timer_now(proc, ...)`, since that takes
+                // `&Process` and can't coexist with `slot`'s own live sub-borrow of
+                // `proc.posix_timers` (same disjoint-field-access pattern this loop's own
+                // `proc.pending_signals` accesses below already rely on).
+                let timer_now = if crate::process::timers::is_cputime_clock(slot.clockid) {
+                    proc.cpu_ticks
+                } else {
+                    now
+                };
                 let fired = if let Some(target) = slot.realtime_target {
                     crate::cpu::rtc::unix_epoch_now_precise() >= target
                 } else if let Some(deadline) = slot.deadline {
-                    now >= deadline
+                    timer_now >= deadline
                 } else {
                     false
                 };
@@ -494,7 +505,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                     // realtime_target`'s own doc comment already flags.
                     slot.realtime_target = None;
                     slot.deadline = if slot.interval_ticks > 0 {
-                        Some(now + slot.interval_ticks)
+                        Some(timer_now + slot.interval_ticks)
                     } else {
                         None
                     };
@@ -526,8 +537,26 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // Ring check via the CPU's own saved CS RPL bits (`& 0x3`), not e.g. `scheduler::current_pid()`
     // state -- see this function's own doc comment for why ring-3-only is the deliberate scope.
     let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
-    if interrupted_ring3 && now.is_multiple_of(PREEMPT_QUANTUM_TICKS) {
-        crate::process::scheduler::schedule();
+    if interrupted_ring3 {
+        // Real `SCHED_FIFO`/`SCHED_RR` priority preemption: checked on *every* tick, not gated on
+        // the quantum below -- a higher-`sched_priority` process becoming Ready must preempt within
+        // about one tick, not wait up to a full `PREEMPT_QUANTUM_TICKS` quantum. Every `SCHED_OTHER`
+        // process (this kernel's spawn-time default, see `Process::sched_policy`'s own doc comment)
+        // shares the one priority valid for that policy (`0`), so `higher_priority_ready` is always
+        // `false` for the pre-existing plain-round-robin case -- this whole branch is inert unless
+        // something has actually called `sched_setscheduler`/`sched_setparam` into a real-time
+        // policy. See `scheduler::ready_queue_has_higher_priority_than`'s own doc comment for why a
+        // process-table lookup here is safe (no lock this handler already holds could conflict).
+        let current_priority = crate::process::table()
+            .lock()
+            .get(&crate::process::scheduler::current_pid())
+            .map(|p| p.sched_priority)
+            .unwrap_or(0);
+        let higher_priority_ready =
+            crate::process::scheduler::ready_queue_has_higher_priority_than(current_priority);
+        if higher_priority_ready || now.is_multiple_of(PREEMPT_QUANTUM_TICKS) {
+            crate::process::scheduler::schedule();
+        }
     }
 }
 

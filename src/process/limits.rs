@@ -119,12 +119,23 @@ pub fn do_umask(caller_pid: Pid, new_mask: u32) -> Result<u64, u64> {
 
 const PRIO_PROCESS: u64 = 0;
 
-/// Real Linux's own `SCHED_RR` value -- `Process::sched_policy`'s default, matching BusyBox
-/// `chrt`'s own default policy when none of `-r`/`-f`/`-o`/`-b`/`-i` is given.
-pub(crate) const SCHED_RR_DEFAULT: i32 = 2;
 const SCHED_OTHER: i32 = 0;
 const SCHED_FIFO: i32 = 1;
 const SCHED_RR: i32 = 2;
+/// `Process::sched_policy`'s real spawn-time default -- real POSIX/Linux processes start
+/// `SCHED_OTHER`, not a real-time policy; a prior version of this codebase defaulted every fresh
+/// process to `SCHED_RR` instead (mis-justified as "matching BusyBox `chrt`'s own default policy
+/// when none of `-r`/`-f`/`-o`/`-b`/`-i` is given" -- irrelevant, since `chrt` always calls
+/// `sched_setscheduler` with its own explicit policy regardless of what a fresh process already
+/// had). That combined with `Process::sched_priority`'s own default of `0` produced a real,
+/// self-inconsistent state: `sched_priority_range(SCHED_RR)` is `1..=99`, so a fresh process's own
+/// stored priority was already outside its own declared policy's valid range before anything ever
+/// touched it. Found live via `sched_setparam/22-1.c`: `sched_getparam(0, &p)` followed immediately
+/// by `sched_setparam(0, &p)` (feeding back the exact value just read) hit this range check and
+/// `EINVAL`'d, which that test doesn't even treat as a distinguishable outcome (only `0` or `EPERM`
+/// are handled) -- a real `FAIL`. `SCHED_OTHER`'s own range is `0..=0`, so priority `0` is the only
+/// valid value for it -- restoring the property every other default should already have held.
+pub(crate) const SCHED_DEFAULT: i32 = SCHED_OTHER;
 const SCHED_BATCH: i32 = 3;
 const SCHED_IDLE: i32 = 5;
 const SCHED_DEADLINE: i32 = 6;
@@ -181,12 +192,35 @@ fn is_known_sched_policy(policy: i32) -> bool {
 /// targets an already-reaped pid and must see `ESRCH` regardless of the (here, valid) priority it
 /// supplies.
 ///
+/// A `sched_setparam`/`sched_setscheduler` call that lowers the *caller's* own priority below an
+/// already-`Ready` process (or raises a *different* `Ready` process above the caller) must give up
+/// the CPU synchronously, before the syscall itself returns -- real POSIX/Linux semantics. Without
+/// this, the only thing that would ever notice the new priority ordering is
+/// `interrupts::timer_interrupt_handler`'s own every-tick check (see that function's own doc
+/// comment), which can be up to one full tick (~10ms at `TIMER_HZ`) away -- far too coarse for a
+/// test that reads a shared counter in the same handful of instructions right after the syscall
+/// returns (`sched_setparam/9-1,10-1.c`'s own `oldcount`/`newcount` pattern: with only the
+/// tick-based check, the read racing the syscall's return would see no change essentially every
+/// time, since a context switch is astronomically unlikely to land in that few-instruction window
+/// on its own). **Must be called with `PROCESS_TABLE` unlocked** -- it may call
+/// `scheduler::schedule()`, which takes that same lock itself (`spin::Mutex` isn't reentrant).
+fn maybe_yield_for_priority(caller_pid: Pid) {
+    let caller_priority = PROCESS_TABLE
+        .lock()
+        .get(&caller_pid)
+        .map(|p| p.sched_priority)
+        .unwrap_or(0);
+    if crate::process::scheduler::ready_queue_has_higher_priority_than(caller_priority) {
+        crate::process::scheduler::schedule();
+    }
+}
+
 /// **Real POSIX return value on success is the *former* scheduling policy, not `0`** (`man 2
 /// sched_setscheduler`: "Upon successful completion, the previous scheduling policy of the
 /// specified thread shall be returned") -- found live: `sched_setscheduler/16-1.c` explicitly
-/// checks `result == old_policy`, and always failed against the old unconditional `Ok(0)` whenever
-/// `old_policy != 0` (i.e. any policy other than `SCHED_OTHER`, which is exactly what this
-/// codebase's own `SCHED_RR_DEFAULT` spawn-time default guarantees on every fresh process).
+/// checks `result == old_policy`, which the old unconditional `Ok(0)` only happened to satisfy
+/// when `old_policy` was already `SCHED_OTHER` (`0`) and silently failed for any other starting
+/// policy (real-time policies included).
 pub fn do_sched_setscheduler(
     caller_pid: Pid,
     pid: i64,
@@ -220,6 +254,8 @@ pub fn do_sched_setscheduler(
     let old_policy = proc.sched_policy;
     proc.sched_policy = policy;
     proc.sched_priority = param.sched_priority;
+    drop(table);
+    maybe_yield_for_priority(caller_pid);
     Ok(old_policy as u64)
 }
 
@@ -258,6 +294,8 @@ pub fn do_sched_setparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u6
         return Err(EINVAL);
     }
     proc.sched_priority = param.sched_priority;
+    drop(table);
+    maybe_yield_for_priority(caller_pid);
     Ok(0)
 }
 

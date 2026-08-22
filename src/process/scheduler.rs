@@ -89,6 +89,59 @@ pub fn enqueue_ready(pid: Pid) {
     READY_QUEUE.lock().push_back(pid);
 }
 
+/// Real `SCHED_FIFO`/`SCHED_RR` priority-based preemption: pops the *highest-`sched_priority`*
+/// pid currently sitting in `READY_QUEUE`, not simply the front (plain FIFO order is preserved as
+/// the tie-break among equal priorities, which is what real `SCHED_RR` round-robin — and this
+/// codebase's original, still-unchanged `SCHED_OTHER` fairness, since every such process shares
+/// the one valid priority for that policy, `0` — both already want). Deliberately reads
+/// `Process::sched_priority` here rather than having every one of `enqueue_ready`'s ~15 call
+/// sites pass it in: several of those already hold `process::table()`'s lock at the point they
+/// enqueue (`spin::Mutex` isn't reentrant, so `enqueue_ready` itself must never try to lock the
+/// table) — but nothing calls *this* function while still holding that lock (only ever reached via
+/// `wait_for_ready`, itself only ever reached from `schedule()` after any table guard it took has
+/// already been dropped), so it's the one safe place to actually consult priority.
+///
+/// O(n) per dequeue instead of the old `pop_front`'s O(1) — fine at this kernel's process-table
+/// scale (never more than a handful of ready processes at once).
+fn dequeue_highest_priority() -> Option<Pid> {
+    let mut queue = READY_QUEUE.lock();
+    if queue.is_empty() {
+        return None;
+    }
+    let table = process::table().lock();
+    let priority_of = |pid: Pid| table.get(&pid).map(|p| p.sched_priority).unwrap_or(0);
+    let mut best_idx = 0;
+    let mut best_priority = priority_of(queue[0]);
+    for (i, &pid) in queue.iter().enumerate().skip(1) {
+        let priority = priority_of(pid);
+        if priority > best_priority {
+            best_priority = priority;
+            best_idx = i;
+        }
+    }
+    drop(table);
+    queue.remove(best_idx)
+}
+
+/// Whether some pid in `READY_QUEUE` outranks `current_priority` — the real-time half of
+/// preemption: `interrupts::timer_interrupt_handler` calls this on *every* tick (not just once a
+/// quantum expires) so a newly-readied higher-priority `SCHED_FIFO`/`SCHED_RR` process preempts
+/// within one tick (~10ms at `TIMER_HZ`), not up to a full `PREEMPT_QUANTUM_TICKS` quantum later —
+/// real POSIX/Linux would preempt essentially instantly (an IPI on a real multi-core kernel); this
+/// kernel has no such mechanism and is single-core regardless, so the next timer tick is the
+/// tightest bound achievable without one. Every `SCHED_OTHER` process shares priority `0`, so this
+/// is always `false` for the pre-existing plain-round-robin case — zero behavioral change there.
+pub fn ready_queue_has_higher_priority_than(current_priority: i32) -> bool {
+    let queue = READY_QUEUE.lock();
+    if queue.is_empty() {
+        return false;
+    }
+    let table = process::table().lock();
+    queue
+        .iter()
+        .any(|&pid| table.get(&pid).map(|p| p.sched_priority).unwrap_or(0) > current_priority)
+}
+
 /// Removes `pid` from `READY_QUEUE` if it's sitting in it -- needed only for a cross-process
 /// `SIGSTOP`/`SIGTSTP` (see `process::signals`'s `Action::Stop` handling) landing on a target
 /// that's `Ready` but hasn't actually run yet. Without this, the scheduler would still pop and run
@@ -229,10 +282,11 @@ pub fn schedule() {
 fn wait_for_ready() -> Pid {
     loop {
         x86_64::instructions::interrupts::disable();
-        // Scoped so the READY_QUEUE guard is dropped before enable_and_hlt() below -- holding it
-        // across that would let the keyboard IRQ handler's own wake-up (which needs this same
-        // lock, see crate::console::stdin::push_byte) deadlock against itself on this single core.
-        let popped = { READY_QUEUE.lock().pop_front() };
+        // Scoped so the READY_QUEUE guard (and the process-table guard `dequeue_highest_priority`
+        // briefly takes internally) are dropped before enable_and_hlt() below -- holding either
+        // across that would let the keyboard IRQ handler's own wake-up (which needs the same
+        // locks, see crate::console::stdin::push_byte) deadlock against itself on this single core.
+        let popped = dequeue_highest_priority();
         if let Some(pid) = popped {
             return pid;
         }
