@@ -896,6 +896,7 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_timer_delete" => {
             Some(crate::syscall::oxidebsd_sys_timer_delete as *const () as u64)
         }
+        "oxidebsd_sys_select" => Some(crate::net::oxidebsd_sys_select as *const () as u64),
         "oxidebsd_sys_mq_open" => Some(crate::syscall::oxidebsd_sys_mq_open as *const () as u64),
         "oxidebsd_sys_mq_unlink" => {
             Some(crate::syscall::oxidebsd_sys_mq_unlink as *const () as u64)

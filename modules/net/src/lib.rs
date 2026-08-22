@@ -28,6 +28,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_listen(fd: u64, backlog: u64) -> i64;
     fn oxidebsd_sys_accept(fd: u64, addr_out_ptr: u64, addrlen_ptr: u64) -> i64;
     fn oxidebsd_sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) -> i64;
+    fn oxidebsd_sys_select(req_ptr: u64) -> i64;
 }
 
 fn log(message: &str) {
@@ -43,6 +44,9 @@ const SYS_CONNECT: u64 = 145;
 const SYS_LISTEN: u64 = 146;
 const SYS_ACCEPT: u64 = 147;
 const SYS_POLL: u64 = 148;
+/// Real Linux's own unclaimed legacy `select(2)` number -- see `crate::net::oxidebsd_sys_select`'s
+/// own doc comment for the real logic.
+const SYS_SELECT: u64 = 23;
 
 extern "C" fn handle_socket(domain: u64, ty: u64, protocol: u64, _r10: u64) -> i64 {
     unsafe { oxidebsd_sys_socket(domain, ty, protocol) }
@@ -80,6 +84,10 @@ extern "C" fn handle_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64, _r10: u64) -
     unsafe { oxidebsd_sys_poll(fds_ptr, nfds, timeout_ms) }
 }
 
+extern "C" fn handle_select(req_ptr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    unsafe { oxidebsd_sys_select(req_ptr) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
     unsafe {
@@ -92,10 +100,11 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_LISTEN, handle_listen);
         oxidebsd_register_syscall(SYS_ACCEPT, handle_accept);
         oxidebsd_register_syscall(SYS_POLL, handle_poll);
+        oxidebsd_register_syscall(SYS_SELECT, handle_select);
     }
     log(
         "[module] net: module_init running (registered SYS_SOCKET/SYS_BIND/SYS_SENDTO/\
-         SYS_RECVFROM/SYS_SETSOCKOPT/SYS_CONNECT/SYS_LISTEN/SYS_ACCEPT/SYS_POLL)\n",
+         SYS_RECVFROM/SYS_SETSOCKOPT/SYS_CONNECT/SYS_LISTEN/SYS_ACCEPT/SYS_POLL/SYS_SELECT)\n",
     );
     0
 }
