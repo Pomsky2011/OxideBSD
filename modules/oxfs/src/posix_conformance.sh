@@ -49,7 +49,35 @@ for rel in $(cat /posix-tests/manifest.txt); do
     # durations (0+1+1+2+10+13s) before it even reaches its invalid-parameter checks -- a real,
     # working nanosleep() genuinely needs that long, not a hang. Found live: an earlier 5s bound
     # timed it out and misclassified a passing test as TIMEOUT.
-    /posix-tests/t0 40 "$bin" >/posix-tests/run-out.txt 2>&1
+    #
+    # A handful of pilot files self-skip (`PTS_UNTESTED`) whenever `getuid() == 0`, since this
+    # whole pilot otherwise always runs as root (`su`'s own child, in turn `sh /posix_conformance.sh`,
+    # is invoked directly by `posix-conformance-driver`, itself pid 1 -- see that crate's own doc
+    # comment). Most such files (`sem_open/3-1.c`, `sigqueue/3-1.c,12-1.c`, `sched_getparam/6-1.c`,
+    # `sched_getscheduler/7-1.c`, `sched_setscheduler/20-1.c`, `shm_open/32-1.c,34-1.c`) already call
+    # the suite's own `set_nonroot()` helper (`ptsupport`) to drop privilege *themselves* once they
+    # detect real uid 0 -- that already works on this kernel (confirmed live: those tests already
+    # PASS), so they need nothing from this script. `sched_setparam/26-1.c` is the one exception in
+    # this pilot's own corpus: its own hand-written `getuid() == 0` check has no `set_nonroot()`
+    # fallback at all -- it just bails `PTS_UNTESTED` unconditionally under root, real assertion
+    # never reached. Patching that check into the test itself was deliberately rejected: unlike
+    # musl/BusyBox/TinyCC (personal forks on an `oxidebsd` branch, real patches allowed and
+    # documented), `third_party/posixtestsuite` is a plain submodule of the real upstream mirror --
+    # editing its own test source would quietly narrow what this pilot is actually verifying.
+    # Fixed instead from *outside* the test, the same way a real user would run it non-interactively
+    # as a regular account: `su`'s own real, already-working root-skips-password path (see CLAUDE.md's
+    # "Session, controlling-tty, and login authentication" section) execs a real `/bin/sh -c CMD` as
+    # uid 1000 (the seeded `user` account) *before* the test binary itself ever starts, so its own
+    # `getuid()` genuinely reads back 1000 -- reaching the real assertion (`sched_setparam(1, ...)`
+    # against root-owned pid 1 -- expects `EPERM`) instead of ever hitting the early bailout.
+    case "$rel" in
+        sched_setparam/26-1.c)
+            su user -c "/posix-tests/t0 40 $bin" >/posix-tests/run-out.txt 2>&1
+            ;;
+        *)
+            /posix-tests/t0 40 "$bin" >/posix-tests/run-out.txt 2>&1
+            ;;
+    esac
     status=$?
 
     case "$status" in

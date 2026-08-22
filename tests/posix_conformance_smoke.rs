@@ -3,8 +3,11 @@
 //! (`SYS_KILL`/`SYS_SIGACTION`/`SYS_SIGTIMEDWAIT`/`SYS_SIGQUEUE` -- the `kill`/`sigqueue`/`sigwait`
 //! pilot interfaces), `clock` (`SYS_CLOCK_GETTIME`/`SYS_NANOSLEEP` -- the other two pilot
 //! interfaces), `posix_compat` (`SYS_MQ_OPEN`...`SYS_MQ_GETSETATTR`, plus `ioctl`/`fcntl` for
-//! musl's own `isatty()`-style startup probes), and `oxfs` (the filesystem -- `/bin/sh`, `/bin/tcc`,
-//! and the whole `/posix-tests` tree this pilot runs against), then spawns
+//! musl's own `isatty()`-style startup probes), `net` (just so `SYS_SOCKET` is a real registered
+//! syscall -- see that module's own loading comment below for why: musl's `initgroups()` needs a
+//! real `EAFNOSUPPORT`, not a generic `ENOSYS`, to fall back to parsing `/etc/group`), and `oxfs`
+//! (the filesystem -- `/bin/sh`, `/bin/tcc`, and the whole `/posix-tests` tree this pilot runs
+//! against), then spawns
 //! `userland/posix-conformance-driver/` as pid 1 -- see that crate's own module doc comment for
 //! why a dedicated driver exists instead of just spawning `sh` directly (this project's own
 //! established rule against scripting live interactive keyboard input -- see CLAUDE.md's Test
@@ -99,6 +102,31 @@ fn main(boot_info: &'static BootInfo) -> ! {
         &mut frame_allocator,
     )
     .unwrap_or_else(|e| panic!("failed to load the posix_compat module: {e:?}"));
+
+    // Real `AF_INET` networking itself is out of this pilot's own scope (no socket-shaped
+    // interface is in `POSIX_TEST_PILOT_FILES`) -- loaded purely so `SYS_SOCKET` is a genuinely
+    // *registered* syscall rather than falling through to the generic "unrecognized syscall
+    // number" ENOSYS path. Found live: `sched_setparam/26-1.c`'s own privilege-drop
+    // (`su user -c ...`, see `modules/oxfs/src/posix_conformance.sh`) calls real `initgroups()`,
+    // which probes a real `AF_UNIX` socket to a local `nscd` daemon first (`third_party/musl/src/
+    // passwd/nscd_query.c`) and only falls back to parsing `/etc/group` for real when that
+    // `socket()` call fails with exactly `EAFNOSUPPORT` -- an unregistered syscall's generic
+    // `ENOSYS` doesn't qualify, so `su` died with a real "can't set groups: Function not
+    // implemented" before ever reaching `initgroups()`'s own real fallback, let alone the test's
+    // own assertion. No NIC/hardware dependency to worry about -- `module_init` here just
+    // registers syscall handlers; it doesn't touch `rtl8139`/`ethernet` at all (unlike e.g.
+    // `tests/udp_syscall_smoke.rs`, which genuinely needs a working NIC and checks for one).
+    const NET_MOD: &[u8] = include_bytes!(env!("NET_MOD_PATH"));
+    const NET_PANIC_SYMBOL: &str = env!("NET_MOD_PANIC_SYMBOL");
+    oxidebsd::module::load(
+        "net",
+        NET_MOD,
+        NET_PANIC_SYMBOL,
+        false,
+        &mut mapper,
+        &mut frame_allocator,
+    )
+    .unwrap_or_else(|e| panic!("failed to load the net module: {e:?}"));
 
     const OXFS_MOD: &[u8] = include_bytes!(env!("OXFS_MOD_PATH"));
     const OXFS_PANIC_SYMBOL: &str = env!("OXFS_MOD_PANIC_SYMBOL");
