@@ -191,6 +191,13 @@ pub(crate) const ERANGE: u64 = 34;
 /// `modules/oxfs`'s own local copy of this constant, used for its unrelated `ENXIO`-on-`open()`
 /// device-node case).
 pub(crate) const ENXIO: u64 = 6;
+/// Returned by `process::mm::do_mmap_file_backed` when a real `off`/`len` combination against a
+/// regular file exceeds the real offset maximum this ABI's `off_t` (a 64-bit signed type, matching
+/// musl's own x86_64 `off_t`) can represent (`mmap/31-1.c`) — checked kernel-side now that
+/// `third_party/musl`'s own `mmap.c` no longer pre-empts this with a blanket `ENOMEM` before the
+/// syscall is even issued (see that file's own doc comment for why). `75`, identical on Linux/BSD/
+/// musl.
+pub(crate) const EOVERFLOW: u64 = 75;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag

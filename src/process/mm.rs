@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
-use crate::syscall::{EAGAIN, EBADF, EINVAL, ENODEV, ENOMEM, ENXIO};
+use crate::syscall::{EAGAIN, EBADF, EINVAL, ENODEV, ENOMEM, ENXIO, EOVERFLOW};
 use super::*;
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
@@ -343,6 +343,23 @@ fn do_mmap_file_backed(
     private: bool,
     fixed_base: Option<u64>,
 ) -> Result<u64, u64> {
+    // Real POSIX `[EOVERFLOW]`: "the value of off plus len exceeds the offset maximum established
+    // in the open file description associated with fildes" (`mmap/31-1.c` in the conformance
+    // pilot) -- a pure arithmetic check against this ABI's real `off_t` range (a 64-bit *signed*
+    // type, matching musl's own x86_64 `off_t`; `i64::MAX`, not `u64::MAX`, is the real ceiling),
+    // independent of the target object's own identity, so it runs before `content_id` is even
+    // resolved. Checked with `u128` arithmetic -- `off` (already `u64`) plus a `len` approaching
+    // `u64::MAX` would otherwise wrap `u64` itself, silently hiding the very overflow being tested
+    // for. `off` only ever carries the wire format's own low 32 bits (see `oxidebsd_sys_mmap`'s own
+    // doc comment) -- narrower than real POSIX `off_t`, but for exactly this check's purpose
+    // (detecting a request that's *already* absurdly oversized) `len` alone reaching this magnitude
+    // is what actually trips it; a real off_t-range caller past 4 GiB of file offset doesn't exist
+    // anywhere in this kernel's own call graph (oxfs's own real per-file cap is ~4 MiB).
+    let region_len = page_count * 4096;
+    if (off as u128) + (region_len as u128) > i64::MAX as u128 {
+        return Err(EOVERFLOW);
+    }
+
     let content_id = crate::fs::fd::content_id_of(fd).ok_or(ENODEV)?;
 
     let phys_offset = memory::phys_mem_offset();
@@ -357,8 +374,7 @@ fn do_mmap_file_backed(
         // legal, common pattern this kernel already handles via a real *deferred* SIGBUS on the
         // actual out-of-bounds *reference*, not an upfront mmap()-time failure -- see
         // `covered_pages` below and `mmap/11-2.c`/`11-3.c`, which depend on that succeeding).
-        let len = page_count * 4096;
-        if off >= real_size || off.saturating_add(len) > real_size {
+        if off >= real_size || off.saturating_add(region_len) > real_size {
             return Err(ENXIO);
         }
         // Still no real support for actually populating from a nonzero offset -- no real caller in
@@ -482,7 +498,6 @@ fn do_mmap_file_backed(
             .collect()
     };
 
-    let region_len = page_count * 4096;
     let base = match fixed_base {
         Some(base) => base,
         None => {

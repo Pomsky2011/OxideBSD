@@ -60,6 +60,7 @@ const SYS_SIGRETURN: u64 = 119;
 const SYS_FTRUNCATE: u64 = 473;
 const SYS_PRLIMIT64: u64 = 478;
 const SYS_MLOCKALL: u64 = 511;
+const SYS_MUNLOCKALL: u64 = 512;
 const SYS_FSTAT: u64 = 126;
 const SYS_MSYNC: u64 = 26;
 const SYS_NANOSLEEP: u64 = 139;
@@ -90,6 +91,7 @@ const EBADF: u64 = 9;
 const EINVAL: u64 = 22;
 const EAGAIN: u64 = 11;
 const ENXIO: u64 = 6;
+const EOVERFLOW: u64 = 75;
 
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
@@ -656,6 +658,13 @@ pub extern "C" fn _start() -> ! {
         mmap_call(0, fd_lock, 1024 * 1024, MAP_SHARED) == Err(EAGAIN),
         "part 10: expected EAGAIN mapping past RLIMIT_MEMLOCK under mlockall(MCL_FUTURE)"
     );
+    // Real POSIX munlockall() semantics: cancels the MCL_FUTURE setting -- undoes part 10's own
+    // process-wide state so later parts aren't affected by it (this whole crate runs sequentially
+    // in one process, not one-scenario-per-process).
+    check!(
+        unsafe { syscall(SYS_MUNLOCKALL, 0, 0, 0) }.is_ok(),
+        "part 10: munlockall failed"
+    );
     write_bytes(b"mmap-syscall-smoke: part 10 (mlockall(MCL_FUTURE) EAGAIN) OK\n");
 
     // --- Part 11: real st_mtime/st_ctime updates through a write via mmap + msync (`mmap/14-1.c`)
@@ -712,6 +721,19 @@ pub extern "C" fn _start() -> ! {
         "part 12: expected ENXIO for an out-of-bounds nonzero-offset request"
     );
     write_bytes(b"mmap-syscall-smoke: part 12 (ENXIO on out-of-bounds offset) OK\n");
+
+    // --- Part 13: real EOVERFLOW when off + len exceeds this ABI's real off_t range (`mmap/31-1.c`)
+    // -- mirrors the real pilot test's own ULONG_MAX-rounded-to-a-page len/off (this crate issues
+    // the raw syscall directly, bypassing musl's own client-side length guard entirely, so the
+    // request genuinely reaches the kernel).
+    let path_of = b"/tmp/mmap-smoke-of\0";
+    let fd_of = open_create(path_of).expect("part 13: open failed");
+    let huge: u64 = 0xffff_ffff_ffff_f000; // ULONG_MAX rounded down to a page boundary
+    check!(
+        mmap_call_off(0, fd_of, huge, MAP_SHARED, huge as u32) == Err(EOVERFLOW),
+        "part 13: expected EOVERFLOW for an off/len combination exceeding the real off_t range"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 13 (EOVERFLOW on off/len overflow) OK\n");
 
     write_bytes(b"mmap-syscall-smoke: all parts passed\n");
     test_exit(true);
