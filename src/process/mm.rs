@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
-use crate::syscall::{EAGAIN, EBADF, EINVAL, ENODEV, ENOMEM};
+use crate::syscall::{EAGAIN, EBADF, EINVAL, ENODEV, ENOMEM, ENXIO};
 use super::*;
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
@@ -315,9 +315,11 @@ fn do_mmap_anon(caller_pid: Pid, fixed_base: Option<u64>, region_len: u64) -> Re
 
 /// Real fd-backed mapping — `do_mmap`'s `fd >= 0` case, now honoring the caller's real
 /// `MAP_SHARED`/`MAP_PRIVATE` choice (`private`) instead of always behaving as `MAP_SHARED`. Scoped
-/// deliberately: `off != 0` is an honest `EINVAL` rather than silently mapping from offset `0`
-/// instead — none of this kernel's own real callers (BusyBox, TinyCC-compiled programs, the POSIX
-/// conformance pilot) ever request a nonzero offset.
+/// deliberately: a nonzero `off` is never actually populated/mapped from — a real, in-bounds
+/// request still gets an honest `EINVAL` (no real caller in this kernel's own call graph, BusyBox/
+/// TinyCC/musl itself, ever requests one), and one genuinely out-of-bounds gets a real `ENXIO` —
+/// see the `off != 0` handling below for why that split exists and doesn't conflict with this same
+/// function's own MPR handling for the (far more common) `off == 0` case.
 ///
 /// **Content population/writeback goes through `crate::fs::fd::content_read`/`content_write`
 /// (keyed by `content_id`, a real inode number), not any fd's own read/write callbacks** — found
@@ -341,13 +343,30 @@ fn do_mmap_file_backed(
     private: bool,
     fixed_base: Option<u64>,
 ) -> Result<u64, u64> {
-    if off != 0 {
-        return Err(EINVAL);
-    }
     let content_id = crate::fs::fd::content_id_of(fd).ok_or(ENODEV)?;
 
     let phys_offset = memory::phys_mem_offset();
     let real_size = crate::fs::fd::content_size(content_id).max(0) as u64;
+
+    if off != 0 {
+        let off = off as u64;
+        // Real POSIX `[ENXIO]`: "Addresses in the range [off,off+len) are invalid for the object
+        // specified by fildes" (`mmap/28-1.c` in the conformance pilot) -- deliberately scoped to a
+        // nonzero, caller-chosen starting offset. `off == 0` is never ENXIO here even when `len`
+        // extends past the object's own real size -- that's real POSIX MPR territory instead (a
+        // legal, common pattern this kernel already handles via a real *deferred* SIGBUS on the
+        // actual out-of-bounds *reference*, not an upfront mmap()-time failure -- see
+        // `covered_pages` below and `mmap/11-2.c`/`11-3.c`, which depend on that succeeding).
+        let len = page_count * 4096;
+        if off >= real_size || off.saturating_add(len) > real_size {
+            return Err(ENXIO);
+        }
+        // Still no real support for actually populating from a nonzero offset -- no real caller in
+        // this kernel's own call graph (BusyBox, TinyCC, musl itself) ever requests one, and the
+        // one case that does (a within-bounds nonzero offset) is purely hypothetical here, so this
+        // stays an honest EINVAL rather than silently reading from offset 0 instead.
+        return Err(EINVAL);
+    }
     // Real POSIX MPR (`mmap/11-2.c`/`11-3.c` in the conformance pilot): only pages actually
     // overlapping the object's own real content -- including its final, real-content-plus-
     // zero-padding partial page -- ever get backed by a real frame. Anything past that, up to the

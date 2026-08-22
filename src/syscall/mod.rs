@@ -184,6 +184,13 @@ pub(crate) const EFBIG: u64 = 27;
 /// when a value would fall outside real SysV's `[0, SEMVMX]` range. `34`, matching musl's own
 /// compiled-in value, same reasoning as `EFBIG`.
 pub(crate) const ERANGE: u64 = 34;
+/// Returned by `process::mm::do_mmap_file_backed` for a real `mmap(2)` request with a nonzero
+/// `off` whose `[off, off+len)` range genuinely doesn't fit within the target object's own real
+/// size (`mmap/28-1.c`) — deliberately not raised for `off == 0`, real POSIX MPR territory
+/// instead (see that function's own doc comment). `6`, identical on Linux/BSD/musl (matches
+/// `modules/oxfs`'s own local copy of this constant, used for its unrelated `ENXIO`-on-`open()`
+/// device-node case).
+pub(crate) const ENXIO: u64 = 6;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag

@@ -89,6 +89,7 @@ const MAP_FIXED: u64 = 0x10;
 const EBADF: u64 = 9;
 const EINVAL: u64 = 22;
 const EAGAIN: u64 = 11;
+const ENXIO: u64 = 6;
 
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
@@ -223,10 +224,15 @@ fn open_create(path: &[u8]) -> Result<u64, u64> {
 
 /// `packed_prot` = real `prot` (low 8 bits) | real `flags` (shifted left 8) -- see
 /// `src/syscall/ffi.rs`'s own `oxidebsd_sys_mmap` doc comment for this exact wire format. `packed`
-/// = `(off << 32) | (fd as u32)`; off is always 0 for every real caller in this port.
-fn mmap_call(addr_hint: u64, fd: u64, len: u64, flags: u64) -> Result<u64, u64> {
+/// = `(off << 32) | (fd as u32)`.
+fn mmap_call_off(addr_hint: u64, fd: u64, len: u64, flags: u64, off: u32) -> Result<u64, u64> {
     let packed_prot = PROT_READ_WRITE | (flags << 8);
-    unsafe { syscall4(SYS_MMAP, addr_hint, len, packed_prot, fd) }
+    let packed = (fd & 0xffff_ffff) | ((off as u64) << 32);
+    unsafe { syscall4(SYS_MMAP, addr_hint, len, packed_prot, packed) }
+}
+
+fn mmap_call(addr_hint: u64, fd: u64, len: u64, flags: u64) -> Result<u64, u64> {
+    mmap_call_off(addr_hint, fd, len, flags, 0)
 }
 
 fn mmap_shared(fd: u64, len: u64) -> Result<u64, u64> {
@@ -689,6 +695,23 @@ pub extern "C" fn _start() -> ! {
         "part 11: munmap failed"
     );
     write_bytes(b"mmap-syscall-smoke: part 11 (real mtime/ctime via mmap) OK\n");
+
+    // --- Part 12: real ENXIO for a nonzero-offset request whose range doesn't fit the object
+    // (`mmap/28-1.c`) -- deliberately distinct from parts 2/3/5 above, which all use off == 0 and
+    // must keep succeeding (real POSIX MPR, not ENXIO) even when their own `len` extends past the
+    // object's real content.
+    let path_nxio = b"/tmp/mmap-smoke-nxio\0";
+    let fd_nxio = open_create(path_nxio).expect("part 12: open failed");
+    let shm_size: u64 = 8192; // two pages
+    check!(
+        unsafe { syscall(SYS_FTRUNCATE, fd_nxio, shm_size, 0) }.is_ok(),
+        "part 12: ftruncate failed"
+    );
+    check!(
+        mmap_call_off(0, fd_nxio, 2 * shm_size, MAP_SHARED, 4096) == Err(ENXIO),
+        "part 12: expected ENXIO for an out-of-bounds nonzero-offset request"
+    );
+    write_bytes(b"mmap-syscall-smoke: part 12 (ENXIO on out-of-bounds offset) OK\n");
 
     write_bytes(b"mmap-syscall-smoke: all parts passed\n");
     test_exit(true);
