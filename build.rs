@@ -1705,6 +1705,45 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
     ));
     src.push_str("];\n");
 
+    // `sigaltstack/9-1.c`'s own real assertion needs a genuine second process it `execl()`s into
+    // to check that no alt stack survives `exec` -- the suite's own test tree ships this as a
+    // separate "-buildonly.c" companion file (excluded from `POSIX_TEST_PILOT_FILES` itself, like
+    // every other "-buildonly.c" file, since it's not runnable as its own standalone assertion --
+    // see this function's own doc comment above), built and referenced only by `9-1.c` via a
+    // literal relative path copied verbatim from the upstream suite's own build-tree convention:
+    // `conformance/interfaces/sigaltstack/9-buildonly.test`, resolved against pid 1's own root cwd
+    // at the point the pilot script runs (`/`) -- so it has to be seeded at that *exact* path, not
+    // under `/posix-tests/` like every other pilot binary. Kept in a second, separate generated
+    // array (`POSIX_TEST_EXTRA_FILES`) seeded directly at oxfs's own root rather than folded into
+    // `POSIX_TEST_FILES` above, which `modules/oxfs` seeds under `/posix-tests` specifically.
+    const SIGALTSTACK_9_BUILDONLY_LOAD_BASE: u64 = 0xa7a0000;
+    let sigaltstack_9_buildonly_c = interfaces_dir.join("sigaltstack/9-buildonly.c");
+    println!(
+        "cargo:rerun-if-changed={}",
+        sigaltstack_9_buildonly_c.display()
+    );
+    let sigaltstack_9_buildonly_out = bin_dir.join("sigaltstack_9-buildonly.test");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg(format!(
+            "-Wl,-Ttext-segment={SIGALTSTACK_9_BUILDONLY_LOAD_BASE:#x}"
+        ))
+        .arg("-I")
+        .arg(&include_dir)
+        .arg("-o")
+        .arg(&sigaltstack_9_buildonly_out)
+        .arg(&sigaltstack_9_buildonly_c)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for sigaltstack/9-buildonly.c: {e}"));
+    if !status.success() {
+        panic!("building sigaltstack/9-buildonly.c failed: {status}");
+    }
+    src.push_str(&format!(
+        "pub static POSIX_TEST_EXTRA_FILES: &[(&str, &[u8])] = &[\n    (\"conformance/interfaces/sigaltstack/9-buildonly.test\", include_bytes!({:?})),\n];\n",
+        sigaltstack_9_buildonly_out.display()
+    ));
+
     std::fs::write(&out_path, src)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
     out_path

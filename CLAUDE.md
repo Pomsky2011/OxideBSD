@@ -2205,6 +2205,117 @@ bound.
 - **Not covered by this pass**: the remaining 36 FAIL/22 UNRESOLVED haven't been individually
   triaged — same open item the section above already flagged, just a smaller remaining set now.
 
+## A real `siginfo_t` field-order bug, plus real `SA_ONSTACK`/`SA_NOCLDWAIT`/`SA_NOCLDSTOP`, plus a real preemption/ready-queue race (`src/process/mod.rs`, `src/process/signals.rs`, `src/process/scheduler.rs`, `src/process/lifecycle.rs`, `src/syscall/mod.rs`, three `userland/*-syscall-smoke` crates)
+
+Investigated the pilot's remaining `sigaction/10-1.c`/`11-1.c` (TIMEOUT) and `sigaltstack/1-1.c`/
+`6-1.c`/`7-1.c`/`9-1.c` (FAIL/FAIL/FAIL/UNRESOLVED) — found and fixed four independent real bugs,
+one of them a previously-undiscovered layout bug that had been silently masking real signal-payload
+content since `RawSiginfo` was first introduced.
+
+- **`RawSiginfo`'s `si_code`/`si_errno` fields were swapped relative to real musl x86_64** — a real
+  bug, not a stale comment: `third_party/musl/include/signal.h`'s `siginfo_t` only swaps this order
+  under `__SI_SWAP_ERRNO_CODE`, which this musl fork's own `bits/signal.h` only ever `#define`s for
+  MIPS — x86_64 always takes the `#else` branch, `si_signo, si_errno, si_code` (`si_code` *third*,
+  not second). `RawSiginfo` had it backwards since the struct was first written, so every real
+  `SA_SIGINFO` handler's `info->si_code` read was actually reading this kernel's own always-`0`
+  `si_errno` slot instead. Silent because `SI_USER == 0` too — any test only ever checking
+  `si_code == SI_USER` (the common case) passed by coincidence regardless. Found live:
+  `sigaction/10-1.c`/`11-1.c` busy-wait on `info->si_code == CLD_STOPPED`/`CLD_CONTINUED`
+  (non-zero), which this bug made permanently unreachable — a genuine infinite loop, not just a
+  missed optimization, cleanly explaining the TIMEOUT. Fixed by reordering `RawSiginfo`'s
+  declared fields (a named-field `#[repr(C)]` struct's layout follows declaration order regardless
+  of the order literals list fields in, so no construction call site needed touching). **Three
+  userland smoke-test crates had their own hand-duplicated copy of this exact struct**
+  (`sig-syscall-smoke`, `rt-signal-syscall-smoke`, `sa-siginfo-syscall-smoke` — this ABI has no
+  shared kernel/userland crate to define it once) and needed the identical reorder; found by
+  re-running the full existing regression suite after the kernel-side fix, not by inspection —
+  `sig-syscall-smoke` genuinely regressed (`si_code wasn't SI_QUEUE`) until its own copy was fixed
+  too. **Any future wire struct duplicated this way needs the same audit whenever the kernel-side
+  original changes.**
+- **Real `SA_ONSTACK`** (`sigaltstack/1-1.c`/`6-1.c`/`7-1.c`) — previously bookkeeping-only (see
+  `AltStack`'s own now-corrected doc comment). `Process::on_altstack` tracks whether a handler is
+  currently executing on the alt stack; `process::signals::begin_altstack_if_requested` (called by
+  `deliver_pending_signal` right before `stash_signal_context`) decides eligibility (a real stack
+  established, and not already on it) and flips it; `SignalStackFrame::used_altstack` records
+  whether *this* delivery is the one that set it, so `take_signal_saved_frame` (`sigreturn`) clears
+  it at the right nesting level. `do_sigaltstack` now reports real `SS_ONSTACK` on read-back and
+  real `EPERM` when a caller tries to change the alt stack while a handler is genuinely running on
+  it, both previously honest-`false`/never-checked placeholders.
+- **Real `SA_NOCLDWAIT`** (`sigaction/21-1.c`) — `process::lifecycle::terminate_process` now checks
+  the parent's own `SIGCHLD` sigaction flags and, if set, detaches the exiting child from the
+  parent's `children` list immediately (a real `ECHILD` on the parent's very next `wait()` with no
+  other children) instead of leaving a `Zombie` for a `wait4` that will never come. **Real frame
+  reclaim only happens safely for a cross-process kill target** (`do_kill`'s `Action::Terminate`,
+  never the active `CR3`) — the far more common self-exit case (`do_exit` terminating itself, still
+  running on its own address space at this exact point) instead defers pid removal via the existing
+  `scheduler::queue_thread_reap` mechanism `CLONE_THREAD` non-leader exit already established for
+  the identical "can't free what I'm still standing on" hazard, at the honest cost of leaking that
+  one address space's frames (no `teardown()` call in that queue's own drain) rather than risking a
+  live-page-table use-after-free — an intentionally narrow gap, `SA_NOCLDWAIT` has exactly one live
+  exerciser today.
+- **Real `SA_NOCLDSTOP`** (`sigaction/9-1.c`) — a second, independent gap the `si_code` fix above
+  exposed for the first time: this flag is supposed to suppress `SIGCHLD` generation specifically
+  for the *stop* transition (not exit/continue), and was never implemented at all — `sigaction/
+  9-1.c` had always silently "passed" only because the `si_code` bug above made its own
+  `info->si_code == CLD_STOPPED` check permanently false regardless of whether suppression actually
+  worked. Fixed in `notify_parent_sigchld` itself: `code == CLD_STOPPED` plus the parent's own
+  `SIGCHLD` action having `SA_NOCLDSTOP` set now skips signal generation for that one transition
+  only, matching real POSIX exactly (found as a **real regression** in this session's own testing —
+  the `si_code` fix alone flipped this test to a genuine, reproducible `CRASH(255)`, i.e. a real
+  `exit(-1)`/"Test FAILED" from the test's own logic, until this was added).
+- **A real preemption/ready-queue race, found chasing a *flaky* — not consistent — `sigaction/
+  11-1.c` hang**: `scheduler::schedule()`'s own re-enqueue branch (`if matches!(prev_state, Ready |
+  Running) { enqueue_ready(prev_pid); }`) pushed the outgoing pid back onto `READY_QUEUE` without
+  ever updating its own `state` field to `Ready` — harmless before real ring-3 preemption existed
+  (this branch was only ever reached via a still-`Running` caller voluntarily yielding via
+  `sched_yield`, where "state stays `Running`-until-actually-resumed" was never observably wrong),
+  but real preemption now reaches this exact branch for a merely-*interrupted* process too, leaving
+  it sitting in `READY_QUEUE` with a stale `state == Running` instead of `Ready`. `process::
+  signals`'s cross-process `Action::Stop` handling (`do_kill`/`signal_foreground_group`) only
+  dequeues a `SIGSTOP`/`SIGTSTP` target from `READY_QUEUE` when it finds `state == Ready` — a
+  target that had merely been preempted once already (virtually guaranteed for any process busy
+  enough to matter) failed that check, so it stayed `Stopped` in `Process::state` while *also*
+  still queued; the scheduler later genuinely popped and resumed it via `activate_and_prepare`
+  (which sets `Running` unconditionally), silently un-stopping it behind the kernel's own back and
+  stomping the `Stopped` state a subsequent real `SIGCONT`'s own `matches!(state, Stopped(_))`
+  check depended on — no `CLD_CONTINUED` ever generated, hanging `sigaction/11-1.c`'s own busy-wait
+  forever. Explains the flakiness exactly: only manifests if the target happened to survive at
+  least one preemption quantum (`PREEMPT_QUANTUM_TICKS = 4` ticks) before the `SIGSTOP` arrived.
+  Fixed at the actual source of the drift (`schedule()` now sets `prev.state = ProcState::Ready`
+  before enqueueing), not by loosening `Action::Stop`'s own dequeue check — restores the real
+  invariant "everything in `READY_QUEUE` has `state == Ready`" that `Action::Stop`'s check already
+  assumed was true.
+- **`sigaltstack/9-1.c`'s own missing `execl()` target, closed too**: its assertion needs a genuine
+  second process — `9-buildonly.c`, the suite's own real helper for this exact test — reachable via
+  a literal relative path copied verbatim from the upstream suite's own build tree
+  (`conformance/interfaces/sigaltstack/9-buildonly.test`, resolved against pid 1's own root cwd at
+  the point the pilot script runs), never seeded anywhere in oxfs before (the pilot only ever
+  builds/seeds files `POSIX_TEST_PILOT_FILES` lists, and `9-buildonly.c`'s own name already excludes
+  it from that list under the pilot's usual "-buildonly.c" exclusion rule — correct for every *other*
+  such file, which are unrunnable standalone, but this one specifically is a real, necessary fixture
+  for `9-1.c`, not dead weight). Fixed by cross-compiling it the same way every other pilot binary
+  is (`build.rs`'s `write_posix_test_manifest`, its own fixed load address `0xa7a0000` — between
+  `t0`'s own base and the main pilot range, both comfortably far away) and seeding it at that exact
+  literal path via a second, separate generated array (`POSIX_TEST_EXTRA_FILES`, seeded straight off
+  oxfs's own root, unlike `POSIX_TEST_FILES`'s `/posix-tests` scoping) — not a kernel-side change at
+  all, purely closing a real gap in what this pilot corpus actually ships.
+- **Verified**: full 488-file pilot re-run clean after each fix, not just once at the end (a real
+  regression — `sigaction/9-1.c` flipping to `CRASH(255)` — was caught and fixed by this same
+  discipline, not by review). Final baseline moved **391P/29F/10U/8US/45UT/4TO/1CR → 398P/25F/9U/
+  8US/45UT/2TO/1CR, 488 total** (net seven real fixes: `sigaltstack/1-1,6-1,7-1,9-1`, `sigaction/
+  21-1,10-1,11-1`; the one remaining `CRASH` is still only `strftime/2-1.c`'s own pre-existing
+  upstream stack-overflow bug). A dedicated final run confirmed the `9-buildonly.test` seeding fix
+  alone changed nothing else — byte-for-byte identical `FAIL`/`CRASH`/`TIMEOUT` lines against the
+  run just before it. Also re-ran the broader signal/scheduling-touching regression suite given how
+  foundational the `schedule()` fix is: `fork_wait`, `session_syscall_smoke`, `sig_syscall_smoke`,
+  `rt_signal_syscall_smoke`, `sa_siginfo_syscall_smoke`, `sysv_sem_syscall_smoke` (the one test
+  whose own source comment already documents depending on real scheduling fairness under
+  preemption), `pause_syscall_smoke`, `mmap_syscall_smoke`, `sysv_shm_syscall_smoke`,
+  `sigaltstack_syscall_smoke`, `sigsuspend_syscall_smoke`, `sched_syscall_smoke`,
+  `clone_syscall_smoke`, `pthread_syscall_smoke`, `mount_syscall_smoke` — all pass unmodified
+  (beyond the two `RawSiginfo`-duplicate fixes above). `cargo build`/`cargo clippy` clean (same
+  pre-existing baseline warnings only).
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a

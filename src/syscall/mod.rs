@@ -556,9 +556,10 @@ const REG_RSP: usize = 15;
 const REG_RIP: usize = 16;
 const REG_EFL: usize = 17;
 
-/// musl's own `stack_t`/`struct sigaltstack` on x86_64 -- `ss_sp` + `ss_flags` (padded to 8 bytes)
-/// + `ss_size`. Always zeroed: `sigaltstack(2)` itself isn't implemented yet (tracked in
-/// `docs/MISSING_POSIX_SYSCALLS.md`), so there is never a real alternate stack to report.
+/// musl's own `stack_t`/`struct sigaltstack` on x86_64 -- `ss_sp`, `ss_flags` (padded to 8 bytes),
+/// `ss_size`. Only ever used for `RawUcontext::uc_stack` below, always zeroed there (a real,
+/// separate gap from `SA_ONSTACK` handler placement itself -- see `Process::altstack`'s own doc
+/// comment -- no current pilot test exercises it).
 #[repr(C)]
 struct RawStackT {
     ss_sp: u64,
@@ -666,11 +667,17 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
             flags,
             siginfo: delivery_siginfo,
         } => {
+            // Real `SA_ONSTACK` (`sigaltstack/1-1.c`/`6-1.c`/`7-1.c`) -- decided (and
+            // `Process::on_altstack` flipped) before `stash_signal_context` below records whether
+            // *this* delivery is the one that did so. See `begin_altstack_if_requested`'s own doc
+            // comment for the real eligibility rules.
+            let altstack = crate::process::begin_altstack_if_requested(pid, flags);
             // Snapshotted *before* frame is mutated below -- this is the exact state the
             // interrupted syscall was about to resume into. `old_mask` is what that state was
             // actually running under -- what `uc_sigmask` reports below, for the SA_SIGINFO case.
             let saved = *frame;
-            let old_mask = crate::process::stash_signal_context(pid, saved, mask_to_add);
+            let old_mask =
+                crate::process::stash_signal_context(pid, saved, mask_to_add, altstack.is_some());
             // A real handler is about to run -- defer the sigsuspend mask restore until it
             // returns (`sigreturn`/`take_signal_saved_frame`) rather than doing it now, real
             // POSIX semantics (see `do_sigsuspend`'s own doc comment).
@@ -678,9 +685,13 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
                 crate::process::set_signal_saved_blocked_override(pid, orig);
             }
 
-            // 128 bytes of red-zone headroom (the interrupted code may have live data there,
-            // System V's own red-zone convention this ABI otherwise never has to think about).
-            let mut sp = frame.user_rsp.wrapping_sub(128);
+            // A real alt stack runs fresh from its own top (no red-zone concern -- nothing else
+            // has ever run here yet); the normal path keeps its existing 128-byte red-zone
+            // headroom under the interrupted code's own live `user_rsp`.
+            let mut sp = match altstack {
+                Some((stack_sp, stack_size)) => stack_sp.wrapping_add(stack_size),
+                None => frame.user_rsp.wrapping_sub(128),
+            };
 
             let (siginfo_addr, ucontext_addr) = if flags & crate::process::SA_SIGINFO != 0 {
                 sp = sp.wrapping_sub(core::mem::size_of::<RawUcontext>() as u64);

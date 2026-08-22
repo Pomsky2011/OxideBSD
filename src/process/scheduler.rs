@@ -148,12 +148,30 @@ pub fn schedule() {
         let has_prev = prev_pid != 0;
 
         if has_prev {
-            let table = process::table().lock();
-            let prev_state = table
-                .get(&prev_pid)
-                .expect("schedule: current process missing from table")
-                .state;
-            if matches!(prev_state, ProcState::Ready | ProcState::Running) {
+            let mut table = process::table().lock();
+            let prev = table
+                .get_mut(&prev_pid)
+                .expect("schedule: current process missing from table");
+            if matches!(prev.state, ProcState::Ready | ProcState::Running) {
+                // Real invariant this codebase's own cross-process `Action::Stop` handling
+                // (`process::signals`) depends on: "every pid sitting in `READY_QUEUE` has
+                // `state == Ready`". Before real ring-3 preemption existed, `schedule()` only
+                // ever reached this branch via a still-`Running` caller voluntarily yielding
+                // (`sched_yield`); a genuinely `Ready` (never-yet-run, or already-preempted-once)
+                // pid re-entering here was never a real case. Real preemption broke that
+                // assumption silently: the timer interrupt now calls this same function directly
+                // on a still-`Running`, merely-interrupted process, and this branch used to leave
+                // `state` at its stale `Running` value while still pushing it onto `READY_QUEUE`.
+                // A cross-process `SIGSTOP` landing on exactly that pid then saw `state ==
+                // Running` (not `Ready`), skipped its own `remove_ready` dequeue, and left a
+                // `Stopped` process's own stale entry sitting in the queue -- which the scheduler
+                // then genuinely popped and resumed later via `activate_and_prepare` (which sets
+                // `Running` unconditionally), silently un-stopping it and stomping the `Stopped`
+                // state a subsequent `SIGCONT`'s own `matches!(state, Stopped(_))` check depended
+                // on. Found live: a flaky (preemption-timing-dependent) hang in
+                // `sigaction/11-1.c`'s own `SIGSTOP`/`SIGCONT`/`CLD_CONTINUED` round trip. Fixed
+                // at the actual source of the drift, not by loosening `Action::Stop`'s own check.
+                prev.state = ProcState::Ready;
                 drop(table);
                 enqueue_ready(prev_pid);
             }

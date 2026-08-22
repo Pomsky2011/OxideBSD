@@ -126,6 +126,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sigactions: [SigAction::DEFAULT; (SIGRTMAX + 1) as usize],
         signal_stack: Vec::new(),
         altstack: AltStack::default(),
+        on_altstack: false,
         priority: 0,
         pgid,
         sid: pid,
@@ -348,6 +349,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         sigactions: parent_sigactions,
         signal_stack: parent_signal_stack,
         altstack: parent_altstack,
+        // Not inherited -- see Process::on_altstack's own doc comment.
+        on_altstack: false,
         priority: 0,
         pgid: parent_pgid,
         sid: parent_sid,
@@ -568,6 +571,8 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         sigactions: parent_sigactions,
         signal_stack: parent_signal_stack,
         altstack: parent_altstack,
+        // Not inherited -- see Process::on_altstack's own doc comment.
+        on_altstack: false,
         priority: 0,
         pgid: parent_pgid,
         sid: parent_sid,
@@ -963,6 +968,7 @@ pub fn do_execve(
         // image and means nothing in the new one -- reset to disabled, same reasoning fs_base
         // above already uses.
         me.altstack = AltStack::default();
+        me.on_altstack = false;
         // Real `timer_create(2)` semantics: POSIX per-process timers are disarmed and deleted
         // across execve -- see `Process::posix_timers`'s own doc comment.
         me.posix_timers = [None; MAX_POSIX_TIMERS];
@@ -1320,6 +1326,52 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
         notify_parent_sigchld(&mut table, pid, CLD_EXITED, ((code >> 8) & 0xff) as u64);
     } else {
         notify_parent_sigchld(&mut table, pid, CLD_KILLED, (code & 0x7f) as u64);
+    }
+    // Real SA_NOCLDWAIT semantics (`sigaction/21-1.c`): if the parent's own SIGCHLD action has
+    // this flag set, a child is never left as a wait4-reapable zombie at all -- real POSIX
+    // (`sigaction(2)`, XSI): "if a process's SIGCHLD action... has the SA_NOCLDWAIT flag set...
+    // child processes... shall not be transformed into zombie processes". SIGCHLD generation
+    // itself is unaffected (matches real Linux -- this flag only governs zombie retention, unlike
+    // SA_NOCLDSTOP's own signal-suppression for stop/continue), so this must run *after* the
+    // notify_parent_sigchld calls above, not instead of them. Detaches from the parent's
+    // `children` list immediately either way, so a parent with no other children gets a real
+    // `ECHILD` on its very next `wait()` call instead of blocking forever.
+    let auto_reap = table
+        .get(&pid)
+        .and_then(|me| me.parent)
+        .and_then(|parent_pid| table.get(&parent_pid))
+        .is_some_and(|parent| parent.sigactions[SIGCHLD as usize].flags & SA_NOCLDWAIT != 0);
+    if auto_reap {
+        let parent_pid = table.get(&pid).unwrap().parent;
+        if let Some(parent_pid) = parent_pid
+            && let Some(parent) = table.get_mut(&parent_pid)
+        {
+            parent.children.retain(|&c| c != pid);
+        }
+        // Real frame reclaim (`AddressSpace::teardown`) requires this entry's own address space to
+        // *not* be the currently active `CR3` -- true immediately for a cross-process kill
+        // (`do_kill`'s `Action::Terminate`, target != caller, exactly like `do_wait4`'s own normal
+        // reap), but **not** for the common case: `do_exit` calling this on *itself*, still
+        // running on this exact entry's own address space/kernel stack at this exact point (same
+        // hazard the `other_thread_alive` branch above documents for the identical reason). A real
+        // fix there needs the same "defer until schedule() confirms current_pid() has moved on"
+        // treatment that branch already established via `scheduler::queue_thread_reap` -- reused
+        // here rather than duplicated, at the cost of that path leaking this one address space's
+        // frames (that queue's own drain just drops the entry, no `teardown()` call) rather than
+        // reclaiming them -- an honest, narrowly-scoped gap (this flag has exactly one live
+        // exerciser today) preferred over risking use-after-free of a live page table.
+        if pid == scheduler::current_pid() {
+            scheduler::remove_ready(pid);
+            drop(table);
+            scheduler::queue_thread_reap(pid);
+            return;
+        }
+        let removed = table
+            .remove(&pid)
+            .expect("terminate_process: just-set zombie vanished under the same lock");
+        drop(table);
+        let phys_offset = memory::phys_mem_offset();
+        with_frame_allocator(|fa| unsafe { removed.address_space.teardown(phys_offset, fa) });
     }
 }
 

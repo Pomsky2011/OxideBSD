@@ -152,8 +152,8 @@ macro_rules! check {
 #[repr(C)]
 struct RawSiginfo {
     si_signo: i32,
-    si_code: i32,
     si_errno: i32,
+    si_code: i32,
     _pad0: i32,
     si_pid: i32,
     si_uid: i32,

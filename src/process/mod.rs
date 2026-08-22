@@ -341,23 +341,32 @@ pub struct QueuedSigInfo {
     pub value: u64,
 }
 
-/// musl's own `siginfo_t` on x86_64 (`third_party/musl/include/signal.h`): three `int`s
-/// (`si_signo`/`si_code`/`si_errno`, no `__SI_SWAP_ERRNO_CODE` on this arch), padded to 8-byte
-/// alignment, then the `__si_common` union's two sub-unions -- `si_pid`/`si_uid` (the
-/// `__piduid`/user-signal-generated shape, the only one this kernel ever actually fills; the
-/// `si_timerid`/`si_overrun` alternative in the same union slot is never populated, no real
-/// per-process timer identity exists to report) followed by `si_value`/`si_status`+`si_utime`+
-/// `si_stime` (also never populated), then padding out to the real, fixed 128-byte `siginfo_t` size
-/// shared across every real Linux architecture. Shared by two real consumers -- the `SA_SIGINFO`
-/// handler-invocation path (`src/syscall/mod.rs`'s `deliver_pending_signal`) and `sigtimedwait`/
-/// `sigqueue`'s own read/write (`process::signals`) -- rather than duplicated a second time, since
-/// getting a wire-format struct's exact layout right in two places independently is exactly the
-/// kind of divergence risk this codebase's own "verified via a direct probe" rigor exists to avoid.
+/// musl's own `siginfo_t` on x86_64 (`third_party/musl/include/signal.h`): three `int`s, ordered
+/// `si_signo`/`si_errno`/`si_code` -- **not** `si_signo`/`si_code`/`si_errno` (a real, previously
+/// undiscovered bug this comment used to claim the opposite of: `__SI_SWAP_ERRNO_CODE` is only
+/// ever defined for MIPS in this musl fork, and its own `#else` branch -- the one that therefore
+/// always applies here -- is `si_signo, si_errno, si_code`, the *un*-swapped order putting
+/// `si_code` third, not second). Found live via `sigaction/10-1.c`/`11-1.c`: both busy-wait on a
+/// real `SA_SIGINFO` `SIGCHLD` handler checking `info->si_code == CLD_STOPPED`/`CLD_CONTINUED` --
+/// with `si_code` and `si_errno` swapped, a real caller reading `si_code` was actually reading this
+/// kernel's own always-zero `si_errno` value, so that check silently never matched (a coincidental
+/// false-negative, not a crash -- `SI_USER == 0` too, so any earlier test only checking *that*
+/// value happened to still pass). Padded to 8-byte alignment, then the `__si_common` union's two
+/// sub-unions -- `si_pid`/`si_uid` (the `__piduid`/user-signal-generated shape, the only one this
+/// kernel ever actually fills; the `si_timerid`/`si_overrun` alternative in the same union slot is
+/// never populated, no real per-process timer identity exists to report) followed by
+/// `si_value`/`si_status`+`si_utime`+`si_stime` (also never populated), then padding out to the
+/// real, fixed 128-byte `siginfo_t` size shared across every real Linux architecture. Shared by two
+/// real consumers -- the `SA_SIGINFO` handler-invocation path (`src/syscall/mod.rs`'s
+/// `deliver_pending_signal`) and `sigtimedwait`/`sigqueue`'s own read/write (`process::signals`) --
+/// rather than duplicated a second time, since getting a wire-format struct's exact layout right in
+/// two places independently is exactly the kind of divergence risk this codebase's own "verified
+/// via a direct probe" rigor exists to avoid.
 #[repr(C)]
 pub(crate) struct RawSiginfo {
     pub si_signo: i32,
-    pub si_code: i32,
     pub si_errno: i32,
+    pub si_code: i32,
     pub _pad0: i32,
     /// `__si_fields.__si_common.__first.__piduid.si_pid` -- real sender identity now (`QueuedSigInfo::pid`),
     /// not the honest-zero placeholder this field used to always be.
@@ -382,16 +391,15 @@ pub const SS_ONSTACK: i32 = 1;
 pub const SS_DISABLE: i32 = 2;
 
 /// Backing store for `SYS_SIGALTSTACK` (`do_sigaltstack`, `src/process/signals.rs`) — real POSIX
-/// per-process alternate-signal-stack bookkeeping. **Bookkeeping only**: no signal is ever
-/// actually delivered at this stack's own *address* — `SA_ONSTACK` isn't honored by
-/// `deliver_pending_signal` (`src/syscall/mod.rs`), which always builds a handler's frame off the
-/// interrupted context's live `user_rsp` regardless of what this struct says (see
-/// `docs/MISSING_POSIX_SYSCALLS.md`). This is now a distinct gap from real handler *nesting*,
-/// which is fixed — see `Process::signal_stack`'s own doc comment — a real `sigaltstack` doesn't
-/// fix `SA_ONSTACK` by itself either way. Since this kernel never actually executes a handler on
-/// the alt stack, `SS_ONSTACK` is always reported as unset on read-back — an honest reflection of
-/// what actually happens, not a fabricated "yes, active" answer. `Default` is the real POSIX
-/// startup state: no alternate stack established (`flags = SS_DISABLE`).
+/// per-process alternate-signal-stack bookkeeping. `SA_ONSTACK` **is** honored by
+/// `deliver_pending_signal` (`src/syscall/mod.rs`) now — a `Handler`-disposition delivery that
+/// requests it, with a real stack established here and the process not already executing on one,
+/// runs with its stack pointer inside `[sp, sp+size)` instead of the interrupted context's own
+/// `user_rsp` (see `process::signals::begin_altstack_if_requested`). `Process::on_altstack`
+/// tracks whether a handler is *currently* running on it, so `SS_ONSTACK` read-back and the real
+/// "can't change the alt stack while it's active" `EPERM` (`do_sigaltstack`) are both genuine now,
+/// not honest-zero placeholders. `Default` is the real POSIX startup state: no alternate stack
+/// established (`flags = SS_DISABLE`).
 ///
 /// Copied by `fork` (a real `fork()` duplicates the whole address space, so the alt stack's own
 /// address stays valid in the child, same reasoning `cwd`/`brk`/`fs_base` already document); reset
@@ -477,6 +485,22 @@ const SA_NODEFER: u64 = 0x40000000;
 /// handler's own stack frame) or the plain 1-argument `void (*)(int)` form. See that function's
 /// own doc comment for what is and isn't faithfully populated.
 pub(crate) const SA_SIGINFO: u64 = 0x00000004;
+/// `SA_ONSTACK` (real Linux/x86_64 value) -- consulted by `deliver_pending_signal` to decide
+/// whether a `Handler`-disposition delivery runs on the process's own alternate signal stack
+/// (`Process::altstack`) instead of the interrupted context's live `user_rsp`. See
+/// `process::signals::begin_altstack_if_requested`'s own doc comment for the real POSIX
+/// eligibility rules (a real alt stack must actually be established, and the process must not
+/// already be executing on it).
+pub(crate) const SA_ONSTACK: u64 = 0x08000000;
+/// `SA_NOCLDWAIT` (real Linux/x86_64 value, matches musl's `bits/signal.h`) -- consulted by
+/// `process::lifecycle::terminate_process` to decide whether an exiting child is auto-reaped
+/// (real POSIX: never left as a wait4-visible zombie at all) instead of the normal `Zombie` state
+/// a plain `wait4` reaps later.
+pub(crate) const SA_NOCLDWAIT: u64 = 2;
+/// `SA_NOCLDSTOP` (real Linux/x86_64 value, matches musl's `bits/signal.h`) -- consulted by
+/// `process::signals::notify_parent_sigchld` to suppress `CLD_STOPPED` generation specifically
+/// (real POSIX: this flag only affects the stop transition, not exit/continue).
+pub(crate) const SA_NOCLDSTOP: u64 = 1;
 /// What `default_disposition` says happens to a signal nothing has installed a handler for (or
 /// that's been explicitly reset to `SIG_DFL`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -590,6 +614,11 @@ pub(crate) struct SignalStackFrame {
     /// `blocked_signals`'s value from just before this entry's own handler was entered —
     /// restored by `take_signal_saved_frame` alongside `saved` above.
     pub(crate) blocked_before: u64,
+    /// Whether *this* delivery ran on `Process::altstack` (`SA_ONSTACK` requested, a real alt
+    /// stack enabled, and the process wasn't already on it) — `take_signal_saved_frame` clears
+    /// `Process::on_altstack` when popping an entry with this set, matching real POSIX: the alt
+    /// stack is "active" for exactly the duration of the handler(s) actually running on it.
+    pub(crate) used_altstack: bool,
 }
 
 /// State genuinely shared by every thread in a real POSIX thread group (`CLONE_THREAD`), once
@@ -717,8 +746,15 @@ pub struct Process {
     /// standard ones.
     pub(crate) signal_stack: Vec<SignalStackFrame>,
     /// `SYS_SIGALTSTACK`'s backing store — see `AltStack`'s own doc comment for the real
-    /// bookkeeping-only semantics and fork/execve treatment.
+    /// semantics and fork/execve treatment.
     pub altstack: AltStack,
+    /// Whether a signal handler is *currently* executing on `altstack` — set by
+    /// `process::signals::begin_altstack_if_requested`, cleared by `take_signal_saved_frame` when
+    /// the `SignalStackFrame` that set it is popped (`sigreturn`). Not inherited by `fork`/`clone`
+    /// (starts `false`, same "no meaningful in-progress-handler state to carry over" reasoning
+    /// applied elsewhere in this file — no live test forks from inside an on-stack handler); reset
+    /// to `false` by `execve` alongside `altstack` itself.
+    pub on_altstack: bool,
     /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
     #[allow(dead_code)]
     pub priority: u8,

@@ -460,11 +460,22 @@ pub(crate) fn wake_if_futex_waiting(pid: Pid, proc: &mut Process, sig: u64) {
 /// `si_value` (`third_party/musl/include/signal.h`'s `__sigchld`/`si_value` union), so no new
 /// `RawSiginfo` field was needed.
 ///
-/// Unconditional -- `SA_NOCLDSTOP`/`SA_NOCLDWAIT` aren't tracked by `Process::sigactions` and no
-/// live caller needs the suppression. Harmless for a parent that never installed a real handler:
-/// `SIGCHLD`'s own default disposition already stays `Ignore` (see `default_disposition`), so
-/// nothing observable happens beyond the same harmless `wait4`/`pause`/etc. wake this function's
-/// own `wake_if_*` calls already produce for every other signal.
+/// Real `SA_NOCLDSTOP` suppression for the `CLD_STOPPED` transition specifically -- real POSIX:
+/// this flag only affects a child's *stop*, not its exit/continue, so `CLD_EXITED`/`CLD_KILLED`/
+/// `CLD_CONTINUED` are still unconditional. `SA_NOCLDWAIT` (zombie retention, not signal
+/// suppression) is handled separately, at the actual reap decision in `process::lifecycle::
+/// terminate_process`, not here. Found live: `sigaction/9-1.c` installs a real `SA_NOCLDSTOP`
+/// `SIGCHLD` handler and checks that its own `child_stopped` counter stays `0` across 10 real
+/// `SIGSTOP`/`SIGCONT` round trips -- previously masked by the `si_code`/`si_errno` field-swap bug
+/// `RawSiginfo`'s own doc comment now documents (this handler's `info->si_code == CLD_STOPPED`
+/// check always silently read the wrong field before that fix, so `child_stopped` never actually
+/// incremented regardless of whether the signal itself was ever suppressed) -- fixing that bug
+/// alone exposed this real, independent, previously-unexercised gap.
+///
+/// Harmless for a parent that never installed a real handler either way: `SIGCHLD`'s own default
+/// disposition stays `Ignore` (see `default_disposition`), so nothing observable happens beyond the
+/// same harmless `wait4`/`pause`/etc. wake this function's own `wake_if_*` calls already produce
+/// for every other signal.
 pub(crate) fn notify_parent_sigchld(
     table: &mut BTreeMap<Pid, Box<Process>>,
     child_pid: Pid,
@@ -481,6 +492,9 @@ pub(crate) fn notify_parent_sigchld(
     let Some(parent) = table.get_mut(&parent_pid) else {
         return;
     };
+    if code == CLD_STOPPED && parent.sigactions[SIGCHLD as usize].flags & SA_NOCLDSTOP != 0 {
+        return;
+    }
     let _ = record_pending(parent, SIGCHLD, code, child_pid, child_uid, status);
     wake_if_paused(parent_pid, parent, SIGCHLD);
     wake_if_sigwaiting(parent_pid, parent, SIGCHLD);
@@ -697,16 +711,22 @@ pub fn do_sigaltstack(pid: Pid, ss_ptr: u64, old_ptr: u64) -> Result<u64, u64> {
     if old_ptr != 0 {
         let raw = RawSigaltstack {
             sp: proc.altstack.sp,
-            // This kernel never actually executes a handler on the alt stack -- SS_ONSTACK is
-            // always reported unset, an honest reflection of what actually happens (see
-            // AltStack's own doc comment).
-            flags: proc.altstack.flags & !SS_ONSTACK,
+            // Real `SS_ONSTACK` read-back now: set exactly while a handler is genuinely running on
+            // this stack (`Process::on_altstack`, see `sigaltstack/6-1.c`), not always stripped.
+            flags: (proc.altstack.flags & !SS_ONSTACK)
+                | if proc.on_altstack { SS_ONSTACK } else { 0 },
             size: proc.altstack.size,
         };
         // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
         unsafe { (old_ptr as *mut RawSigaltstack).write_unaligned(raw) };
     }
     if ss_ptr != 0 {
+        // Real POSIX: attempting to change the alt stack while a handler is currently executing on
+        // it is `EPERM`, regardless of what the new stack_t even says (`sigaltstack/7-1.c`) --
+        // checked before the `ss_flags` validation below, matching real Linux's own check order.
+        if proc.on_altstack {
+            return Err(EPERM);
+        }
         // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
         let raw = unsafe { (ss_ptr as *const RawSigaltstack).read_unaligned() };
         if raw.flags & !SS_DISABLE != 0 {
@@ -845,7 +865,12 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
 /// program was actually running under) — `deliver_pending_signal`'s own `SA_SIGINFO` path uses
 /// this for the constructed `ucontext_t`'s `uc_sigmask`, matching real Linux's own "the mask in
 /// effect just before the handler was entered" semantics.
-pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u64) -> u64 {
+pub(crate) fn stash_signal_context(
+    pid: Pid,
+    saved: SyscallFrame,
+    mask_to_add: u64,
+    used_altstack: bool,
+) -> u64 {
     let mut table = PROCESS_TABLE.lock();
     let Some(proc) = table.get_mut(&pid) else {
         return 0;
@@ -855,6 +880,7 @@ pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u
     proc.signal_stack.push(SignalStackFrame {
         saved,
         blocked_before: old_mask,
+        used_altstack,
     });
     old_mask
 }
@@ -866,12 +892,46 @@ pub(crate) fn stash_signal_context(pid: Pid, saved: SyscallFrame, mask_to_add: u
 /// re-checks for a further deliverable signal right after this returns — see that function's own
 /// doc comment — which is what turns a chain of `stash_signal_context` pushes into a real,
 /// POSIX-shaped succession of handler invocations before userspace ever actually resumes.
+///
+/// Also clears `Process::on_altstack` if the popped entry was the one that set it — real POSIX:
+/// the alt stack is "active" for exactly as long as a handler is genuinely running on it, and a
+/// chained delivery (see this function's own doc comment above) may itself have pushed a further,
+/// non-`SA_ONSTACK` entry on top without ever leaving the stack — only the entry that actually
+/// requested it should ever clear it back.
 pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<SyscallFrame> {
     let mut table = PROCESS_TABLE.lock();
     let proc = table.get_mut(&pid)?;
     let entry = proc.signal_stack.pop()?;
     proc.blocked_signals = entry.blocked_before;
+    if entry.used_altstack {
+        proc.on_altstack = false;
+    }
     Some(entry.saved)
+}
+
+/// Real `SA_ONSTACK` eligibility check (`sigaltstack/1-1.c`/`6-1.c`/`7-1.c`) -- called by
+/// `deliver_pending_signal` right before `stash_signal_context`, so the decision (and the
+/// `on_altstack` flip) happens exactly once per delivery, before that delivery's own stack pointer
+/// is computed. Real POSIX: a handler installed with `SA_ONSTACK` runs on the alternate signal
+/// stack only if one is actually established (`flags != SS_DISABLE`, a real size) *and* the
+/// process isn't already executing on it -- a second signal arriving while already on-stack (e.g.
+/// chained via `do_sigreturn`, or a different handler also requesting `SA_ONSTACK`) keeps running
+/// wherever the first one already put it, exactly like the interrupted-`user_rsp` case does for a
+/// plain nested handler; this kernel doesn't need to reproduce that sharing itself since it never
+/// touches `sp` at all in that case (`deliver_pending_signal` falls back to its normal
+/// `user_rsp`-relative placement, which is *already* on the alt stack in that scenario since that's
+/// what the outer handler is currently running on).
+pub(crate) fn begin_altstack_if_requested(pid: Pid, flags: u64) -> Option<(u64, u64)> {
+    if flags & SA_ONSTACK == 0 {
+        return None;
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.get_mut(&pid)?;
+    if proc.on_altstack || proc.altstack.flags & SS_DISABLE != 0 || proc.altstack.size == 0 {
+        return None;
+    }
+    proc.on_altstack = true;
+    Some((proc.altstack.sp, proc.altstack.size))
 }
 
 /// Real relative-timeout conversion for `sigtimedwait` -- the same whole-second/sub-second tick
