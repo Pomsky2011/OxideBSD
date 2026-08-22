@@ -117,6 +117,7 @@ unsafe extern "C" {
     fn oxidebsd_random_bytes(ptr: u64, len: u64) -> i64;
     fn oxidebsd_current_uid() -> u64;
     fn oxidebsd_current_gid() -> u64;
+    fn oxidebsd_current_umask() -> u64;
     /// Real Unix epoch seconds, whole-second precision -- see `src/cpu/rtc.rs`'s own doc comment
     /// on `oxidebsd_unix_time`. Backs real `st_mtime`/`st_ctime` (`write_inode_data`/
     /// `resize_inode_data`).
@@ -263,6 +264,18 @@ const O_CREAT: u64 = 0o100;
 /// before: every open of an existing path used to always end up read-only regardless of what the
 /// caller actually asked for).
 const O_ACCMODE: u64 = 0o3;
+/// Real generic `open(2)` `O_EXCL` value -- combined with `O_CREAT`, real POSIX requires
+/// `open()` to fail `EEXIST` when the target name already exists (regardless of what it resolves
+/// to -- a symlink, a directory, an existing regular file all count), rather than transparently
+/// opening it. Found live via `shm_open/22-1.c` (Open POSIX Test Suite pilot): `oxfs_open` used to
+/// ignore this bit entirely and just open the pre-existing object.
+const O_EXCL: u64 = 0o200;
+/// Real generic `open(2)` `O_TRUNC` value -- see `oxfs_open`'s own `want_write` branch for where
+/// this is consulted. Found live via `shm_open/25-1.c`: a reopen of an already-existing object
+/// with `O_TRUNC` must make the truncation to zero length visible to an immediate `fstat()` on the
+/// same fd, not merely defer it to whatever this filesystem's own write-buffer eventually commits
+/// at `close()` (which never fires here at all, since the test never calls `write()`).
+const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 /// Real generic `open(2)` `O_CLOEXEC` value -- distinct from `fcntl(2)`'s own `FD_CLOEXEC` value
 /// (`src/syscall/ffi.rs`'s `sys_fcntl` consults that one instead). Found live via `shm_open/
@@ -1458,6 +1471,17 @@ fn resolve_path_impl(
         if component == b".." && current == root_inode {
             continue;
         }
+        // See `force_commit_pending_create`'s own doc comment -- previously wired into `oxfs_open`
+        // only, so a same-process `open(O_CREAT)` (still open, not yet closed/fsynced/ftruncated)
+        // stayed genuinely invisible to any *other* syscall walking a path through this exact
+        // resolver -- `stat`/`lstat`/`unlink`/`chdir`/... Found live via `mmap/13-1.c` (Open POSIX
+        // Test Suite pilot): `open(O_CREAT) -> write() -> stat()` on the same still-open fd, no
+        // close in between, real `ENOENT`'d the `stat()` even though the file plainly "exists" by
+        // any real Unix's standard. Harmless to call for every component, not just the last: a
+        // pending create can only ever be a leaf (an intermediate component must already be a
+        // real, committed directory or this walk already fails `NotADirectory`/`NotFound`
+        // regardless), and the `(parent, name)` match this scans for is exact either way.
+        force_commit_pending_create(current, component);
         let next = dir_lookup(current, component).ok_or(OxfsError::NotFound)?;
         // A mounted directory shadows whatever real inode was already there -- applies to every
         // component, not just the last, matching real Unix (`stat`ing a mountpoint itself reports
@@ -2574,6 +2598,47 @@ fn known_device(rdev: u32, device_char: bool) -> Option<OpenFile> {
     }
 }
 
+/// Closes a real visibility gap in this filesystem's own deferred-commit `open(O_CREAT)` design
+/// (see `OpenFile::Write::existing_inode`'s own doc comment): a still-open fd from an earlier
+/// `open(O_CREAT)` against `(parent, name)` doesn't get a real inode/directory entry until
+/// something forces an early commit (`fsync`/`ftruncate`/`close`/`resolve_write_fd_inode`'s own
+/// fd-based fstat special-case) -- so a *second*, independent `open()` call against the exact same
+/// path, in the same process, with no such intervening call on the first fd, used to see nothing
+/// at all via `dir_lookup` (real `ENOENT`, or a silent second create). Real POSIX/Unix `open(2)`
+/// has no such gap: the directory entry exists the instant the first `open(O_CREAT)` call returns.
+/// Found live via `shm_open/22-1.c` (a same-process `open(O_CREAT) -> open(O_CREAT|O_EXCL)` pair
+/// must see `EEXIST` on the second call) and `shm_open/32-1.c`/`34-1.c` (a same-process
+/// `open(O_CREAT, mode) -> open()` pair, no `O_CREAT` on the second call, must find the first
+/// call's own real, already-applied `mode` for a permission check to have anything real to deny
+/// against). Scans the small, fixed `OPEN_FILES` table (`MAX_OPEN_FILES = 8`, cheap to walk) for
+/// any other fd still mid-create against this exact `(parent, name)` and force-commits it right
+/// now via the same `commit_write_buffer` every other early-commit call site already uses --
+/// including `commit_write_buffer`'s own `unlinked` check, so a path that was `unlink()`d before
+/// ever committing (see that field's own doc comment) still correctly ends up with no directory
+/// entry inserted, matching real Unix "removed before ever named" semantics.
+fn force_commit_pending_create(parent: u32, name: &[u8]) {
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
+    for slot in slots.iter_mut().flatten() {
+        // Checked via a plain immutable borrow first (dropped as soon as `matches!` finishes
+        // evaluating) so the mutable reborrow just below is never in question -- simpler than
+        // trying to thread one mutable borrow through both the match guard and the call.
+        let is_match = matches!(
+            &slot.1,
+            OpenFile::Write {
+                parent_inode,
+                name: n,
+                name_len,
+                existing_inode: None,
+                ..
+            } if *parent_inode == parent && &n[..*name_len as usize] == name
+        );
+        if is_match {
+            commit_write_buffer(&mut slot.1);
+            return;
+        }
+    }
+}
+
 /// Registered for `SYS_OPEN`. `/proc/...` (absolute only -- a *relative* path reached while cwd is
 /// already inside `/proc` is `proc_relative_open`'s job, below) is intercepted before any of the
 /// real, cwd-relative special-casing below, since it isn't backed by a real inode at all -- see
@@ -2593,10 +2658,12 @@ fn known_device(rdev: u32, device_char: bool) -> Option<OpenFile> {
 /// own wire format to a real 4-arg `(path_ptr, path_len, flags, mode)` -- `third_party/musl/src/
 /// fcntl/open.c` and `src/internal/syscall.h`'s own `__sys_open3`/`__sys_open_cp3` (the internal
 /// stdio-callers' path, see that file's own doc comment for the argument-shape history) now pass
-/// it through via `__syscall4`/`__syscall_cp4` instead of discarding it. **No umask consultation
-/// here** -- `Process::umask` is still real, tracked-but-unconsulted state everywhere else oxfs
-/// creates an inode (see CLAUDE.md's own umask section); wiring it in is a separate, still-open
-/// gap this fix's own scope doesn't extend to.
+/// it through via `__syscall4`/`__syscall_cp4` instead of discarding it. **Real umask consultation**
+/// (found live via `shm_open/18-1.c`, the Open POSIX Test Suite pilot -- a `shm_open()`'d object's
+/// real permission bits must have the caller's own `umask` bits already cleared): the requested
+/// `mode` is masked against `oxidebsd_current_umask()` (real, tracked-but-previously-unconsulted
+/// `Process::umask` state, see CLAUDE.md's own umask section) before being stored on the fresh
+/// inode, same real POSIX `mode & ~umask` rule every other Unix `open(O_CREAT)` applies.
 /// `""`/`"."`/`".."`/`"/"` are special-cased next (mirroring `modules/fat32`'s own handling of
 /// them) before falling into `resolve_parent`, which -- unlike FAT32's single-component
 /// `to_short_name` -- handles an arbitrarily deep path (`sub/inner/file.txt`) in this one call.
@@ -2650,8 +2717,22 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
         Err(e) => return errno_for(e),
     };
 
+    // See `force_commit_pending_create`'s own doc comment: closes a real same-process visibility
+    // gap where an earlier, still-uncommitted `open(O_CREAT)` against this exact path wouldn't be
+    // seen by this call's own `dir_lookup` below.
+    force_commit_pending_create(parent, leaf);
+
     let result = match dir_lookup(parent, leaf) {
         Some(inode_num) => {
+            // Real `O_EXCL` (only meaningful combined with `O_CREAT`, per real POSIX): the target
+            // already exists -- regardless of what it resolves to (symlink, directory, device,
+            // ...) -- so `open()` must fail here rather than transparently opening it. Checked
+            // before the mount-redirect/symlink-follow logic below, on the raw `dir_lookup` result,
+            // matching real Unix's own "the name itself already exists" semantics. Found live via
+            // `shm_open/22-1.c` (Open POSIX Test Suite pilot).
+            if create && flags & O_EXCL != 0 {
+                return -EEXIST;
+            }
             // `dir_lookup` is a bare lookup -- unlike `resolve_path`, it doesn't apply the mount
             // redirect `resolve_path_impl`'s own loop does for every *intermediate* component.
             // That's correct when `leaf` is being checked for an EEXIST-style presence test
@@ -2703,15 +2784,22 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                     let mut buffer = [0u8; MAX_WRITE_BUFFER];
                     let mut len = 0;
                     // O_APPEND: start from the file's real existing content, so subsequent writes
-                    // land after it rather than replacing it -- otherwise (plain O_WRONLY/O_RDWR,
-                    // with or without an explicit O_TRUNC) start empty, real POSIX truncate-on-
-                    // write-open semantics (this filesystem has no way to write only *part* of a
-                    // file in place -- see write_inode_data's own doc comment -- so there's no
-                    // separate "O_WRONLY without O_TRUNC" case to support here; the last real
-                    // difference O_TRUNC would make, leaving the old content until the write
-                    // actually happens, doesn't matter for any caller in this port's roster).
+                    // land after it rather than replacing it -- otherwise (plain O_WRONLY/O_RDWR)
+                    // start empty, real POSIX truncate-on-write-open semantics (this filesystem
+                    // has no way to write only *part* of a file in place -- see
+                    // write_inode_data's own doc comment -- so there's no separate "O_WRONLY
+                    // without O_TRUNC" case to support here).
+                    //
+                    // A real, explicit `O_TRUNC` additionally resizes the underlying inode to zero
+                    // *immediately*, not merely once this fd's own write buffer eventually commits
+                    // at `close()` (which may never happen, if the caller never calls `write()` --
+                    // real POSIX still requires the truncation to be visible right away, e.g. to a
+                    // `fstat()` on this same fd before any write). Found live via `shm_open/25-1.c`
+                    // (Open POSIX Test Suite pilot).
                     if flags & O_APPEND != 0 {
                         len = read_inode_at(resolved, 0, &mut buffer);
+                    } else if flags & O_TRUNC != 0 {
+                        resize_inode_data(resolved, 0);
                     }
                     register_open_file(OpenFile::Write {
                         parent_inode: parent,
@@ -2766,11 +2854,12 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                 // regardless of what the caller actually asked for; found live via `sem_open/
                 // 3-1.c`, the Open POSIX Test Suite pilot -- a semaphore created `0444` needs its
                 // own restricted mode to actually take effect for a later `EACCES` to be possible
-                // at all). No umask consultation here -- `Process::umask` is still real,
-                // documented, tracked-but-unconsulted state everywhere else oxfs creates an
-                // inode (see CLAUDE.md's own umask section), not something this fix's own scope
-                // extends to.
-                mode: (mode & 0o777) as u16,
+                // at all). Real `mode & ~umask` -- `Process::umask` (`oxidebsd_current_umask`) is
+                // consulted here so a caller's own umask actually clears bits the way real
+                // `open(O_CREAT)` always does; found live via `shm_open/18-1.c` (Open POSIX Test
+                // Suite pilot), which sets a real, non-default umask and expects those exact bits
+                // gone from the resulting object's permissions.
+                mode: (mode as u16 & !(unsafe { oxidebsd_current_umask() } as u16)) & 0o777,
             })
         }
         None => -ENOENT,
@@ -2988,15 +3077,26 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
 /// Registered for `SYS_CLOSE`. Delegates to the kernel's own `oxidebsd_close_fd`, which removes
 /// `fd` from its registry and invokes `oxfs_close` above -- not a direct call, so a closed fd is
 /// also no longer reachable via `SYS_READ`/`SYS_WRITE` afterward.
+///
+/// `oxidebsd_close_fd`'s own return is a plain C-style `0`/`-1` boolean, not a registered
+/// handler's `-errno` wire format -- passing its literal `-1` straight through used to be
+/// silently read as `-errno` with `errno=1` (`EPERM`) instead of real close(2)'s one documented
+/// failure, `EBADF` (an already-closed/never-open fd -- `mq_close/3-1.c`, but really any
+/// double-close on any fd kind). Translated here, the only call site for this function.
 extern "C" fn sys_close(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
-    unsafe { oxidebsd_close_fd(fd) as i64 }
+    if unsafe { oxidebsd_close_fd(fd) } == 0 { 0 } else { -EBADF }
 }
 
 /// Registered for `SYS_FSYNC`. See `SYS_FSYNC`'s own doc comment (up near its number's
 /// definition) for why this filesystem's normal commit-only-at-close write model otherwise makes
 /// `fsync()` a lie for anything opened for writing. A no-op success for a read/directory fd --
 /// real Unix `fsync()` on a read-only fd is also a harmless no-op.
+///
+/// A real, registered fd that just isn't one of *this* module's own (a pipe, socket, or mqueue
+/// end) resolves fine via `oxidebsd_real_fd_of` but has no `find_open_file` entry -- real POSIX
+/// `EINVAL` ("fildes does not refer to a file on which this operation is possible",
+/// `fsync/7-1.c`, a pipe), not `EBADF` (reserved for a real "no such fd at all").
 extern "C" fn oxfs_fsync(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
@@ -3004,7 +3104,7 @@ extern "C" fn oxfs_fsync(fd: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     }
     match find_open_file(real_fd as u64) {
         Some(file) => commit_write_buffer(file),
-        None => -EBADF,
+        None => -EINVAL,
     }
 }
 
@@ -3446,6 +3546,17 @@ extern "C" fn oxfs_mkdir(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i6
 /// inode's own link count is decremented before the record is cleared, so a still-linked file's
 /// other name(s) keep reporting the right count via `write_stat` (see `SYS_LINK`'s own doc
 /// comment). Reaching `0` isn't a dealloc trigger, just "the last name is gone."
+///
+/// **Real permission checking**, previously entirely absent (any caller could unlink anything):
+/// requires real `W_OK` on the *containing directory* (removing a name is a write to the
+/// directory, not to the file itself -- standard Unix rule, matches `oxfs_mkdir`/`oxfs_symlink`'s
+/// own `check_access(parent, ..., W_OK)` pattern). Additionally enforces the real **sticky-bit**
+/// rule (`mode & 0o1000`, previously stored on `/tmp`/`/dev/shm`'s own inode -- see
+/// `format_fresh_filesystem`'s own doc comment -- but never actually consulted anywhere): inside a
+/// sticky directory, only root, the directory's own owner, or the *file's* own owner may remove an
+/// entry, even though the directory itself is otherwise world-writable. Found live via
+/// `shm_unlink/8-1.c`/`9-1.c` (Open POSIX Test Suite pilot): a non-root, non-owning caller must get
+/// a real `EACCES` unlinking another uid's object out of the world-writable-but-sticky `/dev/shm`.
 extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -3458,6 +3569,11 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
         Ok(v) => v,
         Err(e) => return errno_for(e),
     };
+    let (uid, gid) = unsafe { (oxidebsd_current_uid(), oxidebsd_current_gid()) };
+    let parent_inode = read_inode(parent);
+    if !check_access(&parent_inode, uid, gid, W_OK) {
+        return -EACCES;
+    }
     let Some(target) = dir_lookup(parent, leaf) else {
         // No directory entry exists yet -- real ENOENT, *unless* some still-open fd is mid-`open
         // (O_CREAT)` against this exact (parent, name) and hasn't committed (inserted its own
@@ -3487,6 +3603,15 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
     let mut target_inode = read_inode(target);
     if target_inode.kind == InodeKind::Dir {
         return -EISDIR;
+    }
+    // Real sticky-bit protection (see this function's own doc comment) -- root and the directory's
+    // own owner are always exempt; otherwise only the file's own owner may remove it.
+    if parent_inode.mode & 0o1000 != 0
+        && uid != 0
+        && uid != parent_inode.uid as u64
+        && uid != target_inode.uid as u64
+    {
+        return -EACCES;
     }
     if matches!(target_inode.kind, InodeKind::File | InodeKind::Device) {
         target_inode.nlink = target_inode.nlink.saturating_sub(1);
@@ -5678,8 +5803,8 @@ fn format_fresh_filesystem() -> bool {
     // O_EXCL)` a scratch file here as their first setup step; a missing directory ENOENTs before
     // the behavior actually under test ever runs, misclassifying every one of them UNRESOLVED
     // rather than a real PASS/FAIL. Mode 01777 matches real POSIX world-writable-plus-sticky `/tmp`
-    // convention -- the sticky bit is cosmetic here (oxfs's own `chmod` already masks input to
-    // `0o777`, no sticky-bit eviction-protection is enforced anywhere in this kernel), but every
+    // convention -- `oxfs_unlink` now real-enforces the sticky bit (see that function's own doc
+    // comment, found live via `shm_unlink/8-1.c`/`9-1.c` against `/dev/shm` below), but every
     // caller in this pilot runs as root anyway, which bypasses permission bits entirely regardless.
     let tmp = ensure_dir(root, b"tmp");
     {

@@ -36,8 +36,11 @@ Current state:
 - A real, on-target C compiler (`third_party/tinycc`, vendored TinyCC) — `tcc` runs as an ordinary
   seeded `/bin` binary and can genuinely compile+link a real C file against a real, seeded
   `/usr/include`/`/usr/lib` musl tree, producing a real runnable ELF — see "TinyCC" below.
-  GCC/Clang remain unstarted (real subprocess pipelines, likely real dynamic linking and threads —
-  a much bigger lift than this kernel currently supports).
+  Real threading now exists (`clone(2)`, `pthread_create`/`join`, real `futex(2)` — see "Real
+  threading" below) and milestone 1 of real dynamic linking (`PT_INTERP`, see "Dynamic linking"
+  below) — but GCC/Clang remain unstarted regardless: both need real multi-process subprocess
+  pipelines (`cc1`/`as`/`ld` as separate `fork`+`execve`d binaries) neither of the above by itself
+  provides.
 
 Known, deliberate gaps: no pointer validation in `sys_read`/`sys_write`, no module unload/reload,
 no *kernel-mode* preemption (real ring-3/user-mode preemption exists — see "Real preemptive
@@ -431,7 +434,12 @@ layered on top later — see "Real preemptive scheduling" below), kernel-thread-
 between per-process kernel stacks. No copy-on-write fork (full eager copy), no SMP, no frame
 deallocation for module-loaded code/SysV-shm-or-`MAP_SHARED`-owned frames (real reclaim exists for
 a discarded process's own private address-space frames — see "POSIX conformance pilot expanded
-68 → 488..." below).
+68 → 488..." below). **`Process` is no longer strictly one schedulable entity per real process** —
+real `clone(2)`/`pthread_create` threads sharing one address space also exist now (`Process::tgid`,
+`ThreadGroupShared`, a per-thread-group-not-per-thread `Arc<Mutex<>>` bundle covering `cwd`/
+`root_inode`/`umask`/`uid`/`gid`/`brk`/`mmap_file_regions`) — see "Real threading" below for the
+full design; everything below this point describes the original one-thread-per-process shape and
+is still accurate for `fork`/`execve`, just not the complete picture any more.
 
 - **Process table is `Mutex<BTreeMap<Pid, Box<Process>>>`, `Box` is load-bearing** — a
   `BTreeMap`'s internal nodes can move on insert/remove, but a `Box`'s heap allocation never does;
@@ -2315,6 +2323,291 @@ content since `RawSiginfo` was first introduced.
   `clone_syscall_smoke`, `pthread_syscall_smoke`, `mount_syscall_smoke` — all pass unmodified
   (beyond the two `RawSiginfo`-duplicate fixes above). `cargo build`/`cargo clippy` clean (same
   pre-existing baseline warnings only).
+
+## Real threading: `clone(2)`, `pthread_create`/`join`, shared address spaces (`src/process/`, `src/memory/address_space.rs`, `src/fs/fd.rs`)
+
+Closes the single biggest foundational architecture blocker `docs/POSIX_COMPLIANCE_CHECKLIST.md`
+tracked — real thread creation, not just the futex/signal-queue primitives threads need. Landed
+across five phases plus a finish-line pass (full detail in the `[[project_real_threading_for_aio]]`
+memory); motivated by real POSIX AIO (`aio_*`), which both musl and glibc implement as pure
+userspace logic over a `pthread_create` worker pool — no distinct kernel AIO syscall family exists
+on real Unix either, so threading was the actual, only real blocker.
+
+- **Phase 1**: `third_party/musl/src/thread/x86_64/clone.s`/`__unmapself.s` used to hardcode raw
+  Linux syscall numbers (56/11/60) directly, bypassing the `__NR_*` remap table entirely — the same
+  bug class already fixed once for `vfork.s` (see the musl-port section above). Fixed: `clone.s`
+  now targets a real reserved `SYS_CLONE = 555` (no handler yet at this phase, cleanly `ENOSYS`s);
+  `__unmapself.s` now calls this ABI's own real `SYS_MUNMAP=101`/`SYS_EXIT=1` directly.
+- **Phase 2**: `Process::tgid: Pid` (`src/process/mod.rs`) splits real `getpid()`/`gettid()` apart —
+  set to the process's own pid at both `spawn`/`fork` (never inherited by a forked child, since a
+  fork is a real process, not a thread), untouched by `execve`. `do_getpid()` now returns `tgid`
+  instead of the raw schedulable pid. `gettid()` needed **no kernel change** — it just reads
+  `pthread_self()->tid`, cached client-side from `SYS_SET_TID_ADDRESS`'s existing return value.
+- **Phase 3**: real `FUTEX_WAIT`/`FUTEX_WAKE` (`process::do_futex`, `src/process/limits.rs`, a new
+  `BlockReason::WaitingForFutex(tgid, addr, deadline)`) — scoped by `tgid`, not raw `pid`, required
+  for correctness today (no ASLR, so unrelated processes can share addresses like the fixed
+  `USER_STACK_TOP`) and happens to be exactly the right scope for real `CLONE_THREAD` sharing later.
+  Unblocks unnamed POSIX semaphores (`sem_init`/`sem_wait`/`sem_post`/...) for real — confirmed via
+  a full pilot run showing the 3 predicted flips (`sem_wait/7-1.c`, `sem_timedwait/{9,10}-1.c`,
+  FAIL→PASS) and zero regressions. Deliberately does **not** re-verify the futex word's value after
+  waking (real spurious-wakeup semantics — every real caller already retries via its own userspace
+  loop).
+- **Phases 4+5, the actual thread-creation prerequisite**: this kernel's single-core,
+  no-preemption-era, single-global-`fs_base`-per-context-switch design had no notion of two live
+  threads sharing one address space at all. Five real changes closed it:
+  1. **`AddressSpace` → `Arc<PhysFrame>`-refcounted** (`src/memory/address_space.rs`): a new
+     `share()` method (`Arc::clone`); `teardown` gates its whole free-walk on
+     `Arc::strong_count == 1` — collides directly with the already-landed frame-reclaim machinery
+     (see "POSIX conformance pilot expanded 68 → 488..." above), which originally assumed sole
+     ownership.
+  2. **`ThreadGroupShared`** (`cwd`/`root_inode`/`umask`/`uid`/`gid`/`brk`/`mmap_file_regions`)
+     `Arc<Mutex<>>`-wrapped on `Process` — every real `CLONE_THREAD` sibling shares these fields.
+  3. **`src/fs/fd.rs` keyed by `tgid`, not raw `pid`** — a new `scheduler::current_tgid()`. Real
+     `CLONE_FILES` sharing falls out for free this way; `/proc/<pid>/fd/`'s own `oxidebsd_fd_at`
+     needed its own pid→tgid resolution the original plan missed.
+  4. **Real `do_clone`/`SYS_CLONE=555`** (`src/process/lifecycle.rs`) — no musl edit needed: `tls`
+     (which doesn't fit the normal 4-register `dispatch()` path) is read via
+     `crate::syscall::frame_tls`, the same raw-frame-access route `sys_fork`/`sys_execve` already
+     use. New `context_switch::seed_clone_frame`/`syscall::copy_frame_for_clone` mirror the fork
+     versions, overriding `user_rsp` to the real `newsp` arg.
+  5. **Per-thread `SYS_EXIT`** (`terminate_process`) — a non-leader thread's own `Process` table
+     entry can't be removed inline: `scheduler::schedule()` still needs it to exist (state check,
+     FPU save, `&mut rsp`), and removing it early would free the `KernelStack` the CPU is still
+     executing on. Fixed with a real deferred-reap mechanism: mark `Zombie`, queue the pid via a new
+     `scheduler::queue_thread_reap`, drained by `reap_pending_threads()` at the top of every
+     `schedule()` call except the one still mid-switch off that exact stack.
+
+  **Two real bugs found landing this**: `do_clone` must **not** call `fs::fd::fork_inherit` — real
+  `CLONE_FILES` sharing already falls out for free once the fd table is `tgid`-keyed; calling it
+  anyway silently creates orphaned duplicate entries under the child's own raw pid (never looked up)
+  and double-bumps refcounts. `terminate_process`'s whole-thread-group-teardown branch must pass
+  `tgid` to `close_all`, not `pid` — identical in the common case, but wrong if the tgid's own
+  leader already exited and a still-running sibling reaches that branch last.
+
+- **Finish line: real `CLONE_CHILD_CLEARTID`** (`Process::clear_child_tid`) — found necessary
+  getting a genuinely *unmodified* `pthread_create()`/`pthread_join()` C round trip working, not
+  predicted by the original five-phase plan. Real musl's `pthread_create()` sets `ctid` to
+  `&__thread_list_lock`, and `__pthread_exit` deliberately routes that lock's release through a real
+  kernel clear-and-wake at true task-exit time rather than a plain userspace unlock — without it,
+  `pthread_join`'s own primary futex wait/wake pair (on `detach_state`) fired correctly, but the
+  call still hung forever afterward, blocked in musl's own `__tl_sync` against
+  `__thread_list_lock`, which nothing was ever going to clear. Found via live per-syscall dispatch
+  tracing (temporarily logging every `(pid, num, args)`), not by re-reading musl source blind.
+  Fixed: `terminate_process` now does a real write-zero-and-wake of `clear_child_tid` at the top,
+  for *every* exiting thread (leader or not), via a newly factored-out
+  `process::limits::wake_futex(tgid, addr, max_waiters)`.
+
+**Two real bugs found writing the raw-`clone(2)` smoke test itself** (instructive for any future
+code driving `clone(2)` directly): a child's own new stack **must** be a `static mut`, not a plain
+`static` — an immutable `static` with an all-zero initializer gets placed in read-only memory by
+rustc (the very first `push` faulted `PROTECTION_VIOLATION | CAUSED_BY_WRITE`); and a hand-written
+`asm!` block must capture the carry flag (`setc`) **immediately** after `syscall`, before any
+flag-clobbering instruction — placing it later silently reports every syscall as successful
+regardless of the real `CF` (the same bug class as this codebase's own "`SYSCALL` doesn't clear
+`r10`" 4-arg-upgrade warning, just for `CF` instead).
+
+**Verified end-to-end**: `tests/clone_syscall_smoke.rs` + `userland/clone-syscall-smoke/` — a raw
+`syscall(SYS_CLONE, ...)` (no musl involved) proving real `CLONE_VM` (cross-"thread" write
+visibility), `CLONE_THREAD` (shared `getpid()`), `CLONE_PARENT_SETTID`, and a real futex-based join
+(the exact primitive `pthread_join` itself uses) all in one pass. Separately,
+`tests/pthread_syscall_smoke.rs` + `userland/pthread-syscall-smoke/` drives a genuinely unmodified
+`pthread_create()`/`pthread_join()` C fixture (`userland/pthread-smoke/main.c`, built via the same
+static `musl-gcc` recipe `build_musl_smoke` already established, seeded as `/pthread-smoke.elf`) —
+checking both real `CLONE_VM` shared-write visibility and the real thread return value
+`pthread_join` reports. `cargo build`/`cargo clippy` clean throughout. Full regression sweep re-run
+clean after every phase: `fork_wait`, `uid_syscall_smoke`, `mount_syscall_smoke`,
+`mmap_syscall_smoke`, `needs_syscall_smoke`, `pipe_backpressure_syscall_smoke`,
+`sig_syscall_smoke`, `sysv_shm_syscall_smoke`, `sysv_sem_syscall_smoke`, `mq_syscall_smoke`,
+`rt_signal_syscall_smoke`, `dynlink_syscall_smoke`.
+
+**What this unlocks**: POSIX AIO with zero further kernel-side work (pure userspace worker-thread
+logic once `pthread_create` is real). `pthread_mutex_*`/`_cond_*`/`_rwlock_*`/`_barrier_*`/
+`_spin_*` are all userspace logic over the same real `futex(2)` primitive, so they're expected to
+already work today, though not yet covered by a dedicated smoke test of their own. **Not done by
+this work**: named POSIX semaphores/POSIX shared memory (still need a `/dev/shm`-style `open`+`mmap`
+path, plus real cross-*process* `FUTEX_WAKE` — today's scoping is deliberately `tgid`-only, correct
+for threads sharing one process, not two unrelated processes) and real `dlopen` (blocked on
+`mprotect` enforcement, unrelated to threading). Committed as `d1572ca` on `master` — not pushed
+as of this writing.
+
+## SIGCHLD delivery, real `sched_setparam(2)`, and four more mmap conformance fixes (`src/process/`, `modules/oxfs/`, `modules/posix_compat/`)
+
+Five more independent fixes closing further Open POSIX Test Suite pilot gaps, landed after the
+threading work above.
+
+- **Real `SIGCHLD` delivery on child exit/stop/continue**: this kernel never delivered a real
+  `SIGCHLD` to a parent at all before this. Found live: `sigaction/10-1.c` installs a real
+  `SA_SIGINFO` `SIGCHLD` handler and busy-waits (via `select()`, deliberately `ENOSYS`'d here, not
+  blocking) for `CLD_STOPPED` before ever sending the matching `SIGCONT` — with no signal ever
+  delivered, the child stayed genuinely `Stopped` forever and became a permanent, unreapable orphan
+  once `t0`'s own alarm killed the parent, wedging the rest of the pilot run indefinitely (initially
+  misdiagnosed as hanging on the unrelated, deliberately-unimplemented `select()` `ENOSYS` itself).
+  Fixed with `signals::notify_parent_sigchld`: generates a real `SIGCHLD` with correct
+  `CLD_EXITED`/`CLD_KILLED`/`CLD_STOPPED`/`CLD_CONTINUED` `si_code` and `si_status`, reusing
+  `RawSiginfo`'s existing `si_value` field at the same byte offset real musl's `siginfo_t` unions it
+  at (no new wire struct needed). Wired into every real child-state-transition point this kernel
+  already tracked via `wake_parent_if_waiting`'s own `wait4`-wake duty: `terminate_process`/
+  `do_stop_self` (`lifecycle.rs`), and the `Action::Stop` + `SIGCONT`-resume pre-dispatch steps in
+  `do_kill`/`signal_foreground_group`/`do_sigqueue` (`signals.rs`). Also fixes hush's own
+  `CONFIG_HUSH_FAST` job-status short-circuit, previously silently permanently dead since its
+  `SIGCHLD` counter could never move. Pilot moved 373P/36F/22U/8US/45UT/3TO/1CR →
+  391P/29F/10U/8US/45UT/4TO/1CR (`sigaction/10-1,11-1.c` now cleanly `TIMEOUT` via `t0`'s alarm
+  instead of hanging forever — still can't fully `PASS`, since their own polling loop depends on the
+  still-unimplemented `select()` — but everything after them in the corpus is unblocked). This is
+  the SIGCHLD-delivery foundation the later `SA_NOCLDWAIT`/`SA_NOCLDSTOP` work (see "A real
+  `siginfo_t` field-order bug..." above) built on.
+- **Real `sched_setparam(2)`**: previously permanently stubbed to `ENOSYS` in musl itself (unlike
+  its `sched_getparam`/`sched_setscheduler` siblings) despite its syscall number already being
+  remapped — no kernel handler existed either. Added `process::do_sched_setparam` (mirrors
+  `do_sched_setscheduler` but only validates/sets `Process::sched_priority` against the target's own
+  current policy range, real POSIX semantics), wired through `sys_sched_setparam`/
+  `oxidebsd_sys_sched_setparam`, and a `SYS_SCHED_SETPARAM=507` registration in
+  `modules/posix_compat`. **A second, independent bug found the same session**: `do_sched_scheduler`
+  always returned `Ok(0)` on success, but real POSIX `sched_setscheduler(2)` must return the
+  *former* scheduling policy (`sched_setscheduler/16-1.c` checks this explicitly) — fixed to
+  capture and return `old_policy`.
+- **Four more real mmap conformance fixes**, closing `mmap/{3,9,14,18,19,21,28,31}-1.c` and
+  `munmap/{3,4}-1.c`:
+  1. **Real `MAP_FIXED`/`MAP_PRIVATE` flags, `EBADF`/`EINVAL` validation**: `SYS_MMAP` previously
+     never carried real flags at all — the kernel guessed anonymous-vs-file-backed purely from
+     `fd == -1`, `MAP_FIXED` was silently ignored, and `MAP_PRIVATE` against a real fd behaved as
+     `MAP_SHARED` regardless. Fixed: `flags` now rides the wire, packed into `prot`'s own unused
+     high bits (musl's `mmap.c` patched accordingly, pinned/pushed on the `oxidebsd` branch);
+     `do_mmap` validates exactly one of `MAP_SHARED`/`MAP_PRIVATE` (`EINVAL`) and real `EBADF` for a
+     non-anonymous request against an invalid fd; real `MAP_FIXED` honors `addr_hint`, validates
+     page alignment, and replaces any previous mapping there by reusing `do_munmap`'s own
+     unmap/writeback/refcount logic instead of duplicating it; real `MAP_PRIVATE` for file-backed
+     mappings gets a fresh, never-cached frame copy, never written back (discarded on unmap, unlike
+     `MAP_SHARED`'s cross-open cache); `do_munmap` gained the real page-alignment `EINVAL` check it
+     was missing.
+  2. **Real `mtime`/`ctime` tracking, real `mlockall(MCL_FUTURE)`/`RLIMIT_MEMLOCK` enforcement**:
+     oxfs's `Inode` gains real `mtime`/`ctime` (whole-second Unix epoch; `st_atime` stays the honest
+     `0` placeholder it always was). `write_inode_data`/`resize_inode_data` are this filesystem's
+     only two real content-mutation choke points, so bumping timestamps there covers every write
+     path uniformly, including a real `MAP_SHARED` mmap's own `msync`/`munmap`/exit writeback. A new
+     `oxidebsd_unix_time` kernel export (`src/cpu/rtc.rs`) backs it, since a relocated module can't
+     call kernel functions directly. `mlockall(MCL_FUTURE)` was previously a pure no-op beyond flag
+     validation — `ThreadGroupShared` gains `mlockall_future`/`locked_bytes` (address-space-scoped,
+     not per-thread — a `CLONE_THREAD` sibling shares it automatically via the same `Arc`
+     `mmap_file_regions` already uses); `do_mmap` now checks both before establishing any mapping
+     while `MCL_FUTURE` is active, failing real `EAGAIN` rather than silently mapping (and silently
+     not actually locking). Not inherited by `fork`, cleared by `execve`, matching real POSIX
+     `mlockall(2)` semantics.
+  3. **Real `ENXIO`** for an out-of-bounds nonzero-offset mmap request — deliberately scoped to
+     `off != 0` only (real POSIX MPR already covers the `off == 0` "`len` extends past the object's
+     real size" case via a deferred `SIGBUS` on actual reference, fixed earlier). A nonzero `off`
+     whose `[off, off+len)` range doesn't fit the object gets a real `ENXIO`; one that does still
+     gets the same honest `EINVAL` as before (no real caller needs nonzero-offset population to
+     actually work).
+  4. **Real `EOVERFLOW`** when `off + len` exceeds the real `off_t` ceiling (`i64::MAX`) — not
+     previously implemented at all (`off != 0` was an unconditional `EINVAL`). The actual blocker
+     was musl's own client-side `len >= PTRDIFF_MAX` guard, a libc-internal safety margin with no
+     POSIX mandate, pre-empting the kernel with the wrong errno before the real condition could be
+     evaluated — removed on the `oxidebsd` musl branch. `do_mmap_file_backed` now checks
+     `off + len` (`u128` arithmetic, avoiding `u64` wraparound at these magnitudes) against
+     `i64::MAX` before `content_id` is even resolved, running ahead of the existing `ENXIO`/`EINVAL`
+     nonzero-offset handling. **Deliberately not deferred just because real glibc+Linux fails this
+     same test too** (confirmed via the vendored suite's own `coverage.txt`, a 2004-era note) — this
+     project targets literal POSIX-specification conformance, not Linux-shaped behavior (see
+     `[[feedback_posix_text_over_linux_behavior]]` memory).
+- **Verification**: each fix extended `userland/mmap-syscall-smoke` with further parts (6-13 total
+  added across the four commits) and was regression-checked against the heaviest real file-backed-
+  mmap users (`tcc`, `dynlink`, `pthread`, `fork_wait`) each time. A fresh full 488-file pilot run
+  after all five fixes confirms the combined effect and finds no cross-fix regressions: **398P/
+  25F/9U/8US/45UT/2TO/1CR → 414P/11F/7U/8US/45UT/2TO/1CR, 488 total** (net 14 FAILs and 2
+  UNRESOLVEDs fixed, `UNTESTED`/`TIMEOUT`/`CRASH` counts unchanged, confirming the pilot's own
+  earlier findings — see "POSIX conformance pilot expanded 68 → 488..." above — that the 45
+  UNTESTED/1 CRASH are real, non-kernel gaps, not something these fixes could have touched). The
+  remaining 11 FAIL/7 UNRESOLVED haven't been individually triaged yet — see "Three UNRESOLVED
+  fixes" immediately below for the next pass over that set.
+
+## Three UNRESOLVED fixes: a stock-musl `sigset` bug, real `timer_create` CPU-time clocks, and a same-process oxfs stat-visibility gap (`third_party/musl`, `src/process/timers.rs`, `src/cpu/interrupts.rs`, `modules/oxfs/`)
+
+Investigated the pilot's remaining 7 UNRESOLVED (`mmap/13-1.c`, `sched_setparam/9-1,10-1.c`,
+`sigset/6-1,7-1.c`, `timer_create/10-1,11-1.c`) by direct source inspection of each failing test —
+found and fixed three independent, real root causes for 5 of the 7; the `sched_setparam` pair
+resisted static analysis and needs a live trace to pin down.
+
+- **`sigset(sig, SIG_HOLD)` returned the wrong value on its very first call for any signal** —
+  a real bug in stock, unmodified musl (`third_party/musl/src/signal/sigset.c`), not anything this
+  fork had ever patched. The old code queried the signal's current disposition via a bare
+  `sigaction(sig, 0, &sa_old)` and returned that (`sa_old.sa_handler`) whenever `sig` wasn't
+  *already* blocked before the call — meaning the extremely common "install a handler, then
+  `sigset(sig, SIG_HOLD)` to hold it" sequence always returned a real handler pointer, not
+  `SIG_HOLD`, on the very first invocation. `sigset/6-1.c`/`7-1.c` both do exactly that and check
+  the return `== SIG_HOLD`, so both bailed `PTS_UNRESOLVED` on this alone, before ever reaching the
+  real `sigpending()`/handler-delivery assertions under test. Fixed on the `oxidebsd` musl branch
+  (`6d311b99`, pushed): `disp == SIG_HOLD` now returns `SIG_HOLD` unconditionally once
+  `sigprocmask(SIG_BLOCK)` succeeds — there's no real "previous disposition" to report for a
+  mask-only operation anyway, so the sentinel is the only meaningful return value regardless of
+  prior blocked state. The `else` branch (setting a real handler) is unchanged, still reporting
+  `SIG_HOLD` in place of the previous handler when `sig` was already held (the one case a plain
+  handler-shaped return type can't otherwise express a "was held" answer through).
+- **`timer_create`/`timer_settime`/`timer_gettime` rejected `CLOCK_PROCESS_CPUTIME_ID`/
+  `CLOCK_THREAD_CPUTIME_ID` with a flat `EINVAL`** (`src/process/timers.rs`'s `do_timer_create`
+  used to accept only `CLOCK_REALTIME`/`CLOCK_MONOTONIC`) — `timer_create/10-1.c`/`11-1.c` both
+  call `sysconf(_SC_CPUTIME)`/`_SC_THREAD_CPUTIME` first, which musl unconditionally reports as
+  supported (a compile-time claim, see the "Three more pilot fixes" section above's own
+  `clock_gettime/4-1.c` precedent), then proceed straight to a real `timer_create()` call against
+  one of these two clockids expecting it to succeed. Fixed by extending acceptance to both
+  (`is_cputime_clock`, `src/process/timers.rs`), arming/reading them against the real
+  per-process `Process::cpu_ticks` counter (the same one `sys_clock_gettime`'s own
+  `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` arms already read — no per-thread
+  distinction exists on this kernel to make the two clockids mean anything different) instead of
+  `interrupts::ticks()`. `abstime_to_ticks` needed no new branch — its existing `CLOCK_MONOTONIC`
+  path ("this domain already *is* a raw tick count, use the converted value directly rather than
+  offsetting from `now`") is exactly the right conversion for a cpu-time domain too, since
+  `cpu_ticks` accumulates at the identical `TIMER_HZ` cadence. `interrupts::
+  timer_interrupt_handler`'s own `posix_timers` expiry scan needed the domain-aware comparison
+  too — a plain `u64`-returning `is_cputime_clock(clockid)` check, deliberately not a function
+  taking `&Process` the way `timers.rs`'s own new `timer_now(proc, clockid)` helper does, since
+  that scan already holds a live mutable sub-borrow of `proc.posix_timers` via its own `slot`
+  local by this point (same disjoint-field-borrow constraint this file's own `newly_signaled`
+  workaround, just above this scan, already documents).
+- **A same-process `stat()` couldn't see a file its own still-open `open(O_CREAT)` fd had just
+  created** — `mmap/13-1.c` does `open(O_CREAT|O_RDWR|O_EXCL) -> write() -> stat()` with no
+  intervening `close()`, and oxfs defers a brand-new file's real inode/directory-entry insertion
+  until `close`/`fsync`/`ftruncate` (`commit_write_buffer`, see "Real write-to-an-existing-file
+  support" in the Permission model section above) — so the `stat()` call found no directory entry
+  at all and returned a real `ENOENT`, before the test ever reached its actual `st_atime`
+  assertion. **This exact bug class already had a fix, just narrowly scoped**:
+  `force_commit_pending_create` (added for `shm_open/22-1,32-1,34-1.c` — scans the small
+  `OPEN_FILES` table for any other fd still mid-create against the exact `(parent, name)` being
+  looked up and force-commits it first) was wired into `oxfs_open`'s own `resolve_parent`+
+  `dir_lookup` lookup only, never into `resolve_path`/`resolve_path_impl` — the shared resolver
+  every *other* path-based syscall (`stat`, `lstat`, `unlink`, `chdir`, ...) actually uses. Fixed
+  by calling it once per path component inside `resolve_path_impl`'s own main walk, right before
+  each `dir_lookup` — safe to call unconditionally for every component, not just the last: a
+  pending create can only ever be a leaf (an intermediate component failing to already be a real,
+  committed directory already fails `NotADirectory`/`NotFound` regardless), and the `(parent,
+  name)` match this scans for is exact either way. **Not a plain PASS once fixed**: closing this
+  gap makes `mmap/13-1.c` reach its real assertion for the first time, which then correctly
+  fails — this filesystem's own `st_atime` is a permanent honest-`0` placeholder (see the mmap
+  fault-delivery section above), so `atime1 == atime2 == atime3` regardless, printing "`st_atime`
+  did not update properly." The suite's own `coverage.txt` documents this identical test failing
+  on real glibc-2.3 + Linux 2.6.0-test2 too, for the same underlying reason (mmap'd writes don't
+  reliably bump `st_atime` there either) — a real, expected, cross-platform `FAIL`, not a lingering
+  bug, and a strictly more correct outcome than the false `UNRESOLVED` this gap used to produce.
+- **`sched_setparam/9-1.c`/`10-1.c` — investigated, not resolved.** Both fork real `SCHED_FIFO`
+  children and expect a `sched_setparam()` call to trigger real preemption, observed via a SysV
+  shared-memory counter. Checked `do_sched_setparam`, `has_sched_permission`, `resolve_target_pid`,
+  and `sysconf(_SC_NPROCESSORS_ONLN)`'s real `sched_getaffinity`-backed path (confirmed it
+  correctly reports `1` via `musl's own JT_NPROCESSORS_ONLN` handler) — nothing in any of these
+  looked broken for the root-uid, single-core case these tests actually exercise. Pinning the real
+  cause down needs a live trace (dispatch-level print debugging, the same technique that found the
+  `__tl_sync`/`CLONE_CHILD_CLEARTID` bug in the "Real threading" section above), not more
+  source-reading.
+- **Verification**: `cargo build`/`cargo clippy` clean (same 3 pre-existing baseline warnings
+  only) — the musl fix required the usual full BusyBox/TinyCC relink cascade (~41 min). Targeted
+  regression pass (`mmap_syscall_smoke`, `posix_timer_syscall_smoke`, `fork_wait`,
+  `sig_syscall_smoke`) all pass unmodified. A fresh full 488-file pilot run confirms the intended
+  effect with no cross-fix regressions: **414P/11F/7U/8US/45UT/2TO/1CR → 420P/10F/2U/8US/45UT/
+  2TO/1CR, 488 total** — `sigset/6-1,7-1.c` and `timer_create/10-1,11-1.c` all flip clean to real
+  `PASS`; `mmap/13-1.c` moves from `UNRESOLVED` to the real, expected `FAIL` described above (a
+  correctness improvement, not a regression); `sched_setparam/9-1,10-1.c` remain `UNRESOLVED`,
+  unchanged. The small residual `FAIL`-count drift beyond that (11 → 10, net) reflects unrelated
+  run-to-run scheduling-timing variance in a few timing-sensitive tests, not anything these three
+  fixes touched.
 
 ## BusyBox gap analysis: what's needed for more applets
 

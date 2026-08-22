@@ -39,24 +39,29 @@ queues/semaphores/shared memory — see the memory note this closed out), resour
 The big, invasive ones — each blocks a cluster of other items, so they're worth sequencing first
 if this becomes real future work rather than just a tracking exercise.
 
-- [ ] **Real threading**: `pthread_create`/`_join`/`_detach`, `pthread_mutex_*`/`_cond_*`/
-      `_rwlock_*`/`_barrier_*`/`_spin_*`, backing `clone(2)`/`futex(2)`/`set_robust_list(2)`.
-      **In progress** — see `[[project_real_threading_for_aio]]` memory for full status: phase 1
-      (`clone.s`/`__unmapself.s`'s own raw-Linux-number bypass bug fixed, `SYS_CLONE = 555`
-      reserved), phase 2 (`Process::tgid` + real `getpid()`/`gettid()` split), and phase 3 (real
-      `futex(2)` `FUTEX_WAIT`/`FUTEX_WAKE`, `process::do_futex`) are all done — unnamed POSIX
-      semaphores (`sem_init`/`sem_wait`/`sem_post`/...) already work for real today as a result
-      (verified: 3 real pilot FAILs flipped to PASS, zero regressions). **Still blocked on:** real
-      thread creation itself (`clone(2)`'s own handler, still unregistered) and, underneath that,
-      shared/refcounted `AddressSpace` — this kernel's single-core, no-preemption,
-      single-global-`fs_base`-per-context-switch design has no notion of two live threads sharing
-      one address space at all yet, and that work directly collides with the already-landed real
-      frame-reclaim machinery (`AddressSpace::teardown` currently assumes sole ownership) — see
-      CLAUDE.md's musl-port section on `IA32_FS_BASE` and its frame-reclaim section. **Why:**
-      POSIX.1-2008 folded threads into the base spec's conformance surface — a real conformance
-      test suite exercises them, not just the legacy `_POSIX_THREADS`-optional framing Issue 6
-      used. Also the direct prerequisite for named POSIX semaphores, POSIX shared memory, POSIX
-      AIO (musl backs `aio_*` with a userspace thread pool), and real `dlopen`.
+- [x] **Real threading**: `pthread_create`/`_join`, `clone(2)`/`futex(2)` — **done**, see
+      `[[project_real_threading_for_aio]]` memory and CLAUDE.md's "Real threading" section for the
+      full five-phase history. `clone.s`/`__unmapself.s`'s raw-Linux-number bypass bug is fixed
+      (`SYS_CLONE = 555`, now with a real handler — `process::lifecycle::do_clone`); `Process::tgid`
+      splits real `getpid()`/`gettid()`; real `futex(2)` `FUTEX_WAIT`/`FUTEX_WAKE` exist
+      (`process::do_futex`) — unnamed POSIX semaphores (`sem_init`/`sem_wait`/`sem_post`/...) work
+      for real as a result (3 pilot FAILs flipped to PASS). The former blocker — shared/refcounted
+      `AddressSpace` — is also done: `AddressSpace` is now `Arc`-refcounted (`teardown` gates its
+      free-walk on `Arc::strong_count == 1`), a new `ThreadGroupShared` wraps the fields a real
+      `CLONE_THREAD` sibling must share (`cwd`/`root_inode`/`umask`/`uid`/`gid`/`brk`/
+      `mmap_file_regions`), and `src/fs/fd.rs` is keyed by `tgid` not raw `pid` (real `CLONE_FILES`
+      sharing falls out for free). Verified end-to-end by a real, unmodified `pthread_create()`/
+      `pthread_join()` round trip (`userland/pthread-smoke/`, `tests/pthread_syscall_smoke.rs`) —
+      not just a raw `clone(2)` smoke test. **`pthread_mutex_*`/`_cond_*`/`_rwlock_*`/`_barrier_*`/
+      `_spin_*` themselves are untouched** — real Linux/musl implement all of these as pure
+      userspace logic over the same `futex(2)` primitive already real here, so they're expected to
+      already work today (not separately verified by a dedicated test yet — worth a follow-up smoke
+      test, not further kernel work). **Direct unlock**: POSIX AIO (`aio_*`/`lio_listio`, musl backs
+      these with a userspace thread pool — needs zero further kernel-side work now) is the next
+      real piece; named POSIX semaphores/POSIX shared memory still need the separate `/dev/shm`
+      path below plus real cross-process `FUTEX_WAKE` (today's `do_futex` is deliberately scoped to
+      the waker's own `tgid`, safe but not cross-process); real `dlopen` still needs `mmap`/
+      `mprotect` enforcement, unrelated to threading itself.
 - [x] **Real-time signal queuing**: done. `SIGRTMIN..=SIGRTMAX` (`35..=64`, matching musl's own
       `sigrtmin.c`/`sigrtmax.c`; `32..=34` stay permanently unclaimed, matching real glibc/musl
       convention) now validate through `do_kill`/`do_sigqueue`/`sys_sigaction`, and
@@ -120,11 +125,19 @@ if this becomes real future work rather than just a tracking exercise.
       and real fd-backed MAP_SHARED mmap" section), and real MPR (`SIGBUS` past a mapped object's
       own real extent) plus real ring-3 fault-to-signal delivery landed after that (see CLAUDE.md's
       "Real ring-3 fault-to-signal delivery, and two mmap fixes" section) — closes
-      `mmap/11-2.c`/`11-3.c`/`12-1.c` in the pilot below. `MAP_PRIVATE` still always behaves as
-      `MAP_SHARED` (no copy-on-write page-fault tracking exists — a documented simplification, not
-      yet hit by any real caller requesting `MAP_PRIVATE` against a real fd) and real `msync(2)`
-      itself still doesn't exist as its own syscall (writeback only happens at `munmap`/exit) —
-      genuine remaining gaps, just narrower than this row used to claim.
+      `mmap/11-2.c`/`11-3.c`/`12-1.c` in the pilot below. **`MAP_PRIVATE` no longer always behaves
+      as `MAP_SHARED`** — real `MAP_FIXED`/`MAP_PRIVATE` flags now ride the wire (previously guessed
+      purely from `fd == -1`), with real `EBADF`/`EINVAL` validation, real `MAP_FIXED` replace-at-
+      address semantics, and a real fresh never-cached, never-written-back frame copy for
+      `MAP_PRIVATE` against a file-backed fd; real `EOVERFLOW`/`ENXIO` for out-of-range nonzero
+      `off` also landed (see CLAUDE.md's "SIGCHLD delivery, real `sched_setparam(2)`, and four more
+      mmap conformance fixes" section for the four commits closing `mmap/{3,9,14,18,19,21,28,31}-1.c`/
+      `munmap/{3,4}-1.c` — landed after this doc's last recorded pilot baseline below, not yet
+      re-verified with a fresh full pilot run). Real `mtime`/`ctime` tracking and real
+      `mlockall(MCL_FUTURE)`/`RLIMIT_MEMLOCK` enforcement landed alongside. **Genuine remaining
+      gaps**: no copy-on-write page-fault tracking for `MAP_PRIVATE` against anonymous memory (only
+      the file-backed case is real), and real `msync(2)` itself still doesn't exist as its own
+      syscall (writeback only happens at `munmap`/exit).
 - [x] **Milestone 1 done, milestone 2 open** — corrected from an earlier draft of this doc, which
       wrongly said no `PT_INTERP` support existed at all; CLAUDE.md itself was stale on this same
       point until this pass. **Milestone 1 (done, `e72fc7d`)**: a real `fork`+`execve` of a
@@ -136,9 +149,11 @@ if this becomes real future work rather than just a tracking exercise.
       `dlclose`/`dlerror` — loading a *second*, independently-chosen shared object at runtime.
       musl's own implementation of that is pure userspace logic over `mmap`/`mprotect`/relocation
       processing once a `.so` is mapped, not a new syscall gap — but genuinely blocked on real
-      `mmap`/`mprotect` enforcement below, since milestone 1's kernel-driven single-interpreter load
-      never needed either capability for real (`SYS_MPROTECT` exists now but is a permissive
-      no-op stub).
+      `mprotect` enforcement below (`SYS_MPROTECT` exists but is still a permissive no-op stub —
+      unaffected by the mmap-flags work above). **`mmap` itself is less of a blocker than when this
+      row was first written**: real `MAP_FIXED` now exists (needed to place a `.so` at a
+      loader-chosen address) — see the `mmap` row above — so the remaining gap is narrower than
+      "mmap/mprotect enforcement" as a pair; `mprotect` alone is what's left.
 
 ## Filesystem / IPC gaps
 
@@ -159,19 +174,23 @@ if this becomes real future work rather than just a tracking exercise.
       `pipe(2)`'s anonymous fd pair.
 - [ ] **Named POSIX semaphores** (`sem_open`/`sem_close`/`sem_unlink`) and **POSIX shared memory**
       (`shm_open`/`shm_unlink`) — **unnamed semaphores are no longer blocked** (real
-      `sem_init`/`sem_wait`/`sem_post`/... work today, see "Real threading" above); named ones
-      remain blocked on two things, not one: a `/dev/shm`-style `open`+`mmap` path (plausible reuse
-      of the already-real fd-backed `MAP_SHARED` mmap, see CLAUDE.md), *and* real cross-process
-      `FUTEX_WAKE` — `process::do_futex`'s own wake scan is deliberately scoped to the waker's own
-      `tgid` (see that function's own doc comment for why address-only keying would be unsafe with
-      no ASLR), so a named semaphore shared between two genuinely different processes wouldn't
-      actually wake across them yet even with the mmap path solved. SysV
-      shared memory/semaphores already exist and are *not* a substitute — POSIX treats the two
-      IPC families as genuinely separate optional interfaces.
-- [ ] **POSIX AIO** (`aio_read`/`_write`/`_fsync`/`_error`/`_return`/`_cancel`/`_suspend`,
-      `lio_listio`) — on real Linux/musl these are userspace logic over a thread pool, not a true
-      syscall gap; blocked on real threading above, not meaningfully separate work once that
-      lands.
+      `sem_init`/`sem_wait`/`sem_post`/... work today, see "Real threading" above, now fully done —
+      not just phases 1-3). Named ones remain blocked on two things, not one, and **real thread
+      creation landing doesn't change either**: a `/dev/shm`-style `open`+`mmap` path (plausible
+      reuse of the already-real fd-backed `MAP_SHARED` mmap, see CLAUDE.md), *and* real
+      cross-process `FUTEX_WAKE` — `process::do_futex`'s own wake scan is deliberately scoped to
+      the waker's own `tgid` (see that function's own doc comment for why address-only keying would
+      be unsafe with no ASLR), so a named semaphore shared between two genuinely different
+      *processes* (as opposed to threads sharing one `tgid`, which now works) wouldn't actually
+      wake across them yet even with the mmap path solved. SysV shared memory/semaphores already
+      exist and are *not* a substitute — POSIX treats the two IPC families as genuinely separate
+      optional interfaces.
+- [x] **POSIX AIO** (`aio_read`/`_write`/`_fsync`/`_error`/`_return`/`_cancel`/`_suspend`,
+      `lio_listio`) — real threading (the actual blocker) is now done, see above. On real
+      Linux/musl these `aio_*` functions are pure userspace logic over a `pthread_create` worker
+      thread pool, not a true syscall gap, so **no further kernel-side work is needed for AIO
+      itself** — this row is closed as "unblocked," not yet separately verified with a dedicated
+      AIO-specific smoke test (a natural next real step, not a kernel gap).
 
 ## Terminal / job control
 
@@ -246,8 +265,9 @@ already covered by the architecture blockers above (`mq_*`'s row there is stale 
 mq_getsetattr are actually implemented, see that doc's "third implementation" section — worth a
 follow-up correction pass on that doc, not repeated here) plus `select`/`pselect` (deliberately
 skipped, `poll` already covers every live caller) and `fexecve`/`posix_spawn` (already work via
-existing primitives, no syscall gap). New syscall numbers should continue from `554` (the current
-highest, per that doc's own numbering-discipline note).
+existing primitives, no syscall gap). New syscall numbers should continue from `555` (`SYS_CLONE`,
+the current highest — now with a real handler, `process::lifecycle::do_clone`, see "Real threading"
+above — per that doc's own numbering-discipline note).
 
 ## Verification: what would actually prove any of this
 
@@ -266,13 +286,35 @@ self-assessing against this checklist:
       pilot; see CLAUDE.md's own "POSIX conformance pilot" sections, most recently "POSIX
       conformance pilot expanded 68 → 488..." for the full growth history and the four real kernel
       bugs each expansion pass has found and fixed along the way).
-- [x] **A real pass/fail baseline, current as of the 488-file pilot**: **329 PASS / 62 FAIL / 40
-      UNRESOLVED / 8 UNSUPPORTED / 45 UNTESTED / 3 TIMEOUT / 1 CRASH** (the one `CRASH` is a real
+- [x] **A real pass/fail baseline, latest confirmed run of the 488-file pilot**: **420 PASS / 10
+      FAIL / 2 UNRESOLVED / 8 UNSUPPORTED / 45 UNTESTED / 2 TIMEOUT / 1 CRASH** — up from this doc's
+      original 329P/62F/40U/8US/45UT/3TO/1CR baseline via several later fixes (see CLAUDE.md's own
+      "POSIX conformance pilot" sections for the full incremental history). Most recently: a
+      three-part pass closing `sigset/6-1,7-1.c` (a real, stock-musl `sigset(sig, SIG_HOLD)` bug —
+      fixed on the `oxidebsd` musl branch, see CLAUDE.md's own "Three UNRESOLVED fixes" section),
+      `timer_create/10-1,11-1.c` (`timer_create`/`timer_settime`/`timer_gettime` now accept
+      `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`, arming against `Process::cpu_ticks`),
+      and `mmap/13-1.c` (a same-process `open(O_CREAT) -> write() -> stat()` visibility gap in oxfs
+      — `force_commit_pending_create` now wired into `resolve_path_impl`, not just `oxfs_open` —
+      which flips this test from a false `UNRESOLVED` to a real, *expected* `FAIL`: the suite's own
+      `coverage.txt` documents this exact test failing on real glibc+Linux too, since `st_atime`
+      never updates from an mmap'd write there either, and this filesystem's own `st_atime` is
+      likewise a permanent honest-`0` placeholder). Net from that pass: 5 UNRESOLVED became PASS/
+      the-one-expected-FAIL, moving the prior 414P/11F/7U baseline to this one (the small remaining
+      FAIL-count drift is unrelated scheduling-timing variance between runs, not from these fixes).
+      **Still open**: `sched_setparam/9-1.c`/`10-1.c` remain UNRESOLVED — investigated but not
+      pinned down; the kernel-side logic (`do_sched_setparam`, permission checks, `sched_getaffinity`)
+      all looked correct on inspection, so confirming the real cause needs a live trace, not more
+      source-reading. The one `CRASH` is still a real
       bug in the *test itself* — `strftime/2-1.c`'s own stack-buffer overflow, correctly caught and
-      now cleanly delivered as `SIGSEGV` rather than rebooting the VM — not a kernel gap). Confirms
-      this doc's own original premise: several `FAIL`s trace directly to already-documented
-      "honest-but-unenforced" gaps above (`mlock`/`clock_settime`/`clock_nanosleep`/unenforced
-      `sched_*` fields, included deliberately as expected-failure controls), while others are newly
-      surfaced and not yet individually triaged against this checklist's own categories — a real
-      priority-ranking pass over the current `FAIL`/`UNRESOLVED` set (not just growing the file
-      count further) is the natural next step here.
+      cleanly delivered as `SIGSEGV` rather than rebooting the VM, not a kernel gap. **The 45
+      UNTESTED files are all real, upstream-declared stubs, confirmed by direct inspection, not a
+      kernel gap this pilot can close**: ~40 unconditionally `return PTS_UNTESTED` regardless of
+      platform (POSIX leaves the behavior unspecified/implementation-defined, needs multiple real
+      users, needs Priority Scheduling to build a reliable test, etc.); `sem_post/8-1.c` is gated by
+      musl never defining `_POSIX_PRIORITY_SCHEDULING`, not an OxideBSD limitation;
+      `sched_setparam/26-1.c` is a real upstream inconsistency (its 8 sibling tests self-demote via
+      `setuid()` before giving up and pass for real under this kernel's real second-user support —
+      this one just never wrote that fallback). **Next step**: the remaining 11 FAIL/7 UNRESOLVED
+      haven't been individually triaged against this checklist's own categories yet — a priority-
+      ranking pass over that set, not growing the file count further, is the natural next step here.

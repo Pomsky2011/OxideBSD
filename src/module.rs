@@ -933,6 +933,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_shmdt" => Some(crate::syscall::oxidebsd_sys_shmdt as *const () as u64),
         "oxidebsd_current_uid" => Some(crate::process::oxidebsd_current_uid as *const () as u64),
         "oxidebsd_current_gid" => Some(crate::process::oxidebsd_current_gid as *const () as u64),
+        "oxidebsd_current_umask" => {
+            Some(crate::process::oxidebsd_current_umask as *const () as u64)
+        }
         "oxidebsd_unix_time" => Some(crate::cpu::rtc::oxidebsd_unix_time as *const () as u64),
         "oxidebsd_block_device_present" => {
             Some(crate::drivers::ata::oxidebsd_block_device_present as *const () as u64)

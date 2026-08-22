@@ -274,3 +274,21 @@ pub(crate) extern "C" fn oxidebsd_current_gid() -> u64 {
     }
     do_getgid(pid)
 }
+
+/// Exposed to `modules/oxfs` the same way `oxidebsd_current_uid`/`_gid` are — real per-process
+/// `Process::umask` (real, tracked state since `SYS_UMASK` landed, see CLAUDE.md's own umask
+/// section) finally gets consulted at the one place that creates a new inode's mode:
+/// `oxfs_open`'s own `O_CREAT` create-path. `pid == 0` (oxfs's own boot self-check, before any
+/// real process exists) reports `0` (no bits masked off) — matches `oxidebsd_current_uid`'s own
+/// "report root, unmasked" self-check convention.
+pub(crate) extern "C" fn oxidebsd_current_umask() -> u64 {
+    let pid = scheduler::current_pid();
+    if pid == 0 {
+        return 0;
+    }
+    PROCESS_TABLE
+        .lock()
+        .get(&pid)
+        .map(|p| p.shared.lock().umask as u64)
+        .unwrap_or(0)
+}

@@ -249,6 +249,37 @@ pub fn do_getitimer(pid: Pid, which: u64, old_ptr: u64) -> Result<u64, u64> {
 /// internal ABI boundary" convention this file's own `RawTimespec`/`RawItimerval` already follow.
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+/// Real Linux clockid values -- same duplication-across-the-internal-module-boundary convention as
+/// `CLOCK_REALTIME`/`CLOCK_MONOTONIC` above. Both share this kernel's one real per-process CPU-time
+/// counter (`Process::cpu_ticks`, see `sys_clock_gettime`'s own doc comment) -- no per-thread
+/// distinction exists to make `_THREAD_` mean anything different from `_PROCESS_` here.
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+
+/// `pub(crate)`, not private -- `interrupts::timer_interrupt_handler`'s own `posix_timers` expiry
+/// scan needs this too, to know whether a given slot's `deadline` compares against `ticks()` or
+/// `Process::cpu_ticks`. A plain `u64 -> bool` function, not one taking `&Process`, deliberately --
+/// that scan already holds a live `&mut` sub-borrow of `proc.posix_timers` via its own `slot`
+/// local by the time it needs this, and a function borrowing all of `&Process` wouldn't compile
+/// alongside it (see `timer_now`'s own doc comment for the general version of this constraint).
+pub(crate) fn is_cputime_clock(clockid: u64) -> bool {
+    clockid == CLOCK_PROCESS_CPUTIME_ID || clockid == CLOCK_THREAD_CPUTIME_ID
+}
+
+/// The "now" a `PosixTimer`'s own `deadline` is measured against, per its `clockid` -- real
+/// `interrupts::ticks()` for `CLOCK_REALTIME`/`CLOCK_MONOTONIC`, or `Process::cpu_ticks` for
+/// `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` (the same real per-process CPU-time
+/// counter `sys_clock_gettime` already reads for those two clockids). Shared by `do_timer_settime`
+/// (both the relative-arm case and the `old_ptr` remaining-time readback) and `do_timer_gettime`,
+/// plus `interrupts::timer_interrupt_handler`'s own expiry scan -- one definition, so all four
+/// call sites agree on which counter a given timer's own domain compares against.
+fn timer_now(proc: &Process, clockid: u64) -> u64 {
+    if is_cputime_clock(clockid) {
+        proc.cpu_ticks
+    } else {
+        crate::cpu::interrupts::ticks()
+    }
+}
 
 /// Real Linux `TIMER_ABSTIME` (`third_party/musl/include/time.h`) -- the one `timer_settime(2)`
 /// `flags` bit this ABI understands; any other bit is `EINVAL`.
@@ -309,14 +340,22 @@ fn ticks_to_timespec(ticks: u64) -> (i64, i64) {
 }
 
 /// Converts a `TIMER_ABSTIME` `timer_settime` target (a point in `clockid`'s own domain, not a
-/// duration) into an absolute `interrupts::ticks()` deadline. `CLOCK_MONOTONIC`'s domain already
-/// *is* "seconds since boot at `TIMER_HZ` resolution" -- exactly what `ticks()` counts -- so a
-/// requested absolute timestamp converts the same way a relative one would (`timespec_to_ticks`),
-/// just used directly as the deadline instead of added to `ticks()`. `CLOCK_REALTIME`'s domain is
-/// wall-clock time -- converted via the delta between the requested wall-clock second and *now*,
-/// then applied against the current tick count. A target already in the past (delta `<= 0`)
-/// collapses to "fire on the very next timer IRQ" (`now_ticks`) rather than underflowing, matching
-/// real semantics for an already-elapsed absolute deadline.
+/// duration) into an absolute deadline in the tick-shaped units `interrupts::
+/// timer_interrupt_handler`'s own `PosixTimer::deadline` comparison expects. `CLOCK_MONOTONIC`'s
+/// domain already *is* "seconds since boot at `TIMER_HZ` resolution" -- exactly what `ticks()`
+/// counts -- so a requested absolute timestamp converts the same way a relative one would
+/// (`timespec_to_ticks`), just used directly as the deadline instead of added to `ticks()`.
+/// **`CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` take the identical direct-conversion
+/// path** -- `Process::cpu_ticks` accumulates at the same `TIMER_HZ` cadence as `ticks()` (see its
+/// own doc comment), just gated on "this process was the one actually running," so an absolute
+/// cpu-time target is a raw tick count in exactly the same sense a `CLOCK_MONOTONIC` one is; the
+/// only caller ever passing one of these two clockids here (`do_timer_settime`) compares the
+/// result against `Process::cpu_ticks`, never `interrupts::ticks()`, so reusing this branch is
+/// correct rather than coincidental. `CLOCK_REALTIME`'s domain is wall-clock time -- converted via
+/// the delta between the requested wall-clock second and *now*, then applied against the current
+/// tick count. A target already in the past (delta `<= 0`) collapses to "fire on the very next
+/// timer IRQ" (`now_ticks`) rather than underflowing, matching real semantics for an
+/// already-elapsed absolute deadline.
 ///
 /// **`rtc::unix_epoch_now_precise()`, not `rtc::unix_epoch_seconds()`** -- found live via this
 /// function's own smoke test (`userland/clock-syscall-smoke`'s part 7): the latter reads the real
@@ -333,7 +372,7 @@ pub(crate) fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
     let hz = crate::cpu::pit::TIMER_HZ as u64;
     let frac_ticks = (nsec as u64 * hz).div_ceil(1_000_000_000);
     let now_ticks = crate::cpu::interrupts::ticks();
-    if clockid == CLOCK_MONOTONIC {
+    if clockid == CLOCK_MONOTONIC || is_cputime_clock(clockid) {
         sec.max(0) as u64 * hz + frac_ticks
     } else {
         let (now_wall_sec, now_wall_nsec) = crate::cpu::rtc::unix_epoch_now_precise();
@@ -361,8 +400,16 @@ pub(crate) fn abstime_to_ticks(clockid: u64, sec: i64, nsec: i64) -> u64 {
 /// Finds the first free `Process::posix_timers` slot (`EAGAIN` if all `MAX_POSIX_TIMERS` are
 /// already in use, matching real Linux's own resource-exhaustion errno for this call) and writes
 /// its index back as the real, opaque `timer_t` value.
+///
+/// **`clockid`**: `CLOCK_REALTIME`/`CLOCK_MONOTONIC`, plus `CLOCK_PROCESS_CPUTIME_ID`/
+/// `CLOCK_THREAD_CPUTIME_ID` (added later -- see `is_cputime_clock`'s own doc comment; any other
+/// value is still a real `EINVAL`). Found live via `timer_create/10-1.c`/`11-1.c` (Open POSIX Test
+/// Suite pilot): both unconditionally `EINVAL`'d here before, since only the first two clockids
+/// were ever accepted -- `sysconf(_SC_CPUTIME)`/`_SC_THREAD_CPUTIME` both unconditionally claim
+/// support (musl's own compile-time answer, see `sys_clock_gettime`'s own doc comment), so both
+/// tests proceeded straight to a real `timer_create()` call expecting it to succeed.
 pub fn do_timer_create(pid: Pid, clockid: u64, evp_ptr: u64, timerid_ptr: u64) -> Result<u64, u64> {
-    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC && !is_cputime_clock(clockid) {
         return Err(EINVAL);
     }
 
@@ -458,9 +505,7 @@ pub fn do_timer_settime(
     if old_ptr != 0 {
         let slot = proc.posix_timers[timerid].as_ref().unwrap();
         let (value_sec, value_nsec) = match slot.deadline {
-            Some(deadline) => {
-                ticks_to_timespec(deadline.saturating_sub(crate::cpu::interrupts::ticks()))
-            }
+            Some(deadline) => ticks_to_timespec(deadline.saturating_sub(timer_now(proc, clockid))),
             None => (0, 0),
         };
         let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);
@@ -475,6 +520,12 @@ pub fn do_timer_settime(
         };
     }
 
+    // Computed before `slot` below takes its own mutable borrow of `proc.posix_timers` -- `proc`
+    // (the whole struct, for `proc.cpu_ticks`) can't be reborrowed immutably while a field of it
+    // is already borrowed mutably through `slot`, even though the two touch disjoint fields (same
+    // borrow-splitting limitation `interrupts.rs`'s own `newly_signaled` local already works
+    // around for the identical reason).
+    let now = timer_now(proc, clockid);
     let slot = proc.posix_timers[timerid].as_mut().unwrap();
     if new.it_value_sec == 0 && new.it_value_nsec == 0 {
         slot.deadline = None;
@@ -489,7 +540,7 @@ pub fn do_timer_settime(
             None
         };
     } else {
-        slot.deadline = Some(crate::cpu::interrupts::ticks() + value_ticks);
+        slot.deadline = Some(now + value_ticks);
         slot.interval_ticks = interval_ticks;
         slot.realtime_target = None;
     }
@@ -516,9 +567,7 @@ pub fn do_timer_gettime(pid: Pid, timerid: u64, val_ptr: u64) -> Result<u64, u64
         .ok_or(EINVAL)?;
 
     let (value_sec, value_nsec) = match slot.deadline {
-        Some(deadline) => {
-            ticks_to_timespec(deadline.saturating_sub(crate::cpu::interrupts::ticks()))
-        }
+        Some(deadline) => ticks_to_timespec(deadline.saturating_sub(timer_now(proc, slot.clockid))),
         None => (0, 0),
     };
     let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);

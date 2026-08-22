@@ -439,16 +439,22 @@ pub const MAX_POSIX_TIMERS: usize = 8;
 /// translation layer is needed.
 #[derive(Clone, Copy)]
 pub struct PosixTimer {
-    /// The `clockid_t` given to `timer_create` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC` only, same
-    /// restriction `sys_clock_gettime` already enforces) -- remembered so a later `TIMER_ABSTIME`
-    /// `timer_settime` call knows which clock domain its absolute timestamp is expressed in.
+    /// The `clockid_t` given to `timer_create` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`/
+    /// `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` -- the latter two share this kernel's
+    /// one real per-process CPU-time counter, `Process::cpu_ticks`, same "no real threading-level
+    /// distinction" simplification `sys_clock_gettime` already established for those two clockids)
+    /// -- remembered so a later `TIMER_ABSTIME` `timer_settime` call knows which clock domain its
+    /// absolute timestamp is expressed in, and so `interrupts::timer_interrupt_handler` knows
+    /// whether to compare `deadline` against `ticks()` or against `cpu_ticks`.
     pub clockid: u64,
     /// Real signal number (`1..=31`) to raise on expiry, or `0` for `SIGEV_NONE` (armed, but no
     /// notification is ever delivered -- still real POSIX semantics, just polled via
     /// `timer_gettime`/`timer_getoverrun` instead).
     pub signo: u64,
-    /// Absolute `interrupts::ticks()` deadline, `None` while disarmed -- same shape as
-    /// `real_timer_deadline` above, just one of several rather than the process's only one.
+    /// Absolute deadline, `None` while disarmed -- same shape as `real_timer_deadline` above, just
+    /// one of several rather than the process's only one. In `interrupts::ticks()` units for a
+    /// `CLOCK_REALTIME`/`CLOCK_MONOTONIC` timer, or in `Process::cpu_ticks` units for a
+    /// `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` one -- `clockid` above says which.
     pub deadline: Option<u64>,
     /// Reload value in ticks for a periodic timer; `0` means one-shot -- same convention
     /// `real_timer_interval_ticks` above already uses.

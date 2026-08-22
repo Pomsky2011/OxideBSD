@@ -63,7 +63,9 @@ use spin::Mutex;
 
 use crate::process::{self, BlockReason, Pid, ProcState};
 use crate::process::scheduler;
-use crate::syscall::{EAGAIN, EBADF, EBUSY, EEXIST, EINTR, EINVAL, EMSGSIZE, ENOENT, ETIMEDOUT};
+use crate::syscall::{
+    EAGAIN, EBADF, EBUSY, EEXIST, EINTR, EINVAL, EMSGSIZE, ENAMETOOLONG, ENOENT, ETIMEDOUT,
+};
 
 const O_ACCMODE: u64 = 3;
 const O_CREAT: u64 = 0o100;
@@ -121,6 +123,11 @@ struct MessageQueue {
     open_count: u32,
     unlinked: bool,
     notify: Option<Notify>,
+    /// The `real_fd` that currently owns `notify`, if any -- real POSIX `mq_close(3)`: closing the
+    /// descriptor a notification was registered through removes that registration, freeing the
+    /// queue for another process to register one (`mq_close/2-1.c`). `notify`/`notify_owner_fd`
+    /// are always set and cleared together.
+    notify_owner_fd: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -161,9 +168,13 @@ const _: () = assert!(core::mem::size_of::<RawMqAttr>() == 64);
 /// comment). `None` if no NUL turns up within `max_len` bytes, or the bytes aren't valid UTF-8
 /// (real mqueue names are opaque bytes on Linux, but this port's own `NAMES` map is keyed by
 /// `String` -- no live caller to exercise a non-UTF-8 name today).
-fn read_cstr(ptr: u64, max_len: usize) -> Option<String> {
+/// `Err(EINVAL)` for a null pointer or invalid UTF-8; `Err(ENAMETOOLONG)` specifically when no NUL
+/// terminator turns up within `max_len` bytes -- real POSIX `ENAMETOOLONG` (`mq_open/27-1.c`, a
+/// name deliberately longer than `PATH_MAX`), previously conflated with every other failure mode
+/// into a flat `EINVAL`.
+fn read_cstr(ptr: u64, max_len: usize) -> Result<String, u64> {
     if ptr == 0 {
-        return None;
+        return Err(EINVAL);
     }
     let mut bytes = Vec::with_capacity(16);
     for i in 0..max_len {
@@ -171,11 +182,11 @@ fn read_cstr(ptr: u64, max_len: usize) -> Option<String> {
         // already has.
         let b = unsafe { *((ptr as *const u8).add(i)) };
         if b == 0 {
-            return String::from_utf8(bytes).ok();
+            return String::from_utf8(bytes).map_err(|_| EINVAL);
         }
         bytes.push(b);
     }
-    None
+    Err(ENAMETOOLONG)
 }
 
 fn insert_by_priority(messages: &mut Vec<Message>, priority: u32, data: Vec<u8>) {
@@ -247,9 +258,7 @@ fn resolve_deadline(at_ptr: u64) -> Result<u64, u64> {
 /// honesty tier as `oxfs`'s own pre-permission-model days.
 pub(crate) fn do_mq_open(name_ptr: u64, flags: u64, mode: u64, attr_ptr: u64) -> Result<u64, u64> {
     let _ = mode;
-    let Some(name) = read_cstr(name_ptr, MQ_NAME_MAX) else {
-        return Err(EINVAL);
-    };
+    let name = read_cstr(name_ptr, MQ_NAME_MAX)?;
     if name.is_empty() {
         return Err(EINVAL);
     }
@@ -292,6 +301,7 @@ pub(crate) fn do_mq_open(name_ptr: u64, flags: u64, mode: u64, attr_ptr: u64) ->
                 open_count: 0,
                 unlinked: false,
                 notify: None,
+                notify_owner_fd: None,
             },
         );
         names.insert(name, id);
@@ -336,6 +346,10 @@ extern "C" fn mq_close(real_fd: u64) -> i64 {
     };
     let mut queues = QUEUES.lock();
     if let Some(q) = queues.get_mut(&end.mq_id) {
+        if q.notify_owner_fd == Some(real_fd) {
+            q.notify = None;
+            q.notify_owner_fd = None;
+        }
         q.open_count = q.open_count.saturating_sub(1);
         if q.open_count == 0 && q.unlinked {
             queues.remove(&end.mq_id);
@@ -349,9 +363,7 @@ extern "C" fn mq_close(real_fd: u64) -> i64 {
 /// call-site patch needed). Removes the name immediately; the queue itself survives until every
 /// open descriptor closes (`mq_close`'s own doc comment).
 pub(crate) fn do_mq_unlink(name_ptr: u64) -> Result<u64, u64> {
-    let Some(name) = read_cstr(name_ptr, MQ_NAME_MAX) else {
-        return Err(EINVAL);
-    };
+    let name = read_cstr(name_ptr, MQ_NAME_MAX)?;
     let mut names = NAMES.lock();
     let Some(id) = names.remove(&name) else {
         return Err(ENOENT);
@@ -459,6 +471,7 @@ pub(crate) fn do_mq_timedsend(
             // process must re-register after every notification it receives.
             if let Some(q) = QUEUES.lock().get_mut(&end.mq_id) {
                 q.notify = None;
+                q.notify_owner_fd = None;
             }
             let _ = process::do_kill(pid, pid as i64, signo as i64);
         }
@@ -559,7 +572,10 @@ pub(crate) fn do_mq_notify(mqd: u64, sev_ptr: u64) -> Result<u64, u64> {
     };
 
     if sev_ptr == 0 {
-        q.notify = None;
+        if q.notify_owner_fd == Some(real_fd) {
+            q.notify = None;
+            q.notify_owner_fd = None;
+        }
         return Ok(0);
     }
     if q.notify.is_some() {
@@ -577,7 +593,13 @@ pub(crate) fn do_mq_notify(mqd: u64, sev_ptr: u64) -> Result<u64, u64> {
     match sigev_notify {
         SIGEV_NONE => q.notify = Some(Notify::None),
         SIGEV_SIGNAL => {
-            if !(1..=31).contains(&sigev_signo) {
+            // Real Linux's own `valid_signal()` check for this path accepts `0..=_NSIG` (`64`
+            // here, `SIGRTMAX`) -- notably including `0`, unlike `kill(2)`'s own stricter
+            // `1..=31`/RT range (`mq_close/2-1.c` registers a real notification with
+            // `sigev_signo = 0` and expects it to succeed; a fired signal-`0` notification is
+            // just a harmless no-op through `do_kill`'s own existing `sig == 0` existence-check
+            // convention, same as `kill(pid, 0)`).
+            if !(0..=64).contains(&sigev_signo) {
                 return Err(EINVAL);
             }
             q.notify = Some(Notify::Signal {
@@ -589,6 +611,7 @@ pub(crate) fn do_mq_notify(mqd: u64, sev_ptr: u64) -> Result<u64, u64> {
         // own doc comment.
         _ => return Err(EINVAL),
     }
+    q.notify_owner_fd = Some(real_fd);
     Ok(0)
 }
 

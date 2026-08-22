@@ -198,6 +198,9 @@ pub(crate) const ENXIO: u64 = 6;
 /// syscall is even issued (see that file's own doc comment for why). `75`, identical on Linux/BSD/
 /// musl.
 pub(crate) const EOVERFLOW: u64 = 75;
+/// Real value, identical across Linux/BSD/musl -- a name exceeding an interface's own length
+/// ceiling (`mq_open/27-1.c`: `mq_open()` given a name longer than `PATH_MAX`).
+pub(crate) const ENAMETOOLONG: u64 = 36;
 
 /// A registered syscall handler's own FFI return convention: negative is `-errno`, non-negative
 /// is the success value. Deliberately distinct from the public syscall ABI's own carry-flag

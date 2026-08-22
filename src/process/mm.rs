@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
-use crate::syscall::{EAGAIN, EBADF, EINVAL, ENODEV, ENOMEM, ENXIO, EOVERFLOW};
+use crate::syscall::{EAGAIN, EBADF, EBUSY, EINVAL, ENODEV, ENOMEM, ENXIO, EOVERFLOW};
 use super::*;
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
@@ -134,6 +134,14 @@ pub struct MmapFileRegion {
     /// own doc comment) — `writeback_region` and `release_mmap_file_ref` both no-op for one of
     /// these, real POSIX "modifications... discarded" `MAP_PRIVATE` semantics.
     shared: bool,
+    /// `true` once `mlockall(MCL_CURRENT)` has snapshotted this region as locked (`do_mlockall`).
+    /// No real page-level locking exists to back this (same honesty tier `do_mlock`/`do_munlock`
+    /// already document) -- the one real behavior it drives is `do_msync`'s own `MS_INVALIDATE`
+    /// check: real POSIX documents `EBUSY` when `msync(MS_INVALIDATE)` targets a locked mapping,
+    /// since invalidating a locked page's content would need evicting memory the caller asked to
+    /// keep pinned (`mlockall/3-6.c`). Cleared by `munlockall`, mirroring `ThreadGroupShared::
+    /// mlockall_future`'s own reset.
+    locked: bool,
 }
 
 /// `SYS_MMAP`'s real logic — OxideBSD's own invention, not modeled on any real OS's `mmap` (see
@@ -572,6 +580,7 @@ fn do_mmap_file_backed(
         content_id,
         writable,
         shared: !private,
+        locked: false,
     });
 
     Ok(base)
@@ -783,11 +792,15 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
 /// Linux's own "address doesn't correspond to a mapping" error). `MS_ASYNC`/`MS_SYNC` aren't
 /// distinguished — no async I/O queue exists to differentiate them, so both just flush
 /// synchronously before returning, same honesty tier `fsync`'s own doc comment already sets;
-/// `MS_INVALIDATE` is a no-op — this kernel has no separate page-cache copy to invalidate,
-/// `MAP_SHARED` here already shares `MMAP_FILE_CACHE`'s own live frames directly. `len` isn't
-/// range-checked against the region's own extent — every real caller in this kernel's own call
-/// graph flushes a whole mapping at once (the shape `msync(addr, real_len, ...)` always takes), and
-/// `writeback_region` itself only ever writes the region's real content regardless.
+/// `MS_INVALIDATE` is otherwise a no-op — this kernel has no separate page-cache copy to
+/// invalidate, `MAP_SHARED` here already shares `MMAP_FILE_CACHE`'s own live frames directly —
+/// **except** against a region `mlockall(MCL_CURRENT)` marked `locked` (`MmapFileRegion::locked`'s
+/// own doc comment): real POSIX documents `EBUSY` there ("a mapping... could not be synchronized
+/// because it is locked", `mlockall/3-6.c`), so that combination is checked and rejected before
+/// any writeback happens, real page-pinning or not. `len` isn't range-checked against the region's
+/// own extent — every real caller in this kernel's own call graph flushes a whole mapping at once
+/// (the shape `msync(addr, real_len, ...)` always takes), and `writeback_region` itself only ever
+/// writes the region's real content regardless.
 pub fn do_msync(caller_pid: Pid, addr: u64, len: u64, flags: u64) -> Result<u64, u64> {
     const MS_ASYNC: u64 = 1;
     const MS_INVALIDATE: u64 = 2;
@@ -811,6 +824,9 @@ pub fn do_msync(caller_pid: Pid, addr: u64, len: u64, flags: u64) -> Result<u64,
         .iter()
         .find(|r| addr >= r.va_start && addr < r.va_start + r.npages * 4096)
         .ok_or(ENOMEM)?;
+    if flags & MS_INVALIDATE != 0 && region.locked {
+        return Err(EBUSY);
+    }
     writeback_region(region, phys_offset);
     Ok(0)
 }
@@ -913,13 +929,17 @@ pub fn do_munlock(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
 /// `SYS_MLOCKALL`/`SYS_MUNLOCKALL`'s real logic — real Linux values `511`/`512`, moved off `151`/
 /// `152` for the same `SYS_FCNTL`/`SYS_SHUTDOWN` collision reasons `do_mlock` documents. `mlockall`
 /// validates `flags` is a real, nonzero combination of `MCL_CURRENT`/`MCL_FUTURE`/`MCL_ONFAULT`
-/// (real Linux `EINVAL` otherwise — at least one of `MCL_CURRENT`/`MCL_FUTURE` is required); beyond
-/// that, `MCL_CURRENT`/`MCL_ONFAULT` stay the same unenforced no-op tier `do_mlock` above documents
-/// (no already-mapped-page locking or fault-time locking exists to make real). `MCL_FUTURE` is real
-/// now, though: it flips `ThreadGroupShared::mlockall_future`, which `do_mmap` consults on every
-/// later mapping — see that field's own doc comment. `munlockall` clears both `mlockall_future` and
-/// the accumulated `locked_bytes` (real POSIX: `munlockall()` unlocks everything and cancels a
-/// prior `MCL_FUTURE`) and otherwise always succeeds.
+/// (real Linux `EINVAL` otherwise — at least one of `MCL_CURRENT`/`MCL_FUTURE` is required).
+/// `MCL_ONFAULT` stays the same unenforced no-op tier `do_mlock` above documents (no fault-time
+/// locking exists to make real). `MCL_FUTURE` flips `ThreadGroupShared::mlockall_future`, which
+/// `do_mmap` consults on every later mapping — see that field's own doc comment. `MCL_CURRENT`
+/// snapshots every one of the caller's own currently-live `mmap_file_regions` as `locked` (real
+/// POSIX: locks pages *currently* mapped, not a standing policy for future ones the way
+/// `MCL_FUTURE` is) — the one place this becomes observable is `do_msync`'s own `MS_INVALIDATE`
+/// check (`mlockall/3-6.c`), still no real page-pinning/eviction-prevention beyond that. `munlockall`
+/// clears `mlockall_future`, `locked_bytes`, and every region's own `locked` flag (real POSIX:
+/// `munlockall()` unlocks everything and cancels a prior `MCL_FUTURE`) and otherwise always
+/// succeeds.
 pub fn do_mlockall(caller_pid: Pid, flags: u64) -> Result<u64, u64> {
     const MCL_CURRENT: u64 = 1;
     const MCL_FUTURE: u64 = 2;
@@ -927,12 +947,18 @@ pub fn do_mlockall(caller_pid: Pid, flags: u64) -> Result<u64, u64> {
     if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
         return Err(EINVAL);
     }
+    let table = PROCESS_TABLE.lock();
+    let me = table
+        .get(&caller_pid)
+        .expect("mlockall: current process missing from table");
+    let mut shared = me.shared.lock();
     if flags & MCL_FUTURE != 0 {
-        let table = PROCESS_TABLE.lock();
-        let me = table
-            .get(&caller_pid)
-            .expect("mlockall: current process missing from table");
-        me.shared.lock().mlockall_future = true;
+        shared.mlockall_future = true;
+    }
+    if flags & MCL_CURRENT != 0 {
+        for region in shared.mmap_file_regions.iter_mut() {
+            region.locked = true;
+        }
     }
     Ok(0)
 }
@@ -945,6 +971,9 @@ pub fn do_munlockall(caller_pid: Pid) -> Result<u64, u64> {
     let mut shared = me.shared.lock();
     shared.mlockall_future = false;
     shared.locked_bytes = 0;
+    for region in shared.mmap_file_regions.iter_mut() {
+        region.locked = false;
+    }
     Ok(0)
 }
 

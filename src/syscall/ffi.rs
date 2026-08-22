@@ -1070,6 +1070,15 @@ fn decode_dynamic_cpu_clock_pid(caller_pid: crate::process::Pid, clockid: u64) -
     if raw >= 0 {
         return None;
     }
+    // Real Linux's own `CPUCLOCK_WHICH(clock) >= CPUCLOCK_MAX` check: the low 2 bits are a real
+    // sub-selector (`CPUCLOCK_PROF`/`_VIRT`/`_SCHED` = 0/1/2), and `3` is not a valid value for it
+    // -- rejecting it here is what makes a genuinely-garbage negative `clockid` like `-1` (whose
+    // low 2 bits are `11` = 3) real `EINVAL` instead of silently decoding as a valid clock
+    // (`clock_gettime/8-2.c`). musl's own `clock_getcpuclockid()` always encodes `2` (`CPUCLOCK_
+    // SCHED`) in this position, so a legitimately-encoded id is never affected.
+    if raw & 3 == 3 {
+        return None;
+    }
     let decoded = !(raw >> 3);
     Some(if decoded == 0 {
         caller_pid

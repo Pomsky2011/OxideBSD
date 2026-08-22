@@ -15,8 +15,9 @@ belong in this doc.
 before assigning any new number, grep `third_party/musl/arch/x86_64/bits/syscall.h.in` for a live
 `__NR_*` caller in `third_party/musl/src/`. If musl already calls a real, unremapped Linux number
 directly, use that number — don't invent one. Otherwise continue OxideBSD's own invented sequence
-from the current highest, **555** (`SYS_CLONE` — reserved, no kernel handler yet, see the
-`pthread_create`/threading row further down; see the full sweep below, then the
+from the current highest, **555** (`SYS_CLONE` — now with a real handler,
+`process::lifecycle::do_clone`, real threading having landed since this number was first reserved;
+see "Real threading: `clone(2)`, `pthread_create`/`join`" below; see the full sweep below, then the
 planned-implementation-order pre-reservation batch further down — this range moved four times
 across three sessions). This
 project has been bitten by number collisions twice before (`SYS_KILL`/real `setgroups`,
@@ -542,6 +543,62 @@ survives, followed by real `EIDRM` once the last attachment actually detaches); 
 This brings the batch to 28 of 28 items done -- the whole 28-syscall pre-reserved batch is
 complete.
 
+## Implemented: real threading — `clone(2)`, `pthread_create`/`join`, shared address spaces
+
+`SYS_CLONE = 555` (reserved ahead of implementation, see the numbering-discipline note at the top
+of this doc) now has a real handler — closes what used to be this doc's "Structurally inapplicable"
+`pthread_create` row entirely, landed across five phases plus a finish-line pass. Full detail lives
+in CLAUDE.md's own "Real threading" section and the `[[project_real_threading_for_aio]]` memory;
+summarized here since it's this doc's own reserved number finally getting a handler.
+
+- **Phase 1**: `third_party/musl/src/thread/x86_64/clone.s`/`__unmapself.s` no longer hardcode raw
+  Linux syscall numbers (the same asm-bypass-the-remap-table bug class already fixed once for
+  `vfork.s`) — `clone.s` now targets `SYS_CLONE = 555` directly; `__unmapself.s` calls this ABI's
+  real `SYS_MUNMAP=101`/`SYS_EXIT=1`.
+- **Phase 2**: `Process::tgid` splits real `getpid()`/`gettid()` — `do_getpid()` returns `tgid`;
+  `gettid()` needed no kernel change (musl caches it client-side from `SYS_SET_TID_ADDRESS`'s
+  existing return value).
+- **Phase 3**: real `FUTEX_WAIT`/`FUTEX_WAKE` (`process::do_futex`, `src/process/limits.rs`,
+  `BlockReason::WaitingForFutex(tgid, addr, deadline)`), scoped by `tgid` not raw `pid` (load-
+  bearing today, since there's no ASLR and unrelated processes can share addresses like the fixed
+  `USER_STACK_TOP`) — happens to be exactly the right scope for real `CLONE_THREAD` sharing later
+  too. Unblocked unnamed POSIX semaphores for real (3 pilot FAILs flipped to PASS).
+- **Phases 4+5**: the actual thread-creation prerequisite — `AddressSpace` became
+  `Arc`-refcounted (`src/memory/address_space.rs`, `teardown` gates its free-walk on
+  `Arc::strong_count == 1`); a new `ThreadGroupShared` (`cwd`/`root_inode`/`umask`/`uid`/`gid`/
+  `brk`/`mmap_file_regions`) is `Arc<Mutex<>>`-wrapped on `Process`; `src/fs/fd.rs` is keyed by
+  `tgid` not raw `pid` (real `CLONE_FILES` sharing falls out for free — calling the existing
+  `fs::fd::fork_inherit` on top would double-bump refcounts, a real bug found and fixed while
+  landing this); `process::lifecycle::do_clone` is the real `SYS_CLONE` handler (`tls` read via
+  `crate::syscall::frame_tls`, the same raw-frame-access route `fork`/`execve` already use); a
+  non-leader thread's own exit uses a new deferred-reap mechanism
+  (`scheduler::queue_thread_reap`/`reap_pending_threads`) since its own `Process` table entry can't
+  be removed while the CPU is still executing on its `KernelStack`.
+- **Finish line**: real `CLONE_CHILD_CLEARTID` support (`Process::clear_child_tid`) — found
+  necessary getting a genuinely unmodified `pthread_create()`/`pthread_join()` round trip working:
+  musl's own `__pthread_exit` routes `__thread_list_lock`'s release through a real kernel
+  clear-and-wake at true task-exit time, not a plain userspace unlock, and without it `pthread_join`
+  hung forever in musl's own `__tl_sync` after its primary `detach_state` futex wait/wake already
+  succeeded.
+
+**Verified end-to-end**: `tests/clone_syscall_smoke.rs` + `userland/clone-syscall-smoke/` — a raw
+`syscall(SYS_CLONE, ...)` (no musl) proving real `CLONE_VM` (cross-"thread" write visibility),
+`CLONE_THREAD` (shared `getpid()`), `CLONE_PARENT_SETTID`, and a real futex-based join. Separately,
+`tests/pthread_syscall_smoke.rs` + `userland/pthread-syscall-smoke/` drives a genuinely unmodified
+`pthread_create()`/`pthread_join()` C fixture (`userland/pthread-smoke/main.c`, built via
+`musl-gcc`, seeded as `/pthread-smoke.elf`) — proving real musl threading works, not just the raw
+syscall. Full regression sweep (`fork_wait`, every IPC/signal/mount/mmap smoke test) re-run clean
+after each phase.
+
+**What this unlocks, and what it doesn't**: POSIX AIO (`aio_*`/`lio_listio`) is unblocked with zero
+further kernel-side work — musl implements it as pure userspace logic over a `pthread_create`
+worker pool. `pthread_mutex_*`/`_cond_*`/`_rwlock_*`/`_barrier_*`/`_spin_*` are all userspace logic
+over the same real `futex(2)` primitive, so they're expected to already work, though not yet
+covered by a dedicated smoke test of their own. **Still not done**: named POSIX semaphores/POSIX
+shared memory (need a `/dev/shm` path plus real cross-*process* `FUTEX_WAKE` — today's scoping is
+deliberately `tgid`-only, safe but not cross-process) and real `dlopen` (blocked on `mprotect`
+enforcement, unrelated to threading).
+
 ## Missing, live caller confirmed
 
 Interfaces musl's own C source calls directly (grepped, not inferred) that have no registered
@@ -562,12 +619,12 @@ elsewhere.
 | POSIX interface(s) | Backing concept | Notes |
 |---|---|---|
 | `mq_open`, `mq_close`, `mq_unlink`, `mq_send`, `mq_receive`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getattr`, `mq_setattr` | POSIX message queues | `536-541`, all now implemented — see "Pre-reserved batch: third implementation" above. No seeded applet uses these yet (no live caller in the current roster), but a real handler exists for any future one. |
-| `sem_init`, `sem_destroy`, `sem_wait`, `sem_trywait`, `sem_timedwait`, `sem_post`, `sem_getvalue` (unnamed semaphores) | futex-backed | **No longer blocked — real `futex(2)` `FUTEX_WAIT`/`FUTEX_WAKE` now exist** (`process::do_futex`, `src/process/limits.rs`, real threading phase 3 — see `[[project_real_threading_for_aio]]` memory), so these already work today for the single-process case every unnamed semaphore in this port's roster actually exercises (`sem_init`, not `sem_open`). No distinct syscall of its own to reserve a number for — not part of the pre-reservation batch below. |
-| `sem_open`, `sem_close`, `sem_unlink` (named semaphores) | `/dev/shm`-backed `open`+`mmap` | No live caller; would also want the `shm_open` path below first. Not a distinct syscall either — not part of the pre-reservation batch below. |
+| `sem_init`, `sem_destroy`, `sem_wait`, `sem_trywait`, `sem_timedwait`, `sem_post`, `sem_getvalue` (unnamed semaphores) | futex-backed | **No longer blocked — real `futex(2)` `FUTEX_WAIT`/`FUTEX_WAKE` now exist** (`process::do_futex`, `src/process/limits.rs`, real threading phase 3 — see "Real threading" below), so these already work today for the single-process case every unnamed semaphore in this port's roster actually exercises (`sem_init`, not `sem_open`). Real thread creation itself (`clone(2)`/`pthread_create`) has also landed since (see "Real threading" below), so a `sem_init(&s, 0, ...)` (`pshared == 0`) shared *between threads* of one process should also already work — not separately verified by a dedicated test yet. No distinct syscall of its own to reserve a number for — not part of the pre-reservation batch below. |
+| `sem_open`, `sem_close`, `sem_unlink` (named semaphores) | `/dev/shm`-backed `open`+`mmap` | No live caller; would also want the `shm_open` path below first, plus real cross-*process* `FUTEX_WAKE` (today's `do_futex` is deliberately scoped to the waker's own `tgid` — real threads sharing a `tgid` now wake each other correctly, but two unrelated processes still wouldn't). Not a distinct syscall either — not part of the pre-reservation batch below. |
 | `shm_open`, `shm_unlink` | POSIX shared memory | No live caller in roster. Implemented via plain `open`/`mkdir` on real Linux, not a distinct syscall — not part of the pre-reservation batch below. |
 | `shmget`, `shmat`, `shmctl`, `shmdt`, `msgget`, `msgctl`, `msgrcv`, `msgsnd`, `semget`, `semctl`, `semop`, `semtimedop` | SysV IPC | `542-553`, all now implemented — see "Pre-reserved batch: fourth/fifth/sixth implementation" above. `ipcrm`/`ipcs` were already cut from the BusyBox roster before v0.1 (this didn't exist yet at the time) and haven't been added back — see CLAUDE.md's own gap-analysis table; a real handler now exists for any future BusyBox roster change that wants them back. |
 | `aio_read`, `aio_write`, `aio_fsync`, `aio_error`, `aio_return`, `aio_cancel`, `aio_suspend`, `lio_listio` | POSIX async I/O | On real Linux, musl implements these via a userspace thread pool (`src/aio/aio.c`), not a true async-I/O syscall — not meaningfully "missing" at the kernel level at all; would only become relevant once real threading exists. Not part of the pre-reservation batch below. |
-| `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | POSIX per-process timers | Pre-reserved at `531-535` (see "Pre-reserved ahead of implementation" below — no handler registered yet). Distinct from the already-implemented `setitimer`/`getitimer` (`ITIMER_REAL` only). No live caller confirmed; `timer_delete.c` does call `tkill` internally (see Priority 1 above) but only after a real `timer_create` has ever succeeded, which can't happen yet. |
+| `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | POSIX per-process timers | `531-535`, all now implemented — see "Pre-reserved batch: second implementation" above. Distinct from `setitimer`/`getitimer` (`ITIMER_REAL` only), which were already implemented separately. Still no live caller in the current BusyBox/TinyCC/hush roster, but a real handler exists for any future one and the Open POSIX Test Suite pilot exercises them directly. |
 | `select`, `pselect` | fd readiness | `poll(2)` already exists and covers every confirmed live caller (musl's DNS resolver). `src/select/poll.c` doesn't route through `pselect6` on this build (confirmed: `SYS_poll` is used directly). The only BusyBox callers of raw `select` (`inetd`, `telnetd`, `dhcprelay`, `fdisk`, ...) are already cut from the roster. Not part of the pre-reservation batch below — genuinely not needed. |
 | `posix_spawn`, `posix_spawnp` + the `posix_spawnattr_*`/`posix_spawn_file_actions_*` family | process creation | musl implements `posix_spawn` entirely in userspace on top of `vfork`/`execve` (`src/process/posix_spawn.c`) — both of those already exist here (see CLAUDE.md's `vfork.s` note). Not a missing syscall at all, just unexercised library code. |
 | `fexecve` | `execveat`-style exec by fd | musl's `fexecve` falls back to `/proc/self/fd/<n>` + `execve` when `execveat` is unavailable — would work today given real per-fd `/proc` entries exist, modulo the "not a real symlink" limitation already documented in `docs/BUSYBOX_APPLETS.md`'s `NEEDS_PROC` section. |
@@ -579,7 +636,6 @@ deferred exists.
 
 | POSIX interface(s) | Why inapplicable today |
 |---|---|
-| `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_mutex_*`, `pthread_cond_*`, `pthread_rwlock_*`, `pthread_barrier_*`, `pthread_spin_*`, `clone`(underlying) | No real thread-creation syscall exists (`clone`/`set_robust_list` are still unregistered — **`futex` is not**: real `FUTEX_WAIT`/`FUTEX_WAKE` landed as real threading phase 3, see the `sem_*` row above and `[[project_real_threading_for_aio]]` memory). **The asm-bypass bug is fixed** (`src/thread/x86_64/clone.s`/`__unmapself.s` used to hardcode raw Linux syscall numbers directly, the same bug class already fixed once for `vfork.s` — `clone.s` now calls a real reserved OxideBSD number, `SYS_CLONE = 555` — see "Pre-reserved ahead of implementation" below — with **no kernel handler registered yet** (still cleanly `ENOSYS`'s); `__unmapself.s` now calls this ABI's own already-working `SYS_MUNMAP=101`/`SYS_EXIT=1` directly, so it's genuinely correct the moment a real thread can ever reach it). Real thread creation itself is still blocked on the actual prerequisite: this kernel's single-core, no-preemption, single-global-`fs_base`-per-context-switch design (see CLAUDE.md's musl-port section on `IA32_FS_BASE`) has no notion of two live threads sharing one address space at all yet — a structural gap, not a missing syscall number. Real POSIX AIO (`aio_read`/`aio_write`/...) sits directly behind this too: musl's `aio.c` is pure userspace logic that spawns a `pthread_create` worker per call — no distinct kernel AIO syscall family, so AIO needs zero kernel-side work of its own once real threading exists. |
 | `sched_yield`, `sched_rr_get_interval` | Covered — `sched_setscheduler`/`sched_setparam`/`sched_getscheduler`/`sched_getparam`/`sched_get_priority_max`/`_min` all exist (`modules/posix_compat`), stored/echoed honestly with no real scheduling effect, matching `nice`'s own honesty tier. `sched_yield` itself is a genuine yield now that real preemption exists (see CLAUDE.md's "Real preemptive scheduling"), not just a no-op. |
 | `mlockall`, `munlockall`, `mlock`, `munlock`, `posix_madvise` | This kernel never pages anything out (no swap, no reclaim of any kind anywhere — a documented, deliberate gap per CLAUDE.md's memory-management section) — "lock this page so it can't be swapped" is a no-op by construction, not a missing capability. |
 | `msync` | **No longer inapplicable — real `mmap` here is not always anonymous/private any more** (see CLAUDE.md's "Real /tmp, /dev/shm, and real fd-backed MAP_SHARED mmap" and "Real ring-3 fault-to-signal delivery, and two mmap fixes" sections), so `msync`'s real job (flushing a live `MAP_SHARED` mapping back to its file on demand) is now a genuine, narrow gap, not a structural non-issue: writeback today only happens implicitly, at `munmap`/process exit (`src/process/mm.rs`'s `writeback_region`), never on explicit request. A real caller wanting `msync(2)` itself hasn't shown up yet in this port's roster. |
