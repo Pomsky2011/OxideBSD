@@ -1,3 +1,40 @@
+# OxideBSD 0.1.1
+
+A bugfix-only release on top of 0.1.0 — no new capabilities. `v0.1.x` is this project's
+maintenance branch: it only ever backports real, independently-verified fixes (most found first on
+`master`'s own ongoing POSIX-conformance work, then confirmed to affect this branch too), never new
+feature work — that all happens on `master` toward `0.2.0`.
+
+## Fixed since 0.1.0
+
+- **A real permission/security gap**: `open(path, O_CREAT, mode)` silently discarded the caller's
+  requested creation mode — every new file got a fixed `0o755` regardless of what was actually
+  asked for (e.g. `open(path, O_CREAT|O_WRONLY, 0600)` didn't get a private file). Needed a musl
+  submodule patch (threading `mode` through as a real 4th syscall argument) plus an oxfs-side fix.
+- **`su`'s real privilege-drop path was broken**: `socket(AF_UNIX, ...)` returned the wrong errno
+  (`EPROTONOSUPPORT` instead of `EAFNOSUPPORT`), which broke musl's own `initgroups()` fallback —
+  any real `su` to a non-root uid would fail with "can't set groups: Function not implemented."
+- **A real POSIX filesystem-semantics bug**: `unlink()`ing a file before its first `write()`/
+  `close()` ever committed a real inode used to silently no-op, then resurrect the file on the next
+  commit — breaking the classic "open, unlink, keep writing" temp-file idiom.
+- **`sched_setscheduler(2)` returned the wrong value** on success (always `0` instead of the real
+  POSIX-mandated former scheduling policy).
+- **Real Ctrl+C job control and colored `ls`/prompt** — a session/controlling-tty fix that lets
+  `hush`'s own real job-control startup activate for the first time; `kill(-pgrp, sig)`
+  process-group broadcast also now works. (Real Ctrl+Z stop/resume stays `master`/`0.2.0`-only.)
+- **A real `poll()` livelock**: `nfds == 0` with an infinite timeout used to spin forever with no
+  possible escape, starving the whole (single-core) system.
+- **33 real syscall-number collisions** between this ABI's own invented numbers and still-live real
+  Linux syscall numbers musl's own compiled-in headers reference — found via a full header sweep,
+  fixed by moving every colliding invented number to a verified-unclaimed one.
+- **A real kernel-heap OOM panic**: `yes | head -n 3` (or any pipeline where a non-blocking
+  producer outpaces a consumer that stops reading early) could exhaust the kernel heap. Fixed by
+  bounding the pipe buffer with a real blocking writer.
+
+Building/running instructions are unchanged from 0.1.0 — see below.
+
+---
+
 # OxideBSD 0.1.0
 
 First tagged snapshot of OxideBSD, a 100% Rust, x86_64-only, BSD-like operating system built from
