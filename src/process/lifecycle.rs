@@ -193,6 +193,7 @@ fn map_user_stack(
     let stack_bottom_page = Page::containing_address(stack_top - user_stack_pages() * 4096);
     let stack_top_page = Page::containing_address(stack_top - 1u64);
     let mut mapped_pages = BTreeMap::new();
+    let phys_offset = memory::phys_mem_offset();
     with_frame_allocator(|fa| {
         for page in Page::range_inclusive(stack_bottom_page, stack_top_page) {
             let frame = fa
@@ -213,6 +214,15 @@ fn map_user_stack(
                     .expect("failed to map a user stack page")
                     .flush();
             }
+            // A real frame handed back by `allocate_frame` may be a reused one (see
+            // `BootInfoFrameAllocator`'s own `FrameDeallocator` impl) carrying a previous,
+            // unrelated process's leftover stack content -- `user_stack::build` only ever writes
+            // the top of this region (argv/envp/auxv); everything below that is directly visible
+            // to the new process's own uninitialized locals otherwise, a real cross-process
+            // information leak. Same technique `elf::load`'s BSS zeroing and `do_mmap`'s
+            // anonymous-mapping zeroing already use.
+            let frame_ptr = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
             mapped_pages.insert(page, frame);
         }
     });

@@ -158,8 +158,18 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
             notify_parent_sigchld(&mut table, target, CLD_CONTINUED, SIGCONT);
         }
         let proc = table.get(&target).unwrap();
+        // Real POSIX: a currently-*blocked* signal must never resolve its default disposition
+        // immediately, even with no handler installed and even when that disposition would
+        // otherwise be Terminate/Stop -- delivery is deferred until the target unblocks it (or
+        // consumes it directly via sigwait/sigtimedwait, bypassing normal dispatch entirely).
+        // Found live: mq_timedsend/16-1.c's own child blocks SIGUSR1 then sigwait()s for it: the
+        // parent's `kill(child, SIGUSR1)` was resolving SIGUSR1's real default disposition
+        // (Terminate) right there, silently killing the child instead of waking its sigwait --
+        // this is a general gap, not specific to that one test or that one signal.
+        let is_blocked = proc.blocked_signals & (1 << (sig - 1)) != 0;
         match proc.sigactions[sig as usize].handler {
             1 => Action::Discard, // SIG_IGN
+            0 if is_blocked => Action::SetPending,
             0 => match default_disposition(sig) {
                 DefaultDisposition::Ignore => Action::Discard,
                 DefaultDisposition::Terminate => Action::Terminate,
@@ -255,8 +265,13 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
             .into_iter()
             .map(|pid| {
                 let proc = table.get(&pid).unwrap();
+                // See do_kill's own identical comment: a currently-blocked signal must defer,
+                // never resolve its default disposition immediately, even with no handler
+                // installed.
+                let is_blocked = proc.blocked_signals & (1 << (sig - 1)) != 0;
                 let action = match proc.sigactions[sig as usize].handler {
                     1 => Action::Discard, // SIG_IGN
+                    0 if is_blocked => Action::SetPending,
                     0 => match default_disposition(sig) {
                         DefaultDisposition::Ignore => Action::Discard,
                         DefaultDisposition::Terminate => Action::Terminate,
@@ -1142,8 +1157,18 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
             notify_parent_sigchld(&mut table, target, CLD_CONTINUED, SIGCONT);
         }
         let proc = table.get(&target).unwrap();
+        // Real POSIX: a currently-*blocked* signal must never resolve its default disposition
+        // immediately, even with no handler installed and even when that disposition would
+        // otherwise be Terminate/Stop -- delivery is deferred until the target unblocks it (or
+        // consumes it directly via sigwait/sigtimedwait, bypassing normal dispatch entirely).
+        // Found live: mq_timedsend/16-1.c's own child blocks SIGUSR1 then sigwait()s for it: the
+        // parent's `kill(child, SIGUSR1)` was resolving SIGUSR1's real default disposition
+        // (Terminate) right there, silently killing the child instead of waking its sigwait --
+        // this is a general gap, not specific to that one test or that one signal.
+        let is_blocked = proc.blocked_signals & (1 << (sig - 1)) != 0;
         match proc.sigactions[sig as usize].handler {
             1 => Action::Discard, // SIG_IGN
+            0 if is_blocked => Action::SetPending,
             0 => match default_disposition(sig) {
                 DefaultDisposition::Ignore => Action::Discard,
                 DefaultDisposition::Terminate => Action::Terminate,

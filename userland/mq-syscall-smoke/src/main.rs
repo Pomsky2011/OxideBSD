@@ -51,12 +51,16 @@ const SYS_FORK: u64 = 2;
 const SYS_WRITE: u64 = 4;
 const SYS_CLOSE: u64 = 6;
 const SYS_WAIT4: u64 = 7;
+const SYS_KILL: u64 = 116;
 const SYS_SIGACTION: u64 = 117;
+const SYS_SIGPROCMASK: u64 = 118;
+const SYS_SIGTIMEDWAIT: u64 = 495;
 /// Real, unremapped Linux `__NR_sigreturn` slot -- see `third_party/musl/src/signal/x86_64/
 /// restore.s`'s own comment for why every arch's restorer hardcodes its trap number directly
 /// rather than going through a shared macro.
 const SYS_SIGRETURN: u64 = 119;
 const SYS_CLOCK_GETTIME: u64 = 138;
+const SYS_NANOSLEEP: u64 = 139;
 const SYS_MQ_OPEN: u64 = 536;
 const SYS_MQ_UNLINK: u64 = 537;
 const SYS_MQ_TIMEDSEND: u64 = 538;
@@ -288,6 +292,102 @@ fn add_ms(ts: &RawTimespec, ms: i64) -> RawTimespec {
     RawTimespec { tv_sec: sec, tv_nsec: nsec }
 }
 
+const SIG_BLOCK: u64 = 0;
+
+fn sigprocmask(how: u64, mask: u64) -> Result<u64, u64> {
+    unsafe { syscall4(SYS_SIGPROCMASK, how, &mask as *const u64 as u64, 0, 8) }
+}
+
+/// Real `sigwait(3)` shape -- musl's own wrapper is a thin call over `sigtimedwait` with a null
+/// timeout (see `sig-syscall-smoke`'s own identical helper). A `[u8; 128]` stand-in buffer for
+/// `siginfo_t` since this part never needs to interpret its fields, just the returned signal
+/// number.
+fn sigwait_real(wait_set: u64) -> Result<u64, u64> {
+    let mut info = [0u8; 128];
+    unsafe {
+        syscall4(
+            SYS_SIGTIMEDWAIT,
+            &wait_set as *const u64 as u64,
+            info.as_mut_ptr() as u64,
+            0,
+            8,
+        )
+    }
+}
+
+/// Part 11's own child: mirrors the Open POSIX Test Suite pilot's `mq_timedsend/16-1.c` shape as
+/// closely as this bare-metal crate can -- real `sigprocmask(SIG_BLOCK)` + real blocking
+/// `sigwait()` for a signal the parent sends, *then* fills a fresh queue and blocks in
+/// `mq_timedsend` with a real multi-second deadline. Part 9 already proved the fork+concurrent-
+/// nanosleep shape alone isn't the trigger; this adds the one remaining unreplicated piece from
+/// the real pilot test -- a real prior `sigwait()` completion on the same process.
+fn sigwait_then_timedsend_child(mqd: u64) -> ! {
+    if sigprocmask(SIG_BLOCK, 1 << (SIGUSR1 - 1)).is_err() {
+        write_bytes(b"mq-syscall-smoke: part 10 child sigprocmask failed\n");
+        unsafe {
+            let _ = syscall(SYS_EXIT, 1, 0, 0);
+        }
+    }
+    write_bytes(b"mq-syscall-smoke: part 10 child sigwaiting\n");
+    if sigwait_real(1 << (SIGUSR1 - 1)) != Ok(SIGUSR1) {
+        write_bytes(b"mq-syscall-smoke: part 10 child sigwait didn't return SIGUSR1\n");
+        unsafe {
+            let _ = syscall(SYS_EXIT, 1, 0, 0);
+        }
+    }
+    write_bytes(b"mq-syscall-smoke: part 10 child woke from sigwait, filling queue\n");
+    for msg in [&b"h0"[..], &b"h1"[..], &b"h2"[..], &b"h3"[..]] {
+        if mq_timedsend(mqd, msg, 0, None).is_err() {
+            write_bytes(b"mq-syscall-smoke: part 10 child fill failed\n");
+            unsafe {
+                let _ = syscall(SYS_EXIT, 1, 0, 0);
+            }
+        }
+    }
+    let deadline = add_ms(&clock_realtime(), 1500);
+    let result = mq_timedsend(mqd, b"overflow", 0, Some(&deadline));
+    write_bytes(b"mq-syscall-smoke: part 10 child's blocking mq_timedsend returned\n");
+    unsafe {
+        let _ = syscall(SYS_EXIT, if result == Err(ETIMEDOUT) { 0 } else { 1 }, 0, 0);
+    }
+    loop {
+        spin_loop();
+    }
+}
+
+fn nanosleep_ms(ms: i64) {
+    let ts = RawTimespec { tv_sec: ms / 1000, tv_nsec: (ms % 1000) * 1_000_000 };
+    unsafe {
+        let _ = syscall(SYS_NANOSLEEP, &ts as *const RawTimespec as u64, 0, 0);
+    }
+}
+
+/// Part 9's own child: fills a fresh queue to `mq_maxmsg` then blocks in `mq_timedsend` with a
+/// real multi-second-scale deadline against it -- mirrors the Open POSIX Test Suite pilot's own
+/// `mq_timedsend/16-1.c` shape (a forked child blocking send-side while the parent independently
+/// blocks in its own concurrent `nanosleep`), which hangs against the real kernel even though this
+/// crate's own simpler, single-process part 5b (no concurrent second blocked process) already
+/// proved the same `WaitingForMqSpace` deadline-expiry mechanism works in isolation.
+fn timedsend_child(mqd: u64) -> ! {
+    for msg in [&b"g0"[..], &b"g1"[..], &b"g2"[..], &b"g3"[..]] {
+        if mq_timedsend(mqd, msg, 0, None).is_err() {
+            write_bytes(b"mq-syscall-smoke: part 9 child fill failed\n");
+            unsafe {
+                let _ = syscall(SYS_EXIT, 1, 0, 0);
+            }
+        }
+    }
+    let deadline = add_ms(&clock_realtime(), 1500);
+    let result = mq_timedsend(mqd, b"overflow", 0, Some(&deadline));
+    write_bytes(b"mq-syscall-smoke: part 9 child's blocking mq_timedsend returned\n");
+    unsafe {
+        let _ = syscall(SYS_EXIT, if result == Err(ETIMEDOUT) { 0 } else { 1 }, 0, 0);
+    }
+    loop {
+        spin_loop();
+    }
+}
+
 fn child_process(mqd: u64) -> ! {
     write_bytes(b"mq-syscall-smoke: child sending wake message\n");
     if mq_timedsend(mqd, b"wake", 0, None).is_err() {
@@ -305,6 +405,8 @@ fn child_process(mqd: u64) -> ! {
 }
 
 const NAME1: &[u8] = b"/mqsmoke1\0";
+const NAME2: &[u8] = b"/mqsmoke2\0";
+const NAME3: &[u8] = b"/mqsmoke3\0";
 const NAME_MISSING: &[u8] = b"/mqsmoke_missing\0";
 
 #[unsafe(no_mangle)]
@@ -441,6 +543,25 @@ pub extern "C" fn _start() -> ! {
     );
     write_bytes(b"mq-syscall-smoke: part 5 (real timeout) OK\n");
 
+    // --- Part 5b: a real deadline expiring while blocked on a FULL queue (WaitingForMqSpace,
+    // not WaitingForMqData like part 5 above) -- found live via the Open POSIX Test Suite pilot's
+    // own mq_timedsend/16-1.c, which never returns from this exact call shape.
+    for msg in [&b"f0"[..], &b"f1"[..], &b"f2"[..], &b"f3"[..]] {
+        check!(mq_timedsend(mqd, msg, 0, None).is_ok(), "filling the queue for part 5b failed");
+    }
+    let send_deadline = add_ms(&clock_realtime(), 50);
+    check!(
+        mq_timedsend(mqd, b"overflow", 0, Some(&send_deadline)) == Err(ETIMEDOUT),
+        "a real 50ms deadline against a full queue didn't expire with ETIMEDOUT"
+    );
+    for _ in 0..4 {
+        check!(
+            mq_timedreceive(mqd, &mut buf, &mut prio, None).is_ok(),
+            "draining a part 5b filler message failed"
+        );
+    }
+    write_bytes(b"mq-syscall-smoke: part 5b (real timeout while send-blocked) OK\n");
+
     // --- Part 6: real block/wake pair across fork ---
     let fork_result = unsafe { syscall(SYS_FORK, 0, 0, 0) };
     let child_pid = match fork_result {
@@ -517,6 +638,86 @@ pub extern "C" fn _start() -> ! {
         "closing the mqd failed"
     );
     write_bytes(b"mq-syscall-smoke: part 8 (unlink survives open descriptor) OK\n");
+
+    // --- Part 9: a real deadline expiring while send-blocked in a forked child, concurrently
+    // with the parent independently blocked in its own nanosleep -- see timedsend_child's own doc
+    // comment for why this is a distinct scenario from part 5b.
+    let attr2 = RawMqAttr {
+        mq_flags: 0,
+        mq_maxmsg: 4,
+        mq_msgsize: 16,
+        mq_curmsgs: 0,
+        unused: [0; 4],
+    };
+    let mqd2 = match mq_open(NAME2, O_CREAT | O_EXCL | O_RDWR, 0o600, Some(&attr2)) {
+        Ok(fd) => fd,
+        Err(_) => {
+            write_bytes(b"mq-syscall-smoke: part 9 mq_open failed\n");
+            test_exit(false);
+        }
+    };
+    let fork_result2 = unsafe { syscall(SYS_FORK, 0, 0, 0) };
+    let child_pid2 = match fork_result2 {
+        Ok(0) => timedsend_child(mqd2),
+        Ok(child_pid) => child_pid,
+        Err(_) => {
+            write_bytes(b"mq-syscall-smoke: part 9 fork failed\n");
+            test_exit(false);
+        }
+    };
+    write_bytes(b"mq-syscall-smoke: parent nanosleeping while child send-blocks\n");
+    nanosleep_ms(3000);
+    let mut status2: i32 = -1;
+    check!(
+        unsafe { syscall4(SYS_WAIT4, child_pid2, &mut status2 as *mut i32 as u64, 0, 0) }
+            == Ok(child_pid2),
+        "part 9 wait4 didn't report the child"
+    );
+    check!(status2 == 0, "part 9 child's blocking mq_timedsend didn't return real ETIMEDOUT");
+    write_bytes(b"mq-syscall-smoke: part 9 (concurrent send-block timeout) OK\n");
+
+    // --- Part 10: the real mq_timedsend/16-1.c shape -- a forked child that real-`sigwait()`s
+    // for a signal from the parent *before* blocking in mq_timedsend against a full queue.
+    let attr3 = RawMqAttr {
+        mq_flags: 0,
+        mq_maxmsg: 4,
+        mq_msgsize: 16,
+        mq_curmsgs: 0,
+        unused: [0; 4],
+    };
+    let mqd3 = match mq_open(NAME3, O_CREAT | O_EXCL | O_RDWR, 0o600, Some(&attr3)) {
+        Ok(fd) => fd,
+        Err(_) => {
+            write_bytes(b"mq-syscall-smoke: part 10 mq_open failed\n");
+            test_exit(false);
+        }
+    };
+    let fork_result3 = unsafe { syscall(SYS_FORK, 0, 0, 0) };
+    let child_pid3 = match fork_result3 {
+        Ok(0) => sigwait_then_timedsend_child(mqd3),
+        Ok(child_pid) => child_pid,
+        Err(_) => {
+            write_bytes(b"mq-syscall-smoke: part 10 fork failed\n");
+            test_exit(false);
+        }
+    };
+    nanosleep_ms(200);
+    write_bytes(b"mq-syscall-smoke: parent sending SIGUSR1 to part 10 child\n");
+    check!(
+        unsafe { syscall(SYS_KILL, child_pid3, SIGUSR1, 0) }.is_ok(),
+        "part 10 kill(SIGUSR1) failed"
+    );
+    let mut status3: i32 = -1;
+    check!(
+        unsafe { syscall4(SYS_WAIT4, child_pid3, &mut status3 as *mut i32 as u64, 0, 0) }
+            == Ok(child_pid3),
+        "part 10 wait4 didn't report the child"
+    );
+    check!(
+        status3 == 0,
+        "part 10 child's sigwait-then-mq_timedsend didn't return real ETIMEDOUT"
+    );
+    write_bytes(b"mq-syscall-smoke: part 10 (sigwait then send-block timeout) OK\n");
 
     write_bytes(b"mq-syscall-smoke: PASS\n");
     test_exit(true);

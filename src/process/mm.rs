@@ -28,6 +28,19 @@ const MMAP_REGION_BASE: u64 = 0x_2000_0000_0000;
 const MMAP_REGION_CEILING: u64 = 0x_3000_0000_0000;
 static NEXT_MMAP_PAGE: Mutex<u64> = Mutex::new(MMAP_REGION_BASE);
 
+/// Real per-process cap on the number of live fd-backed mappings — matches real Linux's own
+/// `vm.max_map_count` default (`65530`), which is what actually produces `ENOMEM` in practice for
+/// `mmap/24-1.c`'s own "keep mapping the same object in a tight loop until `ENOMEM`" probe, not
+/// genuine `MMAP_REGION_CEILING` byte-range exhaustion — that range is `2^44` bytes (16 TiB),
+/// which at one page per iteration would need billions of loop iterations to ever exhaust,
+/// timing out this pilot file's own 40s bound long before reaching real VA exhaustion (found
+/// live: `mmap/24-1.c` TIMEOUT with no cap in place). Real Linux hits its own count-based limit
+/// almost immediately regardless of how much raw address space remains, which is exactly the
+/// behavior this mirrors. Scoped to `mmap_file_regions` only (not the separate anonymous-mmap
+/// path, which has no per-region bookkeeping struct to count against) — no pilot file or real
+/// caller in this kernel's own call graph exercises the anonymous case at this scale.
+const MAX_MMAP_FILE_REGIONS: usize = 65530;
+
 /// Real `PROT_WRITE` (matches every real Unix's value) — the only `prot` bit `do_mmap` currently
 /// consults, to decide whether a real fd-backed mapping's frames get write-back on `munmap`/exit.
 /// Every mapped page is still unconditionally `WRITABLE` at the page-table level regardless
@@ -369,6 +382,19 @@ fn do_mmap_file_backed(
     }
 
     let content_id = crate::fs::fd::content_id_of(fd).ok_or(ENODEV)?;
+
+    if PROCESS_TABLE
+        .lock()
+        .get(&caller_pid)
+        .expect("mmap: current process missing from table")
+        .shared
+        .lock()
+        .mmap_file_regions
+        .len()
+        >= MAX_MMAP_FILE_REGIONS
+    {
+        return Err(ENOMEM);
+    }
 
     let phys_offset = memory::phys_mem_offset();
     let real_size = crate::fs::fd::content_size(content_id).max(0) as u64;
