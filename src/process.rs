@@ -1889,6 +1889,11 @@ struct RawSchedParam {
 /// against `policy`'s own `sched_get_priority_min/max`, but nothing in this port's roster depends
 /// on that rejection path firing). See `Process::sched_policy`'s own doc comment for why storing
 /// this has no real RT-scheduling effect on this kernel's cooperative round-robin scheduler.
+///
+/// **Real POSIX return value on success is the *former* scheduling policy, not `0`** (`man 2
+/// sched_setscheduler`: "Upon successful completion, the previous scheduling policy of the
+/// specified thread shall be returned") -- backported from master's `74a37b0`, which found this
+/// live via `sched_setscheduler/16-1.c` explicitly checking `result == old_policy`.
 pub fn do_sched_setscheduler(
     caller_pid: Pid,
     pid: i64,
@@ -1903,9 +1908,10 @@ pub fn do_sched_setscheduler(
     let proc = table
         .get_mut(&target)
         .expect("sched_setscheduler: target process missing from table");
+    let old_policy = proc.sched_policy;
     proc.sched_policy = policy;
     proc.sched_priority = param.sched_priority;
-    Ok(0)
+    Ok(old_policy as u64)
 }
 
 /// `SYS_SCHED_GETSCHEDULER`'s real logic -- echoes back the stored `Process::sched_policy`.
