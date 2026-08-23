@@ -34,6 +34,11 @@ const O_RDONLY: u64 = 0;
 /// index.
 const EXPECTED_FIELDS: usize = 6;
 
+// `r10` is real OxideBSD `open(O_CREAT)`'s own 4th argument (the real requested creation mode) as
+// of the fix threading mode through the syscall ABI (see modules/oxfs's `oxfs_open` doc comment) --
+// `SYSCALL` doesn't clear it, so it must be explicitly zeroed here (this crate's own `SYS_OPEN`
+// call below is `O_RDONLY`, never `O_CREAT`, so it's unused in practice, but a stray garbage value
+// left in `r10` should never be able to influence a syscall this crate didn't intend to send one).
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
     let ret: u64;
@@ -46,6 +51,7 @@ unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u
             in("rdi") arg0,
             in("rsi") arg1,
             in("rdx") arg2,
+            in("r10") 0u64,
             failed = out(reg_byte) failed,
             lateout("rcx") _,
             lateout("r11") _,

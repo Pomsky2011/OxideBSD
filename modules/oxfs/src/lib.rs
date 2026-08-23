@@ -1876,6 +1876,27 @@ enum OpenFile {
         /// the specific case of `close()`/`fsync()` running with *zero* real `write()` calls ever
         /// having happened on this fd.
         resized_directly: bool,
+        /// Set by `oxfs_unlink` when it finds *no* directory entry for the target path but does
+        /// find this exact fd still mid-`open(O_CREAT)` (`existing_inode` still `None`) against
+        /// that same `(parent_inode, name)` -- real POSIX: `unlink()` racing ahead of a
+        /// not-yet-`close()`d `creat()` on the same path must still make the name unreachable the
+        /// moment the create eventually commits (the classic "open, unlink, keep writing" temp-file
+        /// idiom). Without this, `oxfs_unlink` found nothing (`ENOENT`) and a later commit (e.g. an
+        /// explicit `ftruncate()`/`fsync()`, or the final `close()`) went ahead and inserted the
+        /// directory entry anyway, silently resurrecting a name real POSIX says must stay gone.
+        /// `commit_write_buffer` checks this and skips the `dir_insert` call when set, while still
+        /// allocating a real inode and writing real content to it -- matches real Unix: an
+        /// unlinked-but-still-open file keeps working through this fd, it just can never be found
+        /// by path again. Backported from master's `5d2e1dd` (found there via `mmap/12-1.c`, a
+        /// POSIX-pilot test this branch doesn't carry, but the underlying oxfs bug is identical).
+        unlinked: bool,
+        /// The real requested creation mode (`open(O_CREAT, mode)`'s own `mode` argument, masked
+        /// to `0o777`) -- only meaningful when `existing_inode` is still `None` at `commit_write_
+        /// buffer` time (a brand-new inode is being allocated, and this is what its own `mode`
+        /// field gets initialized to); ignored when overwriting/appending to an already-existing
+        /// inode, which keeps whatever real mode it already has. See `oxfs_open`'s own `mode`
+        /// parameter doc comment for why this exists at all.
+        mode: u16,
     },
     /// A synthetic `/proc/<pid>/{stat,cmdline,status}` file's content, generated once at `open`
     /// time by calling into `src/process.rs`'s kernel-exported accessors (see `open_proc_leaf`) --
@@ -2400,10 +2421,28 @@ fn known_device(rdev: u32, device_char: bool) -> Option<OpenFile> {
 /// already inside `/proc` is `proc_relative_open`'s job, below) is intercepted before any of the
 /// real, cwd-relative special-casing below, since it isn't backed by a real inode at all -- see
 /// `proc_open`. `/dev/...` gets the same treatment right after -- see `dev_open`.
+///
+/// `mode` (the 4th real syscall argument, `R10`) is `open(2)`'s own real creation-mode argument --
+/// only meaningful (and only ever read) when `O_CREAT` actually creates a brand-new inode (the
+/// `None if create` arm below); ignored for every other arm, the same way real `open(2)` ignores
+/// it for an existing path. **Found live, a real bug, not a deliberate simplification**: this
+/// ABI's own `SYS_OPEN` used to carry no mode argument at all (`third_party/musl/src/fcntl/
+/// open.c`'s own old comment: "this filesystem doesn't model permissions" -- stale the moment the
+/// real per-inode `mode`/`uid`/`gid` permission model landed, but never revisited), so every
+/// `open(O_CREAT, mode)` silently got `FIXED_PERM` (`0o755`) regardless of what the caller
+/// actually asked for -- a real permission/security gap for anything expecting a restrictive
+/// creation mode (e.g. `open(path, O_CREAT|O_WRONLY, 0600)`). Fixed by extending `open(2)`'s own
+/// wire format to a real 4-arg `(path_ptr, path_len, flags, mode)` -- `third_party/musl/src/
+/// fcntl/open.c` and `src/internal/syscall.h`'s own `__sys_open3`/`__sys_open_cp3` (the internal
+/// stdio-callers' path) now pass it through via `__syscall4`/`__syscall_cp4` instead of discarding
+/// it. Backported from master's `aeeac6f`/musl's `fac4d9c` (found there via `sem_open/3-1.c`, a
+/// POSIX-pilot test this branch doesn't carry, but the underlying bug is identical). **No umask
+/// consultation here** -- `Process::umask` is still real, tracked-but-unconsulted state everywhere
+/// else oxfs creates an inode, unchanged by this fix.
 /// `""`/`"."`/`".."`/`"/"` are special-cased next (mirroring `modules/fat32`'s own handling of
 /// them) before falling into `resolve_parent`, which -- unlike FAT32's single-component
 /// `to_short_name` -- handles an arbitrarily deep path (`sub/inner/file.txt`) in this one call.
-extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> i64 {
+extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> i64 {
     // SAFETY: same trust boundary as sys_write's own documented pointer-validation gap in
     // src/syscall.rs -- the caller (ultimately userland, via SYS_OPEN) owns this pointer/length.
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
@@ -2517,6 +2556,11 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                         owner_uid: inode.uid,
                         existing_inode: Some(resolved),
                         resized_directly: false,
+                        unlinked: false,
+                        // Unused: `commit_write_buffer`'s `existing_inode: Some(_)` branch never
+                        // touches `inode.mode` -- overwriting/appending to a file that already
+                        // exists never changes its own real, already-stored permission bits.
+                        mode: inode.mode,
                     })
                 }
                 _ => register_open_file(OpenFile::FileRead {
@@ -2542,6 +2586,14 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, _r10: u64) -> 
                 owner_uid: uid as u32,
                 existing_inode: None,
                 resized_directly: false,
+                unlinked: false,
+                // Real requested creation mode -- see `oxfs_open`'s own `mode` parameter doc
+                // comment for the wire-format history (this ABI's `open(2)` used to have no way
+                // to carry `mode` at all, so every `O_CREAT` file silently got `FIXED_PERM`
+                // regardless of what the caller actually asked for). No umask consultation here --
+                // `Process::umask` is still real, tracked-but-unconsulted state everywhere else
+                // oxfs creates an inode, not something this fix's own scope extends to.
+                mode: (mode & 0o777) as u16,
             })
         }
         None => -ENOENT,
@@ -2668,6 +2720,8 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         owner_uid,
         existing_inode,
         resized_directly,
+        unlinked,
+        mode,
     } = file
     else {
         return 0;
@@ -2701,9 +2755,18 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     };
     let mut inode = Inode::new(InodeKind::File);
     inode.uid = *owner_uid;
+    inode.mode = *mode;
     write_inode(new_inode, inode);
     if !write_inode_data(new_inode, &buffer[..*len]) {
         return -EIO;
+    }
+    // Real Unix semantics: this fd's own name was already unlinked before it ever got the chance
+    // to name anything (see `unlinked`'s own doc comment) -- a real inode still gets allocated and
+    // populated, so the fd (and any mmap of it) keeps working, but no directory entry is ever
+    // inserted for it.
+    if *unlinked {
+        *existing_inode = Some(new_inode);
+        return 0;
     }
     match dir_insert(*parent_inode, &name[..*name_len as usize], new_inode) {
         Ok(()) => {
@@ -3184,6 +3247,31 @@ extern "C" fn oxfs_unlink(path_ptr: u64, path_len: u64, _a2: u64, _a3: u64) -> i
         Err(e) => return errno_for(e),
     };
     let Some(target) = dir_lookup(parent, leaf) else {
+        // No directory entry exists yet -- real ENOENT, *unless* some still-open fd is mid-`open
+        // (O_CREAT)` against this exact (parent, name) and hasn't committed (inserted its own
+        // directory entry) yet. Real POSIX: `unlink()` racing ahead of a not-yet-`close()`d
+        // `creat()` on the same path must still make the name unreachable the moment the create
+        // eventually commits -- see `OpenFile::Write::unlinked`'s own doc comment.
+        let slots = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_FILES) };
+        for slot in slots.iter_mut().flatten() {
+            if let (
+                _,
+                OpenFile::Write {
+                    parent_inode,
+                    name,
+                    name_len,
+                    existing_inode: None,
+                    unlinked,
+                    ..
+                },
+            ) = slot
+                && *parent_inode == parent
+                && &name[..*name_len as usize] == leaf
+            {
+                *unlinked = true;
+                return 0;
+            }
+        }
         return -ENOENT;
     };
     let mut target_inode = read_inode(target);

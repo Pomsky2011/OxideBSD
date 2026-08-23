@@ -206,6 +206,58 @@ fn check_chmod_chown() -> bool {
     true
 }
 
+/// Part 2b -- verifies the real `open(O_CREAT, mode)` fix (backported from master's `aeeac6f`):
+/// a brand-new file's real requested creation mode must land on the inode *without* any
+/// follow-up `chmod()` -- unlike `check_chmod_chown` above, which always calls `chmod()`
+/// immediately after creating its own file and so would pass even if the create-time `mode`
+/// argument were silently discarded (this ABI's own `SYS_OPEN` used to do exactly that,
+/// unconditionally applying `FIXED_PERM = 0o755` regardless of what the caller asked for).
+fn check_open_creat_mode() -> bool {
+    let path = b"/uidtest_mode";
+    let fd = unsafe {
+        syscall4(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            O_CREAT,
+            0o600,
+        )
+    };
+    let Ok(fd) = fd else {
+        write_bytes(b"uid-syscall-smoke: creating /uidtest_mode failed\n");
+        return false;
+    };
+    // Committing (via close()) is what actually allocates the real inode `oxfs_open`'s deferred-
+    // create design defers to -- the requested mode must have already been carried all the way
+    // from the syscall's own 4th argument into `OpenFile::Write::mode` by this point.
+    unsafe {
+        let _ = syscall(SYS_CLOSE, fd, 0, 0);
+    }
+
+    let mut stat_buf: [u8; 144] = [0; 144];
+    if unsafe {
+        syscall(
+            SYS_STAT,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            stat_buf.as_mut_ptr() as u64,
+        )
+    }
+    .is_err()
+    {
+        write_bytes(b"uid-syscall-smoke: stat /uidtest_mode failed\n");
+        return false;
+    }
+    let st = unsafe { (stat_buf.as_ptr() as *const MuslStat).read_unaligned() };
+    if st.st_mode & 0o777 != 0o600 {
+        write_bytes(b"uid-syscall-smoke: /uidtest_mode's real mode wasn't honored at create time\n");
+        return false;
+    }
+
+    write_bytes(b"uid-syscall-smoke: open(O_CREAT, mode) real mode honored OK\n");
+    true
+}
+
 /// Part 3's child-side logic -- see this file's own module doc comment. Returns the real exit
 /// code the child should report (`0` pass, `1` fail).
 fn child_drop_privilege_and_check_enforcement() -> i32 {
@@ -247,6 +299,9 @@ pub extern "C" fn _start() -> ! {
         test_exit(false);
     }
     if !check_chmod_chown() {
+        test_exit(false);
+    }
+    if !check_open_creat_mode() {
         test_exit(false);
     }
 
