@@ -56,6 +56,20 @@ const EDESTADDRREQ: i64 = 39;
 const EPROTONOSUPPORT: i64 = 93;
 const EADDRINUSE: i64 = 48;
 const EHOSTUNREACH: i64 = 65;
+/// `97`, matching musl's actual compiled-in value (`third_party/musl/arch/generic/bits/errno.h`) --
+/// real Linux's own distinction between "this address family isn't supported at all" (this) and
+/// "this type/protocol combination isn't supported within an otherwise-known family"
+/// (`EPROTONOSUPPORT`, still used below for a bad `SOCK_*`/protocol pairing under `AF_INET`).
+/// **A real, previously-live bug**, not just a naming nicety: musl's own `getgrouplist()`/
+/// `initgroups()` (`third_party/musl/src/passwd/getgrouplist.c` -> `src/passwd/nscd_query.c`)
+/// always probes a real `AF_UNIX` socket to a local `nscd` daemon first, and *only* falls back to
+/// parsing `/etc/group` for real when that `socket()` call itself fails with exactly
+/// `EAFNOSUPPORT` -- any other errno (this handler's old `EPROTONOSUPPORT` for any non-`AF_INET`
+/// domain included) is treated as a hard failure, never reaching the real fallback -- breaking any
+/// real `su`/`login` privilege drop to a non-root uid (backported from master's `c11f5ea`, which
+/// found this live via a POSIX-pilot test's own `su`-based privilege drop; this branch has no such
+/// pilot, but the underlying `su` bug is identical).
+const EAFNOSUPPORT: i64 = 97;
 
 const HEADER_LEN: usize = 8;
 const SOCKADDR_LEN: usize = 16;
@@ -226,7 +240,7 @@ extern "C" fn udp_close(real_fd: u64) -> i64 {
 
 pub extern "C" fn oxidebsd_sys_socket(domain: u64, ty: u64, protocol: u64) -> i64 {
     if domain as i64 != AF_INET {
-        return -EPROTONOSUPPORT;
+        return -EAFNOSUPPORT;
     }
     let base_ty = (ty as i64) & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     match base_ty {
