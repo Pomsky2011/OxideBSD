@@ -594,12 +594,27 @@ struct Inode {
     /// the POSIX conformance pilot). Real POSIX ties `st_mtime`/`st_ctime` to slightly different
     /// events (`st_ctime` also updates on a pure metadata change like `chmod`/`chown`, with no
     /// content write at all) -- not implemented here, a separate, narrower gap than what this field
-    /// closes: nothing in this port's roster checks `st_ctime` after a metadata-only change. Real
-    /// `st_atime` (content *read*) stays the honest `0` placeholder it always was -- no test or
-    /// real caller in this port needs it, and every `content_read` call becoming a write-through
-    /// touch would be real, if narrow, overhead for zero known benefit.
+    /// closes: nothing in this port's roster checks `st_ctime` after a metadata-only change.
     mtime: i64,
     ctime: i64,
+    /// Real, whole-second Unix epoch `st_atime` -- previously a permanent `0` placeholder (see this
+    /// field's own prior doc comment, now stale: "no test or real caller in this port needs it").
+    /// `mmap/13-1.c` (Open POSIX Test Suite) is a genuine, real POSIX "shall" requirement this
+    /// kernel was actually violating: "The initial read or write reference to a mapped region shall
+    /// cause the file's st_atime field to be marked for update if it has not already been marked
+    /// for update" (the same clause also explicitly permits marking it "at any time between the
+    /// mmap() call and the corresponding munmap() call" -- this kernel doesn't do real demand
+    /// paging for file-backed mmap (every covered page is eagerly populated at `mmap()` time, see
+    /// `process::mm::do_mmap_file_backed`), so bumping atime at that one real population read,
+    /// rather than tracking each page's own first-touch, is a spec-legal choice, not a shortcut).
+    /// Bumped by `touch_atime` from two real read paths: `oxfs_read`'s own `OpenFile::FileRead` arm
+    /// (a plain `read()`) and `oxfs_inode_content_read` (the `mmap` population/re-population read
+    /// `process::mm::do_mmap_file_backed` calls by content identity, see that accessor's own doc
+    /// comment) -- both real "read reference" events, not just this one pilot test's own narrow
+    /// need. `touch_atime` skips the write-through if the whole-second value hasn't changed since
+    /// the last touch (a real, common Unix optimization, not a fake pass condition -- POSIX only
+    /// requires atime be "marked for update," not persisted with per-read precision).
+    atime: i64,
 }
 
 impl Inode {
@@ -616,6 +631,7 @@ impl Inode {
         device_char: false,
         mtime: 0,
         ctime: 0,
+        atime: 0,
     };
 
     fn new(kind: InodeKind) -> Inode {
@@ -633,6 +649,7 @@ impl Inode {
             device_char: false,
             mtime: now,
             ctime: now,
+            atime: now,
         }
     }
 }
@@ -910,6 +927,22 @@ fn write_inode_data(inode_num: u32, content: &[u8]) -> bool {
     true
 }
 
+/// Real `st_atime` update -- see `Inode::atime`'s own doc comment for the POSIX text this
+/// implements and why bumping it here (rather than tracking each mmap'd page's own first-touch)
+/// is spec-legal. Skips the write-through entirely if the whole-second value hasn't changed since
+/// the last touch -- a real, common Unix optimization (POSIX only requires atime be "marked for
+/// update," not persisted with per-read precision), not a fake pass condition; keeps a tight read
+/// loop from re-persisting the same inode-table block on every single call.
+fn touch_atime(inode_num: u32) {
+    let mut inode = read_inode(inode_num);
+    let now = unsafe { oxidebsd_unix_time() };
+    if inode.atime == now {
+        return;
+    }
+    inode.atime = now;
+    write_inode(inode_num, inode);
+}
+
 /// `SYS_FTRUNCATE`/`SYS_FALLOCATE`'s real logic -- resizes `inode_num`'s content to exactly
 /// `new_size` bytes without ever materializing the file's complete old-or-new content in one
 /// buffer the way `write_inode_data` does: growing zero-fills only the newly-added region,
@@ -984,9 +1017,9 @@ const _: () = assert!(core::mem::size_of::<MuslStat>() == 144);
 /// Builds a `MuslStat` for `inode_num` and writes it into the caller's buffer at `buf_ptr` --
 /// shared by `oxfs_stat`/`oxfs_lstat` (path-based) and `oxfs_fstat` (fd-based). `st_uid`/`st_gid`
 /// and `st_mode`'s permission bits are now real, backed by the inode's own `uid`/`gid`/`mode`
-/// fields (see `Inode`'s own doc comment) -- everything else this filesystem still doesn't model
-/// stays a fixed, honestly-fake value: timestamps are all `0` (no clock/RTC source exists yet --
-/// see the same gap table's "clock + nanosleep" row). `st_dev` is `1` for the one real, persisted
+/// fields (see `Inode`'s own doc comment) -- `st_atime`/`st_mtime`/`st_ctime` are real too (see
+/// `Inode::atime`/`Inode::mtime`'s own doc comments), whole-second precision only (`*_nsec` fields
+/// stay `0`). `st_dev` is `1` for the one real, persisted
 /// filesystem and `2` for anything in the tmpfs pool (`inode_num >= MAX_INODES`, see
 /// `TMPFS_NUM_BLOCKS`'s own doc comment) -- derivable from the inode number alone, and just enough
 /// for `mountpoint`'s real `st_dev(path) != st_dev(parent)` check to detect a tmpfs mount. A bind
@@ -998,7 +1031,8 @@ const _: () = assert!(core::mem::size_of::<MuslStat>() == 144);
 /// `st_nlink` is `2` for a directory (`.` plus its parent's entry for it)
 /// and `1` for a file -- this filesystem doesn't track hard links, so a directory's real
 /// subdirectory count (which would also bump its parent's linked-from count) isn't reflected
-/// either. `st_ino`/`st_size`/`st_blocks` are the only other fields backed by something real.
+/// either. `st_ino`/`st_size`/`st_blocks`/`st_atime`/`st_mtime`/`st_ctime` are the only other
+/// fields backed by something real (see `Inode::atime`/`Inode::mtime`'s own doc comments).
 /// `write_unaligned` since a userland `struct stat*` has no alignment guarantee this kernel can
 /// rely on (same trust boundary as every other raw user pointer here -- see the module doc
 /// comment).
@@ -1036,8 +1070,7 @@ fn write_stat(inode_num: u32, buf_ptr: u64) -> i64 {
         st_size: size,
         st_blksize: BLOCK_SIZE as i64,
         st_blocks: (size + 511) / 512,
-        // Real atime doesn't exist -- see Inode::mtime's own doc comment for why.
-        st_atime_sec: 0,
+        st_atime_sec: inode.atime,
         st_atime_nsec: 0,
         st_mtime_sec: inode.mtime,
         st_mtime_nsec: 0,
@@ -2119,12 +2152,21 @@ extern "C" fn oxfs_content_id(real_fd: u64) -> i64 {
 /// `read` accessor for `oxidebsd_register_content_accessors` — reads directly from `inode`'s real,
 /// committed block content via `read_inode_at`, bypassing any fd's own `OpenFile` state entirely.
 /// See `crate::fs::fd::ContentRead`'s own doc comment (kernel tree) for why this exists instead of
-/// reusing `oxfs_read`.
+/// reusing `oxfs_read`. Also the one real touch point for `mmap/13-1.c`'s own POSIX requirement
+/// (see `Inode::atime`'s own doc comment): `process::mm::do_mmap_file_backed` calls this to
+/// populate a real fd-backed mapping's covered pages, at `mmap()` call time -- a genuine "read
+/// reference," and the spec text explicitly permits marking atime "at any time between the
+/// mmap() call and the corresponding munmap() call," not just on each individual page's own first
+/// touch (which this kernel's eager, non-demand-paged population has no way to distinguish anyway).
 extern "C" fn oxfs_inode_content_read(inode: u64, offset: u64, ptr: u64, len: u64) -> i64 {
     // SAFETY: same trust boundary as elsewhere -- caller (crate::process::mm, kernel-core) owns
     // this pointer/length, always a page-aligned kernel staging buffer in practice.
     let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
-    read_inode_at(inode as u32, offset as usize, out) as i64
+    let n = read_inode_at(inode as u32, offset as usize, out);
+    if n > 0 {
+        touch_atime(inode as u32);
+    }
+    n as i64
 }
 
 /// `write` accessor for `oxidebsd_register_content_accessors` -- replaces `inode`'s complete real
@@ -2883,6 +2925,12 @@ extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
             let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
             let n = read_inode_at(*inode, *position, out);
             *position += n;
+            // Real POSIX read(): a real data access, marked for st_atime update -- skipped for a
+            // zero-byte read (at or past EOF), matching real Unix's own "no state change" behavior
+            // for that case.
+            if n > 0 {
+                touch_atime(*inode);
+            }
             n as i64
         }
         OpenFile::DirListing {
@@ -4680,7 +4728,9 @@ fn pack_inode(inode: &Inode, out: &mut [u8]) {
     out[mtime_off..mtime_off + 8].copy_from_slice(&inode.mtime.to_le_bytes());
     let ctime_off = mtime_off + 8;
     out[ctime_off..ctime_off + 8].copy_from_slice(&inode.ctime.to_le_bytes());
-    for b in &mut out[ctime_off + 8..] {
+    let atime_off = ctime_off + 8;
+    out[atime_off..atime_off + 8].copy_from_slice(&inode.atime.to_le_bytes());
+    for b in &mut out[atime_off + 8..] {
         *b = 0;
     }
 }
@@ -4738,6 +4788,11 @@ fn unpack_inode(data: &[u8]) -> Inode {
     let mtime = i64::from_le_bytes(data[mtime_off..mtime_off + 8].try_into().unwrap());
     let ctime_off = mtime_off + 8;
     let ctime = i64::from_le_bytes(data[ctime_off..ctime_off + 8].try_into().unwrap());
+    // A pre-existing on-disk inode written before this field existed decodes a zeroed tail here --
+    // an honest `0` (Unix epoch), not an invalid value the way a decoded `nlink == 0` would be, so
+    // no flooring is needed the way Inode::nlink's own doc comment describes for that field.
+    let atime_off = ctime_off + 8;
+    let atime = i64::from_le_bytes(data[atime_off..atime_off + 8].try_into().unwrap());
     Inode {
         kind,
         size,
@@ -4751,6 +4806,7 @@ fn unpack_inode(data: &[u8]) -> Inode {
         device_char,
         mtime,
         ctime,
+        atime,
     }
 }
 
