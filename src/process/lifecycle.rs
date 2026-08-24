@@ -279,10 +279,14 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Real fork() semantics for the now-`ThreadGroupShared` fields: cwd/root_inode/umask/
         // uid/gid/brk are all copied (a forked child is a real POSIX *process*, gets its own
         // independent ThreadGroupShared, never Arc::clone's the parent's -- that's do_clone's own
-        // CLONE_THREAD-only behavior); mmap_file_regions is never inherited by fork regardless
-        // (see MmapFileRegion's own doc comment -- this kernel's fork is a full eager copy, not
-        // COW, so a child's page-table entries at these VAs already point at freshly-copied
-        // private frames no matter what this list remembers).
+        // CLONE_THREAD-only behavior). `mmap_file_regions` itself starts empty here regardless --
+        // deliberately narrower in scope than the matching SysV-shm fix below (see
+        // `fs::sysv_shm::inherit_attachments_for_fork`'s own doc comment): the child's page-table
+        // entries at a MAP_SHARED region's own VAs *do* now correctly alias the real frames
+        // (`AddressSpace::fork`'s own SHARED_LEAF handling applies uniformly, not just to shm), so
+        // real content sharing works -- only this list's own refcount/writeback bookkeeping for
+        // the child's implicit inheritance is left untracked, matching `do_shmat`'s own established
+        // "mapping never unmaps on exit" laissez-faire precedent rather than being wired up too.
         let child_shared = {
             let parent_shared = parent.shared.lock();
             Arc::new(Mutex::new(ThreadGroupShared {
@@ -391,8 +395,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         sigsuspend_restore_mask: None,
         // Not inherited -- see this field's own doc comment (real SysV semadj/fork semantics).
         sysv_sem_undo: Vec::new(),
-        // Not inherited either -- see this field's own doc comment (tied to this kernel's own
-        // "no copy-on-write fork" limitation, not an independent design choice).
+        // Starts empty here -- real inheritance is filled in right after this Process is inserted
+        // into the table, by the `fs::sysv_shm::inherit_attachments_for_fork` call below (needs a
+        // real child_pid table entry to write into, which doesn't exist yet at this point).
         sysv_shm_attach: Vec::new(),
         // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
         // for a forked child too, so there's nothing meaningful to carry over).
@@ -410,6 +415,10 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         table.get_mut(&caller_pid).unwrap().children.push(child_pid);
         table.insert(child_pid, Box::new(child));
     }
+    // Real fork() semantics: a child that inherited an attached SysV shm segment (its own page
+    // table already aliases the real frames -- see AddressSpace::fork's own SHARED_LEAF handling)
+    // needs the matching nattch/attach-list bookkeeping too. See that function's own doc comment.
+    crate::fs::sysv_shm::inherit_attachments_for_fork(caller_pid, child_pid);
     // Real fork() semantics: the child gets its own independently-closable copy of every fd the
     // parent's own thread group currently has open, not a shared view of those table entries --
     // see crate::fs::fd::fork_inherit's own doc comment for why this specifically matters for

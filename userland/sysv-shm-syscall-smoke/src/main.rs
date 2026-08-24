@@ -76,11 +76,14 @@ const EIDRM: u64 = 43;
 
 const KEY_A: u64 = 0x54c54c01;
 const KEY_B: u64 = 0x54c54c02;
+const KEY_C: u64 = 0x54c54c03;
 const KEY_MISSING: u64 = 0x54c54c99;
 const SEG_SIZE: u64 = 4096;
 
 const PARENT_PATTERN: u8 = 0xaa;
 const CHILD_PATTERN: u8 = 0x55;
+const PARENT_PATTERN2: u8 = 0xcc;
+const CHILD_PATTERN2: u8 = 0x33;
 
 #[inline(always)]
 unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Result<u64, u64> {
@@ -248,6 +251,48 @@ fn child_process(shmid: u64) -> ! {
     }
 }
 
+/// Runs entirely inside a forked child that never calls `shmat` itself -- the exact real-fork-
+/// inheritance case `fs::sysv_shm::inherit_attachments_for_fork` closes. `addr_c`/`shmid_c` are the
+/// parent's own already-attached mapping, expected to work purely because it was inherited across
+/// `fork` (real `AddressSpace::fork` now aliases the segment's actual frame at this VA -- see
+/// `memory::address_space::SHARED_LEAF`'s own doc comment).
+fn child_process_inherited(addr_c: u64, shmid_c: u64) -> ! {
+    write_bytes(b"sysv-shm-syscall-smoke: inherited-child running\n");
+
+    // Real nattch bookkeeping: the parent's own shmat set it to 1; a real fork-inherited
+    // attachment must show up as a genuinely separate one, exactly like an unrelated process's own
+    // independent shmat would (see fs::sysv_shm::inherit_attachments_for_fork's own doc comment).
+    let stat = shmctl_stat(shmid_c).unwrap_or_else(|_| {
+        write_bytes(b"sysv-shm-syscall-smoke: inherited-child's shmctl(IPC_STAT) failed\n");
+        test_exit(false);
+    });
+    check!(
+        stat.shm_nattch == 2,
+        "nattch wasn't 2 right after fork with an inherited attachment still live in both processes"
+    );
+
+    // No shmat call at all here -- addr_c is purely inherited from the parent's own pre-fork
+    // mapping. Reading real content through it (with zero shmat calls of its own) is the actual
+    // proof this test exists for.
+    let byte = unsafe { core::ptr::read_volatile(addr_c as *const u8) };
+    check!(
+        byte == PARENT_PATTERN2,
+        "inherited child didn't see the parent's real pattern through a purely fork-inherited mapping"
+    );
+
+    unsafe { core::ptr::write_volatile(addr_c as *mut u8, CHILD_PATTERN2) };
+
+    check!(shmdt(addr_c).is_ok(), "inherited child's shmdt of its own inherited attachment failed");
+
+    write_bytes(b"sysv-shm-syscall-smoke: inherited-child exiting\n");
+    unsafe {
+        let _ = syscall(SYS_EXIT, 0, 0, 0);
+    }
+    loop {
+        spin_loop();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     write_bytes(b"sysv-shm-syscall-smoke: starting\n");
@@ -388,6 +433,54 @@ pub extern "C" fn _start() -> ! {
         "shmctl(IPC_STAT) against a fully-removed shmid wasn't EIDRM"
     );
     write_bytes(b"sysv-shm-syscall-smoke: part 6 (immediate IPC_RMID, ENOENT/EINVAL) OK\n");
+
+    // --- Part 7: real attachment inheritance across fork (no shmat call in the child at all) ---
+    let shmid_c = shmget(KEY_C, SEG_SIZE, IPC_CREAT | IPC_EXCL | 0o600).unwrap_or_else(|_| {
+        write_bytes(b"sysv-shm-syscall-smoke: shmget(KEY_C) failed\n");
+        test_exit(false);
+    });
+    let addr_c = shmat(shmid_c, 0).unwrap_or_else(|_| {
+        write_bytes(b"sysv-shm-syscall-smoke: shmat(KEY_C) failed\n");
+        test_exit(false);
+    });
+    unsafe { core::ptr::write_volatile(addr_c as *mut u8, PARENT_PATTERN2) };
+
+    let fork_result2 = unsafe { syscall(SYS_FORK, 0, 0, 0) };
+    let child_pid2 = match fork_result2 {
+        Ok(0) => child_process_inherited(addr_c, shmid_c),
+        Ok(child_pid) => child_pid,
+        Err(_) => {
+            write_bytes(b"sysv-shm-syscall-smoke: part 7 fork failed\n");
+            test_exit(false);
+        }
+    };
+
+    let (reaped_pid2, status2) = wait4(child_pid2).unwrap_or_else(|_| {
+        write_bytes(b"sysv-shm-syscall-smoke: part 7 wait4 failed\n");
+        test_exit(false);
+    });
+    check!(
+        reaped_pid2 == child_pid2 && status2 == 0,
+        "part 7's wait4 didn't report a clean inherited-child exit"
+    );
+
+    let byte2 = unsafe { core::ptr::read_volatile(addr_c as *const u8) };
+    check!(
+        byte2 == CHILD_PATTERN2,
+        "parent didn't see the inherited child's real write through its own original mapping"
+    );
+
+    let stat_c = shmctl_stat(shmid_c).unwrap_or_else(|_| {
+        write_bytes(b"sysv-shm-syscall-smoke: shmctl(IPC_STAT) after inherited-child exit failed\n");
+        test_exit(false);
+    });
+    check!(
+        stat_c.shm_nattch == 1,
+        "nattch wasn't back to 1 after the inherited child's own shmdt + real exit"
+    );
+
+    check!(shmdt(addr_c).is_ok(), "parent's final shmdt of the KEY_C attachment failed");
+    write_bytes(b"sysv-shm-syscall-smoke: part 7 (real attachment inheritance across fork) OK\n");
 
     write_bytes(b"sysv-shm-syscall-smoke: PASS\n");
     test_exit(true);

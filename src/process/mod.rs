@@ -891,11 +891,12 @@ pub struct Process {
     /// Real SysV shared-memory attachment bookkeeping (`crate::fs::sysv_shm`) -- one `(addr,
     /// shmid)` pair per successful `shmat`, in call order, so `shmdt(addr)` can find (and remove)
     /// the matching entry and `crate::fs::sysv_shm::detach_all_for_exit` can decrement every
-    /// still-attached segment's own `nattch` on real process termination. **Not inherited by
-    /// `fork`** -- a deliberate, documented simplification tied to this kernel's own "no
-    /// copy-on-write fork" limitation, not an independent design choice; see `crate::fs::
-    /// sysv_shm`'s own doc comment for why inheriting the list wouldn't actually preserve real
-    /// sharing anyway. **Real implicit detach on `execve`** — `do_execve` calls the exact same
+    /// still-attached segment's own `nattch` on real process termination. **Real inheritance across
+    /// `fork`** -- `crate::fs::sysv_shm::inherit_attachments_for_fork` gives a forked child its own
+    /// independent copy of this list (and bumps each referenced segment's `nattch` to match), called
+    /// right after `AddressSpace::fork` has already aliased the real backing frames into the
+    /// child's own table (see `memory::address_space::SHARED_LEAF`'s own doc comment). **Real
+    /// implicit detach on `execve`** — `do_execve` calls the exact same
     /// `crate::fs::sysv_shm::detach_all_for_exit` a real process exit does (after committing the
     /// new `AddressSpace`, which is what actually makes every prior `shmat`'s own mapping
     /// unreachable): matches real Linux, where `execve(2)` destroying the old address space is

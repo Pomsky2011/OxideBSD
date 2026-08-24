@@ -22,14 +22,21 @@ use crate::memory::frame_to_page_table;
 /// unmaps on a real process exit). Reuses `PageTableFlags::BIT_9`, one of the hardware-ignored
 /// "available for OS use" bits (9-11) — unused anywhere else in this codebase before this.
 ///
-/// **Known minor gap, not fixed here**: `copy_table_level`'s own real eager-copy `fork()` path
-/// preserves a leaf's original flags (including this one) while pointing the copy at a *freshly
-/// allocated, genuinely private* frame — so a forked child's own copy of a page that was
-/// shm-attached/mmap-shared in the parent at fork time is incorrectly still marked `SHARED_LEAF`,
-/// and `teardown` will skip freeing it forever. Conservative (a small extra leak, never a false
-/// free) rather than unsafe, and a narrow edge case (only reachable when a fork happens while such
-/// a mapping is live) — left as a known imperfection rather than teaching `copy_table_level` to
-/// strip this flag on copy.
+/// **Fixed**: `copy_table_level`'s own real eager-copy `fork()` path now special-cases a leaf
+/// carrying this flag — instead of copying its content into a freshly allocated private frame (the
+/// treatment every other leaf gets), it aliases the *exact same* physical frame into the child's
+/// table, matching real POSIX fork() semantics for an inherited `shmat`/`MAP_SHARED` mapping (a
+/// write through either process's own mapping is genuinely visible through the other's). Still
+/// always safe for `teardown` to skip freeing regardless of how many address spaces now alias it —
+/// see that method's own doc comment. `fs::sysv_shm::inherit_attachments_for_fork` is the matching
+/// `nattch`/attach-list bookkeeping half for the SysV case, called right after `AddressSpace::fork`
+/// from `do_fork_from_current`; a fd-backed `MAP_SHARED` mmap's own `ThreadGroupShared::
+/// mmap_file_regions` bookkeeping is deliberately *not* given the same treatment (out of scope —
+/// no live caller needed it, and it's a fresh `ThreadGroupShared` per forked child regardless, same
+/// as every other `ThreadGroupShared` field) — the underlying page content is still correctly
+/// shared either way, only that list's own refcount/writeback tracking stays unaware of the child's
+/// implicit inheritance, a narrower and already-precedented gap (matches `shmat`'s own "mapping
+/// never unmaps on exit" laissez-faire tracking).
 pub const SHARED_LEAF: PageTableFlags = PageTableFlags::BIT_9;
 
 /// A separate top-level page table — a distinct virtual address space from the kernel's own.
@@ -384,6 +391,21 @@ fn copy_table_level(
                 continue;
             }
             let src_frame = entry.frame().expect("present leaf entry must have a frame");
+            if entry.flags().contains(SHARED_LEAF) {
+                // A real SysV shmat/MAP_SHARED leaf: its backing frame is owned by a separate
+                // store (`fs::sysv_shm::SEGMENTS`/`MMAP_FILE_CACHE`), not by this address space --
+                // real fork() semantics inherit the *same* live sharing, not a private snapshot.
+                // Alias the identical frame instead of copying: no new allocation, no memcpy, and
+                // the child's own write is genuinely visible to every other attached process, same
+                // as an unrelated process's own independent shmat/mmap already is. See
+                // SHARED_LEAF's own doc comment -- this closes the "known minor gap" that comment
+                // used to flag here. The matching attach-count bookkeeping half (so a later
+                // shmdt/exit in either process decrements exactly once) lives in
+                // `fs::sysv_shm::inherit_attachments_for_fork`, called from `do_fork_from_current`
+                // once the child is actually in the process table.
+                child[i].set_frame(src_frame, entry.flags());
+                continue;
+            }
             let new_frame = frame_allocator
                 .allocate_frame()
                 .expect("out of memory copying an address space");

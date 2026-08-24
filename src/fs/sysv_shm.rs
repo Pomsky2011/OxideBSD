@@ -16,18 +16,18 @@
 //! own `MMAP_REGION_BASE`), so a write through one process's mapping is genuinely visible through
 //! another's -- real shared memory, not a per-process private copy.
 //!
-//! **Known, accepted simplification: not inherited across `fork`.** This kernel's own `fork` is
-//! documented as a full eager address-space copy, not real copy-on-write (see CLAUDE.md's process
-//! section) -- `AddressSpace::fork` duplicates the *content* of every user-accessible page into a
-//! brand-new physical frame, including whatever's currently mapped at a parent's own shm
-//! attachment addresses. That means a forked child ends up with its own private snapshot at the
-//! same VA regardless of what this module does, and no amount of attachment-list bookkeeping here
-//! would make the child's copy actually alias the segment's real frames. Given that pre-existing
-//! architectural fact, `Process::sysv_shm_attach` simply starts empty in a forked child (matching
-//! `Process::sysv_sem_undo`'s own "starts fresh across fork" precedent) rather than pretending to
-//! support real Linux's "child inherits attached segments" behavior -- the real cross-process
-//! sharing case this module *does* support fully is the far more common one: unrelated (or
-//! related) processes independently `shmget`ing the same `key` and `shmat`ing it themselves.
+//! **Real inheritance across `fork`.** This kernel's own `fork` is a full eager address-space copy,
+//! not real copy-on-write (see CLAUDE.md's process section) -- but `AddressSpace::fork`'s own
+//! `copy_table_level` now special-cases any leaf marked `memory::address_space::SHARED_LEAF`
+//! (every leaf this module's own `do_shmat` maps carries it) and aliases the segment's *real* frame
+//! into the child's table instead of copying its content into a fresh private one. That closes the
+//! actual sharing gap; `inherit_attachments_for_fork` below (called from `process::lifecycle::
+//! do_fork_from_current` right after the child's `Process` entry exists) closes the matching
+//! bookkeeping half -- the child gets its own real `sysv_shm_attach` copy and each referenced
+//! segment's `nattch` is bumped to match, exactly as if the child had called `shmat` itself. Matches
+//! `Process::sysv_sem_undo`'s own *opposite* "starts fresh across fork" precedent deliberately: real
+//! SysV semaphore adjustments are documented `fork`-local by POSIX itself, while a `shmat` mapping
+//! genuinely is inherited.
 //!
 //! **A real `nattch`/`IPC_RMID` lifecycle**, same shape `crate::fs::sysv_sem`'s own `SemSet`
 //! removal already established for its own `IPC_RMID`: marking a segment for removal detaches its
@@ -439,6 +439,42 @@ pub(crate) fn detach_all_for_exit(pid: Pid) {
         for key in keys_to_remove {
             keys.remove(&key);
         }
+    }
+}
+
+/// Called from `process::lifecycle::do_fork_from_current`, right after the child's own `Process`
+/// entry is inserted into the table and its `AddressSpace::fork` has already aliased (not copied)
+/// every `SHARED_LEAF` leaf — see that flag's own doc comment. Real POSIX fork() semantics: a child
+/// that inherits an attached segment's own live mapping counts as a genuinely separate attachment,
+/// exactly like an unrelated process's own independent `shmat` would — so `IPC_RMID` on a segment
+/// still attached only in a forked descendant must not complete early, and each of the parent's and
+/// child's own later `shmdt`/exit must decrement `nattch` exactly once, not zero times (if the
+/// child's copy were silently ignored) or twice (if both ended up sharing one bookkeeping entry).
+/// Fixed by giving the child a real, independent copy of the parent's own `sysv_shm_attach` list
+/// (the `(addr, shmid)` pairs carry over unchanged — `AddressSpace::fork` preserves every VA
+/// exactly, so the child's mapping sits at the identical address) and bumping each referenced
+/// segment's own `nattch` to match, the same increment `do_shmat` itself performs for a real attach.
+pub(crate) fn inherit_attachments_for_fork(parent_pid: Pid, child_pid: Pid) {
+    let attach_list = {
+        let table = process::table().lock();
+        table
+            .get(&parent_pid)
+            .map(|p| p.sysv_shm_attach.clone())
+            .unwrap_or_default()
+    };
+    if attach_list.is_empty() {
+        return;
+    }
+    {
+        let mut segs = SEGMENTS.lock();
+        for &(_, shmid) in &attach_list {
+            if let Some(seg) = segs.get_mut(&shmid) {
+                seg.nattch += 1;
+            }
+        }
+    }
+    if let Some(child) = process::table().lock().get_mut(&child_pid) {
+        child.sysv_shm_attach = attach_list;
     }
 }
 
