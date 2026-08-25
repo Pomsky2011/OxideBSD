@@ -1004,8 +1004,9 @@ pub fn do_munlockall(caller_pid: Pid) -> Result<u64, u64> {
 }
 
 /// Ceiling for `SYS_BRK`-managed heap growth — matches `module::MODULE_VA_BASE` so a growing heap
-/// can never collide with the kernel-mapped module region every address space shares.
-const BRK_REGION_CEILING: u64 = 0x_1000_0000;
+/// can never collide with the kernel-mapped module region every address space shares. Moved
+/// 0x10000000 -> 0x20000000 alongside that constant -- see its own doc comment.
+const BRK_REGION_CEILING: u64 = 0x_2000_0000;
 /// `SYS_BRK`'s real logic. `addr == 0` queries the current value without changing it (the
 /// convention every real `sbrk(0)` already relies on). Shrinking just lowers the stored value —
 /// no unmap, same no-reclaim simplification `do_munmap` above documents. Growing maps freshly

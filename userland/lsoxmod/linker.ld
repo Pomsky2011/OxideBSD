@@ -1,6 +1,6 @@
-/* Load base 0x40c0000 -- next slot in the "real seeded /bin utility" sequence (stsh 0x4000000,
- * fork-exec-smoke 0x4040000, ring3-smoke 0x4080000, each 0x40000 apart), not the separate
- * 0xb000000+-stepped sequence userland/*-syscall-smoke/ uses for tests/*.rs's own spawned test
+/* Load base 0x80c0000 -- next slot in the "real seeded /bin utility" sequence (stsh 0x8000000,
+ * fork-exec-smoke 0x8040000, ring3-smoke 0x8080000, each 0x40000 apart), not the separate
+ * 0xf000000+-stepped sequence userland/*-syscall-smoke/ uses for tests/*.rs's own spawned test
  * binaries -- lsoxmod is a real embedded /bin executable (see modules/oxfs/src/lib.rs's own
  * seed_file(bin, b"lsoxmod", ...) call), the same category stsh/ring3-smoke are in, not a test.
  * See userland/ring3-smoke/linker.ld's own comment for the full "why this address, and why it's
@@ -11,7 +11,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x40c0000;
+    . = 0x80c0000;
 
     .text : {
         *(.text*)

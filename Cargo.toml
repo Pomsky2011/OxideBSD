@@ -316,13 +316,15 @@ test-args = [
   "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
 ]
 test-success-exit-code = 33
-# 7200 (was 1800, before that 300, then 900): shared across every [[test]] target (bootimage's own
-# per-binary timeout, not per-check), bumped for posix_conformance_smoke -- 1800s was sized for the
-# pilot's original 69 real t0-guarded runs (each individually bounded at 40s); the pilot corpus grew
-# to 492 files in the same session, a ~7x increase, so the same "sum across the whole pilot can
-# genuinely approach a lower ceiling if several tests each burn their full timeout" risk that forced
-# 900 -> 1800 applies again, scaled up. Harmless headroom for every faster existing test.
-test-timeout = 7200
+# 28800 (was 7200, before that 1800/900/300): shared across every [[test]] target (bootimage's own
+# per-binary timeout, not per-check), bumped again for posix_conformance_smoke -- the pilot corpus
+# grew from a 488-file curated dedup to the full ~1700-file Open POSIX Test Suite (see build.rs's
+# `discover_posix_test_files`), a further ~3.5x on top of the growth that justified 1800 -> 7200,
+# now also running real `pthread_*`/`aio_*` content for the first time ever (real threading landed
+# since the old baseline -- see CLAUDE.md's "Real threading" section) with no prior data on how
+# many of those burn their own full 40s `t0` budget rather than finishing fast. Harmless headroom
+# for every faster existing test target sharing this same value.
+test-timeout = 28800
 run-args = [
   "-accel", "kvm",
   "-accel", "tcg",

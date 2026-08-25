@@ -165,13 +165,14 @@ fn main() {
     // `build_musl_sysroot_shared`'s own doc comment for why it can't reuse the static sysroot
     // above, and why it's linked at its own natural base rather than a fixed one) producing
     // `libc.so` (which doubles as `ld-musl-x86_64.so.1`, musl's own convention) -- the kernel
-    // itself picks its real runtime placement (`src/process/lifecycle.rs`'s `INTERP_LOAD_BASE`, `0xc000000`)
+    // itself picks its real runtime placement (`src/process/lifecycle.rs`'s `INTERP_LOAD_BASE`, `0x10000000`)
     // at `execve` time, not this build. The fixture binary
-    // (`userland/dynlink-smoke/main.c`) is fixed at `0x4d00000` -- an ordinary `ET_EXEC` main
+    // (`userland/dynlink-smoke/main.c`) is fixed at `0x8d00000` -- an ordinary `ET_EXEC` main
     // binary, same fixed-link-time-base treatment every other userland crate here gets, distinct
     // from `INTERP_LOAD_BASE` since the two must be *co-resident* in the same address space for a
-    // real `PT_INTERP` exec to work at all.
-    let dynlink_fixture_base: u64 = 0x4d00000;
+    // real `PT_INTERP` exec to work at all. (Both moved `+0x4000000` alongside every other fixed
+    // userland/BusyBox/module address -- see `module::MODULE_VA_BASE`'s own doc comment.)
+    let dynlink_fixture_base: u64 = 0x8d00000;
     let dynlink_musl_sysroot = build_musl_sysroot_shared();
     let dynlink_libc_so_path = dynlink_musl_sysroot.join("lib/libc.so");
     let dynlink_smoke_elf_path =
@@ -410,11 +411,12 @@ fn build_musl_sysroot() -> PathBuf {
 }
 
 /// Cross-builds `userland/musl-smoke/main.c` against `sysroot` (see `build_musl_sysroot` above),
-/// at a load address (`0x40c0000`, 64 MiB + `0xc0000`) clear of both the kernel's own image (the
-/// actually-binding constraint today, not the bootloader's fixed ~6 MiB identity-mapped
+/// at a load address (`0x80c0000`, was `0x40c0000` before the whole family's own `+0x4000000`
+/// move -- see `module::MODULE_VA_BASE`'s own doc comment) clear of both the kernel's own image
+/// (the actually-binding constraint today, not the bootloader's fixed ~6 MiB identity-mapped
 /// low-memory region -- see `userland/ring3-smoke/linker.ld`'s own comment for the full story of
-/// why this floor moved from an original `0xa00000` and how to re-derive it) and every other
-/// userland crate's load base (`0x4000000`-`0x4080000`) -- confirmed empirically via `readelf -hl`
+/// why this floor moves and how to re-derive it) and every other
+/// userland crate's load base (`0x8000000`-`0x8080000`) -- confirmed empirically via `readelf -hl`
 /// before this was written, the same discipline CLAUDE.md's own `ring3-smoke` load-address
 /// collision story already established. Unlike every other `userland/*` crate this isn't a Rust
 /// crate at all -- musl-smoke exists specifically to
@@ -432,7 +434,7 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
     let status = Command::new(&musl_gcc)
         .arg("-static")
         .arg("-no-pie")
-        .arg("-Wl,-Ttext-segment=0x40c0000")
+        .arg("-Wl,-Ttext-segment=0x80c0000") // was 0x40c0000; +0x4000000, see module::MODULE_VA_BASE's own doc comment
         .arg("-O2")
         .arg("-o")
         .arg(&out)
@@ -447,7 +449,7 @@ fn build_musl_smoke(sysroot: &Path) -> PathBuf {
 
 /// "Real threading" phases 1-5's own finish line -- see `userland/pthread-smoke/main.c`'s own doc
 /// comment for the scenario. Same `build_musl_smoke` recipe, one slot further along
-/// (`0x4100000`, clear of `musl-smoke`'s `0x40c0000`) -- this binary is `fork`+`execve`'d fresh by
+/// (`0x8100000`, clear of `musl-smoke`'s `0x80c0000`) -- this binary is `fork`+`execve`'d fresh by
 /// `userland/pthread-syscall-smoke/`, never co-resident with any other fixed-base image (unlike
 /// `build_dynlink_smoke`'s own interpreter-coexistence case), so it only needs to stay clear of the
 /// kernel's own image/heap/phys-mem window, not any other userland crate specifically.
@@ -465,7 +467,7 @@ fn build_pthread_smoke(sysroot: &Path) -> PathBuf {
         .arg("-static")
         .arg("-no-pie")
         .arg("-pthread")
-        .arg("-Wl,-Ttext-segment=0x4100000")
+        .arg("-Wl,-Ttext-segment=0x8100000") // was 0x4100000; +0x4000000, see module::MODULE_VA_BASE's own doc comment
         .arg("-O2")
         .arg("-o")
         .arg(&out)
@@ -736,14 +738,15 @@ fn build_tinycc(musl_sysroot: &Path) -> PathBuf {
         }
     }
 
-    // 0xa280000: next free slot past the BusyBox applet range (highest in use is CRYPTPW's
-    // 0xa240000 in `BUSYBOX_APPLETS_PASS2`) -- tcc lives in the same "standalone binary embedded
+    // 0xe280000 (was 0xa280000; +0x4000000, see module::MODULE_VA_BASE's own doc comment): next
+    // free slot past the BusyBox applet range (highest in use is CRYPTPW's 0xe240000, was
+    // 0xe240000 (was 0xa240000), in `BUSYBOX_APPLETS_PASS2`) -- tcc lives in the same "standalone binary embedded
     // into oxfs's /bin" bucket as every applet, just built from its own upstream project instead
     // of BusyBox's.
     let status = Command::new("make")
         .current_dir(&tinycc_dir)
         .arg("tcc")
-        .arg("LDFLAGS=-static -no-pie -Wl,-Ttext-segment=0xa280000")
+        .arg("LDFLAGS=-static -no-pie -Wl,-Ttext-segment=0xe280000")
         .status()
         .unwrap_or_else(|e| panic!("failed to run make tcc: {e}"));
     if !status.success() {
@@ -996,592 +999,176 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
     out_path
 }
 
-/// A curated pilot subset of `third_party/posixtestsuite`'s `conformance/interfaces/` assertion
-/// files -- see `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s "Verification" section for why this exists
-/// at all (a real conformance-suite baseline, not self-assessment against a checklist) and
-/// `write_posix_test_manifest`'s own doc comment below for how these get built and
-/// `modules/oxfs/src/posix_conformance.sh`'s for how they get run.
-///
-/// **Deliberately not the whole suite** (1750 `.c` files in `conformance/interfaces/` alone,
-/// before `functional`/`stress`): even after this list's own expansion below, this pilot is still
-/// a curated subset, not the final coverage. Restricted to files that don't reference
-/// `pthread_create`/`testfrmw.h` (real threading doesn't exist yet -- see
-/// `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s own foundational-blockers list -- so a test needing it
-/// would only add noise, not signal). The original 68 (kept first, unreordered) were picked from
-/// interfaces that session already knew the implementation status of (real handlers for
-/// `kill`/`sigqueue`/`clock_gettime`/`nanosleep`/`sigwait`/`mq_open`, real-but-anonymous-only
-/// `mmap`, and the two POSIX-named — not SysV — IPC gaps `sem_open`/`shm_open` intentionally
-/// included as expected-failure controls).
-///
-/// **Expanded from 68 to 488** (this session): every remaining non-pthread, non-`aio_*`/
-/// `lio_listio` (real POSIX AIO is thread-pool-backed in musl, same threading blocker) directory
-/// under `conformance/interfaces/` was probed -- every `.c` file not referencing `pthread_create`/
-/// `testfrmw.h` compiled against the real static `musl-gcc` sysroot (same toolchain
-/// `write_posix_test_manifest` below actually builds with), then deduplicated: most of these
-/// directories are machine-generated per-assertion families (`gentests.pl`) where `N-2.c`, `N-3.c`,
-/// ... only vary *which* signal/parameter the same assertion `N` is checked against (confirmed by
-/// reading `sigaction/8-2.c` vs `8-3.c` -- identical assertion, different signal) -- so only the
-/// lowest-numbered variant per assertion number is kept (`sigaction` alone drops from 420 candidate
-/// files to 16 this way). Files whose own name ends `-buildonly.c`/`-core-buildonly.c` are also
-/// excluded -- these expect a real `argv[1]` selecting which of several sub-cases to run (normally
-/// supplied by the suite's own multi-invocation driver script, which this pilot doesn't have); run
-/// with none, per `sigaddset/1-core-buildonly.c`'s own logic, they just return `PTS_UNRESOLVED`
-/// unconditionally, adding no real signal. `sigwait/4-1.c` stays excluded from every re-expansion
-/// for the same already-documented reason (its own internal `alarm(3)` call replaces `t0`'s outer
-/// timeout -- see the comment at its own list position below). New interfaces this expansion adds
-/// real coverage for: every basic signal-set/mask/action manipulation function
-/// (`sigaction`/`sigprocmask`/`sigaltstack`/`sigsuspend`/`sigtimedwait`/`sigwaitinfo`/`sigset`/
-/// `sighold`/`sigrelse`/`sigignore`/`sigpause`/`sigaddset`/`sigdelset`/`sigemptyset`/`sigfillset`/
-/// `sigismember`/`sigpending`/`signal`/`raise`), POSIX per-process timers (`timer_create`/`_delete`/
-/// `_getoverrun`/`_gettime`/`_settime`), the rest of the message-queue family (`mq_close`/
-/// `_getattr`/`_notify`/`_receive`/`_send`/`_setattr`/`_timedreceive`/`_timedsend`/`_unlink`, only
-/// `mq_open` had real coverage before), `munmap`/`shm_unlink` (only `mmap`/`shm_open` had real
-/// coverage before), the `sched_*` field-accessor family (stored/echoed, not enforced -- see
-/// `docs/POSIX_COMPLIANCE_CHECKLIST.md`'s "honest-but-unenforced" section, so these are expected to
-/// surface real, informative gaps rather than pass outright), the unnamed/anonymous half of the
-/// `sem_*` family (`sem_init`/`_destroy`/`_wait`/`_trywait`/`_timedwait`/`_post`/`_getvalue`, plus
-/// the rest of `sem_open`/`_close`/`_unlink` beyond the original 8 files) -- included as real
-/// probes despite named POSIX semaphores being a documented threading-blocked gap, since these
-/// particular functions don't themselves require a second thread to exercise meaningfully single-
-/// process, `fsync`/`killpg` (only `kill`/`sigqueue` had real coverage before), the `clock_*` family
-/// beyond `clock_gettime` (`clock`/`clock_getcpuclockid`/`clock_getres`/`clock_nanosleep`/
-/// `clock_settime` -- all real, kernel-implemented syscalls now, see `SYS_CLOCK_GETRES`/
-/// `SYS_CLOCK_SETTIME`/`SYS_CLOCK_NANOSLEEP` in the OxideBSD tree's `modules/clock`; originally
-/// added to this pilot as expected-`ENOSYS`-failure controls before any of the three existed),
-/// plain time-conversion libc functions (`asctime`/`ctime`/`difftime`/`gmtime`/`localtime`/
-/// `mktime`/`strftime`/`time`), and `mlock`/`mlockall`/`munlock`/`munlockall` (no real handler
-/// exists for any of these -- included as expected-failure controls, same reasoning `sem_open`/
-/// `shm_open` originally used, not because this pilot expects them to pass).
-const POSIX_TEST_PILOT_FILES: &[&str] = &[
-    "clock_gettime/1-1.c",
-    "clock_gettime/1-2.c",
-    "clock_gettime/2-1.c",
-    "clock_gettime/3-1.c",
-    "clock_gettime/4-1.c",
-    "clock_gettime/7-1.c",
-    "clock_gettime/8-1.c",
-    "clock_gettime/8-2.c",
-    "kill/1-1.c",
-    "kill/1-2.c",
-    "kill/2-1.c",
-    "kill/2-2.c",
-    "kill/3-1.c",
-    "mmap/10-1.c",
-    "mmap/11-1.c",
-    "mmap/11-2.c",
-    "mmap/11-3.c",
-    "mmap/11-4.c",
-    "mmap/11-5.c",
-    "mmap/1-1.c",
-    "mmap/12-1.c",
-    "mq_open/10-1.c",
-    "mq_open/11-1.c",
-    "mq_open/1-1.c",
-    "mq_open/12-1.c",
-    "mq_open/13-1.c",
-    "mq_open/14-1.c",
-    "mq_open/15-1.c",
-    "mq_open/16-1.c",
-    "nanosleep/10000-1.c",
-    "nanosleep/1-1.c",
-    "nanosleep/1-2.c",
-    "nanosleep/1-3.c",
-    "nanosleep/2-1.c",
-    "nanosleep/3-1.c",
-    "sem_open/10-1.c",
-    "sem_open/1-1.c",
-    "sem_open/1-2.c",
-    "sem_open/1-3.c",
-    "sem_open/1-4.c",
-    "sem_open/2-1.c",
-    "sem_open/2-2.c",
-    "sem_open/3-1.c",
-    "shm_open/10-1.c",
-    "shm_open/11-1.c",
-    "shm_open/1-1.c",
-    "shm_open/12-1.c",
-    "shm_open/13-1.c",
-    "shm_open/14-2.c",
-    "shm_open/15-1.c",
-    "shm_open/16-1.c",
-    "sigqueue/10-1.c",
-    "sigqueue/11-1.c",
-    "sigqueue/1-1.c",
-    "sigqueue/12-1.c",
-    "sigqueue/2-1.c",
-    "sigqueue/2-2.c",
-    "sigqueue/3-1.c",
-    "sigqueue/4-1.c",
-    "sigqueue/5-1.c",
-    "sigqueue/6-1.c",
-    "sigqueue/7-1.c",
-    "sigqueue/8-1.c",
-    "sigqueue/9-1.c",
-    "sigwait/1-1.c",
-    "sigwait/2-1.c",
-    "sigwait/3-1.c",
-    // sigwait/4-1.c deliberately excluded: it calls its own `alarm(3)` internally, which -- being
-    // real per-process alarm state -- *replaces* `t0`'s own outer `alarm(40)` timeout wrapper the
-    // moment it's called. If this kernel's `sigwait()`/`alarm()` interaction doesn't work exactly
-    // right (unconfirmed -- found live, not yet root-caused), there is no longer any timeout able
-    // to rescue the run at all -- confirmed hanging past a real 30-minute ceiling, not merely slow.
-    // A real, separate finding worth its own investigation later -- not a pilot-infra problem.
-    "sigwait/8-1.c",
-    "clock/1-1.c",
-    "clock/2-1.c",
-    "clock_getcpuclockid/1-1.c",
-    "clock_getcpuclockid/2-1.c",
-    "clock_getres/1-1.c",
-    "clock_getres/3-1.c",
-    "clock_getres/5-1.c",
-    "clock_getres/6-1.c",
-    "clock_getres/7-1.c",
-    "clock_getres/8-1.c",
-    "clock_nanosleep/1-1.c",
-    "clock_nanosleep/2-1.c",
-    "clock_nanosleep/3-1.c",
-    "clock_nanosleep/9-1.c",
-    "clock_nanosleep/10-1.c",
-    "clock_nanosleep/11-1.c",
-    "clock_nanosleep/13-1.c",
-    "clock_settime/1-1.c",
-    "clock_settime/4-1.c",
-    "clock_settime/5-1.c",
-    "clock_settime/6-1.c",
-    "clock_settime/7-1.c",
-    "clock_settime/8-1.c",
-    "clock_settime/17-1.c",
-    "clock_settime/19-1.c",
-    "clock_settime/20-1.c",
-    "asctime/1-1.c",
-    "ctime/1-1.c",
-    "difftime/1-1.c",
-    "gmtime/1-1.c",
-    "gmtime/2-1.c",
-    "localtime/1-1.c",
-    "mktime/1-1.c",
-    "strftime/1-1.c",
-    "strftime/2-1.c",
-    "strftime/3-1.c",
-    "time/1-1.c",
-    "fsync/4-1.c",
-    "fsync/5-1.c",
-    "fsync/7-1.c",
-    "killpg/1-1.c",
-    "killpg/2-1.c",
-    "killpg/4-1.c",
-    "killpg/5-1.c",
-    "killpg/6-1.c",
-    "killpg/8-1.c",
-    "raise/1-1.c",
-    "raise/2-1.c",
-    "raise/4-1.c",
-    "raise/6-1.c",
-    "raise/7-1.c",
-    "raise/10000-1.c",
-    "mlock/5-1.c",
-    "mlock/8-1.c",
-    "mlock/10-1.c",
-    "mlockall/3-6.c",
-    "mlockall/8-1.c",
-    "mlockall/13-1.c",
-    "munlock/7-1.c",
-    "munlock/10-1.c",
-    "munlock/11-1.c",
-    "munlockall/5-1.c",
-    "mmap/1-2.c",
-    "mmap/3-1.c",
-    "mmap/5-1.c",
-    "mmap/6-1.c",
-    "mmap/7-1.c",
-    "mmap/9-1.c",
-    "mmap/13-1.c",
-    "mmap/14-1.c",
-    "mmap/18-1.c",
-    "mmap/19-1.c",
-    "mmap/21-1.c",
-    "mmap/23-1.c",
-    "mmap/24-1.c",
-    "mmap/27-1.c",
-    "mmap/28-1.c",
-    "mmap/31-1.c",
-    "munmap/1-1.c",
-    "munmap/2-1.c",
-    "munmap/3-1.c",
-    "munmap/4-1.c",
-    "munmap/8-1.c",
-    "munmap/9-1.c",
-    "mq_open/2-1.c",
-    "mq_open/3-1.c",
-    "mq_open/4-1.c",
-    "mq_open/7-1.c",
-    "mq_open/8-1.c",
-    "mq_open/9-1.c",
-    "mq_open/17-1.c",
-    "mq_open/18-1.c",
-    "mq_open/19-1.c",
-    "mq_open/20-1.c",
-    "mq_open/21-1.c",
-    "mq_open/22-1.c",
-    "mq_open/23-1.c",
-    "mq_open/24-1.c",
-    "mq_open/25-1.c",
-    "mq_open/27-1.c",
-    "mq_open/28-1.c",
-    "mq_open/29-1.c",
-    "mq_open/30-1.c",
-    "mq_close/1-1.c",
-    "mq_close/2-1.c",
-    "mq_close/3-1.c",
-    "mq_close/4-1.c",
-    "mq_close/5-1.c",
-    "mq_getattr/2-1.c",
-    "mq_getattr/3-1.c",
-    "mq_getattr/4-1.c",
-    "mq_notify/2-1.c",
-    "mq_notify/8-1.c",
-    "mq_notify/9-1.c",
-    "mq_receive/1-1.c",
-    "mq_receive/2-1.c",
-    "mq_receive/5-1.c",
-    "mq_receive/7-1.c",
-    "mq_receive/8-1.c",
-    "mq_receive/10-1.c",
-    "mq_receive/11-1.c",
-    "mq_receive/12-1.c",
-    "mq_receive/13-1.c",
-    "mq_send/1-1.c",
-    "mq_send/2-1.c",
-    "mq_send/3-1.c",
-    "mq_send/4-1.c",
-    "mq_send/5-1.c",
-    "mq_send/6-1.c",
-    "mq_send/7-1.c",
-    "mq_send/8-1.c",
-    "mq_send/9-1.c",
-    "mq_send/10-1.c",
-    "mq_send/11-1.c",
-    "mq_send/12-1.c",
-    "mq_send/13-1.c",
-    "mq_send/14-1.c",
-    "mq_setattr/1-1.c",
-    "mq_setattr/2-1.c",
-    "mq_setattr/5-1.c",
-    "mq_timedreceive/1-1.c",
-    "mq_timedreceive/2-1.c",
-    "mq_timedreceive/5-1.c",
-    "mq_timedreceive/7-1.c",
-    "mq_timedreceive/8-1.c",
-    "mq_timedreceive/10-1.c",
-    "mq_timedreceive/11-1.c",
-    "mq_timedreceive/13-1.c",
-    "mq_timedreceive/14-1.c",
-    "mq_timedreceive/15-1.c",
-    "mq_timedreceive/17-1.c",
-    "mq_timedreceive/18-1.c",
-    "mq_timedsend/1-1.c",
-    "mq_timedsend/2-1.c",
-    "mq_timedsend/3-1.c",
-    "mq_timedsend/4-1.c",
-    "mq_timedsend/5-1.c",
-    "mq_timedsend/6-1.c",
-    "mq_timedsend/7-1.c",
-    "mq_timedsend/8-1.c",
-    "mq_timedsend/9-1.c",
-    "mq_timedsend/10-1.c",
-    "mq_timedsend/11-1.c",
-    "mq_timedsend/13-1.c",
-    "mq_timedsend/14-1.c",
-    "mq_timedsend/15-1.c",
-    "mq_timedsend/16-1.c",
-    "mq_timedsend/17-1.c",
-    "mq_timedsend/18-1.c",
-    "mq_timedsend/19-1.c",
-    "mq_timedsend/20-1.c",
-    "mq_unlink/1-1.c",
-    "mq_unlink/2-1.c",
-    "mq_unlink/7-1.c",
-    "nanosleep/3-2.c",
-    "nanosleep/5-1.c",
-    "nanosleep/6-1.c",
-    "nanosleep/7-1.c",
-    "sched_getparam/1-1.c",
-    "sched_getparam/2-1.c",
-    "sched_getparam/3-1.c",
-    "sched_getparam/4-1.c",
-    "sched_getparam/6-1.c",
-    "sched_get_priority_max/1-1.c",
-    "sched_get_priority_max/2-1.c",
-    "sched_get_priority_min/1-1.c",
-    "sched_get_priority_min/2-1.c",
-    "sched_getscheduler/1-1.c",
-    "sched_getscheduler/2-1.c",
-    "sched_getscheduler/3-1.c",
-    "sched_getscheduler/4-1.c",
-    "sched_getscheduler/5-1.c",
-    "sched_getscheduler/7-1.c",
-    "sched_rr_get_interval/1-1.c",
-    "sched_rr_get_interval/2-1.c",
-    "sched_rr_get_interval/3-1.c",
-    "sched_setparam/1-1.c",
-    "sched_setparam/2-1.c",
-    "sched_setparam/3-1.c",
-    "sched_setparam/5-1.c",
-    "sched_setparam/6-1.c",
-    "sched_setparam/7-1.c",
-    "sched_setparam/8-1.c",
-    "sched_setparam/9-1.c",
-    "sched_setparam/10-1.c",
-    "sched_setparam/12-1.c",
-    "sched_setparam/13-1.c",
-    "sched_setparam/14-1.c",
-    "sched_setparam/15-1.c",
-    "sched_setparam/16-1.c",
-    "sched_setparam/17-1.c",
-    "sched_setparam/18-1.c",
-    "sched_setparam/19-1.c",
-    "sched_setparam/22-1.c",
-    "sched_setparam/23-1.c",
-    "sched_setparam/25-1.c",
-    "sched_setparam/26-1.c",
-    "sched_setparam/27-1.c",
-    "sched_setscheduler/1-1.c",
-    "sched_setscheduler/2-1.c",
-    "sched_setscheduler/4-1.c",
-    "sched_setscheduler/5-1.c",
-    "sched_setscheduler/6-1.c",
-    "sched_setscheduler/7-1.c",
-    "sched_setscheduler/9-1.c",
-    "sched_setscheduler/10-1.c",
-    "sched_setscheduler/11-1.c",
-    "sched_setscheduler/12-1.c",
-    "sched_setscheduler/13-1.c",
-    "sched_setscheduler/14-1.c",
-    "sched_setscheduler/16-1.c",
-    "sched_setscheduler/17-1.c",
-    "sched_setscheduler/19-1.c",
-    "sched_setscheduler/20-1.c",
-    "sched_setscheduler/21-1.c",
-    "sched_yield/2-1.c",
-    "sem_close/1-1.c",
-    "sem_close/2-1.c",
-    "sem_close/3-1.c",
-    "sem_destroy/4-1.c",
-    "sem_getvalue/1-1.c",
-    "sem_getvalue/2-1.c",
-    "sem_getvalue/4-1.c",
-    "sem_getvalue/5-1.c",
-    "sem_init/1-1.c",
-    "sem_init/2-1.c",
-    "sem_init/5-1.c",
-    "sem_init/6-1.c",
-    "sem_open/4-1.c",
-    "sem_open/5-1.c",
-    "sem_open/6-1.c",
-    "sem_post/1-1.c",
-    "sem_post/2-1.c",
-    "sem_post/4-1.c",
-    "sem_post/5-1.c",
-    "sem_post/6-1.c",
+/// Two files, both under `sigwait`/`timer_settime`, **confirmed by direct testing** to hang
+/// permanently against `t0`'s own `alarm(40)` rescue rather than merely run long: each blocks
+/// `SIGALRM` in-process (`sigprocmask(SIG_BLOCK, ...)`) before its own real, potentially-unbounded
+/// wait -- since `t0 execvp`s straight into the test binary, the alarm and the test share one
+/// process/signal mask, so the pending rescue alarm never actually gets delivered.
+/// `timer_settime/2-1.c` alone was confirmed hanging past a real 9+ minute ceiling before this was
+/// understood. Excluded here rather than left for `discover_posix_test_files` to find blind --
+/// this is hard-won, specific knowledge from prior runs, not a guess. Every *other* file also
+/// matching this same `SIG_BLOCK`+`SIGALRM` shape (`pthread_sigmask`/`sigprocmask`'s own 4/7/8/12-1
+/// variants, `pthread_spin_lock/1-1.c`, `timer_settime/9-2.c`, `clock_settime/4-1.c` -- the last
+/// already confirmed *not* to hang, see CLAUDE.md's "real timer-signal wake bug" section) is
+/// **not** pre-excluded -- untested against the now-full corpus, and blocking `SIGALRM` alone isn't
+/// sufficient to hang (only blocking it *and then never reaching an unblock or a bounded wait*
+/// is). If a real full run finds one of these genuinely wedged, add it here the same way these two
+/// were added, then re-run -- the same "found live, fixed forward" discipline every other exclusion
+/// in this codebase's history follows, not something to pre-solve by static reading alone.
+// `fork/11-1.c` added live during the first full-corpus run: a real fork+thread interaction test
+// (`#include <pthread.h>` + `testfrmw.c`) that wedged the whole run for 3.5+ hours with flat CPU
+// usage and no `t0`-rescued TIMEOUT classification -- not a `SIGALRM`-blocking case like the other
+// four (confirmed: no `SIGALRM`/`SIG_BLOCK`/`alarm(` anywhere in it or its `testfrmw.c`), so
+// whatever it's stuck on is a genuine, not-yet-investigated kernel bug in fork-after-thread-setup,
+// worth its own follow-up rather than blocking this corpus expansion on diagnosing it now.
+const POSIX_KNOWN_HANGS: &[&str] = &[
+    "sigwait/4-1.c",
+    "timer_settime/2-1.c",
+    "timer_settime/6-1.c",
+    "timer_settime/9-1.c",
+    "fork/11-1.c",
+    // `fork/8-1.c`: a `do { cur = times(&t); } while (cur - start < sysconf(_SC_CLK_TCK))` busy
+    // loop that should take ~1 real second under KVM (`_SC_CLK_TCK` is musl's own compile-time
+    // `100`, matching this kernel's real `TIMER_HZ`) but instead ran 9+ real minutes at ~90% CPU
+    // (a genuine spin, not a block -- `ticks()` itself must be advancing correctly or the busy
+    // loop the timer handler is fighting for CPU against would never make *any* progress. Added a
+    // `[diag] table_len=` print to `timer_interrupt_handler` to check whether the process table
+    // growing across the run is the real cause before investigating further).
+    "fork/8-1.c",
+    // `pthread_atfork/3-3.c`: real fork+pthread_atfork+SIGUSR1/SIGUSR2 interaction, hung several
+    // real minutes with low CPU (blocked, not spinning) and no `t0`-rescued TIMEOUT -- confirmed
+    // it does *not* block SIGALRM (only `SIGUSR1`/`SIGUSR2` via `pthread_sigmask`), so this is a
+    // distinct bug from the other entries here, not the same known SIGALRM-blocking hazard class.
+    // Landed alongside a real, correlated finding: the `[diag]` process-table-size print jumped
+    // from a stable 3-4 to a stable-but-elevated 16 right around when `pthread_atfork` tests
+    // started -- some real fork+thread child isn't being fully reaped. Worth its own dedicated
+    // investigation session with live kernel introspection, not blind static reading.
+    "pthread_atfork/3-3.c",
+    // `pthread_attr_destroy/1-1.c`: calls `pthread_attr_destroy()` then reuses the destroyed attr
+    // in a real `pthread_create()` call (deliberately testing garbage-in-garbage-out behavior).
+    // Hung several real minutes, low CPU (blocked, not spinning). Investigated `do_futex`'s
+    // `FUTEX_WAIT` path (`src/process/limits.rs`) as a suspected unifying cause for this whole
+    // class of hang, since musl's own `pthread_create`/`_join`/mutex code is futex-backed --
+    // `wake_if_futex_waiting` exists and *is* correctly wired into the real `alarm()`-expiry path
+    // `t0`'s own rescue timeout goes through (`src/cpu/interrupts.rs`), same as every other
+    // blocking primitive's wake hook, so the mechanism looks sound on inspection. Whatever's
+    // actually wrong here needs live kernel introspection (GDB against the QEMU stub) to pin down,
+    // not further static reading -- tracked as a real open question, not resolved.
+    "pthread_attr_destroy/1-1.c",
+    // `sched_yield/1-1.c`: forks `ncpu-1` children and has a real `while(1);` busy-spin thread,
+    // expecting genuine multi-core scheduling fairness to observe `sched_yield()`'s effect --
+    // fundamentally assumes real SMP, which this kernel doesn't have (single-core only, see
+    // CLAUDE.md). Hung with real, sustained CPU usage (~41%). Not a bug to fix so much as a
+    // structural test-vs-kernel mismatch -- worth revisiting only if/when real SMP ever lands.
+    "sched_yield/1-1.c",
+    // Real, multi-*process* named-semaphore coordination (`sem_open` + real `fork()`, distinct
+    // from same-process anonymous-semaphore usage which already passes plenty of sibling tests):
+    // needs cross-process `FUTEX_WAKE`, which this kernel's real futex support doesn't have --
+    // `WaitingForFutex` is scoped by `tgid` only (see CLAUDE.md's "Real threading" section, "Not
+    // done": "named POSIX semaphores/POSIX shared memory (need... real cross-*process*
+    // `FUTEX_WAKE` — today's scoping is `tgid`-only)"). A genuinely documented, not-yet-implemented
+    // gap, not a bug -- confirmed live via `sem_unlink/2-2.c` hanging with low CPU (blocked, not
+    // spinning); the other three share the identical real `sem_open`+`fork()` shape (checked via
+    // `grep -l sem_open sem_*/*.c | xargs grep -l 'fork('`, exactly 4 matches total), so excluded
+    // proactively rather than rediscovering each one the same way.
     "sem_post/8-1.c",
-    "sem_timedwait/1-1.c",
-    "sem_timedwait/2-1.c",
-    "sem_timedwait/3-1.c",
-    "sem_timedwait/4-1.c",
-    "sem_timedwait/6-1.c",
-    "sem_timedwait/7-1.c",
-    "sem_timedwait/9-1.c",
-    "sem_timedwait/10-1.c",
-    "sem_timedwait/11-1.c",
-    "sem_unlink/1-1.c",
-    "sem_unlink/2-1.c",
-    "sem_unlink/4-1.c",
-    "sem_wait/1-1.c",
-    "sem_wait/3-1.c",
-    "sem_wait/5-1.c",
+    "sem_unlink/2-2.c",
+    "sem_unlink/3-1.c",
     "sem_wait/7-1.c",
-    "sem_wait/11-1.c",
-    "sem_wait/12-1.c",
-    "shm_open/2-1.c",
-    "shm_open/3-1.c",
-    "shm_open/5-1.c",
-    "shm_open/6-1.c",
-    "shm_open/7-1.c",
-    "shm_open/8-1.c",
-    "shm_open/9-1.c",
-    "shm_open/17-1.c",
-    "shm_open/18-1.c",
-    "shm_open/19-1.c",
-    "shm_open/20-1.c",
-    "shm_open/21-1.c",
-    "shm_open/22-1.c",
-    // shm_open/23-1.c deliberately excluded: unconditionally forks `NPROCESS = 1000` real child
-    // processes (no CPU-count scaling -- unlike sched_setparam's own `nb_cpu = get_ncpu()`-scaled
-    // fork loops elsewhere in this corpus, harmless here since this kernel's single-core
-    // `get_ncpu()` always returns 1). Confirmed live: this test genuinely times out under `t0`'s
-    // 40s alarm (real POSIX behavior on a kernel this small -- not a bug in the fork/exec path
-    // itself), but when the *parent* dies to that alarm's default-Terminate `SIGALRM`, any children
-    // it had already spawned before the timeout become permanent orphans -- this kernel has no
-    // init-style orphan reparenting/reaping (`hush` never adopts or waits on a process it didn't
-    // itself fork), so they simply keep running forever, each still holding whatever real
-    // `shm_open()` fd it successfully opened. `modules/oxfs`'s own `MAX_OPEN_FILES = 8` pool
-    // (deliberately small -- see that constant's own doc comment) permanently exhausts as a result,
-    // breaking every subsequent test in the corpus that needs to open *anything* (confirmed: `hush`
-    // itself starts failing its own `> /posix-tests/run-out.txt` redirect with a real `EMFILE`
-    // immediately after this file, for the rest of the run). Not a kernel fd-leak -- `close_all`
-    // correctly releases every fd the *parent* process itself held; the leak is real orphaned
-    // *child* processes this kernel has no mechanism to ever reap.
-    "shm_open/24-1.c",
-    "shm_open/25-1.c",
-    "shm_open/26-1.c",
-    "shm_open/27-1.c",
-    "shm_open/28-1.c",
-    "shm_open/29-1.c",
-    "shm_open/32-1.c",
-    "shm_open/34-1.c",
-    "shm_open/36-1.c",
-    "shm_open/37-1.c",
-    "shm_open/38-1.c",
-    "shm_open/39-1.c",
-    "shm_open/41-1.c",
-    "shm_open/42-1.c",
-    "shm_unlink/1-1.c",
-    "shm_unlink/2-1.c",
-    "shm_unlink/3-1.c",
-    "shm_unlink/5-1.c",
-    "shm_unlink/6-1.c",
-    "shm_unlink/8-1.c",
-    "shm_unlink/9-1.c",
-    "shm_unlink/10-1.c",
-    "shm_unlink/11-1.c",
-    "sigaction/1-1.c",
-    "sigaction/2-1.c",
-    "sigaction/3-1.c",
-    "sigaction/4-1.c",
-    "sigaction/6-1.c",
-    "sigaction/8-1.c",
-    "sigaction/9-1.c",
-    "sigaction/10-1.c",
-    "sigaction/11-1.c",
-    "sigaction/12-1.c",
-    "sigaction/13-1.c",
-    "sigaction/17-1.c",
-    "sigaction/21-1.c",
-    "sigaction/22-1.c",
-    "sigaction/25-1.c",
-    "sigaction/28-1.c",
-    "sigaddset/1-3.c",
-    "sigaddset/2-1.c",
-    "sigaltstack/1-1.c",
-    "sigaltstack/2-1.c",
-    "sigaltstack/3-1.c",
-    "sigaltstack/5-1.c",
-    "sigaltstack/6-1.c",
-    "sigaltstack/7-1.c",
-    "sigaltstack/8-1.c",
-    "sigaltstack/9-1.c",
-    "sigaltstack/10-1.c",
-    "sigaltstack/11-1.c",
-    "sigaltstack/12-1.c",
-    "sigdelset/1-3.c",
-    "sigdelset/2-1.c",
-    "sigemptyset/1-1.c",
-    "sigemptyset/2-1.c",
-    "sigfillset/1-1.c",
-    "sigfillset/2-1.c",
-    "sighold/1-1.c",
-    "sighold/2-1.c",
-    "sigignore/1-1.c",
-    "sigignore/4-1.c",
-    "sigignore/6-1.c",
-    "sigismember/3-1.c",
-    "sigismember/4-1.c",
-    "signal/1-1.c",
-    "signal/2-1.c",
-    "signal/3-1.c",
-    "signal/5-1.c",
-    "signal/6-1.c",
-    "signal/7-1.c",
-    "sigpause/4-1.c",
-    "sigpending/1-1.c",
-    "sigpending/2-1.c",
-    "sigprocmask/4-1.c",
-    "sigprocmask/5-1.c",
-    "sigprocmask/6-1.c",
-    "sigprocmask/7-1.c",
-    "sigprocmask/8-1.c",
-    "sigprocmask/9-1.c",
-    "sigprocmask/10-1.c",
-    "sigprocmask/12-1.c",
-    "sigprocmask/15-1.c",
-    "sigrelse/1-1.c",
-    "sigrelse/2-1.c",
-    "sigset/1-1.c",
-    "sigset/2-1.c",
-    "sigset/3-1.c",
-    "sigset/4-1.c",
-    "sigset/5-1.c",
-    "sigset/6-1.c",
-    "sigset/7-1.c",
-    "sigset/8-1.c",
-    "sigset/9-1.c",
-    "sigset/10-1.c",
-    "sigsuspend/1-1.c",
-    "sigsuspend/3-1.c",
-    "sigsuspend/4-1.c",
-    "sigsuspend/6-1.c",
-    "sigtimedwait/1-1.c",
-    "sigtimedwait/2-1.c",
-    "sigtimedwait/4-1.c",
-    "sigtimedwait/5-1.c",
-    "sigtimedwait/6-1.c",
-    "sigwaitinfo/1-1.c",
-    "sigwaitinfo/2-1.c",
-    "sigwaitinfo/3-1.c",
-    "sigwaitinfo/5-1.c",
-    "sigwaitinfo/6-1.c",
-    "sigwaitinfo/7-1.c",
-    "sigwaitinfo/8-1.c",
-    "sigwaitinfo/9-1.c",
-    "timer_create/1-1.c",
-    "timer_create/3-1.c",
-    "timer_create/7-1.c",
-    "timer_create/8-1.c",
-    "timer_create/9-1.c",
-    "timer_create/10-1.c",
-    "timer_create/11-1.c",
-    "timer_create/16-1.c",
-    "timer_delete/1-1.c",
-    "timer_getoverrun/1-1.c",
-    "timer_getoverrun/2-1.c",
-    "timer_getoverrun/3-1.c",
-    "timer_gettime/1-1.c",
-    "timer_gettime/2-1.c",
-    "timer_gettime/3-1.c",
-    "timer_settime/1-1.c",
-    // timer_settime/2-1.c, 6-1.c, 9-1.c deliberately excluded: all three `sigprocmask(SIG_BLOCK,
-    // {SIGALRM}, NULL)` before their own real `sigwait()`-based test loop -- the exact same
-    // t0-defeating pattern `sigwait/4-1.c` is already excluded for above (see that entry's own
-    // comment): blocking SIGALRM in-process blocks *both* the test's own signal-under-test *and*
-    // `t0`'s own outer `alarm(40)` rescue mechanism, since they share one process/signal mask once
-    // `t0` `execvp`s straight into the test binary. Confirmed hanging past a real 9+ minute ceiling
-    // (`timer_settime/2-1.c` specifically) -- not merely slow. `1-1.c`/`3-1.c`/`5-1.c`/`13-1.c`
-    // use `SIGALRM` too but only via a real *caught handler* (`sigaction`), never `sigprocmask`
-    // block -- a caught handler still runs and lets the test's own state machine complete
-    // normally, so `t0`'s rescue alarm is never actually needed for those; only the three
-    // blocking ones create a genuine, unbounded hang risk. `8-1.c` uses `SIGCONT`, unrelated.
-    "timer_settime/3-1.c",
-    "timer_settime/5-1.c",
-    "timer_settime/8-1.c",
-    "timer_settime/13-1.c",
+    // `sigwait/6-1.c`/`6-2.c`: real `pthread_create()`-backed multiple-threads-block-in-sigwait
+    // scenario, hung with sustained ~26-30% CPU for 10+ real minutes past sigwait/3-1.c -- same
+    // broken real-threading territory as the `pthread_*`/`aio_*` wholesale exclusion above, just
+    // not living under a `pthread_*`-named directory so that filter missed it. Confirms the
+    // underlying issue is about *how* `pthread_create` gets used, not the directory name -- a
+    // broad audit (`grep -l pthread_create` across every non-`pthread_*`/`aio_*` file) found 49
+    // matches total; all but these two had *already* run clean (PASS/FAIL/UNSUPPORTED, no hang) by
+    // the time this was checked, so only this specific real-multi-thread-plus-signal-wait shape
+    // seems to trigger it, not `pthread_create` usage in general.
+    "sigwait/6-1.c",
+    "sigwait/6-2.c",
 ];
+
+/// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
+/// `interfaces_dir`, in the codebase's usual `/`-separated form -- the full ~1750-file suite, not
+/// the 488-file curated dedup this pilot ran against before. Two exclusion classes, both narrow:
+///
+/// - **`*-buildonly.c`/`*-core-buildonly.c`** (10 files): expect a real `argv[1]` selecting which
+///   of several sub-cases to run (normally supplied by the suite's own multi-invocation driver
+///   script, which this pilot doesn't have) -- run with none, they just return `PTS_UNRESOLVED`
+///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
+///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
+///   real assertion `execl()`s into it directly by its literal upstream path).
+/// - **`POSIX_KNOWN_HANGS`** above (5 files): specific, already-proven permanent hangs.
+///
+/// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
+/// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
+/// closing the reason that filter existed. A source file needing the suite's own tiny shared
+/// test-framework helper pulls it in itself, via a literal `#include "testfrmw.c"` (confirmed by
+/// reading several -- this suite compiles it as *text* folded into the same translation unit, not
+/// a separate linked object; `write_posix_test_manifest`'s own build loop compiles every
+/// discovered file completely standalone, matching this). Everything else (a helper file with no
+/// standalone `main()` at all -- `testfrmw.c`/`coverage.c` themselves, discovered like any other
+/// `.c` file and simply failing alone -- a source needing headers this musl port doesn't have,
+/// real upstream oddities like `pthread_create/15-1.c`/`pthread_exit/6-2.c` that don't build
+/// alone) is **not** pre-filtered here either -- that build loop is best-effort per file (skip and
+/// log, not panic) specifically so this function can stay a plain filesystem walk instead of
+/// trying to statically prove every file buildable.
+fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".c") || name.ends_with("buildonly.c") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(base)
+                .expect("walked path must be under base")
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
+    }
+    let mut out = Vec::new();
+    walk(interfaces_dir, interfaces_dir, &mut out);
+    out.retain(|rel| !POSIX_KNOWN_HANGS.contains(&rel.as_str()));
+    // Real, live-found reliability problem, not a static guess: individually excluding
+    // `POSIX_KNOWN_HANGS` one file at a time surfaced a *vanilla* `pthread_create()` +
+    // `sleep(1)`-poll-on-a-shared-flag test (`pthread_attr_init/2-1.c`, no garbage attrs, no
+    // signal blocking) hanging the same way the garbage-attr/atfork/futex-adjacent ones did --
+    // meaning real thread creation/scheduling itself is unreliable somewhere past ~400 tests deep
+    // into one continuous boot (correlates with, but doesn't yet explain, the process table
+    // growing from a stable 3-4 to a stable-but-elevated 16 entries right when `pthread_atfork`
+    // tests started -- see `project_posix_full_corpus_expansion` memory). Chasing this file-by-file
+    // across ~600 more `pthread_*`/`aio_*` (musl's own AIO is thread-pool-backed, same exposure)
+    // files would cost hours for something that's clearly one systemic gap, not hundreds of
+    // independent ones -- reverting to the pre-expansion exclusion boundary for *these two
+    // categories only* gets a complete, clean run over the rest of the ~1300-file corpus now, and
+    // defers real threading reliability to its own dedicated debugging session (needs live kernel
+    // introspection, not more static reading) rather than discovering it one hang at a time.
+    out.retain(|rel| {
+        !rel.starts_with("pthread_") && !rel.starts_with("aio_") && !rel.starts_with("lio_listio")
+    });
+    out.sort();
+    out
+}
 
 /// Generates `target/generated/posix_test_manifest.rs` (same `include!`-a-generated-file idiom
 /// `write_tcc_runtime_manifest` above already established, for the same reason: real file content
 /// embedded via literal-path `include_bytes!`, not the `env!()`-per-file pattern every hand-written
 /// embedded ELF in this codebase uses -- there's no reason to invent ~70 one-off names for data
-/// with no other identity need). `POSIX_TEST_PILOT_FILES` above is the single source of truth for
-/// *which* files get embedded.
+/// with no other identity need). `discover_posix_test_files` above is the single source of truth
+/// for *which* files get attempted; this function's own best-effort build loop decides which of
+/// those actually get embedded.
 ///
 /// **Cross-compiled with `musl-gcc` on the host, not compiled on-target by `tcc`** -- an earlier
 /// version of this pilot seeded real `.c` source and compiled it on-target, exercising `tcc` as
@@ -1600,18 +1187,18 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
 /// still real and un-fixed -- worth its own investigation later, tracked separately from this
 /// pilot.)
 ///
-/// Each pilot file gets a unique fixed load address (`POSIX_TEST_LOAD_BASE` + index *
-/// `POSIX_TEST_LOAD_STEP`, `0xa800000`.., 704 slots fit before `module::MODULE_VA_BASE`
-/// (`0x10000000`) -- comfortable headroom over the 488 currently in `POSIX_TEST_PILOT_FILES` for
-/// further growth. Moved down from the original `0xcf40000`/`0x40000`-step layout (which only had
-/// room for ~195 entries in the same gap) when this list grew past 68 -- `POSIX_TEST_LOAD_STEP`
-/// dropped to `0x20000` at the same time (real headroom over every candidate file's own real size,
-/// confirmed against the largest actually observed, ~76 KiB) to fit more entries per byte of VA
-/// space. `0xa800000` itself sits comfortably above `tcc`'s own `0xa280000` load (`build_tinycc`'s
-/// own comment) plus its real ~1.1 MiB size, not just past the BusyBox applet range's own ceiling
-/// (`0xa240000`) tcc's base was originally chosen relative to -- same "every userland binary gets a
-/// real, non-overlapping fixed base" discipline every other embedded ELF in this codebase already
-/// follows. `t0` (the suite's own real timeout-wrapper utility, see
+/// Every pilot file shares one fixed load address (`POSIX_TEST_LOAD_BASE`, `0xe800000`, was
+/// `0xa800000` before the whole low-VA family's own `+0x4000000` move -- see
+/// `module::MODULE_VA_BASE`'s own doc comment) -- see this function's own leading comment for why
+/// sharing one address is safe now (grew past the ~704-slot ceiling a per-file-unique-address
+/// scheme could fit in the gap before `module::MODULE_VA_BASE`, once the corpus expanded from a
+/// 488-file curated dedup to the ~1700-file full suite). Before that, each file got its own
+/// `POSIX_TEST_LOAD_BASE + index * POSIX_TEST_LOAD_STEP` slot -- moved down from an original
+/// `0xcf40000`/`0x40000`-step layout (only ~195 slots in the same gap) when the list first grew
+/// past 68 files. `0xe800000` itself sits comfortably above `tcc`'s own `0xe280000` load
+/// (`build_tinycc`'s own comment) plus its real ~1.1 MiB size, not just past the BusyBox applet
+/// range's own ceiling (`0xe240000`) tcc's base was originally chosen relative to. `t0` (the
+/// suite's own real timeout-wrapper utility, see
 /// `posix_conformance.sh`'s own doc comment for why a real `alarm()`-based wrapper matters on a
 /// kernel with no preemption) is cross-compiled the same way, at its own fixed base just below the
 /// pilot range. Embeds each compiled ELF's real bytes at `bin/<relative-path-with-.c-extension>`
@@ -1621,9 +1208,21 @@ const POSIX_TEST_PILOT_FILES: &[&str] = &[
 /// and writes out a plain-text `manifest.txt` (one relative path per line) generated from the same
 /// list, so the seeded corpus and the runner script's own iteration list can never drift apart.
 fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> PathBuf {
-    const POSIX_TEST_LOAD_BASE: u64 = 0xa800000;
-    const POSIX_TEST_LOAD_STEP: u64 = 0x20000;
-    const T0_LOAD_BASE: u64 = 0xa780000;
+    // One single shared load address for every pilot binary, not a unique slot per file: each
+    // runs as its own `fork`+`execve`'d process in a completely fresh `AddressSpace` (see
+    // CLAUDE.md's "User-mode execution" section) and never coexists with another pilot binary in
+    // the same address space (no `PT_INTERP` here, unlike `libc.so`'s own real dynamic-linking
+    // case) -- so, unlike every hand-written `userland/*` crate's own `linker.ld` (which follows a
+    // "give every embedded ELF a distinct base" convention that was never a hard requirement, just
+    // a longstanding habit), there is no real technical reason these need to differ. This stopped
+    // being optional once the corpus grew past the ~704 slots the old
+    // `POSIX_TEST_LOAD_BASE`..`module::MODULE_VA_BASE` gap could fit at a per-file step wide
+    // enough to clear the largest real observed binary (~76 KiB) -- ~1700 files at that same step
+    // would need ~218 MiB of VA space against an ~88 MiB gap.
+    // Both +0x4000000 (was 0xa800000/0xa780000) alongside every other fixed userland/BusyBox/
+    // module address -- see module::MODULE_VA_BASE's own doc comment.
+    const POSIX_TEST_LOAD_BASE: u64 = 0xe800000;
+    const T0_LOAD_BASE: u64 = 0xe780000;
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let out_dir = Path::new(manifest_dir).join("target/generated");
@@ -1636,28 +1235,120 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
     let include_dir = posixtestsuite_dir.join("include");
     let musl_gcc = musl_sysroot.join("bin/musl-gcc");
 
+    // Watches the whole tree recursively (cargo's own documented behavior for a directory path),
+    // not one `println!` per discovered file like the old hand-curated list needed -- correctly
+    // picks up a file being added/removed/edited anywhere under here without needing build.rs
+    // itself touched.
+    println!("cargo:rerun-if-changed={}", interfaces_dir.display());
+
+    let all_files = discover_posix_test_files(&interfaces_dir);
+
+    // Parallel across test files (mirrors `build_busybox_applet`'s own work-stealing pool over a
+    // shared atomic index -- see that call site's comment for why: a plain thread-per-file pool
+    // would vastly oversubscribe an 8-core host at this corpus size). Best-effort per file, not
+    // `panic!` on the first failure: unlike the old hand-curated 488, this is every file the
+    // upstream suite ships, including real helper files with no standalone `main()`
+    // (`testfrmw.c`/`coverage.c`) and a handful of genuine upstream oddities (see
+    // `discover_posix_test_files`'s own doc comment) -- a build failure here is expected, routine
+    // signal for *some* files, not a build-breaking bug.
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let built: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let skipped: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                loop {
+                    let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(rel) = all_files.get(i) else {
+                        break;
+                    };
+                    let source = interfaces_dir.join(rel);
+                    let out = bin_dir.join(rel.replace('/', "_"));
+                    let mut cmd = Command::new(&musl_gcc);
+                    cmd.arg("-static")
+                        .arg("-no-pie")
+                        .arg(format!("-Wl,-Ttext-segment={POSIX_TEST_LOAD_BASE:#x}"))
+                        .arg("-I")
+                        .arg(&include_dir)
+                        // Real, found-live upstream-vs-modern-host-GCC frictions, not this
+                        // codebase's own patches (same "cross-compiler is stricter than the
+                        // suite's original ~2004-2005 toolchain" class of bug `t0.c`'s own
+                        // `-include string.h` already works around): (1) this suite's own
+                        // `testfrmw.c` (the shared test-framework helper) is meant to be pulled in
+                        // via a literal `#include "testfrmw.c"` *inside* whichever test file needs
+                        // it, inheriting that file's own already-included headers -- **not**
+                        // compiled as a separate translation unit and linked (confirmed live: the
+                        // latter produces real duplicate-symbol link errors against files that
+                        // already `#include` it themselves, which is why this loop doesn't try to
+                        // pair it in at all). (2) plenty of files rely on an implicit `open()`/
+                        // `S_IRUSR`-family declaration this host's GCC 16 now hard-errors on
+                        // regardless of `-std=`, and are simply missing `fcntl.h`/`sys/stat.h`
+                        // outright (real upstream omissions, not a musl-vs-glibc header gap) --
+                        // `-Wno-implicit-function-declaration` downgrades the former back to a
+                        // warning (harmless: musl's own real prototype still governs the actual
+                        // call), the `-include`s backfill the latter. Harmless no-ops for any file
+                        // that already includes these itself (real header guards).
+                        .arg("-Wno-implicit-function-declaration")
+                        .arg("-Wno-implicit-int")
+                        // Same "modern strict-by-default GCC vs. this suite's real ~2004-2005
+                        // toolchain" friction as the pair above, different diagnostic: plenty of
+                        // files pass a `void *(*)(void)` thread-start function where real
+                        // `pthread_create`'s prototype wants `void *(*)(void *)` (a real, common
+                        // relaxed-C89-era style this host's GCC 16 now hard-errors on) or assign a
+                        // same-shaped mismatched handler into a `struct sigaction`. Demoted back to
+                        // a warning, same reasoning as the pair above -- musl's own real prototype
+                        // still governs the actual call ABI-compatibly on this target.
+                        .arg("-Wno-incompatible-pointer-types")
+                        .arg("-Wno-int-conversion")
+                        .arg("-include")
+                        .arg("stdio.h")
+                        .arg("-include")
+                        .arg("stdarg.h")
+                        .arg("-include")
+                        .arg("stdlib.h")
+                        .arg("-include")
+                        .arg("string.h")
+                        .arg("-include")
+                        .arg("unistd.h")
+                        .arg("-include")
+                        .arg("fcntl.h")
+                        .arg("-include")
+                        .arg("sys/stat.h")
+                        .arg("-include")
+                        .arg("sys/types.h")
+                        .arg("-o")
+                        .arg(&out)
+                        .arg(&source);
+                    let ok = cmd.status().is_ok_and(|s| s.success());
+                    if ok {
+                        built.lock().unwrap().push((rel.clone(), out));
+                    } else {
+                        skipped.lock().unwrap().push(rel.clone());
+                    }
+                }
+            });
+        }
+    });
+
+    let mut built = built.into_inner().unwrap();
+    built.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut skipped = skipped.into_inner().unwrap();
+    skipped.sort();
+    println!(
+        "cargo:warning=posix pilot: built {} of {} discovered files ({} skipped -- see target/generated/posix_test_manifest_skipped.txt)",
+        built.len(),
+        all_files.len(),
+        skipped.len()
+    );
+    let skipped_path = out_dir.join("posix_test_manifest_skipped.txt");
+    std::fs::write(&skipped_path, skipped.join("\n"))
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", skipped_path.display()));
+
     let mut src = String::new();
     src.push_str("pub static POSIX_TEST_FILES: &[(&str, &[u8])] = &[\n");
     let mut manifest_txt = String::new();
-    for (i, rel) in POSIX_TEST_PILOT_FILES.iter().enumerate() {
-        let source = interfaces_dir.join(rel);
-        println!("cargo:rerun-if-changed={}", source.display());
-        let out = bin_dir.join(rel.replace('/', "_"));
-        let load_addr = POSIX_TEST_LOAD_BASE + (i as u64) * POSIX_TEST_LOAD_STEP;
-        let status = Command::new(&musl_gcc)
-            .arg("-static")
-            .arg("-no-pie")
-            .arg(format!("-Wl,-Ttext-segment={load_addr:#x}"))
-            .arg("-I")
-            .arg(&include_dir)
-            .arg("-o")
-            .arg(&out)
-            .arg(&source)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run musl-gcc for posix pilot {rel}: {e}"));
-        if !status.success() {
-            panic!("building posix pilot test {rel} failed: {status}");
-        }
+    for (rel, out) in &built {
         src.push_str(&format!(
             "    (\"bin/{rel}\", include_bytes!({:?})),\n",
             out.display()
@@ -1707,7 +1398,7 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
 
     // `sigaltstack/9-1.c`'s own real assertion needs a genuine second process it `execl()`s into
     // to check that no alt stack survives `exec` -- the suite's own test tree ships this as a
-    // separate "-buildonly.c" companion file (excluded from `POSIX_TEST_PILOT_FILES` itself, like
+    // separate "-buildonly.c" companion file (excluded from `discover_posix_test_files` itself, like
     // every other "-buildonly.c" file, since it's not runnable as its own standalone assertion --
     // see this function's own doc comment above), built and referenced only by `9-1.c` via a
     // literal relative path copied verbatim from the upstream suite's own build-tree convention:
@@ -1716,7 +1407,9 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
     // under `/posix-tests/` like every other pilot binary. Kept in a second, separate generated
     // array (`POSIX_TEST_EXTRA_FILES`) seeded directly at oxfs's own root rather than folded into
     // `POSIX_TEST_FILES` above, which `modules/oxfs` seeds under `/posix-tests` specifically.
-    const SIGALTSTACK_9_BUILDONLY_LOAD_BASE: u64 = 0xa7a0000;
+    // +0x4000000 (was 0xa7a0000) alongside every other fixed userland/BusyBox/module address --
+    // see module::MODULE_VA_BASE's own doc comment.
+    const SIGALTSTACK_9_BUILDONLY_LOAD_BASE: u64 = 0xe7a0000;
     let sigaltstack_9_buildonly_c = interfaces_dir.join("sigaltstack/9-buildonly.c");
     println!(
         "cargo:rerun-if-changed={}",
@@ -2172,8 +1865,15 @@ fn write_fat32_image(
 /// already accepts elsewhere (e.g. `Cargo.toml`'s `test-success-exit-code` vs. `src/qemu.rs`'s
 /// `QemuExitCode`).
 const OXFS_BLOCK_SIZE: u64 = 4096;
-const OXFS_NUM_BLOCKS: u64 = 16384;
-const OXFS_MAX_INODES: u64 = 2048;
+// 16384 -> 65536 (64 -> 256 MiB) and 2048 -> 8192 inodes: the POSIX pilot corpus grew from a
+// 488-file curated dedup to the full ~1700-file suite (see `discover_posix_test_files`), each a
+// new inode plus its own data blocks, and ~104 previously-unseeded `pthread_*`/`aio_*`/
+// `lio_listio` directories add real new directory inodes too. Measured the new corpus's own
+// compiled-binary weight directly (~34 KiB average per pilot ELF over a 495-file sample) before
+// picking these -- generous headroom over the ~60 MiB the full corpus's own binaries alone need,
+// not a guess.
+const OXFS_NUM_BLOCKS: u64 = 65536;
+const OXFS_MAX_INODES: u64 = 8192;
 const OXFS_INODE_STRIDE: u64 = 128;
 /// 1 superblock + inode-table blocks (`OXFS_MAX_INODES` inodes at `OXFS_INODE_STRIDE` bytes each,
 /// rounded up to a whole block) + 1 block-used bitmap -- computed from the same real inputs

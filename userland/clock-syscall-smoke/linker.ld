@@ -1,6 +1,6 @@
-/* Load base 0xd000000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
- * established (... sig-syscall-smoke 0xcd00000, posix-conformance-driver 0xce00000,
- * rt-signal-syscall-smoke 0xcf00000 -- see userland/socketpair-syscall-smoke/linker.ld's own
+/* Load base 0x11000000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
+ * established (... sig-syscall-smoke 0x10d00000, posix-conformance-driver 0x10e00000,
+ * rt-signal-syscall-smoke 0x10f00000 -- see userland/socketpair-syscall-smoke/linker.ld's own
  * comment for the full "why this address" story). Re-derive via `readelf -l
  * target/x86_64-oxidebsd/debug/oxidebsd | grep -A1 LOAD` before trusting this if the kernel image
  * has grown meaningfully since this was picked -- confirmed clear as of this crate's own addition
@@ -15,7 +15,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xd000000;
+    . = 0x11000000;
 
     .text : {
         *(.text*)

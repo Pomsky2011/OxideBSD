@@ -1,7 +1,7 @@
-/* Load base 0xcf00000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
- * established (... posix-conformance-driver 0xce00000 -- see userland/socketpair-syscall-smoke/
+/* Load base 0x10f00000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
+ * established (... posix-conformance-driver 0x10e00000 -- see userland/socketpair-syscall-smoke/
  * linker.ld's own comment for the full "why this address" story). Deliberately *not* colliding
- * with build.rs's own POSIX_TEST_LOAD_BASE (also 0xcf00000, for the vendored Open POSIX Test Suite
+ * with build.rs's own POSIX_TEST_LOAD_BASE (also 0x10f00000, for the vendored Open POSIX Test Suite
  * pilot's host-compiled binaries) despite the shared address -- that range is only ever loaded via
  * a real fork+execve from a running `sh` inside a *different* boot (the posix-conformance-driver
  * scenario), never co-resident with this crate's own dedicated single-pid1-binary test boot. Still,
@@ -19,7 +19,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xcf00000;
+    . = 0x10f00000;
 
     .text : {
         *(.text*)

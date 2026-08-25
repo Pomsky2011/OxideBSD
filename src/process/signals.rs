@@ -680,7 +680,7 @@ pub fn do_sigaction(pid: Pid, sig: u64, act_ptr: u64, oldact_ptr: u64) -> Result
             mask: old.mask,
         };
         // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
-        unsafe { (oldact_ptr as *mut RawSigAction).write(raw) };
+        unsafe { (oldact_ptr as *mut RawSigAction).write_unaligned(raw) };
     }
     if act_ptr != 0 {
         // SAFETY: same known pointer-validation gap sys_read/sys_write already document.

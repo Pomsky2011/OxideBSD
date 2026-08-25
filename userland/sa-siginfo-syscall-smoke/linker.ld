@@ -1,9 +1,9 @@
-/* Load base 0xc200000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
- * established, right past dynlink-syscall-smoke's own 0xc100000 -- see
+/* Load base 0x10200000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
+ * established, right past dynlink-syscall-smoke's own 0x10100000 -- see
  * userland/socketpair-syscall-smoke/linker.ld's own comment for the full "why this address"
  * story. Re-derive via `readelf -l target/x86_64-oxidebsd/debug/oxidebsd | grep -A1 LOAD` before
  * trusting this if the kernel image has grown meaningfully since this was picked (currently tops
- * out well under 0x2000000, so 0xc200000 has enormous headroom).
+ * out well under 0x2000000, so 0x10200000 has enormous headroom).
  *
  * The explicit `ALIGN(0x1000)` before `.got`/`.data`/`.bss` below is load-bearing, not cosmetic --
  * this is the first userland crate in this codebase with real writable globals (the `AtomicBool`/
@@ -23,7 +23,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xc200000;
+    . = 0x10200000;
 
     .text : {
         *(.text*)

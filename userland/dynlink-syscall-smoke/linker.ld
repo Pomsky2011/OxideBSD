@@ -1,8 +1,8 @@
-/* Load base 0xc100000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
- * established (... tcc-syscall-smoke 0xbd00000, access-syscall-smoke 0xbe00000,
- * pipe-backpressure-syscall-smoke 0xbf00000 -- see userland/socketpair-syscall-smoke/linker.ld's
- * own comment for the full "why this address" story), stepped past 0xc000000 rather than
- * continuing directly from 0xbf00000 -- 0xc000000 is where build.rs's `build_musl_sysroot_shared`
+/* Load base 0x10100000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
+ * established (... tcc-syscall-smoke 0xfd00000, access-syscall-smoke 0xfe00000,
+ * pipe-backpressure-syscall-smoke 0xff00000 -- see userland/socketpair-syscall-smoke/linker.ld's
+ * own comment for the full "why this address" story), stepped past 0x10000000 rather than
+ * continuing directly from 0xff00000 -- 0x10000000 is where build.rs's `build_musl_sysroot_shared`
  * fixes the dynamic-linking milestone's own `libc.so`/interpreter, and this crate's own address
  * has no real reason to sit adjacent to it. Re-derive via
  * `readelf -l target/x86_64-oxidebsd/debug/oxidebsd | grep -A1 LOAD` before trusting this if the
@@ -13,7 +13,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xc100000;
+    . = 0x10100000;
 
     .text : {
         *(.text*)

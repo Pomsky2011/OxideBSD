@@ -31,9 +31,13 @@
 //! `BLOCK_SIZE / 4` pointers) -- max file size is bounded only by the block pool, not by an
 //! arbitrary per-file cap.
 //!
-//! **Directories are ordinary inodes** whose data blocks hold fixed 32-byte records
-//! (`{ used: u8, name_len: u8, inode: u32, name: [u8; NAME_MAX] }`, `NAME_MAX = 26`) --
-//! `RECORDS_PER_BLOCK = BLOCK_SIZE / 32 = 128` entries per block. A directory that fills its
+//! **Directories are ordinary inodes** whose data blocks hold fixed `DIR_RECORD_SIZE`-byte records
+//! (`{ used: u8, name_len: u8, inode: u32, name: [u8; NAME_MAX] }`, `NAME_MAX = 40`,
+//! `DIR_RECORD_SIZE = 6 + NAME_MAX = 46` -- raised from `26`/`32` once the full Open POSIX Test
+//! Suite corpus (see `build.rs`'s `discover_posix_test_files`) needed real directory names up to
+//! 32 bytes, e.g. `pthread_mutexattr_setprioceiling` -- found live as a real `module_init` panic,
+//! `dir_insert`'s own `InvalidPath` rejection) -- `RECORDS_PER_BLOCK = BLOCK_SIZE / 46 = 89`
+//! entries per block. A directory that fills its
 //! current blocks grows another one via the same `inode_ensure_block_at` every other file write
 //! uses, rather than failing outright the way FAT32's own `DirectoryFull` did. `unlink`/`rmdir`
 //! just clear a record's `used` byte -- the underlying inode/blocks are never freed, matching this
@@ -391,7 +395,7 @@ const BLOCK_SIZE: usize = 4096;
 /// existing BusyBox applet roster's own footprint -- the ~14 MiB of headroom left at 8192 blocks
 /// (32 MiB total, minus BusyBox's own ~18 MiB) wasn't enough. 16384 blocks (64 MiB) leaves real
 /// headroom again, not just enough to exactly fit.
-const NUM_BLOCKS: usize = 16384;
+const NUM_BLOCKS: usize = 65536;
 /// Raised from 64 alongside `NUM_BLOCKS` above, same reason -- ~300 applets plus root/`hello.txt`/
 /// `big.txt`/the self-check's own `/gdtest` fixtures need comfortably more than 64 inode slots.
 /// Raised again, 512 -> 1024, once TinyCC (`third_party/tinycc`, see CLAUDE.md's TinyCC section)
@@ -401,7 +405,13 @@ const NUM_BLOCKS: usize = 16384;
 /// the `tcc` binary itself is ~250 new inodes, overflowing the ~180 that were free at 512.
 /// Raised again, 1024 -> 2048, alongside `NUM_BLOCKS` above -- the expanded POSIX pilot corpus
 /// adds several hundred new files plus one subdirectory per interface under `/posix-tests/bin/`.
-const MAX_INODES: usize = 2048;
+/// Raised again, 2048 -> 8192 (`NUM_BLOCKS` 16384 -> 65536 alongside it), once the pilot expanded
+/// from a 488-file curated dedup to the full ~1700-file Open POSIX Test Suite corpus (see
+/// `build.rs`'s `discover_posix_test_files`) -- both this constant and `build.rs`'s own mirrored
+/// `OXFS_MAX_INODES`/`OXFS_NUM_BLOCKS` must be bumped together, or `mount_from_disk`'s own
+/// layout-version check (see "Real disk persistence" in CLAUDE.md) forces a reformat instead of a
+/// mount against any disk image already written with the old layout.
+const MAX_INODES: usize = 8192;
 const DIRECT_BLOCKS: usize = 12;
 const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
 /// Sentinel for "no block"/"no indirect block" -- block numbers are plain indices into `BLOCKS`
@@ -486,8 +496,13 @@ fn block_device_present() -> bool {
     unsafe { oxidebsd_block_device_present() != 0 }
 }
 
-const DIR_RECORD_SIZE: usize = 32;
-const NAME_MAX: usize = 26;
+// 26 -> 40 (`DIR_RECORD_SIZE` 32 -> 46 alongside it, `6 + NAME_MAX`): the full Open POSIX Test
+// Suite corpus (see `build.rs`'s `discover_posix_test_files`) seeds real directory names up to 32
+// bytes (`pthread_mutexattr_setprioceiling`/`pthread_mutexattr_getprioceiling`) -- found live as a
+// real `module_init` panic when the pilot corpus expanded past the old 488-file curated subset
+// (which happened to never include a name that long).
+const NAME_MAX: usize = 40;
+const DIR_RECORD_SIZE: usize = 6 + NAME_MAX;
 const RECORDS_PER_BLOCK: usize = BLOCK_SIZE / DIR_RECORD_SIZE;
 
 /// Synthetic `/proc/<pid>/{stat,cmdline,status}` content buffer -- comfortably covers any of the

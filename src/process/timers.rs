@@ -193,7 +193,7 @@ pub fn do_setitimer(pid: Pid, which: u64, new_ptr: u64, old_ptr: u64) -> Result<
         let (interval_sec, interval_usec) = ticks_to_timeval(proc.real_timer_interval_ticks);
         // SAFETY: same known pointer-validation gap as above, for a write this time.
         unsafe {
-            (old_ptr as *mut RawItimerval).write(RawItimerval {
+            (old_ptr as *mut RawItimerval).write_unaligned(RawItimerval {
                 it_interval_sec: interval_sec,
                 it_interval_usec: interval_usec,
                 it_value_sec: value_sec,
@@ -234,7 +234,7 @@ pub fn do_getitimer(pid: Pid, which: u64, old_ptr: u64) -> Result<u64, u64> {
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
     // already has.
     unsafe {
-        (old_ptr as *mut RawItimerval).write(RawItimerval {
+        (old_ptr as *mut RawItimerval).write_unaligned(RawItimerval {
             it_interval_sec: interval_sec,
             it_interval_usec: interval_usec,
             it_value_sec: value_sec,
@@ -511,7 +511,7 @@ pub fn do_timer_settime(
         let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);
         // SAFETY: same known pointer-validation gap as above, for a write this time.
         unsafe {
-            (old_ptr as *mut RawItimerspec).write(RawItimerspec {
+            (old_ptr as *mut RawItimerspec).write_unaligned(RawItimerspec {
                 it_interval_sec: interval_sec,
                 it_interval_nsec: interval_nsec,
                 it_value_sec: value_sec,
@@ -574,7 +574,7 @@ pub fn do_timer_gettime(pid: Pid, timerid: u64, val_ptr: u64) -> Result<u64, u64
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
     // already has.
     unsafe {
-        (val_ptr as *mut RawItimerspec).write(RawItimerspec {
+        (val_ptr as *mut RawItimerspec).write_unaligned(RawItimerspec {
             it_interval_sec: interval_sec,
             it_interval_nsec: interval_nsec,
             it_value_sec: value_sec,

@@ -2,7 +2,7 @@
 
 
 
-use crate::syscall::{EAGAIN, EINTR, EINVAL, EPERM, ETIMEDOUT};
+use crate::syscall::{EAGAIN, EFAULT, EINTR, EINVAL, EPERM, ETIMEDOUT};
 use super::*;
 
 /// musl's own `struct timespec` on x86_64 -- see `src/syscall/ffi.rs`'s/`src/process/timers.rs`'s
@@ -53,7 +53,7 @@ pub fn do_prlimit64(
         // SAFETY: same known pointer-validation gap every other user-memory write in this
         // codebase already has.
         unsafe {
-            (old_ptr as *mut RawRlimit).write(RawRlimit {
+            (old_ptr as *mut RawRlimit).write_unaligned(RawRlimit {
                 rlim_cur: cur,
                 rlim_max: max,
             })
@@ -340,9 +340,17 @@ pub fn do_sched_getparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u6
     }
     let sched_priority = proc.sched_priority;
     drop(table);
+    // Unlike `getrlimit`'s `old_limit`/`sigaction`'s `oldact`/etc., `param` is a required output
+    // parameter for real `sched_getparam(2)` -- a null pointer is a genuine usage error (`EFAULT`),
+    // not "caller doesn't want this back". See `EFAULT`'s own doc comment for why this needs an
+    // explicit check rather than just letting the write fault.
+    if param_ptr == 0 {
+        return Err(EFAULT);
+    }
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
-    // already has.
-    unsafe { (param_ptr as *mut RawSchedParam).write(RawSchedParam { sched_priority }) };
+    // already has -- null already ruled out above, a non-null-but-unmapped address still faults
+    // safely through the real ring-3 fault-to-signal path.
+    unsafe { (param_ptr as *mut RawSchedParam).write_unaligned(RawSchedParam { sched_priority }) };
     Ok(0)
 }
 
@@ -359,10 +367,15 @@ pub fn do_sched_rr_get_interval(caller_pid: Pid, pid: i64, ts_ptr: u64) -> Resul
     let _target = resolve_target_pid(caller_pid, pid)?;
     let nsec = 1_000_000_000u64 * crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS
         / crate::cpu::pit::TIMER_HZ as u64;
+    // `tp` is a required output parameter for real `sched_rr_get_interval(2)`, same reasoning as
+    // `do_sched_getparam`'s own `EFAULT` check above.
+    if ts_ptr == 0 {
+        return Err(EFAULT);
+    }
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
-    // already has.
+    // already has -- null already ruled out above.
     unsafe {
-        (ts_ptr as *mut RawTimespecForSchedRr).write(RawTimespecForSchedRr {
+        (ts_ptr as *mut RawTimespecForSchedRr).write_unaligned(RawTimespecForSchedRr {
             tv_sec: 0,
             tv_nsec: nsec as i64,
         })

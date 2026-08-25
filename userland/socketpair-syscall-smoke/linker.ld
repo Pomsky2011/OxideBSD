@@ -1,6 +1,6 @@
-/* Load base 0xb000000: well clear of every existing fixed userland base (stsh 0x4000000,
- * fork-exec-smoke 0x4040000, ring3-smoke 0x4080000, musl-smoke 0x40c0000) and of the entire
- * BusyBox applet range (0x4100000-0xa200000, see build.rs's BUSYBOX_APPLETS/_PASS2 lists), while
+/* Load base 0xf000000: well clear of every existing fixed userland base (stsh 0x8000000,
+ * fork-exec-smoke 0x8040000, ring3-smoke 0x8080000, musl-smoke 0x80c0000) and of the entire
+ * BusyBox applet range (0x8100000-0xe200000, see build.rs's BUSYBOX_APPLETS/_PASS2 lists), while
  * staying well below MODULE_VA_BASE (0x10000000) -- see src/address_space.rs and CLAUDE.md's
  * "User-mode execution" section for why these ranges matter (a new address space shallow-copies
  * the kernel's own page tables, so this binary's segments must not collide with anything mapped
@@ -10,7 +10,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xb000000;
+    . = 0xf000000;
 
     .text : {
         *(.text*)

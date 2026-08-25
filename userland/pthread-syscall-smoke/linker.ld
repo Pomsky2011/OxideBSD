@@ -1,5 +1,5 @@
-/* Load base 0xE300000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
- * established (... mmap-syscall-smoke 0xE100000, clone-syscall-smoke 0xE200000, the current
+/* Load base 0x12300000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL smoke tests
+ * established (... mmap-syscall-smoke 0x12100000, clone-syscall-smoke 0x12200000, the current
  * highest -- see userland/socketpair-syscall-smoke/linker.ld's own comment for the full "why this
  * address" story). Re-derive via `readelf -l target/x86_64-oxidebsd/debug/oxidebsd | grep -A1
  * LOAD` before trusting this if the kernel image has grown meaningfully since this was picked.
@@ -14,7 +14,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xE300000;
+    . = 0x12300000;
 
     .text : {
         *(.text*)

@@ -88,6 +88,19 @@ use crate::process::RawSiginfo;
 pub(crate) const EBADF: u64 = 9;
 pub(crate) const EINVAL: u64 = 22;
 pub(crate) const ENOSYS: u64 = 38;
+/// Identical on Linux and the BSDs. This codebase's usual convention for a bad user pointer is to
+/// let the real dereference page-fault and go through the real ring-3 fault-to-signal path (see
+/// CLAUDE.md's "Real ring-3 fault-to-signal delivery" section) rather than pre-validate — but a
+/// handler whose own output pointer is *required*, not optional (unlike `getrlimit`'s `old_limit`/
+/// `sigaction`'s `oldact`/etc., which already treat a null pointer as "caller doesn't want this
+/// back" and simply skip the write), needs a real, explicit check first: found live via
+/// `sched_getparam/speculative/7-1.c`'s deliberate null `param` — Rust's own debug-mode UB check on
+/// `ptr::write_unaligned` intercepts a null destination *before* the write ever reaches real
+/// hardware (only the alignment half of its precondition is waived, not the non-null half),
+/// panicking the whole kernel instead of the intended "the one offending process page-faults" —
+/// this constant exists so those specific call sites can return a real `EFAULT` instead of ever
+/// attempting the write.
+pub(crate) const EFAULT: u64 = 14;
 pub(crate) const ECHILD: u64 = 10;
 pub(crate) const ENOEXEC: u64 = 8;
 pub(crate) const ENOMEM: u64 = 12;

@@ -1,11 +1,11 @@
-/* Load base 0xb200000 -- see userland/socketpair-syscall-smoke/linker.ld's own comment for the
+/* Load base 0xf200000 -- see userland/socketpair-syscall-smoke/linker.ld's own comment for the
  * full "why this address" story; each real-SYSCALL network smoke test gets its own base, stepped
  * by 0x100000 from there. */
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xb200000;
+    . = 0xf200000;
 
     .text : {
         *(.text*)

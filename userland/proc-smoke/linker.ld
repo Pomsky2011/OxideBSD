@@ -1,13 +1,13 @@
-/* Load base 0xb500000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL network smoke
- * tests established (socketpair 0xb000000, ping 0xb100000, udp 0xb200000, poll 0xb300000, tcp
- * 0xb400000 -- see userland/socketpair-syscall-smoke/linker.ld's own comment for the full "why
+/* Load base 0xf500000 -- next in the stepped-by-0x100000 sequence the real-SYSCALL network smoke
+ * tests established (socketpair 0xf000000, ping 0xf100000, udp 0xf200000, poll 0xf300000, tcp
+ * 0xf400000 -- see userland/socketpair-syscall-smoke/linker.ld's own comment for the full "why
  * this address" story). Re-derive via `readelf -l target/x86_64-oxidebsd/debug/oxidebsd | grep -A1
  * LOAD` before trusting this if the kernel image has grown meaningfully since this was picked. */
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xb500000;
+    . = 0xf500000;
 
     .text : {
         *(.text*)

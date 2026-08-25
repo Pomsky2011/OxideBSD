@@ -807,11 +807,11 @@ const MAX_SHEBANG_DEPTH: u32 = 4;
 /// Real, kernel-chosen runtime base for a `PT_INTERP` interpreter, added as `elf::load`'s `bias`
 /// parameter (see that function's own doc comment for why this must be a real additive bias, not
 /// a link-time-fixed address the interpreter file itself assumes). Clear of every existing fixed
-/// userland load base (`0x4000000`-`0xbf00000`, see every `userland/*/linker.ld`) and of
-/// `module::MODULE_VA_BASE`/`BRK_REGION_CEILING` (`0x10000000`) -- picked once, reused for every
+/// userland load base (`0x8000000`-`0xff00000`, see every `userland/*/linker.ld`) and of
+/// `module::MODULE_VA_BASE`/`BRK_REGION_CEILING` (`0x20000000`) -- picked once, reused for every
 /// `PT_INTERP` load rather than per-binary, since nothing here needs more than one interpreter
 /// image loaded at a time.
-const INTERP_LOAD_BASE: u64 = 0xc000000;
+const INTERP_LOAD_BASE: u64 = 0x10000000; // was 0xc000000; +0x4000000, see module::MODULE_VA_BASE's own doc comment
 
 pub fn do_execve(
     caller_pid: Pid,

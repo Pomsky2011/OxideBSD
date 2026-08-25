@@ -71,7 +71,13 @@ const PAGE_SIZE: u64 = 4096;
 /// simple absolute or PC-relative 32-bit write. Those don't just prefer small addresses, they
 /// silently corrupt if a resolved address doesn't actually fit -- `apply_relocation` below
 /// validates every truncating write and errors loudly rather than trust the range implicitly.
-const MODULE_VA_BASE: u64 = 0x_1000_0000;
+// 0x10000000 -> 0x20000000: the whole low-VA userland/BusyBox/tcc/POSIX-pilot fixed-address
+// family below this (`0x4000000`-`0xE300000` at the time of this change) shifted up by
+// `+0x4000000` once the kernel's own image grew past it (see `userland/ring3-smoke/linker.ld`'s
+// own doc comment for the full "why" and how to re-derive this again) -- moved further still, not
+// just enough to clear that one collision, so the new gap between the top of that family and this
+// ceiling has real headroom for the next few rounds of growth too.
+const MODULE_VA_BASE: u64 = 0x_2000_0000;
 const MODULE_REGION_CEILING: u64 = 0x_8000_0000;
 
 static NEXT_MODULE_PAGE: Mutex<u64> = Mutex::new(MODULE_VA_BASE);

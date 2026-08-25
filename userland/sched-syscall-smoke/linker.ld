@@ -1,12 +1,12 @@
-/* Load base 0xd100000 -- next in the stepped-by-0x100000 sequence, right after
- * userland/clock-syscall-smoke/linker.ld's own 0xd000000 (see that file's own comment for the full
+/* Load base 0x11100000 -- next in the stepped-by-0x100000 sequence, right after
+ * userland/clock-syscall-smoke/linker.ld's own 0x11000000 (see that file's own comment for the full
  * "why this address" story). Confirmed clear as of this crate's own addition (kernel's own highest
  * LOAD segment currently ends well under 0x3000000). */
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0xd100000;
+    . = 0x11100000;
 
     .text : {
         *(.text*)

@@ -20,16 +20,19 @@
  * exercising this path via `stsh`'s `execve` support; then 0x800000, which was clear of *that* but
  * got swallowed by the kernel's own growth in turn (confirmed live: `hush`, at a different but
  * similarly low fixed address, started failing to spawn as pid 1 with exactly this error once
- * `modules/oxfs`'s roster grew). 0x4080000 (64 MiB + 0x80000) leaves close to 3x headroom over the
- * kernel's *current* size, not just barely enough -- re-derive this by hand (`readelf -l
- * target/x86_64-oxidebsd/debug/oxidebsd | grep -A1 LOAD`, highest `VirtAddr + MemSiz`) before
- * adding anything with a fixed load address below this floor. Confirmed clear the same way
- * `stsh`'s own 0x4000000 and `fork-exec-smoke`'s 0x4040000 already are. */
+ * `modules/oxfs`'s roster grew), then 0x4080000 (64 MiB + 0x80000), which got swallowed the same
+ * way again once the POSIX conformance pilot's own full-corpus expansion (see `build.rs`'s
+ * `discover_posix_test_files`) roughly doubled the kernel image's own embedded content again.
+ * 0x8080000 (128 MiB + 0x80000) leaves real headroom over the kernel's *current* size, not just
+ * barely enough -- re-derive this by hand (`readelf -l target/x86_64-oxidebsd/debug/oxidebsd |
+ * grep -A1 LOAD`, highest `VirtAddr + MemSiz`) before adding anything with a fixed load address
+ * below this floor. Confirmed clear the same way `stsh`'s own 0x8000000 and
+ * `fork-exec-smoke`'s 0x8040000 already are. */
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x4080000;
+    . = 0x8080000;
 
     .text : {
         *(.text*)
