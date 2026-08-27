@@ -129,6 +129,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         signal_stack: Vec::new(),
         altstack: AltStack::default(),
         on_altstack: false,
+        // Not inherited -- see Process::preempted_resume's own doc comment.
+        preempted_resume: None,
         priority: 0,
         pgid,
         sid: pid,
@@ -371,6 +373,8 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         altstack: parent_altstack,
         // Not inherited -- see Process::on_altstack's own doc comment.
         on_altstack: false,
+        // Not inherited -- see Process::preempted_resume's own doc comment.
+        preempted_resume: None,
         priority: 0,
         pgid: parent_pgid,
         sid: parent_sid,
@@ -598,6 +602,8 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         altstack: parent_altstack,
         // Not inherited -- see Process::on_altstack's own doc comment.
         on_altstack: false,
+        // Not inherited -- see Process::preempted_resume's own doc comment.
+        preempted_resume: None,
         priority: 0,
         pgid: parent_pgid,
         sid: parent_sid,

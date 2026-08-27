@@ -33,6 +33,24 @@
 //! *something* deliverable -- worst case, default-`Terminate` disposition, which calls
 //! `process::do_exit` and never returns to `syscall_return_tail` at all), so actually reaching it
 //! is a real bug worth a hard stop, not a silent spin.
+//!
+//! **A real, second consumer since `interrupts::timer_interrupt_handler` gained its own redirect
+//! into this same page** (see `Process::preempted_resume`'s own doc comment): that path, unlike
+//! the page-fault one, genuinely needs the interrupted instruction to resume *transparently* --
+//! but `mov eax, SYS_FAULT_PUMP` unavoidably clobbers the live, real `RAX` the interrupted code was
+//! relying on (the `SYSCALL` ABI leaves no other register to carry the syscall number in, and
+//! `timer_interrupt_handler`'s own `extern "x86-interrupt"` entry has no Rust-visible GPR fields to
+//! save it from beforehand -- the exact same limitation this module's own doc comment above already
+//! explains for why this trampoline exists at all). Found live: an earlier version of this redirect
+//! didn't account for this, and a stray default-disposition signal (e.g. `SIGCHLD`) landing on
+//! `hush` mid-instruction silently stomped a live computation's `RAX`, corrupting real control flow
+//! with no crash to point at it. Fixed by having the trampoline itself stash the real `RAX` to
+//! `RAX_SCRATCH_OFFSET` (via `MOV moffs64, RAX`, before it's clobbered) -- `syscall_dispatch`'s own
+//! `SYS_FAULT_PUMP` handling reads it back and restores `frame.rax` right alongside `rcx`/`user_rsp`/
+//! `r11`, but only when `Process::preempted_resume` was actually `Some` (the ordinary page-fault
+//! case has no real prior `RAX` worth preserving and leaves the scratch slot unread). Runs
+//! unconditionally regardless of which path redirected here -- one store is cheap, and branching
+//! inside a 4-instruction trampoline to skip it buys nothing.
 
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
@@ -46,13 +64,20 @@ use crate::memory::with_frame_allocator;
 /// `lifecycle::INTERP_LOAD_BASE`, `fs::sysv_shm::SHM_REGION_BASE`).
 pub const FAULT_TRAMPOLINE_VA: u64 = 0x_1FFF_FFFF_F000;
 
+/// Offset within the trampoline's own page where the real, pre-clobber `RAX` is stashed -- well
+/// past the ~19 bytes of real code, arbitrary otherwise (nothing else ever lives on this page).
+/// One frame per address space (see `map`'s own doc comment on why this page is never shared
+/// across processes), so no cross-process race is possible; single-core, so no cross-thread one
+/// either.
+pub const RAX_SCRATCH_OFFSET: u64 = 0x100;
+
 /// Maps `FAULT_TRAMPOLINE_VA` into `mapper`'s own (not-yet-active) address space with real
-/// `mov eax, SYS_FAULT_PUMP; syscall; ud2` bytes -- called once per fresh address space
-/// (`process::spawn` at boot, `do_execve` on every exec; a forked child gets its own copy for free,
-/// same as every other user page, via `AddressSpace::fork`'s existing full eager copy of
-/// `USER_ACCESSIBLE` content). Not `WRITABLE` -- this kernel has no W^X enforcement anywhere (see
-/// CLAUDE.md's own note on `elf::load`), but there's no reason for this one page to need it
-/// regardless.
+/// `mov [FAULT_TRAMPOLINE_VA + RAX_SCRATCH_OFFSET], rax; mov eax, SYS_FAULT_PUMP; syscall; ud2`
+/// bytes -- called once per fresh address space (`process::spawn` at boot, `do_execve` on every
+/// exec; a forked child gets its own copy for free, same as every other user page, via
+/// `AddressSpace::fork`'s existing full eager copy of `USER_ACCESSIBLE` content). **Now real
+/// `WRITABLE`** -- the leading `RAX`-stashing store needs it (this kernel has no W^X enforcement
+/// anywhere regardless, see CLAUDE.md's own note on `elf::load`, so this costs nothing).
 pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) {
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(FAULT_TRAMPOLINE_VA));
     with_frame_allocator(|fa| {
@@ -66,7 +91,9 @@ pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) {
                 .map_to(
                     page,
                     frame,
-                    PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE,
                     fa,
                 )
                 .expect("failed to map the fault trampoline page")
@@ -74,8 +101,13 @@ pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) {
         }
         let frame_ptr = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
         let imm = (crate::syscall::SYS_FAULT_PUMP as u32).to_le_bytes();
+        let scratch_addr = (FAULT_TRAMPOLINE_VA + RAX_SCRATCH_OFFSET).to_le_bytes();
         #[rustfmt::skip]
-        let code: [u8; 9] = [
+        let code: [u8; 19] = [
+            0x48, 0xA3, scratch_addr[0], scratch_addr[1], scratch_addr[2], scratch_addr[3],
+                        scratch_addr[4], scratch_addr[5], scratch_addr[6], scratch_addr[7],
+                                              // mov [RAX_SCRATCH_OFFSET], rax -- see this
+                                              // module's own doc comment
             0xB8, imm[0], imm[1], imm[2], imm[3], // mov eax, imm32
             0x0F, 0x05,                           // syscall
             0x0F, 0x0B,                           // ud2 -- see this module's own doc comment

@@ -1035,14 +1035,12 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // `[diag] table_len=` print to `timer_interrupt_handler` to check whether the process table
     // growing across the run is the real cause before investigating further).
     "fork/8-1.c",
-    // `pthread_atfork/3-3.c`: real fork+pthread_atfork+SIGUSR1/SIGUSR2 interaction, hung several
-    // real minutes with low CPU (blocked, not spinning) and no `t0`-rescued TIMEOUT -- confirmed
-    // it does *not* block SIGALRM (only `SIGUSR1`/`SIGUSR2` via `pthread_sigmask`), so this is a
-    // distinct bug from the other entries here, not the same known SIGALRM-blocking hazard class.
-    // Landed alongside a real, correlated finding: the `[diag]` process-table-size print jumped
-    // from a stable 3-4 to a stable-but-elevated 16 right around when `pthread_atfork` tests
-    // started -- some real fork+thread child isn't being fully reaped. Worth its own dedicated
-    // investigation session with live kernel introspection, not blind static reading.
+    // `pthread_atfork/3-3.c`: **FIXED**, no longer hangs -- root cause was `kill(getpid(), sig)`'s
+    // real thread-group-wide delivery (see `process::signals::resolve_signal_recipient`/
+    // `route_signal_target`'s own doc comments). Not removed from this list's *effect*, since it's
+    // still swept up by the wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix exclusion just below
+    // regardless of whether it's named here -- kept only as a historical marker of what was
+    // confirmed fixed, not a live exclusion in its own right.
     "pthread_atfork/3-3.c",
     // `pthread_attr_destroy/1-1.c`: calls `pthread_attr_destroy()` then reuses the destroyed attr
     // in a real `pthread_create()` call (deliberately testing garbage-in-garbage-out behavior).
@@ -1075,17 +1073,30 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     "sem_unlink/2-2.c",
     "sem_unlink/3-1.c",
     "sem_wait/7-1.c",
-    // `sigwait/6-1.c`/`6-2.c`: real `pthread_create()`-backed multiple-threads-block-in-sigwait
-    // scenario, hung with sustained ~26-30% CPU for 10+ real minutes past sigwait/3-1.c -- same
-    // broken real-threading territory as the `pthread_*`/`aio_*` wholesale exclusion above, just
-    // not living under a `pthread_*`-named directory so that filter missed it. Confirms the
-    // underlying issue is about *how* `pthread_create` gets used, not the directory name -- a
-    // broad audit (`grep -l pthread_create` across every non-`pthread_*`/`aio_*` file) found 49
-    // matches total; all but these two had *already* run clean (PASS/FAIL/UNSUPPORTED, no hang) by
-    // the time this was checked, so only this specific real-multi-thread-plus-signal-wait shape
-    // seems to trigger it, not `pthread_create` usage in general.
-    "sigwait/6-1.c",
-    "sigwait/6-2.c",
+    // `sigwait/6-1.c`/`6-2.c`: **FIXED**, both confirmed PASS via isolated canary runs -- two real,
+    // independent bugs in `process::signals::resolve_signal_recipient` (a real thread-group-wide
+    // `kill(getpid(), sig)`/`sigqueue` re-router added to fix `pthread_atfork/3-3.c` above), not a
+    // "broken real-threading" gap at all:
+    // (1) its fallback preferred the literal thread-group *leader* when no sibling had reached its
+    //     own `sigwait()` call yet (a real, unavoidable race any of these tests can hit -- create
+    //     several threads, then immediately signal, with no synchronization guaranteeing any of
+    //     them have actually run) -- since the leader itself never calls `sigwait()`, the signal
+    //     sat pending-but-blocked on it forever. Fixed by preferring any *other* live group member
+    //     as the fallback instead, relying on `do_sigtimedwait`'s own real check-before-block loop
+    //     to consume it correctly once that sibling actually reaches `sigwait()` (`6-1.c`, which
+    //     uses `kill(getpid(), SIGUSR1)`).
+    // (2) the re-router applied unconditionally to *every* `kill`/`sigqueue` call, including a real
+    //     `pthread_kill(exact_thread, sig)` -- this ABI has no separate `tkill`/`tgkill` number, so
+    //     that call reaches the exact same code as a real process-directed `kill()`, but must
+    //     target *precisely* the named thread, never substituted. Fixed via `route_signal_target`,
+    //     gating the whole-group reroute to only fire when the literal target names its own
+    //     group's leader (real `kill(pid,...)`'s `pid` always does; a `pthread_kill`-shaped target
+    //     naming a non-leader thread never should be rerouted) (`6-2.c`, which uses
+    //     `pthread_kill(ch[0], SIGUSR1)`).
+    // Removed from this list entirely (unlike `pthread_atfork/3-3.c` just above, which stays as a
+    // historical marker only because the wholesale prefix filter below still catches it
+    // regardless) -- neither file lives under a `pthread_*`/`aio_*`/`lio_listio*` prefix, so
+    // removing them here is what actually re-includes them in a real full-corpus run.
 ];
 
 /// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
@@ -1140,6 +1151,24 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     }
     let mut out = Vec::new();
     walk(interfaces_dir, interfaces_dir, &mut out);
+    // TEMPORARY validation hook: `POSIX_PILOT_CANARY_ONLY=1` shrinks the whole discovered corpus
+    // down to a handful of specific known-hang files (see `POSIX_KNOWN_HANGS`'s own doc comment)
+    // so a candidate real-threading-signal fix can be checked end to end in minutes instead of
+    // rebuilding/booting the full ~1200-file corpus. Not wired into any normal build -- remove
+    // once the underlying fix is validated and landed for real.
+    if std::env::var("POSIX_PILOT_CANARY_ONLY").is_ok() {
+        const CANARY: &[&str] = &[
+            "sigwait/6-1.c",
+            "sigwait/6-2.c",
+            "pthread_atfork/3-3.c",
+            "pthread_attr_destroy/1-1.c",
+            "pthread_attr_init/2-1.c",
+            "fork/11-1.c",
+        ];
+        out.retain(|rel| CANARY.contains(&rel.as_str()));
+        out.sort();
+        return out;
+    }
     out.retain(|rel| !POSIX_KNOWN_HANGS.contains(&rel.as_str()));
     // Real, live-found reliability problem, not a static guess: individually excluding
     // `POSIX_KNOWN_HANGS` one file at a time surfaced a *vanilla* `pthread_create()` +

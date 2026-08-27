@@ -488,6 +488,40 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // exactly what `deliver_pending_signal` finds and acts on; nothing else about this "syscall"
     // needs to happen at all.
     if frame.rax == SYS_FAULT_PUMP {
+        // Real `interrupts::timer_interrupt_handler` redirect (see `Process::preempted_resume`'s
+        // own doc comment): unlike the page-fault-triggered redirect (where the faulting
+        // instruction is never meant to transparently resume), this frame's own `rcx`/`r11`/
+        // `user_rsp` right now describe the *trampoline's* own internal `syscall` instruction, not
+        // the real point execution should continue from once `deliver_pending_signal` is done
+        // (whether that's "no handler, just resume" or "handler installed, resume here after
+        // `sigreturn`"). Overwrite them with the real stashed values first, so everything below
+        // this point -- entirely unaware of *why* it was invoked -- treats this exactly like an
+        // ordinary syscall genuinely issued from that real point. A `None` here (the ordinary
+        // page-fault case) leaves the frame exactly as the trampoline set it, unchanged.
+        if let Some((rip, rsp, rflags)) = crate::process::table()
+            .lock()
+            .get_mut(&crate::process::scheduler::current_pid())
+            .and_then(|p| p.preempted_resume.take())
+        {
+            frame.rcx = rip;
+            frame.user_rsp = rsp;
+            frame.r11 = rflags;
+            // Real, live-found bug: the trampoline's own `mov eax, SYS_FAULT_PUMP` unavoidably
+            // clobbers the interrupted code's real `RAX` before this frame was even captured --
+            // harmless for the ordinary page-fault redirect (nothing meaningful ever resumes a
+            // faulting instruction transparently), fatal here (a stray default-disposition signal
+            // corrupting a live computation's `RAX` with no crash to point at it -- see
+            // `fault_trampoline`'s own doc comment). The trampoline stashes the real value at
+            // `RAX_SCRATCH_OFFSET` before clobbering it specifically so it can be restored here.
+            // SAFETY: this address is mapped `PRESENT | WRITABLE` in every process's own address
+            // space (`fault_trampoline::map`), and `syscall_dispatch` runs with the interrupted
+            // process's own page tables still active (`SYSCALL` never switches `CR3`).
+            frame.rax = unsafe {
+                *((crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA
+                    + crate::process::fault_trampoline::RAX_SCRATCH_OFFSET)
+                    as *const u64)
+            };
+        }
         deliver_pending_signal(frame);
         return;
     }

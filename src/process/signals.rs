@@ -20,6 +20,94 @@ fn has_signal_permission(caller_uid: u32, target_uid: u32) -> bool {
     caller_uid == 0 || caller_uid == target_uid
 }
 
+/// Real POSIX thread-aware recipient selection for a process-directed `kill(pid, sig)` (or a
+/// self-directed `kill(getpid(), sig)`) -- `pid` here is always a thread-group id in real POSIX
+/// terms (this kernel's `Process::tgid`, always numerically equal to the group leader's own raw
+/// pid), but `PROCESS_TABLE` is keyed by real per-thread pid, so a plain `table.get(&pid)` only
+/// ever reaches the literal leader thread's own entry. Real `kill(2)` semantics instead require
+/// the signal be deliverable to *any* live thread in the group, in this preference order: (1) a
+/// thread already blocked in `sigwait`/`sigtimedwait` on exactly this signal -- real POSIX
+/// requires favoring an active waiter so the signal isn't left queued while a thread is sitting
+/// there specifically asking for it; (2) any live thread that doesn't currently block this signal
+/// in its own per-thread mask (real "immediately deliverable" semantics -- a signal blocked by
+/// every thread in the group must still land *somewhere* so it becomes deliverable the moment any
+/// one of them unblocks it, matching real Linux's single pending set shared across a thread
+/// group); (3) the literal `pid` entry itself as a last resort (every thread blocks it, or the
+/// group has exactly one live member -- the ordinary single-threaded case, unchanged from before
+/// this function existed). Returns `None` only if `pid` names no process at all, or every member
+/// of its group is a reaped/zombied dead end -- callers already have their own `ESRCH`/`Ok(0)`
+/// handling for that, unchanged.
+fn resolve_signal_recipient(table: &BTreeMap<Pid, Box<Process>>, pid: Pid, sig: u64) -> Option<Pid> {
+    let tgid = table.get(&pid)?.tgid;
+    let mut fallback = None;
+    // Real, live-found bug (via a per-process-state diagnostic dump, not static reading):
+    // `fallback` alone silently preferred the literal `pid` -- for a `kill(getpid(), sig)`
+    // self-directed call (`sigwait/6-1.c`'s own exact shape: create several sigwait-ing sibling
+    // threads, then immediately self-`kill`), `table.iter()`'s ascending-pid order always reaches
+    // the thread-group *leader* (the smallest pid, `pid` itself) before any sibling -- so if not
+    // one single sibling has reached its own `sigwait()` call yet (a real, unavoidable race: this
+    // test creates all 5 threads and signals immediately, with no synchronization guaranteeing any
+    // of them have actually run), `fallback` landed on `pid` itself. That's a real, permanent
+    // dead end: the leader isn't itself sigwaiting and never will be, so the pending bit (blocked
+    // by its own inherited mask) sat there forever, and every sibling's later real `sigwait()`
+    // call found nothing pending and blocked -- forever, since nothing ever signals the group
+    // again once the leader's own post-`kill()` assertion fails and it exits. Fixed by preferring
+    // *any other* live group member over the literal target as the last-resort fallback --
+    // `do_sigtimedwait`'s own real check-before-block loop (see its own doc comment) means a
+    // pending bit landing on a sibling that hasn't reached `sigwait()` yet is still correctly
+    // consumed the instant it does, resolving the race for real rather than requiring one exact
+    // scheduling order. Only actually falls through to the literal `pid` when it is genuinely the
+    // sole live member of its own group -- the ordinary single-threaded case, unchanged.
+    let mut fallback_other = None;
+    let mut unblocked = None;
+    for (&candidate_pid, proc) in table.iter() {
+        if proc.tgid != tgid || matches!(proc.state, ProcState::Zombie(_)) {
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some(candidate_pid);
+        }
+        if fallback_other.is_none() && candidate_pid != pid {
+            fallback_other = Some(candidate_pid);
+        }
+        if let ProcState::Blocked(BlockReason::WaitingForSpecificSignal(wait_set, _)) = proc.state
+            && wait_set & (1 << (sig - 1)) != 0
+        {
+            return Some(candidate_pid); // best possible match -- stop scanning
+        }
+        if unblocked.is_none() && proc.blocked_signals & (1 << (sig - 1)) == 0 {
+            unblocked = Some(candidate_pid);
+        }
+    }
+    unblocked.or(fallback_other).or(fallback)
+}
+
+/// Gates `resolve_signal_recipient`'s whole-group reroute to genuinely *process*-directed
+/// targets only -- real, live-found bug: this ABI has no separate `tkill`/`tgkill` number (musl's
+/// `pthread_kill()` on this fork reuses plain `kill()` directly, see this codebase's own musl-port
+/// conventions), so `do_kill`/`do_sigqueue` see the exact same shape for both a real
+/// `kill(getpid(), sig)` (must reach *any* group member) and a real `pthread_kill(thread, sig)`
+/// (must reach *exactly* that one named thread, never substituted). The two are only
+/// distinguishable by what `target` actually names: real `kill(pid, sig)`'s `pid` is always the
+/// calling process's own pid, which by definition equals its thread group's own leader tid
+/// (`Process::tgid`); a `pthread_kill`-shaped call can (and, for any non-leader thread, must) name
+/// a raw tid that is *not* its own group's leader. Found live via `sigwait/6-2.c`: its
+/// `pthread_kill(ch[0], SIGUSR1)` targets one specific, not-yet-`sigwait`-ing sibling thread by
+/// its exact tid -- `resolve_signal_recipient`'s own group-wide reroute, applied unconditionally,
+/// silently redirected that signal onto some *other* group member instead (the same "landed on
+/// the leader, sat pending-but-blocked forever" dead end `sigwait/6-1.c` was fixed for), since
+/// `ch[0]` itself hadn't reached `sigwait()` yet at call time. Only reroute when `target` names its
+/// own group's literal leader -- a non-leader target is unambiguously an exact single-thread
+/// target and must be delivered to precisely that pid, unchanged.
+fn route_signal_target(table: &BTreeMap<Pid, Box<Process>>, target: Pid, sig: u64) -> Pid {
+    match table.get(&target) {
+        Some(proc) if proc.tgid == target => {
+            resolve_signal_recipient(table, target, sig).unwrap_or(target)
+        }
+        _ => target,
+    }
+}
+
 /// `SYS_KILL`'s real logic. Signals `1..=31` (standard) or `SIGRTMIN..=SIGRTMAX` (real-time) only;
 /// anything else is `EINVAL`, matching real `kill()`'s own validation. Real permission checking now
 /// exists (`has_signal_permission`) for the single-target case -- `target_pid == 0`/`< 0` are
@@ -113,6 +201,26 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         };
     }
     let sig = sig as u64;
+
+    // Real POSIX: a process-directed `kill(pid, sig)` must be deliverable to ANY thread sharing
+    // `target`'s own thread group, not hardcoded to the literal `PROCESS_TABLE` entry `target`
+    // names -- which, because `tgid` is always the thread-group *leader*'s own raw pid (see
+    // `Process::tgid`'s own doc comment), silently meant "only the leader thread" before this fix.
+    // Found live chasing `sigwait/6-1.c`/`pthread_atfork/3-3.c`'s real hangs (see
+    // `POSIX_KNOWN_HANGS` in build.rs): both call `kill(getpid(), SIGUSR1)` expecting delivery to
+    // some *other*, already-`sigwait`-blocked or non-blocking thread, but every prior build routed
+    // it straight back to the calling/leader thread's own entry, where it sat permanently pending
+    // (blocked by that thread's own mask) since nothing else ever consumed it. See
+    // `resolve_signal_recipient`'s own doc comment for the real POSIX preference order. Must run
+    // *before* the `target == caller_pid` fast path below -- a multi-threaded caller signaling its
+    // own `getpid()` needs the same real re-routing, not just the cross-process branch further
+    // down. A single-threaded target's own group has exactly one live member (itself), so this is
+    // a no-op there -- zero behavior change for the overwhelming majority of already-passing
+    // single-threaded tests.
+    let target = {
+        let table = PROCESS_TABLE.lock();
+        route_signal_target(&table, target, sig)
+    };
 
     if target == caller_pid {
         let mut table = PROCESS_TABLE.lock();
@@ -1117,6 +1225,14 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
     // already has; si_value sits at byte offset 24 in musl's own siginfo_t, matching RawSiginfo's
     // field layout exactly (see this function's own doc comment).
     let value = unsafe { *((siginfo_ptr + 24) as *const u64) };
+
+    // Same real thread-aware re-routing `do_kill` needed -- see `resolve_signal_recipient`'s own
+    // doc comment. `target_pid` is real POSIX's own thread-group id, not necessarily the literal
+    // leader thread that should end up consuming it.
+    let target = {
+        let table = PROCESS_TABLE.lock();
+        route_signal_target(&table, target, sig)
+    };
 
     if target == caller_pid {
         let mut table = PROCESS_TABLE.lock();

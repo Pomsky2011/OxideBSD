@@ -314,7 +314,7 @@ pub(crate) const PREEMPT_QUANTUM_TICKS: u64 = 4;
 /// is sent, the PIC still considers IRQ0 "in service" and won't deliver *any* further timer
 /// interrupt to anyone — which would freeze not just future preemption but every other
 /// `ticks()`-gated wakeup in this file (sleepers, POSIX timers, `SIGALRM`, ...) for good.
-extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStackFrame) {
     let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Wake any process blocked in `process::do_nanosleep` (`BlockReason::Sleeping`) whose deadline
@@ -334,6 +334,23 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         // the other.
         if now % 1000 == 0 {
             crate::serial_println!("[diag] tick={} table_len={}", now, table.len());
+            // TEMPORARY diagnostic for the pthread/aio massfix investigation: per-process state
+            // dump to see exactly what a hung sigwait/6-1.c-shaped test is actually blocked on
+            // (or spinning on) without needing live GDB against the QEMU stub -- narrows whether
+            // `pending_signals`/`blocked_signals` ever reach the "deliverable" state this session's
+            // timer-redirect mechanism checks for, and whether `preempted_resume` ever gets set at
+            // all. Remove once the underlying hang is understood one way or the other.
+            for (&diag_pid, diag_proc) in table.iter() {
+                crate::serial_println!(
+                    "[diag-thread] pid={} tgid={} state={:?} pending={:#x} blocked={:#x} preempted_resume={}",
+                    diag_pid,
+                    diag_proc.tgid,
+                    diag_proc.state,
+                    diag_proc.pending_signals,
+                    diag_proc.blocked_signals,
+                    diag_proc.preempted_resume.is_some()
+                );
+            }
         }
         // Real per-process CPU-time accounting (`Process::cpu_ticks`, see its own doc comment) --
         // the process this tick actually interrupted is the one that was consuming the CPU for it.
@@ -564,6 +581,93 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             crate::process::scheduler::ready_queue_has_higher_priority_than(current_priority);
         if higher_priority_ready || now.is_multiple_of(PREEMPT_QUANTUM_TICKS) {
             crate::process::scheduler::schedule();
+        }
+
+        // Real signal delivery for a ring-3 process making no syscalls of its own -- a tight,
+        // purely userspace-computational loop (e.g. `pthread_atfork/3-3.c`'s own worker thread,
+        // whose `while(do_it) pthread_atfork(...)` loop never traps into the kernel at all).
+        // `syscall::deliver_pending_signal` only ever runs from a real syscall's own dispatch tail
+        // or `sigreturn` -- a signal set pending via `do_kill`/an itimer/POSIX-timer expiry on a
+        // process that never makes another syscall would otherwise sit pending forever, hanging
+        // any caller (or `sigwait`-ing sibling thread) that depends on it. Checked on every tick,
+        // independent of the preemption decision above (real signal delivery isn't gated by
+        // scheduling quantum) -- by the time execution reaches here, whether or not `schedule()`
+        // was just called, `current_pid()` always names the exact process `stack_frame` belongs to
+        // (a preempted process's own call into `schedule()` above only "returns" once *that same*
+        // process is re-selected -- see `scheduler.rs`'s own module doc comment).
+        //
+        // `pending & !blocked != 0` is a safe, sufficient proxy for "something is really
+        // deliverable": `record_pending`/`do_kill`'s own `Action::Discard` arm never sets the
+        // pending bit at all for a `SIG_IGN` disposition, so a set-and-unblocked bit here always
+        // means a real handler invocation or a real default-disposition resolution (including
+        // `Terminate`) is waiting. Reuses the exact same real, kernel-authored trampoline page
+        // `page_fault_handler`'s own fault-to-signal redirect already established (see
+        // `fault_trampoline`'s own module doc comment for why a raw `extern "x86-interrupt" fn`
+        // can't build a real handler-invocation frame itself) -- but stashes the real, true
+        // interrupted `(rip, rsp, rflags)` first (`Process::preempted_resume`), unlike the
+        // page-fault case: a page fault's own "resume" point is the faulting instruction itself
+        // (real POSIX doesn't define resuming past an unhandled fault as portable anyway), but
+        // this is *ordinary*, otherwise-uninterrupted ring-3 code -- resuming it after a handler
+        // returns (or immediately, if no handler fires) must land back on the real original
+        // instruction, not the trampoline's own internal `syscall`.
+        let pid = crate::process::scheduler::current_pid();
+        // Only redirect `instruction_pointer` the *first* tick a deliverable signal is found --
+        // NOT unconditionally on every tick this remains true. Found live, the hard way: an
+        // unconditional per-tick redirect actively prevents forward progress rather than being
+        // the harmless idempotent no-op it looks like -- once redirected, the process needs a few
+        // real cycles to run the trampoline's own `mov`+`syscall` and reach `syscall_dispatch`
+        // (which is what actually clears the pending bit); slamming `instruction_pointer` back to
+        // the trampoline's *start* on every subsequent tick, before that ever completes, resets
+        // that progress every ~10ms forever -- a real, self-inflicted livelock, not a race. Once
+        // `preempted_resume` is `Some`, the process is trusted to already be correctly on its way
+        // through the trampoline on its own; this only fires again for a *genuinely new* signal
+        // becoming deliverable after the previous one was actually consumed (`preempted_resume`
+        // cleared by `syscall_dispatch`'s own `SYS_FAULT_PUMP` handling).
+        // Real, live-found correctness gap: skip entirely while a signal handler is already
+        // running (`!signal_stack.is_empty()`) -- this kernel's own `deliver_pending_signal`
+        // chaining (`do_sigreturn` re-checking for a further deliverable signal, see that
+        // function's own doc comment) already guarantees strict lowest-signal-number-first
+        // delivery order across a chain of several deliverable signals, entirely via real
+        // syscalls (the handler's own eventual `sigreturn`) -- no timer help is ever needed
+        // there, and a currently-running handler is *always* going to make that real syscall
+        // shortly (when it returns through its restorer), so this mechanism's own reason for
+        // existing (a thread making *no* syscalls of its own at all) doesn't apply mid-handler.
+        // Found live: a real RT-signal ordering regression (`rt_signal_syscall_smoke`'s own part
+        // 3, `sigqueue/7-1.c`'s scenario) -- a timer tick landing at the *exact* instant a lower-
+        // numbered signal's handler was about to execute its first instruction (a real, valid,
+        // narrow window: `mask_to_add` only blocks the signal *being delivered*, not siblings)
+        // found the higher-numbered sibling already pending+unblocked too and redirected *that*
+        // one in first, delivering strictly out of the kernel's own documented order -- a real
+        // regression this mechanism must never cause, since the ordinary chaining path already
+        // had this covered without it.
+        let should_redirect = {
+            let mut table = crate::process::table().lock();
+            table.get_mut(&pid).is_some_and(|p| {
+                let deliverable = p.pending_signals & !p.blocked_signals != 0
+                    && p.signal_stack.is_empty();
+                if deliverable && p.preempted_resume.is_none() {
+                    p.preempted_resume = Some((
+                        stack_frame.instruction_pointer.as_u64(),
+                        stack_frame.stack_pointer.as_u64(),
+                        stack_frame.cpu_flags.bits(),
+                    ));
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if should_redirect {
+            // SAFETY: only the resume RIP is changed -- redirecting straight into a real,
+            // kernel-mapped, user-executable trampoline page. RSP/RFLAGS/the segment selectors are
+            // left exactly as they were; this process has exactly one ring-3 code/data selector
+            // pair, already correct. Same technique `page_fault_handler` already uses.
+            unsafe {
+                stack_frame.as_mut().update(|f| {
+                    f.instruction_pointer =
+                        VirtAddr::new(crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA);
+                });
+            }
         }
     }
 }

@@ -780,6 +780,21 @@ pub struct Process {
     /// applied elsewhere in this file — no live test forks from inside an on-stack handler); reset
     /// to `false` by `execve` alongside `altstack` itself.
     pub on_altstack: bool,
+    /// Real `(rip, rsp, rflags)` of a ring-3 instruction `interrupts::timer_interrupt_handler`
+    /// diverted away from to force real signal delivery, or `None` for the ordinary case (a
+    /// page-fault-triggered or syscall-dispatch-tail-triggered delivery, where the live
+    /// `SyscallFrame`'s own `rcx`/`r11`/`user_rsp` are already exactly right). `syscall::
+    /// deliver_pending_signal`'s `SYS_FAULT_PUMP` entry consumes this (clearing it) to make the
+    /// *real* interrupted point the resume target -- not the trampoline's own internal `syscall`
+    /// instruction -- when a process was redirected here purely because it wasn't making any
+    /// syscalls of its own (a tight, purely userspace-computational loop, e.g. `pthread_atfork/
+    /// 3-3.c`'s own worker thread) and so would otherwise never notice a pending signal at all.
+    /// Never observed by anything else -- always consumed on the very next kernel entry after
+    /// being set (the redirect that sets it also overwrites `instruction_pointer`, guaranteeing
+    /// that), so `fork`/`clone`/`execve` never see it non-`None`; not inherited regardless, same
+    /// "no meaningful in-progress-handler state to carry over" reasoning `on_altstack` above
+    /// already establishes.
+    pub preempted_resume: Option<(u64, u64, u64)>,
     /// Unused today; reserved so a future priority scheduler doesn't need a PCB layout change.
     #[allow(dead_code)]
     pub priority: u8,
