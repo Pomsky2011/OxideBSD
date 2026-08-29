@@ -1283,6 +1283,17 @@ pub(crate) extern "C" fn oxidebsd_sys_exit(code: u64) -> ! {
     crate::process::do_exit(crate::process::scheduler::current_pid(), status)
 }
 
+/// `oxidebsd_sys_exit_group` goes through `process::do_exit_group` -- real, whole-thread-group
+/// termination, distinct from `oxidebsd_sys_exit` above. See `process::do_exit_group`'s own doc
+/// comment and `third_party/musl/arch/x86_64/bits/syscall.h.in`'s `__NR_exit_group` doc comment
+/// for why real `exit()`/`_Exit()` need a genuinely separate syscall from a bare per-thread
+/// `SYS_exit`. Same real `wait(2)`-status-word encoding as `oxidebsd_sys_exit` above -- this is
+/// the *other* place a genuine user-supplied `exit(code)` value becomes a `Zombie` status.
+pub(crate) extern "C" fn oxidebsd_sys_exit_group(code: u64) -> ! {
+    let status = ((code as i32) & 0xff) << 8;
+    crate::process::do_exit_group(crate::process::scheduler::current_pid(), status)
+}
+
 // `pub`, not `pub(crate)` -- same "kept public for test use" precedent `oxidebsd_register_syscall`
 // already has (see `tests/fork_wait.rs`). `tests/tcp_smoke.rs` needs the real SYS_READ/SYS_WRITE
 // entry point (not a lower-level shortcut) to exercise an accepted TCP connection's fd-ops

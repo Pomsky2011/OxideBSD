@@ -1021,6 +1021,15 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
 // four (confirmed: no `SIGALRM`/`SIG_BLOCK`/`alarm(` anywhere in it or its `testfrmw.c`), so
 // whatever it's stuck on is a genuine, not-yet-investigated kernel bug in fork-after-thread-setup,
 // worth its own follow-up rather than blocking this corpus expansion on diagnosing it now.
+// Live diagnostic dump (chasing the `SYS_EXIT_GROUP` fix above) narrowed this further: the forked
+// child (a fresh, distinct `tgid`) deadlocks on `FUTEX_WAIT` at a real, plausible
+// `__thread_list_lock`-shaped address as soon as it calls `pthread_create()` itself -- consistent
+// with the classic "`fork()` in a multithreaded process" hazard (the child inherits a copy of that
+// lock frozen at whatever value it had at fork time; if the *actual* holder was a sibling thread
+// that didn't survive the fork, the lock is permanently stuck locked in the child). Real
+// musl/glibc guard against exactly this in their own `fork()` wrapper -- whether that guard path
+// is reachable/correct against this kernel's own fork() implementation is the open question, not
+// yet root-caused.
 const POSIX_KNOWN_HANGS: &[&str] = &[
     "sigwait/4-1.c",
     "timer_settime/2-1.c",
@@ -1158,11 +1167,7 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // once the underlying fix is validated and landed for real.
     if std::env::var("POSIX_PILOT_CANARY_ONLY").is_ok() {
         const CANARY: &[&str] = &[
-            "sigwait/6-1.c",
-            "sigwait/6-2.c",
-            "pthread_atfork/3-3.c",
             "pthread_attr_destroy/1-1.c",
-            "pthread_attr_init/2-1.c",
             "fork/11-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
@@ -1171,19 +1176,25 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     }
     out.retain(|rel| !POSIX_KNOWN_HANGS.contains(&rel.as_str()));
     // Real, live-found reliability problem, not a static guess: individually excluding
-    // `POSIX_KNOWN_HANGS` one file at a time surfaced a *vanilla* `pthread_create()` +
+    // `POSIX_KNOWN_HANGS` one file at a time originally surfaced a *vanilla* `pthread_create()` +
     // `sleep(1)`-poll-on-a-shared-flag test (`pthread_attr_init/2-1.c`, no garbage attrs, no
-    // signal blocking) hanging the same way the garbage-attr/atfork/futex-adjacent ones did --
-    // meaning real thread creation/scheduling itself is unreliable somewhere past ~400 tests deep
-    // into one continuous boot (correlates with, but doesn't yet explain, the process table
-    // growing from a stable 3-4 to a stable-but-elevated 16 entries right when `pthread_atfork`
-    // tests started -- see `project_posix_full_corpus_expansion` memory). Chasing this file-by-file
-    // across ~600 more `pthread_*`/`aio_*` (musl's own AIO is thread-pool-backed, same exposure)
-    // files would cost hours for something that's clearly one systemic gap, not hundreds of
-    // independent ones -- reverting to the pre-expansion exclusion boundary for *these two
-    // categories only* gets a complete, clean run over the rest of the ~1300-file corpus now, and
-    // defers real threading reliability to its own dedicated debugging session (needs live kernel
-    // introspection, not more static reading) rather than discovering it one hang at a time.
+    // signal blocking) hanging the same way the garbage-attr/atfork/futex-adjacent ones did.
+    // **`pthread_attr_init/2-1.c` is now FIXED** (confirmed PASS via an isolated canary run) --
+    // root cause was `SYS_exit_group` sharing the exact same syscall number as a bare per-thread
+    // `SYS_exit` (see `third_party/musl/arch/x86_64/bits/syscall.h.in`'s `__NR_exit_group` doc
+    // comment and `process::do_exit_group`'s own doc comment in the OxideBSD tree): `main()`
+    // returning on the thread-group leader only ever tore down the leader itself, silently
+    // orphaning this test's still-sleeping detached child thread, which later deadlocked in its
+    // own `pthread_exit()` cleanup against musl's userspace thread-list bookkeeping -- not the
+    // "thread creation/scheduling itself is unreliable" theory this comment originally floated.
+    // `pthread_attr_destroy/1-1.c` and `fork/11-1.c` remain real, open, *distinct* hangs (confirmed
+    // via live diagnostic dumps *not* to share this same root cause -- `fork/11-1.c`'s own hang
+    // signature is a forked child deadlocking on a stale, still-locked `__thread_list_lock` it
+    // inherited from a discarded sibling thread at fork time, a real "fork() in a multithreaded
+    // process" hazard, not an exit-path bug), so the wholesale `pthread_*`/`aio_*`/`lio_listio*`
+    // prefix exclusion below stays in place until those are root-caused too -- chasing the
+    // remaining ~600 files one at a time isn't worth it when the known survivors are exactly two
+    // files' worth of not-yet-understood bugs, not hundreds of independent ones.
     out.retain(|rel| {
         !rel.starts_with("pthread_") && !rel.starts_with("aio_") && !rel.starts_with("lio_listio")
     });

@@ -55,6 +55,7 @@ unsafe extern "C" {
         handler: extern "C" fn(u64, u64, u64, u64) -> i64,
     ) -> i32;
     fn oxidebsd_sys_exit(code: u64) -> !;
+    fn oxidebsd_sys_exit_group(code: u64) -> !;
     fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_fork() -> i64;
@@ -102,9 +103,20 @@ const SYS_MSYNC: u64 = 26;
 /// own hardcoded `mov $555,%eax` -- see `docs/MISSING_POSIX_SYSCALLS.md`) -- this is the real
 /// handler registration that number was always waiting for, not a fresh pick.
 const SYS_CLONE: u64 = 555;
+/// Real POSIX/Linux `exit_group(2)` -- genuinely distinct from `SYS_EXIT` above (real `exit()`/
+/// `_Exit()`'s own kernel entry point, not a bare per-thread `SYS_exit`), continuing right past
+/// `SYS_CLONE = 555` (the current highest assigned anywhere in this ABI as of this addition). See
+/// `process::do_exit_group`'s own doc comment for why this needed its own number: sharing
+/// `SYS_EXIT`'s number left every sibling thread silently orphaned whenever a thread-group
+/// leader's own `main()` returned while other threads were still alive.
+const SYS_EXIT_GROUP: u64 = 556;
 
 extern "C" fn handle_exit(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_exit(code) }
+}
+
+extern "C" fn handle_exit_group(code: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_exit_group(code) }
 }
 
 extern "C" fn handle_read(fd: u64, ptr: u64, len: u64, _arg3: u64) -> i64 {
@@ -187,6 +199,7 @@ extern "C" fn handle_readv(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i6
 pub extern "C" fn module_init() -> i32 {
     unsafe {
         oxidebsd_register_syscall(SYS_EXIT, handle_exit);
+        oxidebsd_register_syscall(SYS_EXIT_GROUP, handle_exit_group);
         oxidebsd_register_syscall(SYS_READ, handle_read);
         oxidebsd_register_syscall(SYS_WRITE, handle_write);
         oxidebsd_register_syscall(SYS_FORK, handle_fork);

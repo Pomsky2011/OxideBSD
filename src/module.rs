@@ -702,6 +702,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::syscall::oxidebsd_register_syscall as *const () as u64)
         }
         "oxidebsd_sys_exit" => Some(crate::syscall::oxidebsd_sys_exit as *const () as u64),
+        "oxidebsd_sys_exit_group" => {
+            Some(crate::syscall::oxidebsd_sys_exit_group as *const () as u64)
+        }
         "oxidebsd_sys_read" => Some(crate::syscall::oxidebsd_sys_read as *const () as u64),
         "oxidebsd_sys_write" => Some(crate::syscall::oxidebsd_sys_write as *const () as u64),
         "oxidebsd_sys_fork" => Some(crate::syscall::oxidebsd_sys_fork as *const () as u64),

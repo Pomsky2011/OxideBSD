@@ -1223,6 +1223,61 @@ pub fn do_exit(caller_pid: Pid, code: i32) -> ! {
     unreachable!("do_exit: schedule() returned control to a Zombie process");
 }
 
+/// `sys_exit_group`'s real, whole-thread-group logic (reached only through
+/// `syscall::oxidebsd_sys_exit_group`, real `exit()`/`_Exit()`'s own kernel entry point -- see
+/// `third_party/musl/arch/x86_64/bits/syscall.h.in`'s `__NR_exit_group` doc comment for why this
+/// must be a genuinely distinct syscall from `do_exit`/`SYS_EXIT`). Real POSIX/Linux
+/// `exit_group(2)` semantics: terminates every thread sharing the caller's `tgid`, not just the
+/// calling thread -- found live, the hard way, chasing the Open POSIX Test Suite pilot's
+/// `pthread_attr_init/2-1.c` permanent hang. Before this syscall existed, `exit()`/`_Exit()` and a
+/// bare per-thread `SYS_exit` (real musl's own `__pthread_exit` cleanup path,
+/// `third_party/musl/src/thread/pthread_create.c`) shared the exact same syscall number, so a
+/// thread-group leader's own `main()` returning only ever tore down the leader itself, silently
+/// orphaning any still-alive sibling thread. That orphaned sibling then ran on indefinitely
+/// (`pthread_attr_init/2-1.c`'s own detached, still-sleeping worker thread), eventually
+/// deadlocking against musl's own userspace thread-list bookkeeping (`__tl_lock`/
+/// `__thread_list_lock`) inside its own later `pthread_exit()` -- that bookkeeping's own
+/// `self->next == self` fast-path assumes a real `exit_group` already unlinked the leader from the
+/// live-thread list atomically at process-exit time, which never happened here. Worse, the
+/// leader's own pending `alarm()`-based rescue timer (the whole POSIX pilot's `t0` harness relies
+/// on this to bound every test) died with the leader too, so the orphaned sibling could spin
+/// forever with nothing left to time it out.
+///
+/// Terminates every *other* live thread in the group first -- each independently reaches
+/// `terminate_process`'s own `other_thread_alive` branch (marked `Zombie` and deferred to
+/// `scheduler::queue_thread_reap`, exactly like an ordinary non-leader thread's own bare `SYS_exit`
+/// already does, real per-thread teardown safety unchanged) -- then the caller itself last. By
+/// then `other_thread_alive` is false for the caller, so `terminate_process` takes its real "last
+/// thread of the group" path: `close_all`/SysV cleanup/mmap writeback run exactly once, and the
+/// parent gets exactly one `SIGCHLD` for the whole process, not one per thread.
+pub fn do_exit_group(caller_pid: Pid, code: i32) -> ! {
+    let tgid = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(&caller_pid)
+            .expect("do_exit_group: caller missing from table")
+            .tgid
+    };
+    let siblings: Vec<Pid> = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|&(&pid, proc)| {
+                pid != caller_pid
+                    && proc.tgid == tgid
+                    && !matches!(proc.state, ProcState::Zombie(_))
+            })
+            .map(|(&pid, _)| pid)
+            .collect()
+    };
+    for sibling in siblings {
+        terminate_process(sibling, code);
+    }
+    terminate_process(caller_pid, code);
+    scheduler::schedule();
+    unreachable!("do_exit_group: schedule() returned control to a Zombie process");
+}
+
 /// The actual state transition `do_exit` (the caller terminating itself) and `do_kill` (one
 /// process terminating a *different* one, for a default-disposition signal — see that function's
 /// own doc comment) both need: closes every fd `pid` still has open, marks it `Zombie(code)`, and
