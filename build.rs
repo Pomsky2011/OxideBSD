@@ -1227,6 +1227,24 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
         return out;
     }
     out.retain(|rel| !POSIX_KNOWN_HANGS.contains(&rel.as_str()));
+    // `POSIX_EXTRA_EXCLUDE_FILE=<path>` (optional): a plain text file, one `relative/path.c` per
+    // line, merged into the exclusion set the same way `POSIX_KNOWN_HANGS` is -- lets
+    // `scripts/run_posix_pilot_supervised.sh` (a host-side supervisor that kills a genuinely
+    // wedged QEMU boot and retries with the stuck file excluded, since a kernel-level hang can't
+    // be rescued by `t0`'s own userspace `alarm()` -- see that script's own header comment) drive
+    // a real full-corpus run to completion across several retries without hand-editing
+    // `POSIX_KNOWN_HANGS` (and triggering this whole file's `cargo:rerun-if-changed` on itself)
+    // between every iteration. Not wired into any normal build -- unset means no extra exclusions,
+    // same "opt-in only" contract `POSIX_PILOT_CANARY_ONLY` already has. A file newly found stuck
+    // by that script should still graduate into a real, documented `POSIX_KNOWN_HANGS` entry once
+    // root-caused -- this is a fast iteration aid, not a permanent exclusion mechanism.
+    if let Ok(extra_path) = std::env::var("POSIX_EXTRA_EXCLUDE_FILE") {
+        println!("cargo:rerun-if-changed={extra_path}");
+        if let Ok(contents) = std::fs::read_to_string(&extra_path) {
+            let extra: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            out.retain(|rel| !extra.contains(&rel.as_str()));
+        }
+    }
     // Real, live-found reliability problem, not a static guess: individually excluding
     // `POSIX_KNOWN_HANGS` one file at a time originally surfaced a *vanilla* `pthread_create()` +
     // `sleep(1)`-poll-on-a-shared-flag test (`pthread_attr_init/2-1.c`, no garbage attrs, no
@@ -1241,17 +1259,15 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // "thread creation/scheduling itself is unreliable" theory this comment originally floated.
     // **`pthread_attr_destroy/1-1.c` and `fork/11-1.c` are now also FIXED** (see `POSIX_KNOWN_HANGS`'s
     // own doc comments above for both) -- so the specific "known survivors" this wholesale
-    // exclusion was originally scoped around are all resolved. The exclusion itself stays in place
-    // regardless: it was never proven that these three were the *only* real hangs under
-    // `pthread_*`/`aio_*`/`lio_listio*`, only that they were the ones a partial run happened to
-    // find before this prefix filter went in -- lifting it is a genuinely separate, substantial
-    // next step (re-including ~600 files, needing a real multi-hour full-corpus run to find
-    // whatever else is actually in there), not something either of these fixes does on its own.
-    // Do that deliberately, with the user, not as a side effect of fixing the last known name on
-    // this list.
-    out.retain(|rel| {
-        !rel.starts_with("pthread_") && !rel.starts_with("aio_") && !rel.starts_with("lio_listio")
-    });
+    // exclusion was originally scoped around are all resolved.
+    //
+    // **2026-09-02: lifted, per explicit user direction**, re-including the ~600
+    // `pthread_*`/`aio_*`/`lio_listio*` files this prefix filter used to drop. It was never proven
+    // that the three fixed hangs above were the *only* real hangs under this prefix, only that
+    // they were the ones a partial run happened to find before the filter went in -- this run is
+    // what actually finds out. If it surfaces a genuine new permanent hang, add it to
+    // `POSIX_KNOWN_HANGS` by name (the established "found live, fixed forward" discipline this
+    // whole file follows) rather than reinstating a blanket prefix filter.
     out.sort();
     out
 }
