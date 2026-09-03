@@ -480,7 +480,7 @@ fn build_busybox_applet(
     let status = Command::new("make")
         .current_dir(&busybox_dir)
         .arg(&out_arg)
-        .arg(format!("CC={}", musl_gcc.display()))
+        .arg(format!("CC={}", compiler_invocation(&musl_gcc).join(" ")))
         .arg(format!(
             "EXTRA_LDFLAGS=-static -no-pie -Wl,-Ttext-segment={load_addr:#x}"
         ))

@@ -10,6 +10,40 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Prefixes a compiler invocation with `ccache` when it's available on the host, letting
+/// BusyBox's own ~232-applet fanout (and the POSIX pilot's own up-to-~1700-file fanout) reuse
+/// identical object code across build directories instead of recompiling shared BusyBox-core/
+/// musl-static-lib content from scratch every time. Both already do a real rm-rf-and-rebuild on
+/// any musl core change (see `build_busybox_applet`'s own doc comment) -- correct for staleness,
+/// but it throws away an enormous amount of otherwise-identical recompilation across applets/test
+/// files that share the vast majority of their own object code. Detected once via `OnceLock`, not
+/// per call site (`Command::new("ccache")` spawning a process per applet/test file at this fanout
+/// would itself add real overhead) -- safe to call from the parallel worker pools both `main()`
+/// and `build_busybox_applet` already use, since `OnceLock::get_or_init` serializes concurrent
+/// first callers. Falls back to the plain compiler, unprefixed, when `ccache` isn't on `PATH` --
+/// this is a pure speed optimization, never load-bearing for correctness. Returns the argv prefix
+/// (`["ccache", "<compiler>"]` or just `["<compiler>"]`) rather than a single string so callers
+/// building a real `Command` don't need to re-split a shell-quoted string; a `make CC=` caller
+/// instead wants `.join(" ")` (`make` treats a multi-word `$(CC)` as a shell command prefix
+/// inside its own recipe lines, so this is safe to hand it directly).
+fn compiler_invocation(compiler: &Path) -> Vec<String> {
+    static CCACHE_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let available = *CCACHE_AVAILABLE.get_or_init(|| {
+        Command::new("ccache")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    if available {
+        vec!["ccache".to_string(), compiler.display().to_string()]
+    } else {
+        vec![compiler.display().to_string()]
+    }
+}
+
 // `BUSYBOX_APPLETS`/`BUSYBOX_APPLETS_PASS2`/`build_busybox_applet`/`configure_busybox_single_applet`/
 // `resolve_busybox_new_config_options` -- split into their own file specifically so unrelated
 // edits to *this* file don't invalidate every cached BusyBox applet binary. See
@@ -1015,27 +1049,35 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
 /// is). If a real full run finds one of these genuinely wedged, add it here the same way these two
 /// were added, then re-run -- the same "found live, fixed forward" discipline every other exclusion
 /// in this codebase's history follows, not something to pre-solve by static reading alone.
-// `fork/11-1.c` added live during the first full-corpus run: a real fork+thread interaction test
-// (`#include <pthread.h>` + `testfrmw.c`) that wedged the whole run for 3.5+ hours with flat CPU
-// usage and no `t0`-rescued TIMEOUT classification -- not a `SIGALRM`-blocking case like the other
-// four (confirmed: no `SIGALRM`/`SIG_BLOCK`/`alarm(` anywhere in it or its `testfrmw.c`), so
-// whatever it's stuck on is a genuine, not-yet-investigated kernel bug in fork-after-thread-setup,
-// worth its own follow-up rather than blocking this corpus expansion on diagnosing it now.
-// Live diagnostic dump (chasing the `SYS_EXIT_GROUP` fix above) narrowed this further: the forked
-// child (a fresh, distinct `tgid`) deadlocks on `FUTEX_WAIT` at a real, plausible
-// `__thread_list_lock`-shaped address as soon as it calls `pthread_create()` itself -- consistent
-// with the classic "`fork()` in a multithreaded process" hazard (the child inherits a copy of that
-// lock frozen at whatever value it had at fork time; if the *actual* holder was a sibling thread
-// that didn't survive the fork, the lock is permanently stuck locked in the child). Real
-// musl/glibc guard against exactly this in their own `fork()` wrapper -- whether that guard path
-// is reachable/correct against this kernel's own fork() implementation is the open question, not
-// yet root-caused.
+// `fork/11-1.c`: **FIXED**, confirmed PASS via an isolated canary run -- root cause was two real,
+// independent musl bugs, not a kernel bug at all (patched on `third_party/musl`'s `oxidebsd`
+// branch, `src/process/_Fork.c` and `src/stdio/ftrylockfile.c`):
+// (1) `_Fork()`'s `__post_Fork` correctly resets the surviving thread's own `tid` and
+//     `__thread_list_lock` in the child, but never touched any `FILE`'s own `.lock` word -- a
+//     `flockfile(stdout)` held by the parent before `fork()` left `stdout`'s lock word holding a
+//     "ghost" tid in the child's eager-copied memory, one that no longer refers to any live thread
+//     in that address space, so any later `ftrylockfile()`/`flockfile()` call in the child --
+//     regardless of which thread -- permanently failed or deadlocked. Real glibc avoids this via
+//     its own `pthread_atfork`-registered stdio-lock-reset handler (`_IO_list_resetlock`); stock
+//     musl has no equivalent. Fixed by resetting every known `FILE`'s lock (`stdin`/`stdout`/
+//     `stderr` plus the open-file list) to unlocked in `__post_Fork`'s child branch, matching
+//     glibc's real behavior.
+// (2) Once (1) let the test's new thread successfully lock `stdout`, a second, genuinely
+//     fork-independent musl bug surfaced: that thread exits without ever calling `funlockfile()`
+//     (legal -- POSIX doesn't require balancing flockfile/funlockfile before thread exit), and
+//     musl's own `__do_orphaned_stdio_locks()` marked the lock with a poison bit (`MAYBE_WAITERS`,
+//     owner bits cleared) instead of actually releasing it -- permanently unrecoverable, since
+//     nothing ever calls `__wake()` on that address afterward. The process's own later `exit()`-
+//     time stdio flush then deadlocked trying to re-lock `stdout` for good. Fixed by making the
+//     orphan handler do a real release-and-wake, matching `__unlockfile()`'s own established
+//     pattern.
+// Both confirmed via an isolated canary run (`POSIX_PILOT_CANARY_ONLY=1`): clean `PASS`, clean
+// QEMU exit -- not just "no longer hangs."
 const POSIX_KNOWN_HANGS: &[&str] = &[
     "sigwait/4-1.c",
     "timer_settime/2-1.c",
     "timer_settime/6-1.c",
     "timer_settime/9-1.c",
-    "fork/11-1.c",
     // `fork/8-1.c`: a `do { cur = times(&t); } while (cur - start < sysconf(_SC_CLK_TCK))` busy
     // loop that should take ~1 real second under KVM (`_SC_CLK_TCK` is musl's own compile-time
     // `100`, matching this kernel's real `TIMER_HZ`) but instead ran 9+ real minutes at ~90% CPU
@@ -1051,16 +1093,19 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // regardless of whether it's named here -- kept only as a historical marker of what was
     // confirmed fixed, not a live exclusion in its own right.
     "pthread_atfork/3-3.c",
-    // `pthread_attr_destroy/1-1.c`: calls `pthread_attr_destroy()` then reuses the destroyed attr
-    // in a real `pthread_create()` call (deliberately testing garbage-in-garbage-out behavior).
-    // Hung several real minutes, low CPU (blocked, not spinning). Investigated `do_futex`'s
-    // `FUTEX_WAIT` path (`src/process/limits.rs`) as a suspected unifying cause for this whole
-    // class of hang, since musl's own `pthread_create`/`_join`/mutex code is futex-backed --
-    // `wake_if_futex_waiting` exists and *is* correctly wired into the real `alarm()`-expiry path
-    // `t0`'s own rescue timeout goes through (`src/cpu/interrupts.rs`), same as every other
-    // blocking primitive's wake hook, so the mechanism looks sound on inspection. Whatever's
-    // actually wrong here needs live kernel introspection (GDB against the QEMU stub) to pin down,
-    // not further static reading -- tracked as a real open question, not resolved.
+    // `pthread_attr_destroy/1-1.c`: **FIXED** -- turned out to never have been an independent bug
+    // at all. Every prior canary run that included it also included `fork/11-1.c`, which sorts
+    // first alphabetically in a sequential pilot boot and, before its own real fix (see this
+    // array's own doc comment above), permanently wedged the whole run before this file ever got
+    // a chance to execute -- so it was never actually re-validated against the real
+    // `SYS_EXIT_GROUP` fix (see `pthread_attr_init/2-1.c`'s own history) that landed *before* this
+    // file was ever investigated on its own. The earlier "needs live GDB introspection" theory was
+    // chasing a hang that, by the time it was written, may already have been fixed by that same
+    // change. Confirmed PASS via an isolated canary run once `fork/11-1.c` stopped blocking the
+    // boot ahead of it. Not removed from this list's *effect*, since it's still swept up by the
+    // wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix exclusion just below regardless of
+    // whether it's named here -- kept only as a historical marker, same as `pthread_atfork/3-3.c`
+    // just above.
     "pthread_attr_destroy/1-1.c",
     // `sched_yield/1-1.c`: forks `ncpu-1` children and has a real `while(1);` busy-spin thread,
     // expecting genuine multi-core scheduling fairness to observe `sched_yield()`'s effect --
@@ -1105,7 +1150,9 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // Removed from this list entirely (unlike `pthread_atfork/3-3.c` just above, which stays as a
     // historical marker only because the wholesale prefix filter below still catches it
     // regardless) -- neither file lives under a `pthread_*`/`aio_*`/`lio_listio*` prefix, so
-    // removing them here is what actually re-includes them in a real full-corpus run.
+    // removing them here is what actually re-includes them in a real full-corpus run. `fork/11-1.c`
+    // (see this array's own doc comment above) is the same story -- also removed entirely, also
+    // outside that prefix filter.
 ];
 
 /// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
@@ -1162,9 +1209,14 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     walk(interfaces_dir, interfaces_dir, &mut out);
     // TEMPORARY validation hook: `POSIX_PILOT_CANARY_ONLY=1` shrinks the whole discovered corpus
     // down to a handful of specific known-hang files (see `POSIX_KNOWN_HANGS`'s own doc comment)
-    // so a candidate real-threading-signal fix can be checked end to end in minutes instead of
-    // rebuilding/booting the full ~1200-file corpus. Not wired into any normal build -- remove
-    // once the underlying fix is validated and landed for real.
+    // so a candidate fix can be checked end to end in minutes instead of rebuilding/booting the
+    // full ~1200-file corpus. Not wired into any normal build. Currently holds `fork/11-1.c` and
+    // `pthread_attr_destroy/1-1.c` -- both now fixed and confirmed via this exact mechanism (see
+    // `POSIX_KNOWN_HANGS`'s own doc comments), left in as a quick two-file regression check for
+    // any future futex/threading/fork change rather than emptied out. Repoint at whatever's
+    // actually being investigated next (`fork/8-1.c`'s CPU-timing anomaly and the named-semaphore
+    // cross-process futex gap are the remaining genuinely-open items in `POSIX_KNOWN_HANGS`) when
+    // that starts.
     if std::env::var("POSIX_PILOT_CANARY_ONLY").is_ok() {
         const CANARY: &[&str] = &[
             "pthread_attr_destroy/1-1.c",
@@ -1187,14 +1239,16 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // orphaning this test's still-sleeping detached child thread, which later deadlocked in its
     // own `pthread_exit()` cleanup against musl's userspace thread-list bookkeeping -- not the
     // "thread creation/scheduling itself is unreliable" theory this comment originally floated.
-    // `pthread_attr_destroy/1-1.c` and `fork/11-1.c` remain real, open, *distinct* hangs (confirmed
-    // via live diagnostic dumps *not* to share this same root cause -- `fork/11-1.c`'s own hang
-    // signature is a forked child deadlocking on a stale, still-locked `__thread_list_lock` it
-    // inherited from a discarded sibling thread at fork time, a real "fork() in a multithreaded
-    // process" hazard, not an exit-path bug), so the wholesale `pthread_*`/`aio_*`/`lio_listio*`
-    // prefix exclusion below stays in place until those are root-caused too -- chasing the
-    // remaining ~600 files one at a time isn't worth it when the known survivors are exactly two
-    // files' worth of not-yet-understood bugs, not hundreds of independent ones.
+    // **`pthread_attr_destroy/1-1.c` and `fork/11-1.c` are now also FIXED** (see `POSIX_KNOWN_HANGS`'s
+    // own doc comments above for both) -- so the specific "known survivors" this wholesale
+    // exclusion was originally scoped around are all resolved. The exclusion itself stays in place
+    // regardless: it was never proven that these three were the *only* real hangs under
+    // `pthread_*`/`aio_*`/`lio_listio*`, only that they were the ones a partial run happened to
+    // find before this prefix filter went in -- lifting it is a genuinely separate, substantial
+    // next step (re-including ~600 files, needing a real multi-hour full-corpus run to find
+    // whatever else is actually in there), not something either of these fixes does on its own.
+    // Do that deliberately, with the user, not as a side effect of fixing the last known name on
+    // this list.
     out.retain(|rel| {
         !rel.starts_with("pthread_") && !rel.starts_with("aio_") && !rel.starts_with("lio_listio")
     });
@@ -1305,7 +1359,9 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
                     };
                     let source = interfaces_dir.join(rel);
                     let out = bin_dir.join(rel.replace('/', "_"));
-                    let mut cmd = Command::new(&musl_gcc);
+                    let invocation = compiler_invocation(&musl_gcc);
+                    let mut cmd = Command::new(&invocation[0]);
+                    cmd.args(&invocation[1..]);
                     cmd.arg("-static")
                         .arg("-no-pie")
                         .arg(format!("-Wl,-Ttext-segment={POSIX_TEST_LOAD_BASE:#x}"))
