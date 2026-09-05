@@ -1301,6 +1301,33 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // removing them here is what actually re-includes them in a real full-corpus run. `fork/11-1.c`
     // (see this array's own doc comment above) is the same story -- also removed entirely, also
     // outside that prefix filter.
+    //
+    // `shm_open/23-1.c`: **not a hang** (it correctly `TIMEOUT`s at `t0`'s own 40s bound, never
+    // wedges the boot) but genuinely needs excluding anyway -- added 2026-09-05 chasing a report
+    // that 210 of a full pilot run's 268 FAILs were all `sigaction/1-N.c`, individually confirmed
+    // `PASS` in isolation. Root cause traced to this file specifically, not `sigaction` at all: it
+    // forks `NPROCESS=1000` children, each looping `NLOOP=1000` times calling
+    // `shm_open(name, O_RDONLY|O_CREAT|O_EXCL, ...)` with **no `close(fd)` anywhere in the loop** --
+    // a real bug in the test's own child_func on any system, but harmless on real POSIX platforms
+    // since fd exhaustion there is scoped *per-process* (bounded by that one process's own
+    // `RLIMIT_NOFILE`, ~1024) -- once a child's own descriptor table fills, only *that child's*
+    // later `shm_open` calls start failing, `*create_cnt != NLOOP`, and the test correctly reports
+    // `PTS_FAIL` for itself alone. `modules/oxfs`'s `OPEN_FILES` table (`MAX_OPEN_FILES`, see that
+    // constant's own doc comment) is **global**, not per-process -- a known, accepted architectural
+    // gap (no VFS-level per-process fd quota exists anywhere in this kernel), but this is the first
+    // test to actually depend on real per-process isolation to stay self-contained. `sleep(1)` plus
+    // a random 0-20ms `nanosleep` between iterations means these 1000 children keep running and
+    // leaking new global fd-table entries for a real, sustained stretch of wall-clock time (not a
+    // one-shot cost) -- `MAX_OPEN_FILES` was bumped 8 -> 256 alongside this exclusion (see that
+    // constant's own doc comment) as a genuine, worthwhile improvement in its own right, but 256 (or
+    // any single static bump) only delays this file's own exhaustion, it can't survive an unbounded
+    // leak given enough wall-clock time in a full ~1700-file run -- confirmed live: with the bump
+    // alone (no exclusion), `timer_settime/{2-1,6-1,9-1}.c` -- many files later, well past this
+    // file's own classification -- still hit the identical "No file descriptors available" cascade
+    // once these orphans had leaked enough over the intervening real time. Excluding this one file
+    // is what actually stops the cascade at its root; fixing the underlying gap for real would mean
+    // a genuine per-process (or per-tgid) fd quota, out of scope for this pass.
+    "shm_open/23-1.c",
 ];
 
 /// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
@@ -1313,10 +1340,12 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above (2 files, both with a live effect -- no historical-marker-only
+/// - **`POSIX_KNOWN_HANGS`** above (3 files, all with a live effect -- no historical-marker-only
 ///   or stale entries any more, see that array's own doc comment): `fork/8-1.c` (a genuinely
 ///   unresolved busy-loop timing anomaly), `sched_yield/1-1.c` (needs real SMP, out of scope until
-///   then).
+///   then), `shm_open/23-1.c` (an unbounded global-fd-table leak from the test's own orphaned,
+///   never-closing children -- not a hang, but left running it cascades into misclassifying
+///   hundreds of unrelated later files, see that entry's own doc comment).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1362,17 +1391,27 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // down to a handful of specific known-hang/regression files (see `POSIX_KNOWN_HANGS`'s own doc
     // comment) so a candidate fix can be checked end to end in minutes instead of rebuilding/
     // booting the full ~1700-file corpus. Not wired into any normal build. Every file below is
-    // already fixed and confirmed `PASS` (`sem_post/8-1.c` confirmed clean `UNTESTED`, see
-    // `POSIX_KNOWN_HANGS`'s own doc comment) via this exact mechanism -- kept as a standing
-    // regression suite for any future futex/threading/fork/signal-delivery/timer change, not
-    // emptied out: `fork/11-1.c`/`pthread_attr_destroy/1-1.c`/`pthread_atfork/3-3.c` (real
-    // thread-group signal delivery + `exit_group(2)`), the four named-semaphore files (real
-    // physical-address-keyed shared-futex, `process::limits::futex_key` in `src/process/
-    // limits.rs`), and `sigwait/4-1.c`/`timer_settime/{2-1,6-1,9-1}.c` (real timer-expiry signal
-    // wake, `wake_if_sigwaiting`). Repoint at whatever's actually being investigated next
-    // (`fork/8-1.c`'s CPU-timing anomaly is the remaining genuinely-open item in
-    // `POSIX_KNOWN_HANGS`) when that starts, but there's no need to remove these first --
-    // add to this list, don't just replace it, so a real regression gets caught immediately.
+    // already fixed and confirmed `PASS` (`sem_post/8-1.c` confirmed clean `UNTESTED`; the
+    // `shm_open`/`shm_unlink` block's own `TIMEOUT`/two narrow `ENAMETOOLONG` FAILs are expected,
+    // real, individually-classified outcomes, not a symptom of the bug this block regression-tests
+    // -- see below) via this exact mechanism -- kept as a standing regression suite for any future
+    // futex/threading/fork/signal-delivery/timer/fd-table change, not emptied out:
+    // `fork/11-1.c`/`pthread_attr_destroy/1-1.c`/`pthread_atfork/3-3.c` (real thread-group signal
+    // delivery + `exit_group(2)`), the four named-semaphore files (real physical-address-keyed
+    // shared-futex, `process::limits::futex_key` in `src/process/limits.rs`),
+    // `sigwait/4-1.c`/`timer_settime/{2-1,6-1,9-1}.c` (real timer-expiry signal wake,
+    // `wake_if_sigwaiting`), and the `shm_open`+`shm_unlink`+`sigaction/1-{1,2}.c` block minus
+    // `shm_open/23-1.c` itself (real `MAX_OPEN_FILES` global-fd-table-exhaustion cascade fix,
+    // `modules/oxfs/src/lib.rs`; `shm_open/23-1.c` is deliberately *not* included here even though
+    // it's what originally exposed the bug -- it's now a permanent `POSIX_KNOWN_HANGS` exclusion
+    // (see that entry's own doc comment: an unbounded, ongoing global-fd leak, not a one-shot cost
+    // any static `MAX_OPEN_FILES` bump can absorb) and never runs in a real full-corpus build
+    // either, so keeping it here would make this suite fail on its own downstream neighbors
+    // forever regardless of kernel correctness -- not a useful regression signal). Repoint at
+    // whatever's actually being investigated next (`fork/8-1.c`'s CPU-timing anomaly is the
+    // remaining genuinely-open item in `POSIX_KNOWN_HANGS`) when that starts, but there's no need
+    // to remove these first -- add to this list, don't just replace it, so a real regression gets
+    // caught immediately.
     //
     // `rerun-if-env-changed`, not just relying on the file-content watch above: plain
     // `std::env::var` reads aren't tracked by cargo at all on their own -- toggling this var on/off
@@ -1383,17 +1422,70 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     println!("cargo:rerun-if-env-changed=POSIX_EXTRA_EXCLUDE_FILE");
     if std::env::var("POSIX_PILOT_CANARY_ONLY").is_ok() {
         const CANARY: &[&str] = &[
-            "pthread_attr_destroy/1-1.c",
             "fork/11-1.c",
-            "sem_post/8-1.c",
+            "pthread_attr_destroy/1-1.c",
+            "pthread_atfork/3-3.c",
             "sem_unlink/2-2.c",
             "sem_unlink/3-1.c",
             "sem_wait/7-1.c",
-            "pthread_atfork/3-3.c",
+            "sem_post/8-1.c",
             "sigwait/4-1.c",
             "timer_settime/2-1.c",
             "timer_settime/6-1.c",
             "timer_settime/9-1.c",
+            "shm_open/1-1.c",
+            "shm_open/10-1.c",
+            "shm_open/11-1.c",
+            "shm_open/12-1.c",
+            "shm_open/13-1.c",
+            "shm_open/14-2.c",
+            "shm_open/15-1.c",
+            "shm_open/16-1.c",
+            "shm_open/17-1.c",
+            "shm_open/18-1.c",
+            "shm_open/19-1.c",
+            "shm_open/2-1.c",
+            "shm_open/20-1.c",
+            "shm_open/20-2.c",
+            "shm_open/20-3.c",
+            "shm_open/21-1.c",
+            "shm_open/22-1.c",
+            "shm_open/24-1.c",
+            "shm_open/25-1.c",
+            "shm_open/26-1.c",
+            "shm_open/26-2.c",
+            "shm_open/27-1.c",
+            "shm_open/28-1.c",
+            "shm_open/28-2.c",
+            "shm_open/28-3.c",
+            "shm_open/29-1.c",
+            "shm_open/3-1.c",
+            "shm_open/32-1.c",
+            "shm_open/34-1.c",
+            "shm_open/36-1.c",
+            "shm_open/37-1.c",
+            "shm_open/38-1.c",
+            "shm_open/39-1.c",
+            "shm_open/39-2.c",
+            "shm_open/41-1.c",
+            "shm_open/42-1.c",
+            "shm_open/5-1.c",
+            "shm_open/6-1.c",
+            "shm_open/7-1.c",
+            "shm_open/8-1.c",
+            "shm_open/9-1.c",
+            "shm_unlink/1-1.c",
+            "shm_unlink/10-1.c",
+            "shm_unlink/10-2.c",
+            "shm_unlink/11-1.c",
+            "shm_unlink/2-1.c",
+            "shm_unlink/3-1.c",
+            "shm_unlink/5-1.c",
+            "shm_unlink/6-1.c",
+            "shm_unlink/8-1.c",
+            "shm_unlink/9-1.c",
+            "sigaction/1-1.c",
+            "sigaction/1-2.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

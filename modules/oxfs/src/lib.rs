@@ -532,7 +532,21 @@ const CWD_PROC_KIND_TASKLIST: u64 = 2 << CWD_PROC_KIND_SHIFT;
 const CWD_PROC_KIND_FDLIST: u64 = 3 << CWD_PROC_KIND_SHIFT;
 const CWD_PROC_PID_MASK: u64 = 0xFFFF_FFFF;
 
-const MAX_OPEN_FILES: usize = 8;
+/// **Bumped 8 -> 256 (2026-09-05), root cause found chasing a pilot-run cascade**: this table is
+/// *global*, not per-process, and this kernel has no orphan-reaping mechanism (see `do_wait4`'s
+/// own doc comment) -- a process whose real parent already exited (or that itself gets stuck)
+/// leaves any fd it opened here permanently leaked. The POSIX pilot's own `shm_open/23-1.c` (up to
+/// 1000 processes x 1000 loop iterations, each a real `shm_open(..., O_CREAT|O_EXCL, ...)` that
+/// never closes the fd) drove this straight to exhaustion at just 8 slots -- and because the table
+/// is global, that exhaustion didn't just fail `shm_open/23-1.c` itself, it made `hush` (pid 1)
+/// unable to open *its own* redirect file for every single test that ran afterward, silently
+/// misclassifying hundreds of unrelated, individually-correct tests as FAIL for the rest of the
+/// boot. `shm_open/23-1.c` is still expected to fail/timeout on its own terms (a legitimate,
+/// extreme stress test this kernel was never going to fully pass) -- 256 just gives enough
+/// headroom that one extreme test can't cascade into corrupting everything that runs after it.
+/// Each slot costs `MAX_WRITE_BUFFER` bytes regardless of use (see that constant's own doc
+/// comment) -- 256 slots is ~32 MiB, a safe, cheap increase.
+const MAX_OPEN_FILES: usize = 256;
 /// Write-side accumulator cap (see `OpenFile::Write`'s own doc comment) -- comfortably past
 /// today's largest embedded binary (`sh.elf`, ~102 KB). Matches `modules/fat32`'s own final,
 /// proven-sufficient `MAX_FILE_BUFFER` value exactly (rather than something bigger): `OpenFile`'s

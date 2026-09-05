@@ -1370,6 +1370,60 @@ also catches this" needs that other mechanism re-checked to still exist, not tru
 value — the canary mechanism (`POSIX_PILOT_CANARY_ONLY=1`, see `build.rs`'s own doc comment) is now
 kept as a standing regression suite covering all ten of these fixes plus the four `sem_*` ones, not
 emptied out after use, specifically to make catching this kind of drift cheap going forward.
+**Stale as of the next section below**: `POSIX_KNOWN_HANGS` gained a third live exclusion,
+`shm_open/23-1.c`, for an unrelated reason (a global-fd-table leak cascade, not a hang).
+
+## A global-fd-table exhaustion cascade misclassifying hundreds of unrelated tests as `sigaction/1-N.c` FAILs, `MAX_OPEN_FILES` bumped, `shm_open/23-1.c` excluded (`modules/oxfs/src/lib.rs`, `build.rs`)
+
+A full-corpus supervised pilot run reported 268 FAILs, 210 of them `sigaction/1-N.c` — wildly
+disproportionate for a handful of small, previously-passing files. Isolating `sigaction/1-1.c`/
+`1-2.c` alone (`POSIX_PILOT_CANARY_ONLY=1`) showed both cleanly `PASS`, proving the bug was
+state-dependent on the full sequential run, not in signal delivery itself.
+
+- **Root cause**: `modules/oxfs`'s `OPEN_FILES` table (`MAX_OPEN_FILES`, used for any write-mode or
+  newly-created-file open) is a single **global** fixed-size array, not scoped per process. The
+  pilot's own `shm_open/23-1.c` (real POSIX atomicity stress test: `NPROCESS=1000` children, each
+  looping `NLOOP=1000` times calling `shm_open(name, O_RDONLY|O_CREAT|O_EXCL, ...)`) never calls
+  `close(fd)` anywhere in that loop — harmless on a real POSIX system, where fd exhaustion is
+  scoped *per-process* (bounded by that one process's own `RLIMIT_NOFILE`), but on this kernel it
+  permanently drains a table every other process shares, including **`hush` itself**. Once
+  exhausted, `hush` can no longer open its own output-redirect file for the rest of the boot, so
+  every later test — regardless of that test's own actual correctness — got misclassified as FAIL
+  (`hush: can't open '/posix-tests/run-out.txt': No file descriptors available` on every line).
+  Confirmed by rebuilding the canary list to the real manifest slice from `shm_open/1-1.c` through
+  `sigaction/1-2.c`: the exact same cascade reproduced in isolation, with `[diag] tick=` showing the
+  process table still growing rapidly right as `shm_open/23-1.c` hit its own real `TIMEOUT`.
+  `close_all()` (`src/fs/fd.rs`, called from `terminate_process`) is not the bug — verified correct;
+  the leaked children are still alive and running, not exited-but-unreaped.
+- **`MAX_OPEN_FILES` bumped 8 → 256** (`modules/oxfs/src/lib.rs`) — a genuine, worthwhile increase
+  in its own right (each slot costs `MAX_WRITE_BUFFER` = 128 KiB regardless of use, so 256 slots is
+  a cheap ~32 MiB), but **not sufficient alone**: `shm_open/23-1.c`'s children keep running and
+  leaking new global entries for a real, sustained stretch of wall-clock time (`sleep(1)` plus a
+  random 0–20 ms `nanosleep` between each of 1000 iterations, times 1000 children) — confirmed live
+  that even with the bump, running the same file far enough ahead of other tests (`timer_settime/
+  {2-1,6-1,9-1}.c`, well past `sigaction` in the canary's alphabetical order) still hit the
+  identical "No file descriptors available" cascade once enough wall-clock time had passed for the
+  orphans to re-exhaust the larger table. A static bump only buys time against an unbounded leak,
+  it can't fix one.
+- **`shm_open/23-1.c` added to `POSIX_KNOWN_HANGS`** (not a hang — it correctly `TIMEOUT`s at
+  `t0`'s own 40s bound, never wedges the boot — but excluded anyway since leaving it in a real
+  full-corpus run cascades into misclassifying hundreds of unrelated later files regardless of how
+  large `MAX_OPEN_FILES` is). The real fix for this class of test would be a genuine per-process
+  (or per-tgid) fd quota — out of scope for this pass; noted as a known architectural gap
+  (`OPEN_FILES` being global rather than per-process is otherwise invisible, since almost nothing
+  in this corpus leaks fds at this kind of scale). Also dropped from the `POSIX_PILOT_CANARY_ONLY`
+  standing regression suite for the same reason — keeping a permanently-excluded, unboundedly
+  leaking file in that suite would fail its own downstream neighbors forever regardless of kernel
+  correctness, not a useful signal.
+- **Verified**: the real manifest slice (all `shm_open`/`shm_unlink` files plus `sigaction/1-{1,2}
+  .c`, run in order) now completes cleanly with `sigaction/1-1.c`/`1-2.c` both `PASS` and no
+  cascade; the full 64-file standing canary suite (all prior fixes plus this one) also passes
+  clean, `table_len` staying flat at 2–3 throughout instead of climbing into the hundreds. Two
+  narrow, unrelated, pre-existing FAILs surfaced once the cascade stopped masking them —
+  `shm_open/39-2.c`/`shm_unlink/10-2.c`, both `ENAMETOOLONG`-for-`PATH_MAX` enforcement gaps
+  neither `shm_open`/`shm_unlink` currently implements — noted as a follow-up, not fixed here. A
+  fresh full-corpus supervised run to fold this fix into an official baseline number hasn't been
+  done yet.
 
 ## SIGCHLD delivery, real `sched_setparam(2)`, and four more mmap conformance fixes (`src/process/`, `modules/oxfs/`, `modules/posix_compat/`)
 
