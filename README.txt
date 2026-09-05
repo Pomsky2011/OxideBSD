@@ -13,9 +13,11 @@ Dependencies:
 A C compiler (clang or gcc) with musl support
 GNU make (for BusyBox)
 Cargo nightly
+bootimage (`cargo install bootimage`)
+QEMU (for testing in a VM)
 
 Building:
-To build it, use `cargo build`. There might be some difficulties which I am working on smoothing out before the upcoming v0.1.x release series.
+To build it, use `cargo build`.
 
 Versions:
 Each major release will have extended support for a year after the release of its successor - i.e. if v1.x comes out in 2027, and v2.x comes out in 2029, v1.x will be discontinued in 2030.
