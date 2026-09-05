@@ -1486,6 +1486,12 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "shm_unlink/9-1.c",
             "sigaction/1-1.c",
             "sigaction/1-2.c",
+            // `pthread_attr_setdetachstate/2-1.c`: real regression coverage for the per-process
+            // scheduler quantum fix (`Process::quantum_ticks_left`, see its own doc comment) --
+            // this file's own `pthread_join()`/`pthread_detach()` against an already-detached
+            // thread raced that thread's own exit (`__unmapself` unmapping the very memory holding
+            // `detach_state`) badly enough to flakily `CRASH`/hang before that fix.
+            "pthread_attr_setdetachstate/2-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

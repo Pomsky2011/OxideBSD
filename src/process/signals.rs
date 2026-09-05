@@ -289,7 +289,11 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
 
     match action {
         Action::Discard => {}
-        Action::Terminate => terminate_process(target, 128 + sig as i32),
+        // Real POSIX semantics: a default-disposition-terminating signal kills the *whole* thread
+        // group, not just the one named target thread -- see `terminate_thread_group`'s own doc
+        // comment for the real bug this closed (a thread-group leader with live siblings silently
+        // treated as a disposable, invisible-to-wait4 CLONE_THREAD sibling).
+        Action::Terminate => terminate_thread_group(target, 128 + sig as i32),
         Action::Stop => {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {
@@ -395,7 +399,8 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
     for (pid, action) in targets {
         match action {
             Action::Discard => {}
-            Action::Terminate => terminate_process(pid, 128 + sig as i32),
+            // See `terminate_thread_group`'s own doc comment.
+            Action::Terminate => terminate_thread_group(pid, 128 + sig as i32),
             Action::Stop => {
                 let mut table = PROCESS_TABLE.lock();
                 if let Some(proc) = table.get_mut(&pid) {
@@ -1296,7 +1301,11 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
 
     match action {
         Action::Discard => {}
-        Action::Terminate => terminate_process(target, 128 + sig as i32),
+        // Real POSIX semantics: a default-disposition-terminating signal kills the *whole* thread
+        // group, not just the one named target thread -- see `terminate_thread_group`'s own doc
+        // comment for the real bug this closed (a thread-group leader with live siblings silently
+        // treated as a disposable, invisible-to-wait4 CLONE_THREAD sibling).
+        Action::Terminate => terminate_thread_group(target, 128 + sig as i32),
         Action::Stop => {
             let mut table = PROCESS_TABLE.lock();
             if let Some(proc) = table.get_mut(&target) {

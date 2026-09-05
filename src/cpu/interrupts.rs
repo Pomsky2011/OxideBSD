@@ -334,15 +334,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
         // the other.
         if now % 1000 == 0 {
             crate::serial_println!("[diag] tick={} table_len={}", now, table.len());
-            // The matching `[diag-thread]` per-process state dump (a TEMPORARY diagnostic for the
-            // pthread/aio massfix investigation -- see CLAUDE.md's "real thread-group signal
-            // delivery" section) is removed: that investigation is done, and an O(table_len) full
-            // scan-and-print *every 10 real seconds* is a genuine, unbounded performance hazard
-            // for any real workload with many live processes/threads -- found live via
-            // `pthread_cond_broadcast/1-2.c` (up to 10000 real threads), whose own per-interval
-            // dump cost grows with thread count and dominated the file's total real runtime, badly
-            // enough to look like a hang even after the actual bug (`KernelStack::new`'s hard
-            // panic on allocation failure, see that function's own doc comment) was fixed.
+            // The matching `[diag-thread]` per-process state dump (a TEMPORARY diagnostic, most
+            // recently for the `pthread_attr_setdetachstate/2-1.c` race/hang investigation -- see
+            // CLAUDE.md's "closing a real scheduler race and a real thread-group-leader signal
+            // termination bug" section) is removed: that investigation is done, and an
+            // O(table_len) full scan-and-print *every 10 real seconds* is a genuine, unbounded
+            // performance hazard for any real workload with many live processes/threads.
         }
         // Real per-process CPU-time accounting (`Process::cpu_ticks`, see its own doc comment) --
         // the process this tick actually interrupted is the one that was consuming the CPU for it.
@@ -564,14 +561,25 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
         // something has actually called `sched_setscheduler`/`sched_setparam` into a real-time
         // policy. See `scheduler::ready_queue_has_higher_priority_than`'s own doc comment for why a
         // process-table lookup here is safe (no lock this handler already holds could conflict).
-        let current_priority = crate::process::table()
-            .lock()
-            .get(&crate::process::scheduler::current_pid())
-            .map(|p| p.sched_priority)
-            .unwrap_or(0);
+        //
+        // Real per-process quantum (`Process::quantum_ticks_left`'s own doc comment) replacing a
+        // purely global-clock-phase check -- decremented here, once per tick this exact process is
+        // found actually running, rather than checking whether the *global* tick counter's phase
+        // happens to line up. One combined table lookup for both this and the priority check above.
+        let (current_priority, quantum_expired) = {
+            let mut table = crate::process::table().lock();
+            match table.get_mut(&crate::process::scheduler::current_pid()) {
+                Some(p) => {
+                    let priority = p.sched_priority;
+                    p.quantum_ticks_left = p.quantum_ticks_left.saturating_sub(1);
+                    (priority, p.quantum_ticks_left == 0)
+                }
+                None => (0, false),
+            }
+        };
         let higher_priority_ready =
             crate::process::scheduler::ready_queue_has_higher_priority_than(current_priority);
-        if higher_priority_ready || now.is_multiple_of(PREEMPT_QUANTUM_TICKS) {
+        if higher_priority_ready || quantum_expired {
             crate::process::scheduler::schedule();
         }
 

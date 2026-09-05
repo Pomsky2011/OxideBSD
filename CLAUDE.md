@@ -1425,6 +1425,86 @@ state-dependent on the full sequential run, not in signal delivery itself.
   fresh full-corpus supervised run to fold this fix into an official baseline number hasn't been
   done yet.
 
+## Closing a real scheduler race and a real thread-group-leader signal-termination bug (`src/process/{mod,scheduler,lifecycle,signals}.rs`, `src/cpu/interrupts.rs`, `src/syscall/mod.rs`)
+
+A fresh, `--reset` full-corpus supervised pilot run hit the same "naive exclude-the-stalled-file
+heuristic doesn't converge" trap the `ofl_lock` investigation hit earlier — 7 iterations, 7
+exclusions, every one landing in `pthread_cond_*`/`pthread_cancel`/`pthread_attr_*` territory (new
+ground, since the `ofl_lock` fix only just unblocked reaching this far). Investigating the first of
+these, `pthread_attr_setdetachstate/2-1.c`, found two real, independent, now-fixed bugs — one
+scheduler-level, one signal-delivery-level — behind what looked like one flaky test.
+
+- **Bug 1, the scheduler**: `interrupts::timer_interrupt_handler`'s ring-3 preemption check used to
+  be `now.is_multiple_of(PREEMPT_QUANTUM_TICKS)` — a purely **global** tick-counter-phase check, not
+  a per-process quantum. A process's actual remaining time before a possible preemption was pure
+  luck (1 to `PREEMPT_QUANTUM_TICKS` ticks) depending only on where the global counter's phase
+  happened to be when it started running, never on anything about that process itself. Real
+  musl's `pthread_join()`/`pthread_detach()` against an already-`PTHREAD_CREATE_DETACHED` thread
+  deliberately call `a_crash()` (see Bug 2) after reading that thread's own `detach_state` field —
+  a field living inside the very stack mapping the detached thread's own exit path (`__unmapself`)
+  unmaps out from under it, with zero synchronization (real POSIX documents this exact case —
+  joining/detaching an already-detached thread — as undefined behavior). A real multi-core
+  machine's own fast, tiny instruction window between `pthread_create()` returning and that read
+  almost never loses this race. Under this kernel's single-core, QEMU/TCG-emulated execution, that
+  same handful of instructions can span a whole 10ms tick, making a same-tick preemption to the
+  freshly-created (and nearly idle) child land in the middle of that window a real, reproducible
+  occurrence.
+  - **Fix**: real per-process round-robin quantum. `Process::quantum_ticks_left` is set to a fresh
+    `PREEMPT_QUANTUM_TICKS` every time a process is (re)activated to `Running`
+    (`scheduler::activate_and_prepare`, and `schedule()`'s own "nothing else ready, same process
+    keeps running" fast path, which bypasses that function entirely) and decremented once per tick
+    it's found actually running; preempted at `0`. **The actual race-closing move**: `do_clone`
+    resets the *caller's own* remaining quantum back to a fresh value right as its new child
+    becomes schedulable — giving a thread that just created another thread a real, guaranteed
+    window to finish any immediate follow-up work (like this test's own `pthread_join`/
+    `pthread_detach` pair) before the brand-new child could possibly preempt it.
+- **Bug 2, the real crash-or-hang mechanism**: real, unmodified musl's `a_crash()` (x86_64) is a
+  raw ring-3 `hlt` instruction — a privileged opcode, `#GP`-faulting at CPL=3, converted by this
+  kernel's own real fault-to-signal delivery (see "Real ring-3 fault-to-signal delivery" above)
+  into a genuine self-`SIGSEGV`. That default-disposition termination path
+  (`syscall::deliver_pending_signal`'s `SignalDelivery::Terminate` arm) called `do_exit` — a
+  **per-thread**-only exit — instead of `do_exit_group`. If the crashing thread happened to be a
+  thread-group **leader** with a still-live sibling thread (exactly this test's own shape: the
+  main thread crashes inside `pthread_join()` while its own newly-created worker thread might
+  still be alive), `terminate_process`'s `other_thread_alive` check saw that live sibling and
+  concluded this was "just another disposable `CLONE_THREAD` sibling exiting" — correct for an
+  *actual* non-leader thread (never an independent `wait4` target), catastrophically wrong for the
+  leader itself, which is the *only* process a real `wait4()` is ever watching. The leader got
+  silently marked `Zombie` and queued for full table-entry removal with **no**
+  `wake_parent_if_waiting`/`notify_parent_sigchld` call at all — permanently hanging the parent's
+  `wait4(-1, ...)`, whether the queued removal finished first (the pid vanishes outright, wait4's
+  own children-list scan finds nothing) or not (an unreachable, never-notified zombie sitting
+  there, since no second wake is ever coming). This is the **same underlying gap** `do_kill`'s
+  cross-process `Action::Terminate` had too (a `kill(pid, SIGKILL)` on a thread-group leader with
+  live siblings would hit the identical bug) — both were auditing the wrong function for a signal
+  that must, per real POSIX, terminate the *whole* process, not one thread.
+  - **Fix**: factored `do_exit_group`'s own "kill every other thread first, then this one" logic
+    into `terminate_thread_group` (non-diverging, for a target that isn't necessarily the
+    currently-running process — `do_exit_group` itself now just calls this then its own
+    `schedule()`/`unreachable!()` epilogue). `deliver_pending_signal`'s `SignalDelivery::Terminate`
+    arm now calls `do_exit_group` directly (a strict superset of `do_exit`'s own behavior for a
+    genuinely single-threaded caller, safe unconditionally); `do_kill`'s three `Action::Terminate`
+    call sites now call `terminate_thread_group` instead of `terminate_process` directly.
+- **Debugging note**: found via three rounds of targeted `serial_println!` tracing (queue/drain
+  events in the thread-reap queue, then `do_exit`/`do_exit_group`/`wake_parent_if_waiting`/
+  `do_wait4`'s own entry points and decisions), not guesswork — the first theory (a pure musl
+  detached-thread-exit race, unfixable kernel-side) was **wrong**; mapping a genuine ring-0 page
+  fault's own instruction pointer back through the compiled test binary's symbol table (`addr2line`)
+  is what actually located the real, fixable bug. All temporary tracing was removed once the real
+  fix was confirmed.
+- **Verified**: `pthread_attr_setdetachstate/2-1.c` now `CRASH(139)`s **deterministically** (matching
+  real musl's own intentional `a_crash()` behavior for this exact undefined-behavior case — not
+  something to "fix" further) and the pilot recovers cleanly afterward every time, across 9
+  consecutive isolated canary runs (previously flaky: sometimes crashed cleanly, sometimes hung
+  forever). Full existing regression suite (`fork_wait`, `clone_syscall_smoke`,
+  `pthread_syscall_smoke`, `sysv_sem_syscall_smoke`, `sem_open_syscall_smoke`,
+  `pthread_cancel_crash_smoke`, `pshared_cond_crash_smoke`, `mmap_syscall_smoke`,
+  `dynlink_syscall_smoke`) still passes, including every fault-to-signal and cross-process-kill
+  path this change touches. `pthread_attr_setdetachstate/2-1.c` added to the `POSIX_PILOT_CANARY_ONLY`
+  standing regression suite. Other files found stalling in the same supervised run
+  (`pthread_cond_broadcast/2-3.c`/`4-2.c`, `pthread_cond_destroy/2-1.c`) are separate, not yet
+  investigated — a fresh full-corpus run hasn't been done yet.
+
 ## SIGCHLD delivery, real `sched_setparam(2)`, and four more mmap conformance fixes (`src/process/`, `modules/oxfs/`, `modules/posix_compat/`)
 
 - **Real `SIGCHLD` delivery on child exit/stop/continue**: this kernel never delivered a real

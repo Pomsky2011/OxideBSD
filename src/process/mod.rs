@@ -995,6 +995,32 @@ pub struct Process {
     /// a forked child (real POSIX: a process's own CPU time never carries over from a parent);
     /// preserved by `execve` (the same process, still accumulating, just running a new image).
     pub cpu_ticks: u64,
+    /// Real per-process round-robin quantum, replacing a purely global-clock-phase preemption
+    /// check (`now.is_multiple_of(PREEMPT_QUANTUM_TICKS)` in `interrupts::timer_interrupt_handler`)
+    /// that used to let a process's actual remaining time before preemption be pure luck -- 1 to
+    /// `PREEMPT_QUANTUM_TICKS` ticks depending only on the *global* tick counter's phase when it
+    /// happened to start running, not on anything about that process itself. Set to
+    /// `PREEMPT_QUANTUM_TICKS` whenever a process is (re)activated to `Running`
+    /// (`scheduler::activate_and_prepare`); decremented once per tick it's found `Running` in
+    /// `timer_interrupt_handler`, preempted at `0`. **Load-bearing for closing a real race**: a
+    /// thread that just created another thread (`do_clone`) resets its own remaining quantum back
+    /// to a fresh `PREEMPT_QUANTUM_TICKS` right there — real musl's own `pthread_join`/
+    /// `pthread_detach` against an already-`PTHREAD_CREATE_DETACHED` thread reads that thread's own
+    /// `detach_state` field with zero synchronization (real POSIX documents this exact case as
+    /// undefined behavior), and that field lives inside the very stack mapping the detached
+    /// thread's own exit path (`__unmapself`) unmaps out from under it — a real race present in
+    /// stock musl too, but one a real multi-core machine's own fast, tiny post-`clone()` instruction
+    /// window almost never loses. Under this kernel's single-core, QEMU/TCG-emulated execution, that
+    /// same handful of instructions can span a whole 10ms tick, making a same-tick preemption to the
+    /// freshly-created child (which does almost no work before exiting) landing in the middle of
+    /// exactly this window a real, reproducible occurrence — manifesting as either a `SIGSEGV`
+    /// reading now-unmapped memory or, worse, a permanent hang reading stale bytes that happen to
+    /// look like a still-joinable state and genuinely block on a wake that will never come (the
+    /// detached-exit path never calls one). Found chasing `pthread_attr_setdetachstate/2-1.c`'s own
+    /// flaky crash-or-hang behavior in the Open POSIX Test Suite pilot. Not inherited across
+    /// `fork`/`execve` (a fresh quantum, same as spawn) — this field describes *scheduling*
+    /// standing, not process identity.
+    pub quantum_ticks_left: u64,
 }
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());

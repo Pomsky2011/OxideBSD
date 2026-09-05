@@ -713,7 +713,20 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
     };
     match delivery {
         crate::process::SignalDelivery::Terminate(code) => {
-            crate::process::do_exit(pid, code);
+            // Real POSIX semantics: an uncaught, default-disposition-terminating signal kills the
+            // *whole* thread group, not just the one thread that happened to receive/generate it
+            // (e.g. `a_crash()`'s deliberate ring-3 `hlt` -> `#GP` -> self-`SIGSEGV`, reached here).
+            // `do_exit` alone let `terminate_process`'s own `other_thread_alive` check see this
+            // thread's still-live siblings and wrongly treat it as "just another disposable
+            // CLONE_THREAD sibling" -- even when it was the thread-group *leader*, the one process
+            // a real `wait4()` is actually watching -- silently zombifying-and-removing it with no
+            // parent notification at all, permanently hanging the parent's own `wait4(-1, ...)`.
+            // `do_exit_group` is a strict superset of `do_exit`'s own behavior for a genuinely
+            // single-threaded caller (its own sibling scan finds nothing, falls straight through to
+            // the same "last thread of group" path `do_exit` alone would have taken) so this is
+            // safe unconditionally, not just for the multi-threaded case that exposed the bug.
+            // Found chasing a flaky crash-or-hang in `pthread_attr_setdetachstate/2-1.c`.
+            crate::process::do_exit_group(pid, code);
         }
         crate::process::SignalDelivery::Stop(signum) => {
             crate::process::do_stop_self(pid, signum);

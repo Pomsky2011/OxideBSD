@@ -164,6 +164,9 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: crate::cpu::fpu::clean_state(),
         cpu_ticks: 0,
+        // A fresh process/thread always starts with a full quantum -- see `Process::
+        // quantum_ticks_left`'s own doc comment.
+        quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
     };
 
     {
@@ -466,6 +469,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // Not inherited -- real POSIX: a forked child's own CPU time starts at 0, it hasn't run
         // yet (see this field's own doc comment on Process).
         cpu_ticks: 0,
+        // A fresh process/thread always starts with a full quantum -- see `Process::
+        // quantum_ticks_left`'s own doc comment.
+        quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
     };
 
     {
@@ -692,6 +698,9 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: parent_fpu_state,
         cpu_ticks: 0,
+        // A fresh process/thread always starts with a full quantum -- see `Process::
+        // quantum_ticks_left`'s own doc comment.
+        quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
     };
 
     {
@@ -699,6 +708,14 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         // Deliberately not pushed into caller's own `children` -- see this function's own doc
         // comment on why a CLONE_THREAD child is never an independent wait4 target.
         table.insert(child_pid, Box::new(child));
+        // Real race closed here -- see `Process::quantum_ticks_left`'s own doc comment. Give the
+        // caller a fresh, full quantum right as its new child becomes schedulable (below), so any
+        // immediate follow-up work (a `pthread_join`/`pthread_detach` racing the new thread's own
+        // exit, the shape that exposed this) gets a real, guaranteed window to finish before the
+        // brand-new child -- which does no real work here yet -- could possibly preempt it.
+        if let Some(me) = table.get_mut(&caller_pid) {
+            me.quantum_ticks_left = crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS;
+        }
     }
     // Real CLONE_FILES: unlike do_fork_from_current, no explicit fs::fd::fork_inherit call is
     // needed here at all -- the child's own tgid is the same as the caller's (set above), and
@@ -1327,19 +1344,46 @@ pub fn do_exit(caller_pid: Pid, code: i32) -> ! {
 /// thread of the group" path: `close_all`/SysV cleanup/mmap writeback run exactly once, and the
 /// parent gets exactly one `SIGCHLD` for the whole process, not one per thread.
 pub fn do_exit_group(caller_pid: Pid, code: i32) -> ! {
+    terminate_thread_group(caller_pid, code);
+    scheduler::schedule();
+    unreachable!("do_exit_group: schedule() returned control to a Zombie process");
+}
+
+/// The actual "kill every other thread in the group, then this one" logic `do_exit_group` needs —
+/// factored out so `do_kill`'s cross-process `Action::Terminate` and `deliver_pending_signal`'s
+/// self-signal `SignalDelivery::Terminate` (see that match arm's own doc comment) can reach the
+/// exact same real POSIX behavior for a target that isn't necessarily the currently-running
+/// process, without `do_exit_group`'s own diverging `scheduler::schedule()` epilogue (only correct
+/// when the *caller* is terminating itself).
+///
+/// **Real bug this closed**: both of those call sites used to call `terminate_process` directly on
+/// just the one named/signaled thread. If that thread happened to be a thread-group *leader* with
+/// still-live sibling threads, `terminate_process`'s own `other_thread_alive` check saw those
+/// siblings and concluded this was "just another disposable `CLONE_THREAD` sibling exiting" —
+/// silently marking the *leader* `Zombie` and queuing it for full removal, without ever calling
+/// `wake_parent_if_waiting`/`notify_parent_sigchld` (correct for an *actual* non-leader sibling,
+/// which is never an independent `wait4` target — wrong for the leader, which is the one process a
+/// real `wait4()` is ever watching). The parent's `wait4(-1, ...)` then blocked forever: the pid it
+/// was tracking either vanished outright (once the queued removal drained) or sat as an
+/// unreachable, un-notified zombie, with no second wake ever coming. Found chasing a flaky
+/// crash-or-hang in `pthread_attr_setdetachstate/2-1.c`: real musl's `pthread_join()`/
+/// `pthread_detach()` against an already-detached thread deliberately executes `a_crash()` (a raw
+/// ring-3 `hlt`, `#GP`-faulting into a self-`SIGSEGV`) — reaching exactly this path, on a process
+/// that, in this exact test, still has one live sibling thread at that moment.
+pub(crate) fn terminate_thread_group(target_pid: Pid, code: i32) {
     let tgid = {
         let table = PROCESS_TABLE.lock();
-        table
-            .get(&caller_pid)
-            .expect("do_exit_group: caller missing from table")
-            .tgid
+        match table.get(&target_pid) {
+            Some(p) => p.tgid,
+            None => return,
+        }
     };
     let siblings: Vec<Pid> = {
         let table = PROCESS_TABLE.lock();
         table
             .iter()
             .filter(|&(&pid, proc)| {
-                pid != caller_pid
+                pid != target_pid
                     && proc.tgid == tgid
                     && !matches!(proc.state, ProcState::Zombie(_))
             })
@@ -1349,9 +1393,7 @@ pub fn do_exit_group(caller_pid: Pid, code: i32) -> ! {
     for sibling in siblings {
         terminate_process(sibling, code);
     }
-    terminate_process(caller_pid, code);
-    scheduler::schedule();
-    unreachable!("do_exit_group: schedule() returned control to a Zombie process");
+    terminate_process(target_pid, code);
 }
 
 /// The actual state transition `do_exit` (the caller terminating itself) and `do_kill` (one

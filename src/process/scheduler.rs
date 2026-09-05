@@ -279,7 +279,13 @@ pub fn schedule() {
         let next_pid = wait_for_ready();
 
         if has_prev && next_pid == prev_pid {
-            process::table().lock().get_mut(&prev_pid).unwrap().state = ProcState::Running;
+            let mut table = process::table().lock();
+            let prev = table.get_mut(&prev_pid).unwrap();
+            prev.state = ProcState::Running;
+            // Same fresh-quantum reasoning as `activate_and_prepare` -- this fast path (nothing
+            // else was ready, so the same process just keeps running) skips that function
+            // entirely, so it needs its own reset here.
+            prev.quantum_ticks_left = crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS;
             return;
         }
 
@@ -371,6 +377,9 @@ fn activate_and_prepare(pid: Pid) -> u64 {
         .get_mut(&pid)
         .expect("activate_and_prepare: pid missing from table");
     next.state = ProcState::Running;
+    // A fresh quantum every time a process is (re)activated -- see `Process::quantum_ticks_left`'s
+    // own doc comment for why this replaced a purely global-clock-phase preemption check.
+    next.quantum_ticks_left = crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS;
     // SAFETY: next's AddressSpace carries the kernel's own mappings (shared by every process, per
     // AddressSpace::new's shallow copy) plus its own user segments/stack, so activating it here —
     // still running on the outgoing stack, about to switch away — is safe, mirroring
