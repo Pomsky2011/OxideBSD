@@ -35,7 +35,10 @@ const SYS_CLOSE: u64 = 6;
 pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     let phys_offset = memory::phys_mem_offset();
 
-    let address_space = with_frame_allocator(|fa| AddressSpace::new(phys_offset, fa));
+    // Boot-time only: no syscall caller to report a real ENOMEM to, and no recovery from pid 1
+    // itself failing to start -- see KernelStack::new's own doc comment (src/process/mod.rs).
+    let address_space = with_frame_allocator(|fa| AddressSpace::new(phys_offset, fa))
+        .expect("out of memory allocating a new address space's level 4 table");
     // SAFETY: phys_offset is the bootloader's phys-memory mapping; this is the only live view of
     // address_space's own (not-yet-active) level 4 table right now.
     let mut mapper = unsafe { address_space.mapper(phys_offset) };
@@ -45,8 +48,11 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         .map_err(SpawnError::Elf)?;
 
     let stack_top = VirtAddr::new(USER_STACK_TOP);
-    let mapped_pages = map_user_stack(&mut mapper, stack_top);
-    crate::process::fault_trampoline::map(&mut mapper, phys_offset);
+    // Boot-time only -- same reasoning as address_space's own `.expect()` just above.
+    let mapped_pages =
+        map_user_stack(&mut mapper, stack_top).expect("out of memory mapping a user stack");
+    crate::process::fault_trampoline::map(&mut mapper, phys_offset)
+        .expect("out of memory mapping the fault trampoline page");
     // spawn() has no real invocation path to use as argv[0] (unlike do_execve, which knows exactly
     // what path it opened) -- this is only ever pid 1, built directly from an embedded ELF at
     // boot, so a fixed placeholder is all there is to give. pid 1 is a real musl-linked binary
@@ -191,33 +197,54 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
 /// page it just mapped — `user_stack::build` needs this to write the argv/envp/auxv image into the
 /// right physical frames afterward, the same way `elf::load` already tracks its own mapped pages
 /// for BSS zeroing.
+///
+/// # Errors
+///
+/// `Err(())` on real frame exhaustion -- same "a real resource limit must fail one syscall, not
+/// panic the kernel" motivation as `process::KernelStack::new`/`AddressSpace::build_from_active`/
+/// `fault_trampoline::map`. Deliberately doesn't unmap/free whatever pages this call already
+/// mapped before hitting exhaustion -- `do_execve`, this function's one fallible-path caller, has
+/// no established convention for tearing down its own scratch `new_address_space` on *any*
+/// mid-build failure yet (an `ENOEXEC` found partway through `elf::load`, for instance, leaks the
+/// same way today) -- not introducing a new, inconsistent partial-cleanup discipline for just this
+/// one call site. `spawn`'s boot-time call site still panics on this, same as every other
+/// boot-time allocation site.
 fn map_user_stack(
     mapper: &mut impl Mapper<Size4KiB>,
     stack_top: VirtAddr,
-) -> BTreeMap<Page<Size4KiB>, PhysFrame<Size4KiB>> {
+) -> Result<BTreeMap<Page<Size4KiB>, PhysFrame<Size4KiB>>, ()> {
     let stack_bottom_page = Page::containing_address(stack_top - user_stack_pages() * 4096);
     let stack_top_page = Page::containing_address(stack_top - 1u64);
-    let mut mapped_pages = BTreeMap::new();
     let phys_offset = memory::phys_mem_offset();
     with_frame_allocator(|fa| {
+        let mut mapped_pages = BTreeMap::new();
         for page in Page::range_inclusive(stack_bottom_page, stack_top_page) {
-            let frame = fa
-                .allocate_frame()
-                .expect("out of memory mapping a user stack");
+            let frame = fa.allocate_frame().ok_or(())?;
             // SAFETY: frame was just allocated (unused, per BootInfoFrameAllocator's contract),
             // and page falls in this address space's own, not-yet-active range.
-            unsafe {
-                mapper
-                    .map_to(
-                        page,
-                        frame,
-                        PageTableFlags::PRESENT
-                            | PageTableFlags::WRITABLE
-                            | PageTableFlags::USER_ACCESSIBLE,
-                        fa,
-                    )
-                    .expect("failed to map a user stack page")
-                    .flush();
+            let flush = unsafe {
+                mapper.map_to(
+                    page,
+                    frame,
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE,
+                    fa,
+                )
+            };
+            match flush {
+                // Real, resource-exhaustion-triggerable: map_to's own internal page-table-
+                // structure allocation can hit the same frame exhaustion the leaf allocation just
+                // above already reports as a real ENOMEM, not a kernel panic.
+                Err(x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed) => {
+                    return Err(());
+                }
+                // A real logic-invariant violation, not a resource limit -- this range is always
+                // freshly computed and unmapped in a brand-new address space, so hitting either
+                // means a future change broke that assumption, worth a loud panic rather than a
+                // silently-wrong ENOMEM.
+                Err(e) => panic!("failed to map a user stack page: {e:?}"),
+                Ok(flush) => flush.flush(),
             }
             // A real frame handed back by `allocate_frame` may be a reused one (see
             // `BootInfoFrameAllocator`'s own `FrameDeallocator` impl) carrying a previous,
@@ -230,8 +257,8 @@ fn map_user_stack(
             unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
             mapped_pages.insert(page, frame);
         }
-    });
-    mapped_pages
+        Ok(mapped_pages)
+    })
 }
 
 /// `stack_top` minus enough room for `user_stack::build`'s image to always fit, regardless of
@@ -287,6 +314,13 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
                 .expect("fork: caller has no address space")
                 .fork(phys_offset, fa)
         });
+        // Real ENOMEM, not a kernel panic, on real frame exhaustion mid-copy -- see
+        // AddressSpace::build_from_active's own doc comment. Nothing to tear down on this
+        // particular path (unlike the matching KernelStack::new failure below): a failed `fork()`
+        // already freed everything it allocated internally before returning `Err` here.
+        let Ok(child_address_space) = child_address_space else {
+            return Err(ENOMEM);
+        };
         // Real fork() semantics for the now-`ThreadGroupShared` fields: cwd/root_inode/umask/
         // uid/gid/brk are all copied (a forked child is a real POSIX *process*, gets its own
         // independent ThreadGroupShared, never Arc::clone's the parent's -- that's do_clone's own
@@ -907,8 +941,8 @@ pub fn do_execve(
     // calling process's own, already-populated one (execve runs mid-syscall, on the caller's own
     // kernel stack, with its own CR3 still live) -- AddressSpace::new would shallow-copy that
     // process's *user* mappings too, aliasing them into what's supposed to be a fresh image.
-    let new_address_space =
-        with_frame_allocator(|fa| AddressSpace::new_excluding_user(phys_offset, fa));
+    let new_address_space = with_frame_allocator(|fa| AddressSpace::new_excluding_user(phys_offset, fa))
+        .map_err(|_| ENOMEM)?;
     // SAFETY: phys_offset is the bootloader's phys-memory mapping; this is the only live view of
     // new_address_space's own (not-yet-active) level 4 table right now.
     let mut mapper = unsafe { new_address_space.mapper(phys_offset) };
@@ -940,8 +974,8 @@ pub fn do_execve(
     }
 
     let stack_top = VirtAddr::new(USER_STACK_TOP);
-    let mapped_pages = map_user_stack(&mut mapper, stack_top);
-    crate::process::fault_trampoline::map(&mut mapper, phys_offset);
+    let mapped_pages = map_user_stack(&mut mapper, stack_top).map_err(|_| ENOMEM)?;
+    crate::process::fault_trampoline::map(&mut mapper, phys_offset).map_err(|_| ENOMEM)?;
     // raw_argv (read above, while the caller's own address space was still active) is the caller's
     // complete, real argv[] -- including a real, caller-chosen argv[0], which need not equal
     // path_bytes (see RawArgvEntry's own doc comment). An empty raw_argv (argv_ptr == 0, or a

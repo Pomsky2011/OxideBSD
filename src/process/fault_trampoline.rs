@@ -78,26 +78,43 @@ pub const RAX_SCRATCH_OFFSET: u64 = 0x100;
 /// `AddressSpace::fork`'s existing full eager copy of `USER_ACCESSIBLE` content). **Now real
 /// `WRITABLE`** -- the leading `RAX`-stashing store needs it (this kernel has no W^X enforcement
 /// anywhere regardless, see CLAUDE.md's own note on `elf::load`, so this costs nothing).
-pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) {
+///
+/// # Errors
+///
+/// `Err(())` on real frame exhaustion -- same "a real resource limit must fail one syscall, not
+/// panic the kernel" motivation as `process::KernelStack::new`/`AddressSpace::build_from_active`.
+/// `do_execve`'s own caller propagates this as a real `ENOMEM`; `spawn`'s boot-time call site
+/// still panics (no syscall caller to report to that early, matching every other boot-time
+/// allocation site).
+#[allow(clippy::result_unit_err)] // see AddressSpace::new's own identical allow.
+pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) -> Result<(), ()> {
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(FAULT_TRAMPOLINE_VA));
     with_frame_allocator(|fa| {
-        let frame = fa
-            .allocate_frame()
-            .expect("out of memory mapping the fault trampoline page");
+        let frame = fa.allocate_frame().ok_or(())?;
         // SAFETY: frame was just allocated (unused, per BootInfoFrameAllocator's contract), and
         // page falls in this address space's own, not-yet-active, otherwise-unused VA range.
-        unsafe {
-            mapper
-                .map_to(
-                    page,
-                    frame,
-                    PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::USER_ACCESSIBLE,
-                    fa,
-                )
-                .expect("failed to map the fault trampoline page")
-                .flush();
+        let flush = unsafe {
+            mapper.map_to(
+                page,
+                frame,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+                fa,
+            )
+        };
+        match flush {
+            // Real, resource-exhaustion-triggerable: map_to's own internal page-table-structure
+            // allocation (for this page's not-yet-existing PT/PD/PDPT entries) can hit the exact
+            // same frame exhaustion this whole function exists to report as a real ENOMEM, not a
+            // kernel panic -- same reasoning as the leaf frame allocation just above.
+            Err(x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed) => {
+                return Err(());
+            }
+            // Anything else (ParentEntryHugePage/PageAlreadyMapped) is a real logic-invariant
+            // violation, not a resource limit -- this VA is always fresh in a brand-new address
+            // space, so hitting either means a future change broke that assumption, worth a loud
+            // panic rather than a silently-wrong ENOMEM.
+            Err(e) => panic!("failed to map the fault trampoline page: {e:?}"),
+            Ok(flush) => flush.flush(),
         }
         let frame_ptr = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
         let imm = (crate::syscall::SYS_FAULT_PUMP as u32).to_le_bytes();
@@ -117,5 +134,6 @@ pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) {
             core::ptr::write_bytes(frame_ptr, 0, 4096);
             core::ptr::copy_nonoverlapping(code.as_ptr(), frame_ptr, code.len());
         }
-    });
+        Ok(())
+    })
 }

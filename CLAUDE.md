@@ -1254,7 +1254,8 @@ additionally tears down its already-built `child_address_space` on this path —
 still panics — no syscall caller to report `ENOMEM` to that early. Same *class* of bug the "Real
 zombie address-space frame reclaim" section above already fixed once, at a sibling allocation site
 — `AddressSpace::new`'s own L4-table `.expect()` and the "out of memory mapping a user stack" site
-in `lifecycle.rs` are the same shape and remain unfixed, narrower scope than this pass. **A second,
+in `lifecycle.rs` were the same shape and unfixed at the time — since closed, see this section's
+own follow-up paragraph below. **A second,
 unrelated bug this investigation also found**: `interrupts::timer_interrupt_handler`'s own
 `[diag-thread]` per-process diagnostic dump (added for the thread-group-signal-delivery
 investigation two sections up, explicitly marked temporary) did a full `O(table_len)` scan-and-
@@ -1262,6 +1263,60 @@ investigation two sections up, explicitly marked temporary) did a full `O(table_
 dominated a test's real wall-clock runtime badly enough to look like a permanent hang even after
 the actual `KernelStack::new` panic was fixed. Removed (the `[diag] tick=table_len=` line itself
 stays, `O(1)` per interval, still relevant to `fork/8-1.c`'s own open mystery below).
+
+**The remaining two OOM-panic sites, since closed** (`src/memory/address_space.rs`,
+`src/process/lifecycle.rs`, `src/process/fault_trampoline.rs`): `AddressSpace::new`/
+`build_from_active` (the shared implementation behind `new_excluding_user`/`fork`) and
+`copy_table_level` no longer hard-panic on frame exhaustion, matching `KernelStack::new`'s own
+fix just above. `build_from_active`'s frame allocator bound tightened from `FrameAllocator` alone
+to `FrameAllocator + FrameDeallocator`: a `copy_table_level` failure partway through a real
+`fork()`'s eager deep-copy can leave the new child table holding a genuine, partially-built
+subtree that must be freed before returning the error, or it leaks permanently. That cleanup
+reuses `free_table_level` (already used by `AddressSpace::teardown`) directly, with no new walk of
+its own — safe on a partially-built table because `child` is fully `zero()`'d immediately before
+`copy_table_level` starts, so every entry it never reached is still `!PRESENT`, which
+`free_table_level` already skips outright. `map_user_stack`/`fault_trampoline::map`
+(`lifecycle.rs`) got the identical treatment, including distinguishing `map_to`'s own
+`MapToError::FrameAllocationFailed` (real `ENOMEM`) from `ParentEntryHugePage`/`PageAlreadyMapped`
+(real logic-invariant violations, still a hard panic — always-fresh VAs in a brand-new address
+space, so hitting either means a future change broke that assumption). `do_execve`'s own three
+call sites propagate a real `ENOMEM`; `spawn`'s boot-time call sites still panic, same reasoning as
+every other boot-time allocation site. **Deliberately not addressed**: `do_execve` still has no
+established convention for tearing down its own scratch `new_address_space` on *any* mid-build
+failure (an `ENOEXEC` found partway through `elf::load`, for instance, already leaked the same way
+before this pass) — the new `ENOMEM` paths in `map_user_stack`/`fault_trampoline::map` match that
+existing (imperfect) precedent rather than inventing a new, inconsistent partial-cleanup discipline
+for just those two call sites. Verified via `tests/fork_wait.rs`/`clone_syscall_smoke.rs`/
+`dynlink_syscall_smoke.rs` (the real `PT_INTERP` path, `new_excluding_user`'s one exerciser)/
+`mmap_syscall_smoke.rs` (forks into `fault_trampoline`-driven `SIGBUS`/`SIGSEGV` handlers) in an
+isolated git worktree — the happy path is unaffected; the OOM path itself has no dedicated
+regression test (would need a real way to force frame exhaustion on demand, not attempted here).
+
+**A much bigger, separate discovery running a fresh full-corpus supervised pilot** (`scripts/
+run_posix_pilot_supervised.sh --reset`) to establish a post-session baseline: the naive "exclude
+whatever file didn't get a classification line, retry" heuristic doesn't converge on this corpus
+at all. 23 iterations (~90 real minutes) each excluded exactly one file and stalled again almost
+immediately — most of those exclusions were **wrong**: `pthread_atfork/3-3.c`/
+`pthread_attr_destroy/1-1.c`/`pthread_attr_init/2-1.c` (all independently reconfirmed `PASS` in
+isolation earlier the same session) got excluded anyway, because they merely happened to sit
+immediately after whichever file actually broke the boot. The real pattern, found by reading
+`supervised_iter23`'s own log directly: `pthread_cancel/5-1.c` (real `pthread_cancel(3)` isn't
+implemented) genuinely crashes with `CRASH(139)` (a real `SIGSEGV` inside that one pilot binary) —
+and after that single crash, `[diag] tick=table_len=` goes flat and **no further file ever gets a
+classification for the rest of that boot**. A real per-process fault is already supposed to
+terminate just the faulting process (see "Real ring-3 fault-to-signal delivery" above) — something
+about this specific crash shape instead leaves the whole kernel wedged for everything that runs
+afterward in the same boot, a real robustness gap distinct from (and likely affecting many more
+files across) both `fork/8-1.c`'s own standalone-hang mystery and the `[diag-thread]` print-storm
+bug above. The very first stall (iteration 1, no `CRASH` line before it at all) looks like it may
+be a second, genuinely-standalone hang rather than this same crash-wedge shape — not disambiguated
+before the run was stopped. **Not investigated further this session** — the run was killed rather
+than let continue burning iterations against a systematically wrong exclude list; a real fix needs
+root-causing why a crashed pilot child doesn't leave the rest of the boot able to proceed (a stuck
+lock, an unreaped zombie exhausting some resource, or a genuine kernel-level deadlock the crash
+itself triggers) before another full-corpus run is worth attempting. `target/
+posix_supervised_run.log`/`target/posix-pilot-logs/supervised_iter*.log` from this run are kept as
+the first real evidence trail.
 
 **A real, separate staleness bug found auditing `build.rs`'s own exclusion bookkeeping**:
 `pthread_atfork/3-3.c`/`pthread_attr_destroy/1-1.c` were marked "historical markers only, still

@@ -70,13 +70,22 @@ impl AddressSpace {
     /// or `process::do_execve`'s replacement address space, both of which run with the calling
     /// process's own, already-populated address space active and need `fork`/
     /// `new_excluding_user` below instead.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` on real frame exhaustion -- see `build_from_active`'s own doc comment for the
+    /// real-crash-vs-real-`ENOMEM` reasoning this and every other constructor here now shares. No
+    /// partial state to clean up on this path: the single allocation below is the only one this
+    /// constructor ever does (the rest is a plain, non-allocating raw-entry clone), so a failure
+    /// here never left anything behind. `#[allow(clippy::result_unit_err)]`: no real error-detail
+    /// type exists anywhere in this codebase's own OOM paths yet (see `build_from_active`'s own
+    /// doc comment) -- every caller only ever branches on `Ok`/`Err`, never inspects the value.
+    #[allow(clippy::result_unit_err)]
     pub fn new(
         physical_memory_offset: VirtAddr,
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    ) -> Self {
-        let new_frame = frame_allocator
-            .allocate_frame()
-            .expect("out of memory allocating a new address space's level 4 table");
+    ) -> Result<Self, ()> {
+        let new_frame = frame_allocator.allocate_frame().ok_or(())?;
         let (active_frame, _flags) = Cr3::read();
 
         // SAFETY: physical_memory_offset is the bootloader's phys-memory mapping (same
@@ -90,9 +99,9 @@ impl AddressSpace {
         };
         *new_table = active_table.clone();
 
-        AddressSpace {
+        Ok(AddressSpace {
             level_4_frame: Arc::new(new_frame),
-        }
+        })
     }
 
     /// Builds a fresh address space that shares every one of the currently active table's
@@ -108,10 +117,14 @@ impl AddressSpace {
     /// MMU's own hierarchical walk requires to be set at *every* level down to a user page (so a
     /// clear `USER_ACCESSIBLE` bit anywhere guarantees nothing user-facing exists beneath it, safe
     /// to alias as-is).
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` on real frame exhaustion -- see `build_from_active`'s own doc comment.
     pub(crate) fn new_excluding_user(
         physical_memory_offset: VirtAddr,
-        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    ) -> Self {
+        frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
+    ) -> Result<Self, ()> {
         Self::build_from_active(physical_memory_offset, frame_allocator, false)
     }
 
@@ -125,12 +138,14 @@ impl AddressSpace {
     /// copy, matching this codebase's existing correctness-over-cleverness bias (see e.g.
     /// `BootInfoFrameAllocator`'s own no-reuse policy).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics (via `expect`) on frame exhaustion or an unexpected huge page -- this codebase has
-    /// no established error-propagation convention for OOM during address-space setup yet (`new`
-    /// and every `elf::load` caller panic the same way today), and nothing here creates a huge
-    /// page, so encountering one means a future change violated that assumption.
+    /// `Err(())` on real frame exhaustion -- see `build_from_active`'s own doc comment for why
+    /// this no longer panics (matches `process::KernelStack::new`'s own real-`ENOMEM`-not-a-
+    /// kernel-panic fix). Still panics on an unexpected huge page (`copy_table_level`'s own
+    /// `assert!`) -- nothing here creates one, so encountering one means a future change violated
+    /// that assumption, a real logic bug rather than a resource limit any caller could recover
+    /// from.
     ///
     /// # Safety requirement, not enforced by the type system
     ///
@@ -140,24 +155,37 @@ impl AddressSpace {
     /// caller's own kernel stack with its own CR3 still loaded), so this holds for every call site
     /// this codebase has -- but a hypothetical future caller trying to fork some other, non-running
     /// process would silently copy the *wrong* table.
+    #[allow(clippy::result_unit_err)] // see AddressSpace::new's own identical allow.
     pub fn fork(
         &self,
         physical_memory_offset: VirtAddr,
-        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    ) -> AddressSpace {
+        frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
+    ) -> Result<AddressSpace, ()> {
         Self::build_from_active(physical_memory_offset, frame_allocator, true)
     }
 
     /// Shared implementation behind `new_excluding_user`/`fork`: allocates a fresh level 4 table
     /// and recursively walks it against the currently active one via `copy_table_level`.
+    ///
+    /// **Real, not-a-kernel-panic `ENOMEM` on frame exhaustion** -- same motivation as
+    /// `process::KernelStack::new`'s own fix (`src/process/mod.rs`): a real `fork()`/`execve()`
+    /// hitting resource exhaustion mid-copy must fail that one syscall, not take the whole kernel
+    /// down. Requires `FrameDeallocator` now, not just `FrameAllocator` (tightened from this
+    /// function's own prior bound): a `copy_table_level` failure partway through can leave `child`
+    /// holding a real, partially-built subtree that must be freed before returning the error, or
+    /// every one of its already-allocated frames leaks permanently. That cleanup reuses
+    /// `free_table_level` directly rather than needing any new walk of its own -- safe to call on
+    /// a partially-built table for the same reason `AddressSpace::teardown` (which also uses it)
+    /// documents `child` is completely `zero()`'d immediately before `copy_table_level` ever
+    /// starts, so every entry `copy_table_level` didn't get to yet is still `!PRESENT`, and
+    /// `free_table_level` already skips every non-`PRESENT` entry outright -- it only ever touches
+    /// exactly the (real, exclusively-owned) subset this call actually built.
     fn build_from_active(
         physical_memory_offset: VirtAddr,
-        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
         copy_user_leaves: bool,
-    ) -> AddressSpace {
-        let new_frame = frame_allocator
-            .allocate_frame()
-            .expect("out of memory allocating a new address space's level 4 table");
+    ) -> Result<AddressSpace, ()> {
+        let new_frame = frame_allocator.allocate_frame().ok_or(())?;
         let (active_frame, _flags) = Cr3::read();
 
         // SAFETY: physical_memory_offset is the bootloader's phys-memory mapping (same
@@ -170,18 +198,30 @@ impl AddressSpace {
             )
         };
         new_table.zero();
-        copy_table_level(
+        if copy_table_level(
             active_table,
             new_table,
             4,
             physical_memory_offset,
             frame_allocator,
             copy_user_leaves,
-        );
-
-        AddressSpace {
-            level_4_frame: Arc::new(new_frame),
+        )
+        .is_err()
+        {
+            // See this function's own doc comment: new_table is fully zeroed except for whatever
+            // copy_table_level actually managed to build before failing, so this frees exactly
+            // that (and nothing it never touched) before also freeing new_frame itself.
+            free_table_level(new_table, 4, physical_memory_offset, frame_allocator);
+            // SAFETY: new_frame was never activated as CR3 (this AddressSpace never got past this
+            // constructor), and free_table_level just above only ever frees content strictly
+            // beneath it, never the frame itself -- exclusively ours to free here.
+            unsafe { frame_allocator.deallocate_frame(new_frame) };
+            return Err(());
         }
+
+        Ok(AddressSpace {
+            level_4_frame: Arc::new(new_frame),
+        })
     }
 
     /// Returns a new `AddressSpace` handle sharing the exact same underlying level 4 table (an
@@ -359,6 +399,15 @@ fn free_table_level(
 ///   this kernel's own PML4 index 0 hosts both its own code and every userland ELF's load
 ///   address, since it has no higher-half split). It can't be aliased *or* skipped outright:
 ///   `child` gets its own fresh, zeroed next-level table, and this function recurses into it.
+///
+/// # Errors
+///
+/// `Err(())` on real frame exhaustion -- deliberately leaves `child` exactly as it stood at the
+/// point of failure (whatever was already fully built stays built, everything not yet reached
+/// stays zeroed/absent) rather than unwinding any partial state itself. `build_from_active`'s own
+/// single top-level `free_table_level` sweep over the *whole* table already correctly frees
+/// exactly that partial subset and nothing else (see its own doc comment) -- so there's no need
+/// for this function, or its own recursive calls, to do any cleanup of their own on this path.
 fn copy_table_level(
     parent: &PageTable,
     child: &mut PageTable,
@@ -366,7 +415,7 @@ fn copy_table_level(
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     copy_user_leaves: bool,
-) {
+) -> Result<(), ()> {
     for i in 0..512usize {
         let entry = &parent[i];
         if !entry.flags().contains(PageTableFlags::PRESENT) {
@@ -406,9 +455,7 @@ fn copy_table_level(
                 child[i].set_frame(src_frame, entry.flags());
                 continue;
             }
-            let new_frame = frame_allocator
-                .allocate_frame()
-                .expect("out of memory copying an address space");
+            let new_frame = frame_allocator.allocate_frame().ok_or(())?;
             let src = (physical_memory_offset + src_frame.start_address().as_u64()).as_ptr::<u8>();
             let dst =
                 (physical_memory_offset + new_frame.start_address().as_u64()).as_mut_ptr::<u8>();
@@ -426,9 +473,7 @@ fn copy_table_level(
         let parent_next = entry
             .frame()
             .expect("present non-leaf entry must have a frame");
-        let child_next_frame = frame_allocator
-            .allocate_frame()
-            .expect("out of memory copying an address space");
+        let child_next_frame = frame_allocator.allocate_frame().ok_or(())?;
         // SAFETY: physical_memory_offset is the bootloader's phys-memory mapping; parent_next is a
         // real, live next-level table (entry is PRESENT and not a leaf at this level);
         // child_next_frame was just allocated, so nothing else can be viewing it yet.
@@ -447,6 +492,7 @@ fn copy_table_level(
             physical_memory_offset,
             frame_allocator,
             copy_user_leaves,
-        );
+        )?;
     }
+    Ok(())
 }
