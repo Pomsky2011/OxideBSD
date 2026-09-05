@@ -14,7 +14,7 @@ use crate::memory::address_space::AddressSpace;
 use crate::process::elf::{self, Elf};
 use crate::memory::{self, with_frame_allocator};
 use crate::process::scheduler;
-use crate::syscall::{self, ECHILD, EINVAL, ELOOP, ENOEXEC, SyscallFrame};
+use crate::syscall::{self, ECHILD, EINVAL, ELOOP, ENOEXEC, ENOMEM, SyscallFrame};
 use super::*;
 
 // Real FreeBSD syscall numbers, duplicated here rather than imported — same "no shared crate
@@ -93,7 +93,10 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     // for `/proc/1/stat`'s `(comm)` field than reusing that same "(init)" placeholder verbatim.
     let comm = b"hush".to_vec();
     let cmdline = build_cmdline(&[b"(init)"]);
-    let kernel_stack = KernelStack::new();
+    // Boot-time only: no syscall caller to report a real ENOMEM to, and no recovery from pid 1
+    // itself failing to start -- see KernelStack::new's own doc comment.
+    let kernel_stack =
+        KernelStack::new().expect("out of memory allocating a kernel stack");
     let kernel_stack_top = kernel_stack.top();
     let rsp = crate::process::context_switch::seed_spawn_frame(kernel_stack_top);
 
@@ -347,7 +350,18 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         )
     };
 
-    let kernel_stack = KernelStack::new();
+    let Ok(kernel_stack) = KernelStack::new() else {
+        // child_address_space was already built above (a real, freshly-allocated deep copy via
+        // AddressSpace::fork) and would otherwise leak permanently -- nothing else references it
+        // yet (it was never installed into the process table or activated as CR3), so tearing it
+        // down here is safe and required to avoid trading this panic for a silent frame leak.
+        // SAFETY: child_address_space's level 4 frame was never activated (CR3 never switched to
+        // it) -- exactly teardown's own safety requirement.
+        unsafe {
+            with_frame_allocator(|fa| child_address_space.teardown(phys_offset, fa));
+        }
+        return Err(ENOMEM);
+    };
     let kernel_stack_top = kernel_stack.top();
     // SAFETY: parent_frame is the caller's own live SyscallFrame, valid for the duration of this
     // call (we're still inside sys_fork's own handling of it).
@@ -581,7 +595,13 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         )
     };
 
-    let kernel_stack = KernelStack::new();
+    // Unlike do_fork_from_current's identical failure path, no teardown is needed here on
+    // failure: child_address_space above is a real CLONE_VM AddressSpace::share -- a plain
+    // Arc::clone, not a fresh deep copy -- so dropping it here (via early return) just decrements
+    // that Arc's refcount back to where it was, no frames allocated, nothing to free.
+    let Ok(kernel_stack) = KernelStack::new() else {
+        return Err(ENOMEM);
+    };
     let kernel_stack_top = kernel_stack.top();
     // SAFETY: parent_frame is valid per the same reasoning as the frame_tls read above; newsp is
     // the caller's own real clone(2) argument, already validated to be a real user-space stack

@@ -1211,9 +1211,76 @@ flag-clobbering instruction.
 unmodified `pthread_create()`/`pthread_join()` C fixture). **What this unlocks**: POSIX AIO with
 zero further kernel work; `pthread_mutex_*`/`_cond_*`/`_rwlock_*`/`_barrier_*`/`_spin_*` all
 expected to already work (userspace logic over the same real `futex(2)`), not yet covered by a
-dedicated smoke test. **Not done**: named POSIX semaphores/POSIX shared memory (need a
-`/dev/shm`-style path + real cross-*process* `FUTEX_WAKE` — today's scoping is `tgid`-only) and
-real `dlopen` (blocked on `mprotect` enforcement, unrelated to threading).
+dedicated smoke test. real `dlopen` stays **not done** (blocked on `mprotect` enforcement,
+unrelated to threading).
+
+**Named POSIX semaphores, since fixed** (`process::limits::futex_key`, `src/process/limits.rs`):
+`do_futex`'s `FUTEX_WAIT`/`FUTEX_WAKE` used to key every wait/wake pair on `(tgid, addr)` alone —
+correct for a *private* futex, but real `sem_open()` semaphores are `pshared` (real, unmodified
+musl clears `FUTEX_PRIVATE` for them), meaning `addr` is a virtual address inside a real
+`/dev/shm`-backed `MAP_SHARED` mapping that two independent `fork()`ed processes generally map at
+their own, *different* virtual addresses (`NEXT_MMAP_PAGE`, `src/process/mm.rs`'s own bump
+allocator, is one global counter shared across every process, never reset per caller) — so a
+waiter's own `FUTEX_WAIT` and a waker's own `FUTEX_WAKE` almost never agreed on the same key,
+permanently hanging `sem_open()`+`fork()` coordination (`build.rs`'s `POSIX_KNOWN_HANGS`'s
+`sem_post/8-1.c`/`sem_unlink/{2-2,3-1}.c`/`sem_wait/7-1.c`). Fixed: a *shared* (non-
+`FUTEX_PRIVATE`) futex now resolves `addr` through the caller's own address space to the real
+physical address backing it instead — identical across every process mapping the same physical
+frame, regardless of each one's own virtual address. A private futex is unaffected, still keyed by
+`(tgid, addr)` exactly as before (still required on this no-ASLR kernel — see
+`BlockReason::WaitingForFutex`'s own doc comment). **Verified**: `tests/sem_open_syscall_smoke.rs`
+(a genuinely unmodified `sem_open()`+`fork()`+`sem_post()`/`sem_wait()` C fixture, `userland/
+sem-open-smoke/main.c`), plus an isolated canary pilot run (`POSIX_PILOT_CANARY_ONLY=1`, see
+`build.rs`'s own doc comment for this validation mechanism) confirming all four previously-excluded
+`POSIX_KNOWN_HANGS` files: `sem_unlink/{2-2,3-1}.c`/`sem_wait/7-1.c` now genuinely `PASS`;
+`sem_post/8-1.c` cleanly `UNTESTED` (it early-returns on `#ifndef _POSIX_PRIORITY_SCHEDULING`
+before ever touching a semaphore or forking — it was swept into the exclusion list by a proactive
+pattern match, not an individually confirmed hang, and never actually needed this fix). All four
+removed from `POSIX_KNOWN_HANGS`; a full corpus re-run to fold this into the pilot's own official
+baseline hasn't been done yet.
+Still not done: named POSIX shared memory (`shm_open`, a separate real cross-*process*
+coordination path with its own gaps beyond futex keying).
+
+**A real crash found chasing this, from a different angle** (`KernelStack::new`, `src/process/
+mod.rs`): canary-testing `pthread_cond_broadcast/1-2.c` (a real `PTHREAD_PROCESS_SHARED` condvar/
+mutex stress test creating up to `MAX_THREAD_CHILDREN = 10000` real threads at once) found
+`KernelStack::new` hard-`assert!`ed on allocation failure — a single userspace process legitimately
+exhausting the kernel-stack pool took the *entire kernel* down, not just that one `pthread_create`/
+`fork` call. Fixed: `KernelStack::new` returns `Result<Self, ()>`; `do_fork_from_current`/
+`do_clone` (`src/process/lifecycle.rs`) propagate a real `ENOMEM` instead (`do_fork_from_current`
+additionally tears down its already-built `child_address_space` on this path — a real deep copy via
+`AddressSpace::fork`, would otherwise leak; `do_clone`'s own `child_address_space` is a plain
+`Arc::clone` via `AddressSpace::share`, so no teardown needed there). `spawn`'s boot-time call site
+still panics — no syscall caller to report `ENOMEM` to that early. Same *class* of bug the "Real
+zombie address-space frame reclaim" section above already fixed once, at a sibling allocation site
+— `AddressSpace::new`'s own L4-table `.expect()` and the "out of memory mapping a user stack" site
+in `lifecycle.rs` are the same shape and remain unfixed, narrower scope than this pass. **A second,
+unrelated bug this investigation also found**: `interrupts::timer_interrupt_handler`'s own
+`[diag-thread]` per-process diagnostic dump (added for the thread-group-signal-delivery
+investigation two sections up, explicitly marked temporary) did a full `O(table_len)` scan-and-
+`serial_println!` *every 10 real seconds* — with hundreds to thousands of live threads, this alone
+dominated a test's real wall-clock runtime badly enough to look like a permanent hang even after
+the actual `KernelStack::new` panic was fixed. Removed (the `[diag] tick=table_len=` line itself
+stays, `O(1)` per interval, still relevant to `fork/8-1.c`'s own open mystery below).
+
+**A real, separate staleness bug found auditing `build.rs`'s own exclusion bookkeeping**:
+`pthread_atfork/3-3.c`/`pthread_attr_destroy/1-1.c` were marked "historical markers only, still
+excluded in effect by the wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix filter regardless" —
+true when written, but that filter's own code was deleted on 2026-09-02 (the "POSIX pilot: full
+corpus expansion" section above), and the two array entries were never revisited. Both were quietly
+live-excluding two already-fixed, passing files for no real reason since that date. Separately,
+`sigwait/4-1.c`/`timer_settime/{2-1,6-1,9-1}.c` turned out to be the same staleness class from a
+different cause: all four share one shape (`sigprocmask(SIG_BLOCK, SIGALRM)`, arm a real timer,
+`sigwait()` for it) exactly matching the delivery path "A real timer-signal wake bug" (above)
+fixed — added to `POSIX_KNOWN_HANGS` before that fix landed, never re-verified after. All six
+confirmed `PASS` via isolated canary runs and removed. `POSIX_KNOWN_HANGS` is down to two genuine,
+live exclusions: `fork/8-1.c` (confirmed still genuinely stuck, unrelated to the `[diag-thread]`
+fix above — needs a live dispatch trace, not more source-reading) and `sched_yield/1-1.c` (needs
+real SMP). **Lesson for next time**: an exclusion-list entry justified by "some other mechanism
+also catches this" needs that other mechanism re-checked to still exist, not trusted at face
+value — the canary mechanism (`POSIX_PILOT_CANARY_ONLY=1`, see `build.rs`'s own doc comment) is now
+kept as a standing regression suite covering all ten of these fixes plus the four `sem_*` ones, not
+emptied out after use, specifically to make catching this kind of drift cheap going forward.
 
 ## SIGCHLD delivery, real `sched_setparam(2)`, and four more mmap conformance fixes (`src/process/`, `modules/oxfs/`, `modules/posix_compat/`)
 

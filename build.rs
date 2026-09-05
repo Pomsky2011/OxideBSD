@@ -147,6 +147,10 @@ fn main() {
         "pthread-syscall-smoke",
         "PTHREAD_SYSCALL_SMOKE_ELF_PATH",
     );
+    build_userland_crate(
+        "sem-open-syscall-smoke",
+        "SEM_OPEN_SYSCALL_SMOKE_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -176,6 +180,10 @@ fn main() {
     // "Real threading" phases 1-5's own finish line -- see userland/pthread-smoke/main.c's own
     // doc comment.
     let pthread_smoke_elf_path = build_pthread_smoke(&musl_sysroot);
+
+    // Real cross-process named-semaphore coordination -- see userland/sem-open-smoke/main.c's own
+    // doc comment.
+    let sem_open_smoke_elf_path = build_sem_open_smoke(&musl_sysroot);
 
     // TinyCC: OxideBSD's first on-target C compiler -- see CLAUDE.md's TinyCC section and
     // `build_tinycc`'s own doc comment. The `tcc` binary itself is embedded into oxfs's `/bin`
@@ -294,6 +302,10 @@ fn main() {
         (
             "OXFS_PTHREAD_SMOKE_ELF_PATH",
             pthread_smoke_elf_path.to_str().unwrap(),
+        ),
+        (
+            "OXFS_SEM_OPEN_SMOKE_ELF_PATH",
+            sem_open_smoke_elf_path.to_str().unwrap(),
         ),
         ("OXFS_LSOXMOD_ELF_PATH", lsoxmod_elf_path.to_str().unwrap()),
         ("OXFS_TCC_ELF_PATH", tcc_elf_path.to_str().unwrap()),
@@ -510,6 +522,40 @@ fn build_pthread_smoke(sysroot: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("failed to run musl-gcc for pthread-smoke: {e}"));
     if !status.success() {
         panic!("building pthread-smoke failed: {status}");
+    }
+    out
+}
+
+/// Real cross-process named-semaphore coordination (`sem_open()`+`fork()`) -- see
+/// `userland/sem-open-smoke/main.c`'s own doc comment for the scenario, and
+/// `process::limits::futex_key`'s own doc comment (`src/process/limits.rs`) for the real
+/// physical-address-keyed `FUTEX_WAIT`/`FUTEX_WAKE` fix this proves. Same `build_musl_smoke`
+/// recipe `build_pthread_smoke` above already establishes, one slot further along (`0x8140000`,
+/// clear of `pthread-smoke`'s own `0x8100000`) -- this binary is `fork`+`execve`'d fresh by
+/// `userland/sem-open-syscall-smoke/`, never co-resident with any other fixed-base image, so it
+/// only needs to stay clear of the kernel's own image/heap/phys-mem window.
+fn build_sem_open_smoke(sysroot: &Path) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest_dir).join("userland/sem-open-smoke/main.c");
+    let target_dir = Path::new(manifest_dir).join("target/sem-open-smoke");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/sem-open-smoke");
+    let out = target_dir.join("sem-open-smoke");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let musl_gcc = sysroot.join("bin/musl-gcc");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg("-Wl,-Ttext-segment=0x8140000")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for sem-open-smoke: {e}"));
+    if !status.success() {
+        panic!("building sem-open-smoke failed: {status}");
     }
     out
 }
@@ -1074,59 +1120,69 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
 // Both confirmed via an isolated canary run (`POSIX_PILOT_CANARY_ONLY=1`): clean `PASS`, clean
 // QEMU exit -- not just "no longer hangs."
 const POSIX_KNOWN_HANGS: &[&str] = &[
-    "sigwait/4-1.c",
-    "timer_settime/2-1.c",
-    "timer_settime/6-1.c",
-    "timer_settime/9-1.c",
+    // `sigwait/4-1.c`/`timer_settime/{2-1,6-1,9-1}.c`: **FIXED**, all four confirmed PASS via an
+    // isolated canary run -- same staleness class as `pthread_atfork/3-3.c`/
+    // `pthread_attr_destroy/1-1.c` just below: added to this array before the real
+    // `wake_if_sigwaiting`-on-timer-expiry fix (CLAUDE.md's "A real timer-signal wake bug"
+    // section) landed, never revisited since. All four share one shape (`sigprocmask(SIG_BLOCK,
+    // SIGALRM)`, arm a real timer via `alarm()`/`timer_settime()`, then `sigwait()` for it) --
+    // exactly the delivery path that fix closed. Removed from this list entirely.
+    //
     // `fork/8-1.c`: a `do { cur = times(&t); } while (cur - start < sysconf(_SC_CLK_TCK))` busy
     // loop that should take ~1 real second under KVM (`_SC_CLK_TCK` is musl's own compile-time
     // `100`, matching this kernel's real `TIMER_HZ`) but instead ran 9+ real minutes at ~90% CPU
     // (a genuine spin, not a block -- `ticks()` itself must be advancing correctly or the busy
-    // loop the timer handler is fighting for CPU against would never make *any* progress. Added a
-    // `[diag] table_len=` print to `timer_interrupt_handler` to check whether the process table
-    // growing across the run is the real cause before investigating further).
+    // loop the timer handler is fighting for CPU against would never make *any* progress).
+    // **Confirmed still genuinely stuck** (re-tested via an isolated canary run after removing
+    // the unrelated `[diag-thread]` per-process print-storm below, which was the real bug behind
+    // a *different* file's own apparent hang, `pthread_cond_broadcast/1-2.c` -- this file's own
+    // process table stayed flat at 4 entries for 500+ real seconds with zero progress, ruling
+    // that theory out for this file specifically). Still needs a live dispatch trace, not more
+    // source-reading -- same class of open item `sched_setparam/9-1,10-1.c` already is.
     "fork/8-1.c",
-    // `pthread_atfork/3-3.c`: **FIXED**, no longer hangs -- root cause was `kill(getpid(), sig)`'s
-    // real thread-group-wide delivery (see `process::signals::resolve_signal_recipient`/
-    // `route_signal_target`'s own doc comments). Not removed from this list's *effect*, since it's
-    // still swept up by the wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix exclusion just below
-    // regardless of whether it's named here -- kept only as a historical marker of what was
-    // confirmed fixed, not a live exclusion in its own right.
-    "pthread_atfork/3-3.c",
-    // `pthread_attr_destroy/1-1.c`: **FIXED** -- turned out to never have been an independent bug
-    // at all. Every prior canary run that included it also included `fork/11-1.c`, which sorts
-    // first alphabetically in a sequential pilot boot and, before its own real fix (see this
-    // array's own doc comment above), permanently wedged the whole run before this file ever got
-    // a chance to execute -- so it was never actually re-validated against the real
-    // `SYS_EXIT_GROUP` fix (see `pthread_attr_init/2-1.c`'s own history) that landed *before* this
-    // file was ever investigated on its own. The earlier "needs live GDB introspection" theory was
-    // chasing a hang that, by the time it was written, may already have been fixed by that same
-    // change. Confirmed PASS via an isolated canary run once `fork/11-1.c` stopped blocking the
-    // boot ahead of it. Not removed from this list's *effect*, since it's still swept up by the
-    // wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix exclusion just below regardless of
-    // whether it's named here -- kept only as a historical marker, same as `pthread_atfork/3-3.c`
-    // just above.
-    "pthread_attr_destroy/1-1.c",
+    // `pthread_atfork/3-3.c`/`pthread_attr_destroy/1-1.c`: both **FIXED** (root causes: real
+    // thread-group-wide `kill(getpid(), sig)` delivery for the former, the `SYS_EXIT_GROUP`/
+    // `pthread_attr_init/2-1.c` fix for the latter -- see git history for the full write-up this
+    // array used to carry inline). **Actually removed from the array now**, correcting a real
+    // staleness bug: both used to say "kept only as a historical marker, still excluded in effect
+    // by the wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix filter below regardless" -- true
+    // when written, but that filter's own code was deleted on 2026-09-02 (see
+    // `discover_posix_test_files`'s own doc comment/history just below), and these two entries
+    // were never revisited afterward. They were quietly live-excluding two already-fixed,
+    // passing files for no real reason since that date. **Any future "kept as a historical
+    // marker, a filter below still catches it" entry needs to be re-verified against the filter
+    // it names actually still existing, not trusted at face value.**
+    //
     // `sched_yield/1-1.c`: forks `ncpu-1` children and has a real `while(1);` busy-spin thread,
     // expecting genuine multi-core scheduling fairness to observe `sched_yield()`'s effect --
     // fundamentally assumes real SMP, which this kernel doesn't have (single-core only, see
     // CLAUDE.md). Hung with real, sustained CPU usage (~41%). Not a bug to fix so much as a
     // structural test-vs-kernel mismatch -- worth revisiting only if/when real SMP ever lands.
     "sched_yield/1-1.c",
-    // Real, multi-*process* named-semaphore coordination (`sem_open` + real `fork()`, distinct
-    // from same-process anonymous-semaphore usage which already passes plenty of sibling tests):
-    // needs cross-process `FUTEX_WAKE`, which this kernel's real futex support doesn't have --
-    // `WaitingForFutex` is scoped by `tgid` only (see CLAUDE.md's "Real threading" section, "Not
-    // done": "named POSIX semaphores/POSIX shared memory (need... real cross-*process*
-    // `FUTEX_WAKE` — today's scoping is `tgid`-only)"). A genuinely documented, not-yet-implemented
-    // gap, not a bug -- confirmed live via `sem_unlink/2-2.c` hanging with low CPU (blocked, not
-    // spinning); the other three share the identical real `sem_open`+`fork()` shape (checked via
-    // `grep -l sem_open sem_*/*.c | xargs grep -l 'fork('`, exactly 4 matches total), so excluded
-    // proactively rather than rediscovering each one the same way.
-    "sem_post/8-1.c",
-    "sem_unlink/2-2.c",
-    "sem_unlink/3-1.c",
-    "sem_wait/7-1.c",
+    // Real, multi-*process* named-semaphore coordination (`sem_open` + real `fork()`), **FIXED**:
+    // `sem_unlink/{2-2,3-1}.c`/`sem_wait/7-1.c` all confirmed PASS via an isolated canary run
+    // (`POSIX_PILOT_CANARY_ONLY=1`); `sem_post/8-1.c` confirmed clean `UNTESTED` (it early-returns
+    // on `#ifndef _POSIX_PRIORITY_SCHEDULING` before ever touching a semaphore or forking at all --
+    // it was swept into this list by a proactive `grep -l sem_open sem_*/*.c | xargs grep -l
+    // 'fork('` pattern match, not an individually confirmed hang, and never actually needed this
+    // fix). Root cause was `process::limits::do_futex`'s own `FUTEX_WAIT`/`FUTEX_WAKE` keying every
+    // wait/wake pair on `(tgid, addr)` alone -- correct for a *private* futex, but a real
+    // `sem_open()` semaphore is `pshared` (real, unmodified musl clears `FUTEX_PRIVATE` for it),
+    // and its backing `/dev/shm`-mapped `MAP_SHARED` page generally lands at a *different* virtual
+    // address in each of two independent `fork()`ed processes (`NEXT_MMAP_PAGE`, `src/process/
+    // mm.rs`'s own bump allocator, is one global counter shared across every process, never reset
+    // per caller) -- so a waiter's own `FUTEX_WAIT` and a waker's own `FUTEX_WAKE` almost never
+    // agreed on the same key. Fixed via `process::limits::futex_key` (`src/process/limits.rs`): a
+    // *shared* futex now resolves `addr` through the caller's own address space to the real
+    // physical address backing it instead, identical across every process mapping the same
+    // physical frame regardless of virtual address; a private futex is unaffected, still keyed by
+    // `(tgid, addr)` exactly as before. Also verified end to end via `tests/
+    // sem_open_syscall_smoke.rs` (a genuinely unmodified `sem_open()`+`fork()`+`sem_post()`/
+    // `sem_wait()` C fixture, `userland/sem-open-smoke/main.c`). Removed from this list entirely,
+    // same as `sigwait/6-1.c`/`6-2.c`/`fork/11-1.c` below -- none of these four live under a
+    // `pthread_*`/`aio_*`/`lio_listio*` prefix, so removing them here is what actually re-includes
+    // them in a real full-corpus run.
+    //
     // `sigwait/6-1.c`/`6-2.c`: **FIXED**, both confirmed PASS via isolated canary runs -- two real,
     // independent bugs in `process::signals::resolve_signal_recipient` (a real thread-group-wide
     // `kill(getpid(), sig)`/`sigqueue` re-router added to fix `pthread_atfork/3-3.c` above), not a
@@ -1165,7 +1221,10 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above (5 files): specific, already-proven permanent hangs.
+/// - **`POSIX_KNOWN_HANGS`** above (2 files, both with a live effect -- no historical-marker-only
+///   or stale entries any more, see that array's own doc comment): `fork/8-1.c` (a genuinely
+///   unresolved busy-loop timing anomaly), `sched_yield/1-1.c` (needs real SMP, out of scope until
+///   then).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1208,15 +1267,20 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     walk(interfaces_dir, interfaces_dir, &mut out);
     // TEMPORARY validation hook: `POSIX_PILOT_CANARY_ONLY=1` shrinks the whole discovered corpus
-    // down to a handful of specific known-hang files (see `POSIX_KNOWN_HANGS`'s own doc comment)
-    // so a candidate fix can be checked end to end in minutes instead of rebuilding/booting the
-    // full ~1200-file corpus. Not wired into any normal build. Currently holds `fork/11-1.c` and
-    // `pthread_attr_destroy/1-1.c` -- both now fixed and confirmed via this exact mechanism (see
-    // `POSIX_KNOWN_HANGS`'s own doc comments), left in as a quick two-file regression check for
-    // any future futex/threading/fork change rather than emptied out. Repoint at whatever's
-    // actually being investigated next (`fork/8-1.c`'s CPU-timing anomaly and the named-semaphore
-    // cross-process futex gap are the remaining genuinely-open items in `POSIX_KNOWN_HANGS`) when
-    // that starts.
+    // down to a handful of specific known-hang/regression files (see `POSIX_KNOWN_HANGS`'s own doc
+    // comment) so a candidate fix can be checked end to end in minutes instead of rebuilding/
+    // booting the full ~1700-file corpus. Not wired into any normal build. Every file below is
+    // already fixed and confirmed `PASS` (`sem_post/8-1.c` confirmed clean `UNTESTED`, see
+    // `POSIX_KNOWN_HANGS`'s own doc comment) via this exact mechanism -- kept as a standing
+    // regression suite for any future futex/threading/fork/signal-delivery/timer change, not
+    // emptied out: `fork/11-1.c`/`pthread_attr_destroy/1-1.c`/`pthread_atfork/3-3.c` (real
+    // thread-group signal delivery + `exit_group(2)`), the four named-semaphore files (real
+    // physical-address-keyed shared-futex, `process::limits::futex_key` in `src/process/
+    // limits.rs`), and `sigwait/4-1.c`/`timer_settime/{2-1,6-1,9-1}.c` (real timer-expiry signal
+    // wake, `wake_if_sigwaiting`). Repoint at whatever's actually being investigated next
+    // (`fork/8-1.c`'s CPU-timing anomaly is the remaining genuinely-open item in
+    // `POSIX_KNOWN_HANGS`) when that starts, but there's no need to remove these first --
+    // add to this list, don't just replace it, so a real regression gets caught immediately.
     //
     // `rerun-if-env-changed`, not just relying on the file-content watch above: plain
     // `std::env::var` reads aren't tracked by cargo at all on their own -- toggling this var on/off
@@ -1229,6 +1293,15 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
         const CANARY: &[&str] = &[
             "pthread_attr_destroy/1-1.c",
             "fork/11-1.c",
+            "sem_post/8-1.c",
+            "sem_unlink/2-2.c",
+            "sem_unlink/3-1.c",
+            "sem_wait/7-1.c",
+            "pthread_atfork/3-3.c",
+            "sigwait/4-1.c",
+            "timer_settime/2-1.c",
+            "timer_settime/6-1.c",
+            "timer_settime/9-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

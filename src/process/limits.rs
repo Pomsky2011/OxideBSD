@@ -2,6 +2,10 @@
 
 
 
+use x86_64::VirtAddr;
+use x86_64::structures::paging::Translate;
+
+use crate::memory;
 use crate::syscall::{EAGAIN, EFAULT, EINTR, EINVAL, EPERM, ETIMEDOUT};
 use super::*;
 
@@ -487,22 +491,22 @@ pub fn do_sched_getaffinity(
 /// conversion before ever calling `__futex4_cp`) converts to an absolute tick deadline the same
 /// way `do_nanosleep` already does; a null `to` is `u64::MAX`, the same "no timeout" sentinel
 /// `WaitingForMqData`/`WaitingForSemOp` already establish. Blocks via `BlockReason::
-/// WaitingForFutex(tgid, addr, deadline)` -- see that variant's own doc comment for why `tgid`,
-/// not raw `pid`, is the correctness-required scope. Checks for a deliverable signal before ever
-/// blocking (avoiding a lost wakeup, same discipline every blocking primitive here already
-/// follows) and once more after waking, in that priority order, then a deadline check -- **and
-/// then, if neither, a plain success**: unlike every other blocking primitive in this codebase,
-/// this deliberately does **not** loop and re-verify its own condition (the futex word's value)
-/// after waking. That's not an oversight -- see `BlockReason::WaitingForFutex`'s own doc comment:
-/// real `FUTEX_WAIT` permits genuinely spurious wakeups by spec, and every real caller (musl's own
-/// `sem_timedwait`) already re-verifies via its own userspace retry loop before ever trusting a
-/// zero return. Re-verifying here too would be redundant, not more correct, and would depart from
-/// what a real Linux kernel's own `futex_wait` actually does.
+/// WaitingForFutex(scope, key, deadline)` -- `(scope, key)` come from `futex_key` below, see its
+/// own doc comment for why a bare `(tgid, addr)` isn't enough once a *shared* futex is involved.
+/// Checks for a deliverable signal before ever blocking (avoiding a lost wakeup, same discipline
+/// every blocking primitive here already follows) and once more after waking, in that priority
+/// order, then a deadline check -- **and then, if neither, a plain success**: unlike every other
+/// blocking primitive in this codebase, this deliberately does **not** loop and re-verify its own
+/// condition (the futex word's value) after waking. That's not an oversight -- see
+/// `BlockReason::WaitingForFutex`'s own doc comment: real `FUTEX_WAIT` permits genuinely spurious
+/// wakeups by spec, and every real caller (musl's own `sem_timedwait`) already re-verifies via its
+/// own userspace retry loop before ever trusting a zero return. Re-verifying here too would be
+/// redundant, not more correct, and would depart from what a real Linux kernel's own `futex_wait`
+/// actually does.
 ///
-/// **Real `FUTEX_WAKE`**: scans `process::table()` for every process genuinely `Blocked` on
-/// `WaitingForFutex` with a matching `tgid` (the *waker's* own tgid -- real futex wake, like wait,
-/// is scoped to addresses meaningful within the caller's own address space) and the exact same
-/// `addr`, flips up to `val` of them back to `Ready` (real Linux's own "max waiters to wake" `val`
+/// **Real `FUTEX_WAKE`**: resolves the same `(scope, key)` pair via `futex_key`, scans
+/// `process::table()` for every process genuinely `Blocked` on `WaitingForFutex` with a matching
+/// pair, flips up to `val` of them back to `Ready` (real Linux's own "max waiters to wake" `val`
 /// argument -- `sem_post`'s own call, via `__wake`, passes a small fixed count), and returns the
 /// real number actually woken (musl's own `__wake` never checks this return value, so `0` would
 /// have been just as honest, but a real count costs nothing extra and is a genuinely correct
@@ -516,6 +520,7 @@ pub fn do_futex(pid: Pid, addr: u64, op: u64, val: u64, to: u64) -> Result<u64, 
     const FUTEX_WAKE: u64 = 1;
     const FUTEX_PRIVATE: u64 = 128;
     let base_op = op & !FUTEX_PRIVATE;
+    let private = op & FUTEX_PRIVATE != 0;
 
     if base_op == FUTEX_WAIT {
         // SAFETY: same known pointer-validation gap every other user-memory read in this codebase
@@ -544,14 +549,15 @@ pub fn do_futex(pid: Pid, addr: u64, op: u64, val: u64, to: u64) -> Result<u64, 
             return Err(ETIMEDOUT);
         }
 
+        let (scope, key) = futex_key(pid, addr, private)?;
+
         {
             let mut table = PROCESS_TABLE.lock();
             let proc = table.get_mut(&pid).unwrap();
             if proc.pending_signals & !proc.blocked_signals != 0 {
                 return Err(EINTR);
             }
-            let tgid = proc.tgid;
-            proc.state = ProcState::Blocked(BlockReason::WaitingForFutex(tgid, addr, deadline));
+            proc.state = ProcState::Blocked(BlockReason::WaitingForFutex(scope, key, deadline));
         } // lock dropped before schedule() -- see process::table()'s own doc comment
         crate::process::scheduler::schedule();
 
@@ -567,32 +573,85 @@ pub fn do_futex(pid: Pid, addr: u64, op: u64, val: u64, to: u64) -> Result<u64, 
     }
 
     if base_op == FUTEX_WAKE {
-        let waker_tgid = {
-            let table = PROCESS_TABLE.lock();
-            table.get(&pid).map(|p| p.tgid).unwrap_or(pid)
-        };
-        return Ok(wake_futex(waker_tgid, addr, val));
+        let (scope, key) = futex_key(pid, addr, private)?;
+        return Ok(wake_futex(scope, key, val));
     }
 
     Ok(0)
+}
+
+/// Resolves the real `(scope, key)` pair `do_futex`'s `FUTEX_WAIT`/`FUTEX_WAKE` match on -- real
+/// Linux's own `get_futex_key` (`kernel/futex/core.c`) never keys a *shared* (non-
+/// `FUTEX_PRIVATE`) futex on a bare virtual address either, for exactly the reason this function
+/// exists: two processes mapping the same real `MAP_SHARED` file -- `sem_open`'s own `/dev/shm`
+/// mapping, see `third_party/musl/src/thread/sem_open.c`, which `sem_init`s the new semaphore with
+/// `pshared=1`, clearing `FUTEX_PRIVATE` on every subsequent `sem_wait`/`sem_post` -- generally get
+/// *different* virtual addresses for it (`NEXT_MMAP_PAGE`, `mm.rs`'s own bump allocator, is a
+/// single counter shared across every process and never resets per caller). Keying by raw `addr`
+/// there would mean a waiter's own `FUTEX_WAIT` and a waker's own `FUTEX_WAKE` almost never agree
+/// on the same key at all -- the real, previously-unfixed reason named-semaphore
+/// `sem_open`+`fork()` coordination hung permanently (see `build.rs`'s `POSIX_KNOWN_HANGS`'s
+/// `sem_post/8-1.c`/`sem_unlink/{2-2,3-1}.c`/`sem_wait/7-1.c` entries).
+///
+/// A **private** futex (the common, same-process-only case: an anonymous `pthread_mutex_t`/
+/// `pthread_cond_t`, or a semaphore `sem_init`'d directly with `pshared=0`) stays keyed by
+/// `(tgid, addr)` exactly as before -- real, unrelated processes can and do share the identical
+/// virtual address on this no-ASLR kernel (every stack sits at `USER_STACK_TOP`), so scoping by
+/// `tgid` there is still required, see `BlockReason::WaitingForFutex`'s own doc comment.
+///
+/// A **shared** futex instead resolves `addr` through the caller's own currently-active address
+/// space to the real physical address backing it (`Translate::translate_addr`, which folds in the
+/// real offset within the mapped frame, so this is correct even against a huge page) and returns
+/// `(0, phys_addr)` -- `0` is never a live `tgid` (`Process::tgid` is always a real pid,
+/// `NEXT_PID` starts at `1`), so a shared key can never collide with a private one's own scope.
+/// Two processes mapping the same shared page (real `MAP_SHARED` mmap always aliases the identical
+/// physical frame across every mapper, see `SHARED_LEAF`'s own doc comment) always resolve to the
+/// exact same physical address regardless of their own differing virtual addresses. `EFAULT` if
+/// `addr` isn't actually mapped in the caller's own address space -- shouldn't happen in practice
+/// since `FUTEX_WAIT`'s own caller just dereferenced the identical address successfully immediately
+/// before calling this.
+fn futex_key(pid: Pid, addr: u64, private: bool) -> Result<(Pid, u64), u64> {
+    let table = PROCESS_TABLE.lock();
+    let proc = table.get(&pid).ok_or(EFAULT)?;
+    if private {
+        return Ok((proc.tgid, addr));
+    }
+    let va = VirtAddr::try_new(addr).map_err(|_| EFAULT)?;
+    let phys_offset = memory::phys_mem_offset();
+    // SAFETY: `do_futex`'s only caller (`src/syscall/ffi.rs`) always passes
+    // `scheduler::current_pid()`, so `pid`'s own address space is the one genuinely active right
+    // now -- same reasoning every other `unsafe { ... .mapper(phys_offset) }` call in this module
+    // already relies on.
+    let mapper = unsafe {
+        proc.address_space
+            .as_ref()
+            .expect("futex_key: caller has no address space")
+            .mapper(phys_offset)
+    };
+    mapper
+        .translate_addr(va)
+        .map(|phys| (0, phys.as_u64()))
+        .ok_or(EFAULT)
 }
 
 /// The real `FUTEX_WAKE` scan (`do_futex`'s own branch above), factored out so
 /// `process::lifecycle::terminate_process`'s own real `CLONE_CHILD_CLEARTID` handling (a genuine
 /// kernel-driven futex wake at a real, unmodified musl-issued `clone(2)`'s `ctid` address, at real
 /// task-exit time -- see that function's own doc comment) can reuse the exact same primitive
-/// rather than duplicating this scan. `tgid`-scoped, same reasoning `BlockReason::WaitingForFutex`'s
-/// own doc comment already gives.
-pub(crate) fn wake_futex(tgid: Pid, addr: u64, max_waiters: u64) -> u64 {
+/// rather than duplicating this scan. Takes an already-resolved `(scope, key)` pair -- `scope` is
+/// a real `tgid` for a private futex (`terminate_process`'s own call always is: `CLONE_CHILD_
+/// CLEARTID` is inherently within one thread group) or `0` for a shared one, see `futex_key`'s own
+/// doc comment.
+pub(crate) fn wake_futex(scope: Pid, key: u64, max_waiters: u64) -> u64 {
     let mut woken = 0u64;
     let mut table = PROCESS_TABLE.lock();
     for (&waiter_pid, proc) in table.iter_mut() {
         if woken >= max_waiters {
             break;
         }
-        if let ProcState::Blocked(BlockReason::WaitingForFutex(wtgid, waddr, _)) = proc.state
-            && wtgid == tgid
-            && waddr == addr
+        if let ProcState::Blocked(BlockReason::WaitingForFutex(wscope, wkey, _)) = proc.state
+            && wscope == scope
+            && wkey == key
         {
             proc.state = ProcState::Ready;
             crate::process::scheduler::enqueue_ready(waiter_pid);

@@ -334,24 +334,15 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
         // the other.
         if now % 1000 == 0 {
             crate::serial_println!("[diag] tick={} table_len={}", now, table.len());
-            // TEMPORARY diagnostic for the pthread/aio massfix investigation: per-process state
-            // dump to see exactly what a hung sigwait/6-1.c-shaped test is actually blocked on
-            // (or spinning on) without needing live GDB against the QEMU stub -- narrows whether
-            // `pending_signals`/`blocked_signals` ever reach the "deliverable" state this session's
-            // timer-redirect mechanism checks for, and whether `preempted_resume` ever gets set at
-            // all. Remove once the underlying hang is understood one way or the other.
-            for (&diag_pid, diag_proc) in table.iter() {
-                crate::serial_println!(
-                    "[diag-thread] pid={} tgid={} state={:?} pending={:#x} blocked={:#x} preempted_resume={} has_addr_space={}",
-                    diag_pid,
-                    diag_proc.tgid,
-                    diag_proc.state,
-                    diag_proc.pending_signals,
-                    diag_proc.blocked_signals,
-                    diag_proc.preempted_resume.is_some(),
-                    diag_proc.address_space.is_some()
-                );
-            }
+            // The matching `[diag-thread]` per-process state dump (a TEMPORARY diagnostic for the
+            // pthread/aio massfix investigation -- see CLAUDE.md's "real thread-group signal
+            // delivery" section) is removed: that investigation is done, and an O(table_len) full
+            // scan-and-print *every 10 real seconds* is a genuine, unbounded performance hazard
+            // for any real workload with many live processes/threads -- found live via
+            // `pthread_cond_broadcast/1-2.c` (up to 10000 real threads), whose own per-interval
+            // dump cost grows with thread count and dominated the file's total real runtime, badly
+            // enough to look like a hang even after the actual bug (`KernelStack::new`'s hard
+            // panic on allocation failure, see that function's own doc comment) was fixed.
         }
         // Real per-process CPU-time accounting (`Process::cpu_ticks`, see its own doc comment) --
         // the process this tick actually interrupted is the one that was consuming the CPU for it.

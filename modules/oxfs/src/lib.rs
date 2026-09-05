@@ -5963,6 +5963,19 @@ fn format_fresh_filesystem() -> bool {
         include_bytes!(env!("OXFS_PTHREAD_SMOKE_ELF_PATH")),
     );
 
+    // Real cross-process named-semaphore coordination (`sem_open()`+`fork()`) via the real
+    // `/dev/shm`-backed `MAP_SHARED` mmap two independent processes each map at their own,
+    // generally *different*, virtual address -- see `userland/sem-open-smoke/main.c`'s own doc
+    // comment for the scenario and `process::limits::futex_key`'s own doc comment for the real
+    // physical-address-keyed `FUTEX_WAIT`/`FUTEX_WAKE` fix this proves. Driven by
+    // `tests/sem_open_syscall_smoke.rs` via a real `fork`+`execve`, exactly like
+    // `pthread-smoke.elf` above.
+    ok &= seed_file(
+        root,
+        b"sem-open-smoke.elf",
+        include_bytes!(env!("OXFS_SEM_OPEN_SMOKE_ELF_PATH")),
+    );
+
     // A real fixture for exercising the compiler end to end (`tcc -static -o hello.elf hello.c`,
     // by hand at the hush prompt or via `tests/tcc_syscall_smoke.rs`) -- a real `printf`, not a
     // bare `return`, so it exercises musl's stdio/writev path, not just process exit.
