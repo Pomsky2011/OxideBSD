@@ -41,10 +41,11 @@ themselves as userland programs.
 **Status:** far along, but not "done" by this phase's own stated bar. Every milestone below is
 built except the last — a C libc (musl), not a Rust `std` port, ended up being the actual
 libc/userland story that got this phase moving (see `CLAUDE.md`'s musl-port section), and
-`rustc`/`cargo` running as OxideBSD processes hasn't been attempted yet. Current `v0.2.x` work
-(below) is deepening the C-toolchain side of userland (glibc, GCC/Clang, full POSIX syscall
-coverage) rather than attacking `rustc`/`std` directly — a deliberate detour, not abandonment of
-this phase's actual goal.
+`rustc`/`cargo` running as OxideBSD processes hasn't been attempted yet. Current work (v0.2.0
+closing the POSIX pilot gap, v0.3.0/v0.4.0 deepening the C-toolchain side of userland with
+GCC/Clang and glibc — see "Release sequence" below) is deepening the existing C-based userland
+story rather than attacking `rustc`/`std` directly — a deliberate detour, not abandonment of this
+phase's actual goal.
 
 Depends on phase 1's interactivity, plus:
 
@@ -74,10 +75,10 @@ Phase 2 is "done" when `rustc` can run as an OxideBSD process and compile a prog
 **Goal:** close the loop — an OxideBSD instance can build a new, bootable OxideBSD image using
 only tools running under OxideBSD itself, with no host OS involved.
 
-**Status:** not started on the Rust-toolchain side this phase originally describes. `v0.2.x`'s
-goals (below) are a first step toward self-hosting from the C side instead — a real glibc port,
-self-hosting C-side toolchain components, and retiring `tcc` for real GCC/Clang — ahead of, not
-instead of, eventually closing this loop for `rustc`/`cargo` themselves.
+**Status:** not started on the Rust-toolchain side this phase originally describes. The v0.3.0/
+v0.4.0 goals below are a first step toward self-hosting from the C side instead — self-hosting
+C-side toolchain components, retiring `tcc` for real GCC/Clang, and a real glibc port — ahead of,
+not instead of, eventually closing this loop for `rustc`/`cargo` themselves.
 
 - The full build toolchain (`rustc`, `cargo`, a linker, an assembler) running as userland programs.
 - Enough of a POSIX/BSD-like surface (process spawning, file I/O, environment variables, pipes)
@@ -86,21 +87,38 @@ instead of, eventually closing this loop for `rustc`/`cargo` themselves.
   within the running OS.
 - A working bootstrap: boot an OxideBSD image, rebuild OxideBSD from source on it, boot the result.
 
-## v0.2.x goals
+## Release sequence: v0.2.0 → v0.3.0 → v0.4.0
 
-Concrete near-term targets for the `v0.2.x` line (see `CLAUDE.md`'s TinyCC section for why this is
-a much bigger lift than TinyCC — real subprocess pipelines, likely real dynamic linking and
-threads, none of which this kernel supports yet):
+As of 2026-09-04, the old single "v0.2.x goals" bucket below is split into three separate,
+sequential releases — each ships standalone rather than bundling everything into one v0.2.0:
 
-- **A real glibc port**, alongside or eventually beside the existing native-ABI musl port.
-- **Self-hosting C-side components** — real C toolchain pieces (not just `tcc`) built and able to
-  run on-target, moving further into Phase 3's "build itself" goal from the C side first.
-- **Retire `tcc` in favor of GCC and Clang** once both are real, working on-target ports — TinyCC
-  was always the first/easiest target (see `CLAUDE.md`), not the intended long-term C compiler.
-- **Full POSIX syscall coverage** — implement every POSIX-mandated syscall, even where this ABI's
-  own number/shape (see `CLAUDE.md`'s Syscall ABI section) diverges from Linux's or any real BSD's.
-  Not a promise to match Linux/BSD numbering or wire format, just POSIX-complete coverage under
-  OxideBSD's own invented ABI.
-- **Real text editors: `nano` and real `vim`** — BusyBox's roster today only has the small `vi`
-  applet (see `docs/BUSYBOX_APPLETS.md`); `nano` and full (non-BusyBox) `vim` are separate ports,
-  for meaningfully better on-target text editing than the current applet-only story.
+- **v0.2.0 — POSIX pilot compliance.** The current focus. Close as much of the gap as practical
+  between OxideBSD's own Open POSIX Test Suite pilot run and a mature glibc/Linux baseline, using
+  the full ~1673-file corpus (not a curated subset — see `CLAUDE.md`'s "POSIX pilot: full corpus
+  expansion" section) as the measuring stick. Latest measured baseline (2026-09-04): OxideBSD
+  **82.1%** raw pass rate / **85.6%** excluding UNTESTED, vs. a real, apples-to-apples run of the
+  identical suite on a mature glibc/Linux host at **86.7%** / **89.7%** (`scripts/
+  run_posix_pilot_host.sh` reproduces the host side, `scripts/run_posix_pilot_supervised.sh` the
+  OxideBSD side — see CLAUDE.md's "Real zombie address-space frame reclaim..." section for the full
+  per-category table). Closing this ~4-point gap means triaging the full corpus's own remaining
+  FAIL/UNRESOLVED set, not growing the corpus further — it's already complete. **Full POSIX syscall
+  coverage** (every POSIX-mandated syscall, even where this ABI's own number/shape — see
+  `CLAUDE.md`'s Syscall ABI section — diverges from Linux's or any real BSD's; not a promise to
+  match Linux/BSD numbering or wire format) falls out of this same push, not a separate goal.
+- **v0.3.0 — GCC and Clang self-hosted ports.** What v0.2.0 used to target before the 2026-09-04
+  re-scope (see `CLAUDE.md`'s TinyCC section for why this is a much bigger lift than TinyCC — real
+  subprocess pipelines, likely real dynamic linking and threads beyond what exists today):
+  self-hosting C-side toolchain components running on-target (moving further into Phase 3's "build
+  itself" goal from the C side first), then retiring `tcc` once both GCC and Clang are real,
+  working on-target ports — TinyCC was always the first/easiest target, never the intended
+  long-term C compiler.
+- **v0.4.0 — a real glibc port**, alongside (not replacing) the existing native-ABI musl port.
+
+A separate idea — replacing some BusyBox utilities with Rust `uutils` ahead of GCC/Clang — was
+raised and set aside: not a real dependency of GCC/Clang bring-up (unrelated subsystems), just a
+possible future nice-to-have, not currently sequenced into this list.
+
+**Real text editors: `nano` and real `vim`** — BusyBox's roster today only has the small `vi`
+applet (see `docs/BUSYBOX_APPLETS.md`); `nano` and full (non-BusyBox) `vim` are separate ports, for
+meaningfully better on-target text editing than the current applet-only story — not yet slotted
+into a specific release above.
