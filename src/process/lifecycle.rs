@@ -104,7 +104,7 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         parent,
         children: Vec::new(),
         state: ProcState::Ready,
-        address_space,
+        address_space: Some(address_space),
         kernel_stack,
         kernel_stack_top,
         rsp,
@@ -275,9 +275,15 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             .expect("fork: current process missing from table");
         // SAFETY: AddressSpace::fork requires self to be the currently active address space --
         // true here, since sys_fork runs synchronously on the calling process's own kernel stack
-        // with its own CR3 still live.
-        let child_address_space =
-            with_frame_allocator(|fa| parent.address_space.fork(phys_offset, fa));
+        // with its own CR3 still live. `.expect()`: the live, currently-running caller of a
+        // syscall always has Some -- only a Zombie ever has None, and a Zombie can't be mid-syscall.
+        let child_address_space = with_frame_allocator(|fa| {
+            parent
+                .address_space
+                .as_ref()
+                .expect("fork: caller has no address space")
+                .fork(phys_offset, fa)
+        });
         // Real fork() semantics for the now-`ThreadGroupShared` fields: cwd/root_inode/umask/
         // uid/gid/brk are all copied (a forked child is a real POSIX *process*, gets its own
         // independent ThreadGroupShared, never Arc::clone's the parent's -- that's do_clone's own
@@ -355,7 +361,7 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent: Some(caller_pid),
         children: Vec::new(),
         state: ProcState::Ready,
-        address_space: child_address_space,
+        address_space: Some(child_address_space),
         kernel_stack,
         kernel_stack_top,
         rsp,
@@ -544,8 +550,13 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
             .expect("clone: current process missing from table");
         (
             // Real CLONE_VM: an Arc::clone of the exact same level 4 table, not a fresh copy --
-            // see AddressSpace::share's own doc comment.
-            caller.address_space.share(),
+            // see AddressSpace::share's own doc comment. `.expect()`: same reasoning as
+            // do_fork_from_current's identical call -- the live caller always has Some.
+            caller
+                .address_space
+                .as_ref()
+                .expect("clone: caller has no address space")
+                .share(),
             // Real CLONE_THREAD sharing: the new thread gets the exact same
             // cwd/root_inode/umask/uid/gid/brk/mmap_file_regions Arc, not its own copy -- see
             // ThreadGroupShared's own doc comment.
@@ -583,7 +594,7 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         parent: parent_field,
         children: Vec::new(),
         state: ProcState::Ready,
-        address_space: child_address_space,
+        address_space: Some(child_address_space),
         kernel_stack,
         kernel_stack_top,
         rsp,
@@ -962,7 +973,7 @@ pub fn do_execve(
         // Old AddressSpace captured here, torn down for real below (once this lock is dropped) --
         // see AddressSpace::teardown's own doc comment for why this exact call site is safe:
         // new_address_space.activate() above already switched CR3 away from it.
-        let old_address_space = core::mem::replace(&mut me.address_space, new_address_space);
+        let old_address_space = me.address_space.replace(new_address_space);
         me.user_stack_top = initial_rsp;
         // The real jump target (interpreter's own entry when PT_INTERP loaded one, else the main
         // binary's) -- not read again for this exact pid (only a never-run process's first switch,
@@ -1018,7 +1029,13 @@ pub fn do_execve(
     // image had live is protected from this by SHARED_LEAF (see that constant's own doc comment)
     // regardless of whether the cleanup calls below have run yet. `phys_offset` here is the same
     // one this function established above, still valid (it never changes at runtime).
-    with_frame_allocator(|fa| unsafe { old_address_space.teardown(phys_offset, fa) });
+    // `.expect()`: a live, currently-executing process (which execve always is) always had
+    // Some -- only a Zombie ever has None.
+    with_frame_allocator(|fa| unsafe {
+        old_address_space
+            .expect("execve: old address space already gone")
+            .teardown(phys_offset, fa)
+    });
     // Real SysV shm semantics: the old address space (just torn down above) is what every prior
     // shmat's own mapping actually lived in -- the new image can't see any of it, so this is a
     // real implicit detach of everything, exactly like a real process exit's own
@@ -1125,7 +1142,12 @@ pub fn do_wait4(
                 let removed = table
                     .remove(&child_pid)
                     .expect("wait4: zombie child vanished under the same lock that found it");
-                reaped_address_space = Some(removed.address_space);
+                // Already `None` here if `terminate_process` already tore this down for real at
+                // exit time (the common case now -- see `ProcState`/`Process::address_space`'s own
+                // doc comments); `Some` only for the narrower cases that still defer teardown all
+                // the way to reap (e.g. a genuinely still-running self-exit whose own
+                // `queue_thread_reap` hasn't drained yet by the time this reap runs).
+                reaped_address_space = removed.address_space;
                 table
                     .get_mut(&caller_pid)
                     .unwrap()
@@ -1356,7 +1378,7 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
         }
         scheduler::remove_ready(pid);
         drop(table);
-        scheduler::queue_thread_reap(pid);
+        scheduler::queue_thread_reap(pid, scheduler::ReapKind::RemoveEntry);
         return;
     }
     // Real exit() semantics: every fd this thread group still has open gets closed automatically.
@@ -1446,25 +1468,58 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
         // (`do_kill`'s `Action::Terminate`, target != caller, exactly like `do_wait4`'s own normal
         // reap), but **not** for the common case: `do_exit` calling this on *itself*, still
         // running on this exact entry's own address space/kernel stack at this exact point (same
-        // hazard the `other_thread_alive` branch above documents for the identical reason). A real
-        // fix there needs the same "defer until schedule() confirms current_pid() has moved on"
-        // treatment that branch already established via `scheduler::queue_thread_reap` -- reused
-        // here rather than duplicated, at the cost of that path leaking this one address space's
-        // frames (that queue's own drain just drops the entry, no `teardown()` call) rather than
-        // reclaiming them -- an honest, narrowly-scoped gap (this flag has exactly one live
-        // exerciser today) preferred over risking use-after-free of a live page table.
+        // hazard the `other_thread_alive` branch above documents for the identical reason). Deferred
+        // via `scheduler::queue_thread_reap`'s `ReapKind::RemoveEntry` -- real removal *and* real
+        // teardown now (see that enum's own doc comment; it used to only remove the entry, leaking
+        // this one address space's frames -- closed as part of the same fix that closes the much
+        // bigger default-path leak just below).
         if pid == scheduler::current_pid() {
             scheduler::remove_ready(pid);
             drop(table);
-            scheduler::queue_thread_reap(pid);
+            scheduler::queue_thread_reap(pid, scheduler::ReapKind::RemoveEntry);
             return;
         }
         let removed = table
             .remove(&pid)
             .expect("terminate_process: just-set zombie vanished under the same lock");
         drop(table);
+        if let Some(address_space) = removed.address_space {
+            let phys_offset = memory::phys_mem_offset();
+            with_frame_allocator(|fa| unsafe { address_space.teardown(phys_offset, fa) });
+        }
+        return;
+    }
+    // Real frame reclaim, real POSIX zombie semantics: the address space's own physical frames get
+    // reclaimed *right now* (deferred only as long as it takes to safely leave this exact stack, for
+    // a self-exit), not left pinned for however long it takes some parent to actually call
+    // `wait4()` -- the table entry itself still survives in `ProcState::Zombie` either way, for a
+    // real future `wait4` to find and report exit status/rusage from (see `do_wait4`'s own reap
+    // path, which now correctly finds `address_space` already `None` here and skips its own
+    // teardown call as a no-op).
+    //
+    // **Why this matters, found live**: this codebase never reparents an orphan to a pid-1 "init"
+    // (see `do_wait4`'s own doc comment on that accepted simplification) -- so any process whose
+    // real parent already exited (or simply never calls `wait4()` on this specific child) leaves a
+    // zombie that is *never* reaped by anyone, ever. Before this fix, that permanently pinned the
+    // zombie's *entire* address space -- every mapped page, not just bookkeeping -- for the rest of
+    // the boot. Across the POSIX conformance pilot's own ~1675-file corpus (many `pthread_*`/`fork`
+    // tests legitimately fork a child and exit without joining/waiting it, as part of what they're
+    // actually testing), this compounded until physical memory was exhausted: a real, reproducible
+    // kernel panic (`out of memory mapping a user stack`, `map_user_stack`'s own
+    // `allocate_frame().expect(...)`) partway through the corpus, confirmed via a supervised
+    // multi-hour run that hit the identical panic site repeatedly regardless of which specific file
+    // happened to be running when the shared frame pool finally ran dry.
+    if pid == scheduler::current_pid() {
+        scheduler::remove_ready(pid);
+        drop(table);
+        scheduler::queue_thread_reap(pid, scheduler::ReapKind::TeardownOnly);
+        return;
+    }
+    let address_space = table.get_mut(&pid).and_then(|me| me.address_space.take());
+    drop(table);
+    if let Some(address_space) = address_space {
         let phys_offset = memory::phys_mem_offset();
-        with_frame_allocator(|fa| unsafe { removed.address_space.teardown(phys_offset, fa) });
+        with_frame_allocator(|fa| unsafe { address_space.teardown(phys_offset, fa) });
     }
 }
 

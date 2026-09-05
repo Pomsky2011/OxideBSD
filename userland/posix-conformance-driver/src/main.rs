@@ -68,6 +68,30 @@ fn write_bytes(s: &[u8]) {
     }
 }
 
+/// Hand-rolled decimal formatting, no `core::fmt` -- this crate is `#![no_std]` with no `alloc`,
+/// same discipline every other minimal userland smoke crate in this codebase already follows.
+fn write_i32(n: i32) {
+    let mut buf = [0u8; 11]; // "-2147483648" worst case
+    let mut i = buf.len();
+    let neg = n < 0;
+    // i32::MIN can't be negated directly (would overflow) -- work in i64 for the magnitude.
+    let mut mag = if neg { -(n as i64) } else { n as i64 };
+    if mag == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while mag > 0 {
+        i -= 1;
+        buf[i] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    write_bytes(&buf[i..]);
+}
+
 fn test_exit(pass: bool) -> ! {
     unsafe {
         let _ = syscall(SYS_TEST_EXIT, if pass { 0 } else { 1 }, 0, 0);
@@ -140,9 +164,28 @@ pub extern "C" fn _start() -> ! {
         Ok(child_pid) => {
             let mut status: i32 = -1;
             match wait4(child_pid, &mut status) {
-                Ok(reaped) if reaped == child_pid => {
+                // Real wait(2) encoding: `status == 0` is the only shape meaning "exited
+                // normally, via exit(0)". Anything else -- a nonzero exit code, or the
+                // low-7-bits-nonzero signal-terminated shape (`terminate_process`'s own
+                // `128 + sig`/pre-shifted encoding, see CLAUDE.md's process/scheduler section) --
+                // means `sh` didn't run its own `posix_conformance.sh` loop to completion,
+                // whatever the reason. Found live: this check didn't exist before, so a shell
+                // that silently died partway through the corpus (not a hang -- `wait4` still
+                // returned promptly -- and not a kernel panic either) was reported as a clean
+                // "PASS" regardless, hiding a real, separate infrastructure failure from every
+                // caller that (reasonably) trusted this line to mean "the whole corpus ran."
+                // Still deliberately doesn't touch the *tally* itself (see this module's own doc
+                // comment) -- only whether `sh` actually finished its own loop and reached
+                // `echo === summary ===`, a strictly narrower, purely infrastructural check.
+                Ok(reaped) if reaped == child_pid && status == 0 => {
                     write_bytes(b"posix-conformance-driver: sh finished, harness done\n");
                     test_exit(true);
+                }
+                Ok(reaped) if reaped == child_pid => {
+                    write_bytes(b"posix-conformance-driver: sh exited abnormally, status=");
+                    write_i32(status);
+                    write_bytes(b"\n");
+                    test_exit(false);
                 }
                 _ => {
                     write_bytes(b"posix-conformance-driver: wait4 for sh failed\n");

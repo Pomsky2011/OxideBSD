@@ -342,13 +342,14 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
             // all. Remove once the underlying hang is understood one way or the other.
             for (&diag_pid, diag_proc) in table.iter() {
                 crate::serial_println!(
-                    "[diag-thread] pid={} tgid={} state={:?} pending={:#x} blocked={:#x} preempted_resume={}",
+                    "[diag-thread] pid={} tgid={} state={:?} pending={:#x} blocked={:#x} preempted_resume={} has_addr_space={}",
                     diag_pid,
                     diag_proc.tgid,
                     diag_proc.state,
                     diag_proc.pending_signals,
                     diag_proc.blocked_signals,
-                    diag_proc.preempted_resume.is_some()
+                    diag_proc.preempted_resume.is_some(),
+                    diag_proc.address_space.is_some()
                 );
             }
         }

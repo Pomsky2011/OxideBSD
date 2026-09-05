@@ -1217,6 +1217,14 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // actually being investigated next (`fork/8-1.c`'s CPU-timing anomaly and the named-semaphore
     // cross-process futex gap are the remaining genuinely-open items in `POSIX_KNOWN_HANGS`) when
     // that starts.
+    //
+    // `rerun-if-env-changed`, not just relying on the file-content watch above: plain
+    // `std::env::var` reads aren't tracked by cargo at all on their own -- toggling this var on/off
+    // between builds (nothing else changed) could otherwise silently reuse a stale cached manifest
+    // built under the *other* setting. Same reasoning for `POSIX_EXTRA_EXCLUDE_FILE`'s own *value*
+    // (as opposed to that path's file content, already watched above).
+    println!("cargo:rerun-if-env-changed=POSIX_PILOT_CANARY_ONLY");
+    println!("cargo:rerun-if-env-changed=POSIX_EXTRA_EXCLUDE_FILE");
     if std::env::var("POSIX_PILOT_CANARY_ONLY").is_ok() {
         const CANARY: &[&str] = &[
             "pthread_attr_destroy/1-1.c",
@@ -1227,23 +1235,33 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
         return out;
     }
     out.retain(|rel| !POSIX_KNOWN_HANGS.contains(&rel.as_str()));
-    // `POSIX_EXTRA_EXCLUDE_FILE=<path>` (optional): a plain text file, one `relative/path.c` per
-    // line, merged into the exclusion set the same way `POSIX_KNOWN_HANGS` is -- lets
-    // `scripts/run_posix_pilot_supervised.sh` (a host-side supervisor that kills a genuinely
-    // wedged QEMU boot and retries with the stuck file excluded, since a kernel-level hang can't
-    // be rescued by `t0`'s own userspace `alarm()` -- see that script's own header comment) drive
-    // a real full-corpus run to completion across several retries without hand-editing
-    // `POSIX_KNOWN_HANGS` (and triggering this whole file's `cargo:rerun-if-changed` on itself)
-    // between every iteration. Not wired into any normal build -- unset means no extra exclusions,
-    // same "opt-in only" contract `POSIX_PILOT_CANARY_ONLY` already has. A file newly found stuck
-    // by that script should still graduate into a real, documented `POSIX_KNOWN_HANGS` entry once
+    // `POSIX_EXTRA_EXCLUDE_FILE=<path>` (optional, defaults to `target/posix_extra_excludes.txt`):
+    // a plain text file, one `relative/path.c` per line, merged into the exclusion set the same
+    // way `POSIX_KNOWN_HANGS` is -- lets `scripts/run_posix_pilot_supervised.sh` (a host-side
+    // supervisor that kills a genuinely wedged QEMU boot and retries with the stuck file excluded,
+    // since a kernel-level hang can't be rescued by `t0`'s own userspace `alarm()` -- see that
+    // script's own header comment) drive a real full-corpus run to completion across several
+    // retries without hand-editing `POSIX_KNOWN_HANGS` (and triggering this whole file's
+    // `cargo:rerun-if-changed` on itself) between every iteration. A file newly found stuck by that
+    // script should still graduate into a real, documented `POSIX_KNOWN_HANGS` entry once
     // root-caused -- this is a fast iteration aid, not a permanent exclusion mechanism.
-    if let Ok(extra_path) = std::env::var("POSIX_EXTRA_EXCLUDE_FILE") {
-        println!("cargo:rerun-if-changed={extra_path}");
-        if let Ok(contents) = std::fs::read_to_string(&extra_path) {
-            let extra: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-            out.retain(|rel| !extra.contains(&rel.as_str()));
-        }
+    //
+    // The `rerun-if-changed` registration below is **unconditional**, not gated on the env var
+    // being set -- found live, the hard way: cargo's own watch list for a build script is exactly
+    // whatever that script's *most recent* invocation emitted, not a union across every past
+    // invocation. An earlier plain `cargo build` (no env var set, run to sanity-check an unrelated
+    // change) took what used to be the `if let Ok(extra_path) = ...` branch's *else* -- emitting no
+    // watch directive for this file at all -- which made cargo "forget" to watch it, so every
+    // later `POSIX_EXTRA_EXCLUDE_FILE`-driven invocation silently kept reusing the stale cached
+    // manifest regardless of how many new lines the supervisor script appended. Always watching
+    // the same fixed default path (whether or not this exact build set the env var) keeps the
+    // watch list stable across every build, mixed-env-var or not.
+    let extra_path = std::env::var("POSIX_EXTRA_EXCLUDE_FILE")
+        .unwrap_or_else(|_| "target/posix_extra_excludes.txt".to_string());
+    println!("cargo:rerun-if-changed={extra_path}");
+    if let Ok(contents) = std::fs::read_to_string(&extra_path) {
+        let extra: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        out.retain(|rel| !extra.contains(&rel.as_str()));
     }
     // Real, live-found reliability problem, not a static guess: individually excluding
     // `POSIX_KNOWN_HANGS` one file at a time originally surfaced a *vanilla* `pthread_create()` +

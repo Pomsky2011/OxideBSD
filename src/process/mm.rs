@@ -300,7 +300,7 @@ fn do_mmap_anon(caller_pid: Pid, fixed_base: Option<u64>, region_len: u64) -> Re
     // SAFETY: me.address_space is the currently active address space -- mmap runs synchronously on
     // the caller's own kernel stack mid-syscall, with its own CR3 still live -- sound for the same
     // reason AddressSpace::fork's own doc comment already establishes for this "active table" case.
-    let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
+    let mut mapper = unsafe { me.address_space.as_ref().expect("mm: caller has no address space").mapper(phys_offset) };
 
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + region_len - 1));
@@ -568,7 +568,7 @@ fn do_mmap_file_backed(
         .expect("mmap: current process missing from table");
     // SAFETY: see do_mmap's identical reasoning -- me.address_space is the currently active
     // address space.
-    let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
+    let mut mapper = unsafe { me.address_space.as_ref().expect("mm: caller has no address space").mapper(phys_offset) };
     // Only `[base, base + covered_pages*4096)` is actually mapped -- `[covered_pages, page_count)`
     // is deliberately left with no page-table entry at all, real POSIX MPR (see MmapFileRegion's
     // own `mapped_pages` field doc comment); `covered_pages == 0` (the whole reservation is beyond
@@ -748,7 +748,7 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
 
     // SAFETY: me.address_space is the currently active address space -- same reasoning do_mmap's
     // own identical comment already establishes.
-    let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
+    let mut mapper = unsafe { me.address_space.as_ref().expect("mm: caller has no address space").mapper(phys_offset) };
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr_inclusive));
 
@@ -918,7 +918,7 @@ fn range_fully_mapped(caller_pid: Pid, addr: u64, len: u64) -> bool {
     };
     // SAFETY: me.address_space is the currently active address space -- same reasoning do_mmap's
     // own identical comment already establishes; read-only here, no mutation.
-    let mapper = unsafe { me.address_space.mapper(phys_offset) };
+    let mapper = unsafe { me.address_space.as_ref().expect("mm: caller has no address space").mapper(phys_offset) };
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_inclusive));
     Page::range_inclusive(start_page, end_page)
@@ -1038,7 +1038,7 @@ pub fn do_brk(caller_pid: Pid, addr: u64) -> Result<u64, u64> {
     if new_top > map_start {
         // SAFETY: see do_mmap's identical reasoning -- me.address_space is the currently active
         // address space.
-        let mut mapper = unsafe { me.address_space.mapper(phys_offset) };
+        let mut mapper = unsafe { me.address_space.as_ref().expect("mm: caller has no address space").mapper(phys_offset) };
         let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(map_start));
         let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(new_top - 1));
         with_frame_allocator(|fa| -> Result<(), u64> {

@@ -152,37 +152,79 @@ pub fn remove_ready(pid: Pid) {
     READY_QUEUE.lock().retain(|&p| p != pid);
 }
 
-/// Non-leader `CLONE_THREAD` children queued for real removal by `process::lifecycle::
-/// terminate_process` -- see that function's own doc comment for why it can't just remove its own
-/// `Process` entry directly (it's still running on that exact entry's own `KernelStack` at the
-/// point it decides to exit). Drained by `reap_pending_threads` below, called at the top of every
-/// `schedule()` -- by the time *any* call to `schedule()` other than the one a queued pid made to
-/// exit itself runs, `CURRENT_PID` has necessarily moved on, so that pid's own stack is
-/// guaranteed no longer live.
-static PENDING_THREAD_REAPS: Mutex<Vec<Pid>> = Mutex::new(Vec::new());
-
-pub(crate) fn queue_thread_reap(pid: Pid) {
-    PENDING_THREAD_REAPS.lock().push(pid);
+/// What `reap_pending_threads` should do once it's safe (`current_pid()` has genuinely moved off
+/// the queued pid's own stack) -- see `PENDING_THREAD_REAPS`'s own doc comment for why this can't
+/// happen inline at the moment a process decides to exit itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReapKind {
+    /// Remove the whole `Process` table entry -- a non-leader `CLONE_THREAD` sibling (never an
+    /// independent `wait4` target, see `do_clone`'s own doc comment) or a self-exiting process
+    /// whose parent's `SIGCHLD` action has `SA_NOCLDWAIT` set (never left as a wait4-reapable
+    /// zombie at all, see `terminate_process`'s own doc comment on that flag).
+    RemoveEntry,
+    /// Tear down just the address space's own physical frames (`me.address_space.take()`), but
+    /// leave the table entry itself alive in `ProcState::Zombie` for a real future `wait4` to
+    /// find and reap -- the default self-exit case. Real POSIX zombie semantics: only a small
+    /// exit-status stub needs to survive until reaped, not the process's entire memory image.
+    /// Splits "free the big stuff" (must happen promptly, or a long-running sequence of
+    /// exit-without-being-reaped children permanently pins physical memory -- found live via a
+    /// real kernel OOM panic under the POSIX conformance pilot's own full corpus, see
+    /// `terminate_process`'s own doc comment) from "keep the small stuff for reap" (still fully
+    /// gated on a parent's own `wait4` call, unchanged).
+    TeardownOnly,
 }
 
-/// Removes every queued pid's real `Process` entry -- except one that still equals
-/// `current_pid()`, which means this is the exact same `schedule()` call that pid's own `do_exit`
-/// made to switch away from itself (still running on its own about-to-be-freed `KernelStack`,
-/// mid-switch) -- left queued for a later call, once some other process's own turn confirms
-/// `current_pid()` has genuinely moved on. See `PENDING_THREAD_REAPS`'s own doc comment.
+/// Pids queued for real cleanup by `process::lifecycle::terminate_process` once it's safe -- see
+/// that function's own doc comment for why it can't just act on its own `Process` entry directly
+/// when exiting itself (it's still running on that exact entry's own `KernelStack` at the point it
+/// decides to exit). Drained by `reap_pending_threads` below, called at the top of every
+/// `schedule()` -- by the time *any* call to `schedule()` other than the one a queued pid made to
+/// exit itself runs, `CURRENT_PID` has necessarily moved on, so that pid's own stack (and, for
+/// `ReapKind::TeardownOnly`, its own address space) is guaranteed no longer live/active.
+static PENDING_THREAD_REAPS: Mutex<Vec<(Pid, ReapKind)>> = Mutex::new(Vec::new());
+
+pub(crate) fn queue_thread_reap(pid: Pid, kind: ReapKind) {
+    PENDING_THREAD_REAPS.lock().push((pid, kind));
+}
+
+/// Acts on every queued pid -- except one that still equals `current_pid()`, which means this is
+/// the exact same `schedule()` call that pid's own `do_exit` made to switch away from itself
+/// (still running on its own about-to-be-freed `KernelStack`/active `CR3`, mid-switch) -- left
+/// queued for a later call, once some other process's own turn confirms `current_pid()` has
+/// genuinely moved on. See `PENDING_THREAD_REAPS`'s own doc comment.
 fn reap_pending_threads() {
     let mut pending = PENDING_THREAD_REAPS.lock();
     if pending.is_empty() {
         return;
     }
     let cur = current_pid();
-    pending.retain(|&pid| {
+    pending.retain(|&(pid, kind)| {
         if pid == cur {
-            true
-        } else {
-            process::table().lock().remove(&pid);
-            false
+            return true;
         }
+        let address_space = match kind {
+            ReapKind::RemoveEntry => process::table()
+                .lock()
+                .remove(&pid)
+                .and_then(|p| p.address_space),
+            ReapKind::TeardownOnly => process::table()
+                .lock()
+                .get_mut(&pid)
+                .and_then(|p| p.address_space.take()),
+        };
+        // Real frame reclaim, not just a table-entry drop: `AddressSpace` has no `Drop` impl
+        // (`teardown` is the only thing that ever frees its frames -- see that method's own doc
+        // comment), and its own `Arc::strong_count` gate already correctly no-ops for a
+        // `CLONE_THREAD` sibling whose address space is still shared with the rest of its thread
+        // group, so this is safe to call unconditionally here regardless of which `ReapKind` this
+        // was queued as.
+        if let Some(address_space) = address_space {
+            let phys_offset = crate::memory::phys_mem_offset();
+            crate::memory::with_frame_allocator(|fa| unsafe {
+                address_space.teardown(phys_offset, fa)
+            });
+        }
+        false
     });
 }
 
@@ -333,7 +375,15 @@ fn activate_and_prepare(pid: Pid) -> u64 {
     // AddressSpace::new's shallow copy) plus its own user segments/stack, so activating it here —
     // still running on the outgoing stack, about to switch away — is safe, mirroring
     // AddressSpace::activate's own safety contract.
-    unsafe { next.address_space.activate() };
+    // `.expect()`: only `ProcState::Zombie` ever has `address_space == None` (see that field's own
+    // doc comment), and a Zombie is never picked to run -- `schedule()` only ever activates a
+    // `Ready` pid.
+    unsafe {
+        next.address_space
+            .as_ref()
+            .expect("activate_and_prepare: picked a process with no address space")
+            .activate()
+    };
     gdt::set_kernel_stack(next.kernel_stack_top);
     // IA32_FS_BASE is a single global MSR, not something switch_context itself saves/restores (it
     // only touches RSP/callee-saved GPRs) -- without this, one process's own %fs-relative TLS

@@ -279,42 +279,21 @@ self-assessing against this checklist:
       each file a real pre-built ELF run through `t0` (the suite's own real `alarm()`-based timeout
       wrapper) inside a real, single continuous boot (`tests/posix_conformance_smoke.rs` +
       `userland/posix-conformance-driver/`, driven by `modules/oxfs/src/posix_conformance.sh`'s own
-      seeded corpus/manifest — see that script's own doc comment for the full design). Not the
-      whole suite (1750 files in `conformance/interfaces/` alone, before `functional`/`stress`, and
-      real threading/AIO are out of scope until the "Real threading" blocker above is addressed) —
-      a curated, steadily-growing pilot subset, currently 488 files (grew from an initial 68-file
-      pilot; see CLAUDE.md's own "POSIX conformance pilot" sections, most recently "POSIX
-      conformance pilot expanded 68 → 488..." for the full growth history and the four real kernel
-      bugs each expansion pass has found and fixed along the way).
-- [x] **A real pass/fail baseline, latest confirmed run of the 488-file pilot**: **420 PASS / 10
-      FAIL / 2 UNRESOLVED / 8 UNSUPPORTED / 45 UNTESTED / 2 TIMEOUT / 1 CRASH** — up from this doc's
-      original 329P/62F/40U/8US/45UT/3TO/1CR baseline via several later fixes (see CLAUDE.md's own
-      "POSIX conformance pilot" sections for the full incremental history). Most recently: a
-      three-part pass closing `sigset/6-1,7-1.c` (a real, stock-musl `sigset(sig, SIG_HOLD)` bug —
-      fixed on the `oxidebsd` musl branch, see CLAUDE.md's own "Three UNRESOLVED fixes" section),
-      `timer_create/10-1,11-1.c` (`timer_create`/`timer_settime`/`timer_gettime` now accept
-      `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`, arming against `Process::cpu_ticks`),
-      and `mmap/13-1.c` (a same-process `open(O_CREAT) -> write() -> stat()` visibility gap in oxfs
-      — `force_commit_pending_create` now wired into `resolve_path_impl`, not just `oxfs_open` —
-      which flips this test from a false `UNRESOLVED` to a real, *expected* `FAIL`: the suite's own
-      `coverage.txt` documents this exact test failing on real glibc+Linux too, since `st_atime`
-      never updates from an mmap'd write there either, and this filesystem's own `st_atime` is
-      likewise a permanent honest-`0` placeholder). Net from that pass: 5 UNRESOLVED became PASS/
-      the-one-expected-FAIL, moving the prior 414P/11F/7U baseline to this one (the small remaining
-      FAIL-count drift is unrelated scheduling-timing variance between runs, not from these fixes).
-      **Still open**: `sched_setparam/9-1.c`/`10-1.c` remain UNRESOLVED — investigated but not
-      pinned down; the kernel-side logic (`do_sched_setparam`, permission checks, `sched_getaffinity`)
-      all looked correct on inspection, so confirming the real cause needs a live trace, not more
-      source-reading. The one `CRASH` is still a real
-      bug in the *test itself* — `strftime/2-1.c`'s own stack-buffer overflow, correctly caught and
-      cleanly delivered as `SIGSEGV` rather than rebooting the VM, not a kernel gap. **The 45
-      UNTESTED files are all real, upstream-declared stubs, confirmed by direct inspection, not a
-      kernel gap this pilot can close**: ~40 unconditionally `return PTS_UNTESTED` regardless of
-      platform (POSIX leaves the behavior unspecified/implementation-defined, needs multiple real
-      users, needs Priority Scheduling to build a reliable test, etc.); `sem_post/8-1.c` is gated by
-      musl never defining `_POSIX_PRIORITY_SCHEDULING`, not an OxideBSD limitation;
-      `sched_setparam/26-1.c` is a real upstream inconsistency (its 8 sibling tests self-demote via
-      `setuid()` before giving up and pass for real under this kernel's real second-user support —
-      this one just never wrote that fallback). **Next step**: the remaining 11 FAIL/7 UNRESOLVED
-      haven't been individually triaged against this checklist's own categories yet — a priority-
-      ranking pass over that set, not growing the file count further, is the natural next step here.
+      seeded corpus/manifest — see that script's own doc comment for the full design). **No longer a
+      curated subset**: the pilot now covers the **full corpus** (~1673 files in
+      `conformance/interfaces/`, `pthread_*`/`aio_*`/`lio_listio*` included now that real threading
+      exists) — see CLAUDE.md's "POSIX pilot: full corpus expansion..." section for the growth
+      history (68 → 488 → full corpus) and every real kernel/musl bug each expansion pass found.
+- [x] **A real pass/fail baseline against the full ~1673-file corpus** (2026-09-04, both sides
+      including `pthread_*`/`aio_*`): OxideBSD **82.1%** raw pass rate / **85.6%** excluding
+      UNTESTED, measured against a real apples-to-apples comparison run of the identical suite on
+      the user's own Artix Linux host (glibc, native): **86.7%** / **89.7%** — a ~4-point gap, with
+      most of it coming from UNRESOLVED/UNSUPPORTED (test-setup gaps and genuinely-unimplemented
+      optional features) rather than correctness failures on paths that do run — see CLAUDE.md's
+      "Real zombie address-space frame reclaim..." section for the full per-category table and
+      `scripts/run_posix_pilot_host.sh`/`scripts/run_posix_pilot_supervised.sh` to reproduce either
+      side. The 488-file curated-subset baseline this section previously tracked (420P/10F/2U/8US/
+      45UT/2TO/1CR) is superseded, not current — don't cite it going forward.
+      **Next step**: individually triage the full corpus's own FAIL/UNRESOLVED set (much larger now
+      that threading/AIO are included) rather than growing the file count further — the corpus is
+      now complete.

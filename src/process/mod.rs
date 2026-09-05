@@ -690,7 +690,18 @@ pub struct Process {
     pub parent: Option<Pid>,
     pub children: Vec<Pid>,
     pub state: ProcState,
-    pub address_space: AddressSpace,
+    /// `None` only for a `ProcState::Zombie` whose frames have already been reclaimed (either at
+    /// real exit time or by an earlier `wait4` reap) -- every other state always has `Some`. Real
+    /// POSIX zombie semantics: once a process has exited, only a small exit-status stub needs to
+    /// survive until some parent's `wait4` reaps it, not its entire memory image. Kept as an
+    /// `Option` on the live field (not removed from the table immediately) specifically so a
+    /// `wait4`-reapable zombie can still report real exit status/rusage after its own memory is
+    /// already gone -- see `process::scheduler::ReapKind::TeardownOnly`'s own doc comment for why
+    /// this split matters (a real kernel OOM otherwise, found live via the POSIX conformance
+    /// pilot's own full corpus: nothing in this codebase ever reparents an orphan to a pid-1
+    /// "init", so any zombie whose real parent already exited is *never* reaped by anyone, and
+    /// used to pin its entire address space's physical frames for the rest of the boot).
+    pub address_space: Option<AddressSpace>,
     #[allow(dead_code)] // kept alive for its Drop impl; never read after construction
     kernel_stack: KernelStack,
     pub kernel_stack_top: VirtAddr,

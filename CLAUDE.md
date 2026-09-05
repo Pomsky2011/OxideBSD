@@ -1271,6 +1271,147 @@ real `dlopen` (blocked on `mprotect` enforcement, unrelated to threading).
   needs a live dispatch trace to pin down, not more source-reading.
 - **Verified**: 414P/11F/7U/8US/45UT/2TO/1CR → **420P/10F/2U/8US/45UT/2TO/1CR, 488 total**.
 
+## POSIX pilot: full corpus expansion, real thread-group signal delivery, `exit_group(2)`, two real musl `fork()` bugs (`build.rs`, `src/process/`, `third_party/musl`)
+
+Grew the pilot from the 488-file curated/deduplicated subset above to the **full Open POSIX Test
+Suite corpus** (~1700 files in `conformance/interfaces/`, `pthread_*`/`aio_*`/`lio_listio*` included
+now that real threading exists — see "Real threading" above): `discover_posix_test_files` walks the
+directory dynamically instead of a hand-curated file list; the build loop is best-effort
+(skip+log, not panic) since not every file cross-compiles clean; every pilot binary shares one
+fixed load address instead of a unique slot each (the old per-file scheme ran out of VA room past
+~700 files); oxfs `NUM_BLOCKS`/`MAX_INODES`/`NAME_MAX` bumped again (65536/8192/40) for the larger,
+longer-named corpus; the kernel's own low-VA family shifted `+0x4000000` (third time this exact
+"embedded corpus grew past the fixed load-base floor" class of bug has hit — see the userland
+load-base note above).
+
+**Reliability fixes needed to get real threading's own test directories past a permanent hang**,
+found via a `[diag-thread]` per-process diagnostic dump added to `timer_interrupt_handler`
+(pid/tgid/state/pending/blocked/preempted_resume, printed alongside the existing periodic `[diag]
+tick=` line) rather than live GDB — each a genuine, independent kernel or musl bug, not one root
+cause:
+
+- **Real thread-group-wide signal delivery had two bugs**, both in `process::signals`: (1)
+  `resolve_signal_recipient`'s fallback preferred the literal thread-group leader when no sibling
+  had reached its own `sigwait()` yet — since the leader itself never sigwaits, a signal aimed at
+  the group sat pending-but-blocked on it forever; fixed to prefer any *other* live group member,
+  relying on `do_sigtimedwait`'s own check-before-block loop to consume it once that sibling
+  arrives. (2) The whole-group reroute fired unconditionally on every `kill`/`sigqueue`, including
+  a real `pthread_kill(exact_thread, sig)` (this ABI has no separate `tkill`/`tgkill` — it reaches
+  the same code as a process-directed `kill()`, but must target *precisely* the named thread).
+  Fixed via `route_signal_target`, gating the reroute to only fire when the literal target names
+  its own group's leader. Also fixed in the same pass: `fault_trampoline`'s `mov eax,
+  SYS_FAULT_PUMP` (see "Real ring-3 fault-to-signal delivery" above) permanently clobbered the
+  interrupted process's real `RAX` before it could be captured — silently corrupting live
+  computation on resume for any ring-3 process fielding a signal with no syscall of its own in
+  flight. Fixed by stashing real `RAX` to a scratch slot on the trampoline's own page first.
+- **A real, distinct `SYS_exit_group` bug**: `exit()`/`_Exit()` shared the exact same syscall
+  number as a bare per-thread `SYS_exit` (a leftover predating real threading). A thread-group
+  leader calling plain `exit()` only tore down itself — any still-running sibling thread was
+  silently orphaned, and later deadlocked in its own `pthread_exit()` cleanup
+  (`__tl_lock()`/`__thread_list_lock`) against musl's userspace thread-list bookkeeping, whose
+  invariants assume a real `exit_group` already unlinked the leader atomically. Fixed with a
+  genuinely distinct `SYS_EXIT_GROUP=556` (`process::do_exit_group`, kills every other tgid member
+  first, then the caller) plus a matching `__NR_exit_group` remap on the musl fork.
+- **Two real, independent, stock-musl bugs (not kernel bugs) behind `fork/11-1.c`'s permanent
+  hang** — found by decoding the exact futex-wait addresses against the compiled test binary's own
+  symbol table (`nm` + manual `struct _IO_FILE` offset math), not guesswork: (1) `_Fork()`'s
+  `__post_Fork` reset the surviving thread's own `tid`/`__thread_list_lock` in the child but never
+  touched any `FILE`'s own `.lock` word — a `flockfile(stdout)` held by the parent before `fork()`
+  left `stdout`'s lock word holding a "ghost" tid in the child's eager-copied memory, unrecoverable
+  by any thread there (real glibc avoids this via its own `pthread_atfork`-registered
+  `_IO_list_resetlock`; stock musl has no equivalent). Fixed by resetting every known `FILE`'s lock
+  in `__post_Fork`'s child branch. (2) Once fix (1) let the new thread lock `stdout` successfully, a
+  second, fork-independent bug surfaced: that thread exits without ever calling `funlockfile()`
+  (legal per POSIX), and musl's own `__do_orphaned_stdio_locks()` marked the lock with a poison bit
+  instead of actually releasing it — permanently stuck, since nothing ever wakes it. Fixed to do a
+  real release-and-wake, matching `__unlockfile()`'s own pattern. Both fixed on the `oxidebsd` musl
+  branch. `pthread_attr_destroy/1-1.c` turned out not to be an independent bug at all: `fork/11-1.c`
+  sorts first alphabetically in the sequential pilot boot and permanently wedged the run before this
+  file ever got a chance to execute — once `fork/11-1.c` was fixed, it passed with zero further
+  changes.
+- **`ccache` wired into both the BusyBox applet build and the pilot's own per-file compile loop**
+  (`build.rs`'s `compiler_invocation()` helper) — both already did a real rm-rf-and-rebuild-from-
+  scratch on any musl core change (correct for staleness, but threw away enormous amounts of
+  identical recompilation across BusyBox's ~232 applets). ~79% cache hit rate confirmed live on the
+  next build; falls back cleanly when `ccache` isn't installed.
+
+**The wholesale `pthread_*`/`aio_*`/`lio_listio*` prefix exclusion (~600 files) is now lifted** —
+the full ~1673-file corpus (all of `conformance/interfaces/`, threading included) has been run to
+completion. `sched_yield/1-1.c` stays excluded permanently (assumes real SMP fairness this
+single-core kernel can't provide); a handful of `timer_settime`/`sigwait` files stay excluded for
+reasons predating this expansion (see `POSIX_KNOWN_HANGS` in `build.rs` for the current, authoritative
+list — several entries there are kept only as historical markers of bugs already fixed, not live
+exclusions).
+
+## Real zombie address-space frame reclaim at exit, a host-vs-OxideBSD POSIX comparison, and supervised full-corpus tooling (`src/process/`, `scripts/run_posix_pilot_{supervised,host}.sh`, `userland/posix-conformance-driver/`, `build.rs`)
+
+Running the full ~1673-file corpus unattended (`scripts/run_posix_pilot_supervised.sh`, a host-side
+supervisor that kills a wedged QEMU boot and retries with the stuck file excluded, since a
+kernel-level hang can't be rescued by `t0`'s own userspace `alarm()`) surfaced a real, reproducible
+kernel panic partway through — `out of memory mapping a user stack` — confirmed via a supervised
+multi-hour run hitting the identical panic site repeatedly regardless of which file happened to be
+running when the shared frame pool finally ran dry.
+
+- **Root cause**: this codebase never reparents an orphan to a pid-1 "init" (an accepted
+  simplification — see `do_wait4`'s own doc comment), so any process whose real parent already
+  exited (or simply never calls `wait4()` on this specific child) leaves a permanent zombie that is
+  *never* reaped by anyone. Before this fix, `Process::address_space` was a plain `AddressSpace`
+  (not optional) freed only by `wait4`'s own reap path — so an unreaped zombie pinned its *entire*
+  address space (every mapped page, not just bookkeeping) for the rest of the boot. Many
+  `pthread_*`/`fork` tests in the real POSIX corpus legitimately fork a child and exit without
+  joining/waiting it (that's part of what they're testing) — across ~1673 files this compounded
+  until physical memory was exhausted.
+- **Fix**: `Process::address_space` is now `Option<AddressSpace>` — `None` only for a
+  `ProcState::Zombie` whose frames have already been reclaimed; every other state always has
+  `Some` (every live read site — `fork`, `clone`, `execve`, `mmap`/`munmap`/`brk`, `shmat`/`shmdt`,
+  `activate_and_prepare`'s own context-switch activation — updated to `.expect()` accordingly,
+  since a live/`Ready` process always has one). `terminate_process` now tears down the address
+  space's physical frames **immediately at exit** (self-exit still has to defer the *teardown call
+  itself* until `scheduler::schedule()` confirms `current_pid()` has moved off this exact stack —
+  see `scheduler::ReapKind::TeardownOnly`, called via the same `queue_thread_reap` mechanism a
+  non-leader thread's table-entry removal already used, now generalized to also do a real teardown
+  rather than only a table-entry drop) — not deferred all the way to some future `wait4`. The table
+  entry itself still survives in `ProcState::Zombie` either way, so a real future `wait4` can still
+  find and report real exit status/rusage; `do_wait4`'s own reap path now correctly finds
+  `address_space` already `None` in the common case and skips its own teardown call as a no-op.
+- **A real, separate infrastructure gap found alongside this**: `posix-conformance-driver`'s
+  harness only checked that `wait4` for `sh` returned the right pid, not that `sh`'s own exit
+  *status* was `0` — a shell that silently died partway through the corpus (not a hang, not a
+  panic — `wait4` still returned promptly) was reported as a clean "PASS" regardless, hiding the
+  failure from every caller trusting that line. Fixed to also check `status == 0` and print the
+  real wait-encoded status otherwise (see the syscall-ABI section's own note on `wait4`'s status
+  encoding).
+- **`scripts/run_posix_pilot_supervised.sh` hardened** to actually find every file standing between
+  here and a clean run, not just hang-shaped ones: now excludes+retries on a real crash/panic exit
+  (previously only a stall — a detected stall or the run exiting on its own without a clean PASS
+  both now feed the same exclude-and-retry path), fixed a `set -e` trap where a bare `wait
+  "$test_pid"` on a nonzero exit (a genuine crash, not a stall) used to abort the whole supervisor
+  before it could log or exclude anything, added a duplicate-exclusion detector (excluding the same
+  file twice in a row means the previous exclusion never actually took effect — most likely a
+  `build.rs` `cargo:rerun-if-changed` mtime-granularity race with the very next `cargo test`, now
+  padded with a real 2-second sleep — rather than a second genuine hang), and now caches every
+  already-classified file's own result line (`target/posix_verified_results.txt`) across
+  iterations so a long supervised run never re-executes a file it already has a real answer for
+  (still counted in the final tally, just not re-run). `build.rs`'s own `POSIX_EXTRA_EXCLUDE_FILE`
+  handling gained an **unconditional** `cargo:rerun-if-changed` (previously only registered when the
+  env var was set) — found live: cargo's watch list for a build script is exactly whatever that
+  script's *most recent* invocation emitted, so a single plain `cargo build` with the env var unset
+  made cargo "forget" to watch the file, silently reusing a stale cached manifest on every later
+  supervised invocation regardless of how many new exclusions the script appended.
+- **New: `scripts/run_posix_pilot_host.sh`** — builds and runs the exact same vendored corpus
+  directly on the host's own real glibc/Linux (same `t0`-wrapped 40s-per-file alarm, same
+  PASS/FAIL/UNRESOLVED/UNSUPPORTED/UNTESTED/TIMEOUT/CRASH classification), for a genuine
+  apples-to-apples comparison rather than a guess. Must run as root (`sudo`, in a real terminal —
+  `sudo` refuses a password prompt with no genuine TTY, so this is manual/user-run only, not
+  something to drive via the Bash tool). **Measured result, full ~1673-file corpus, both sides
+  including `pthread_*`/`aio_*`**: OxideBSD **82.1%** raw / **85.6%** excluding UNTESTED, vs. the
+  user's Artix host (glibc, native) **86.7%** / **89.7%** — a ~4-point gap. Notably, Artix has *more*
+  raw FAILs (35 vs 27) and more real self-contained CRASHes (10 vs OxideBSD's genuine 6) than
+  OxideBSD does; most of OxideBSD's gap is UNRESOLVED (38 vs 9, likely test-setup/environment gaps,
+  not logic bugs) and UNSUPPORTED (131 vs 108, genuinely-unimplemented optional features), not
+  correctness failures on paths that do run. The other 28 of OxideBSD's 34 counted CRASHes were the
+  kernel-level wedges this section's own frame-reclaim fix targets, not independent bugs each.
+
 ## BusyBox gap analysis: what's needed for more applets
 
 Almost everything left needs one of a handful of missing kernel capabilities, each unlocking a
