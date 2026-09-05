@@ -151,6 +151,14 @@ fn main() {
         "sem-open-syscall-smoke",
         "SEM_OPEN_SYSCALL_SMOKE_ELF_PATH",
     );
+    build_userland_crate(
+        "pthread-cancel-crash-smoke",
+        "PTHREAD_CANCEL_CRASH_SMOKE_ELF_PATH",
+    );
+    build_userland_crate(
+        "pshared-cond-crash-smoke",
+        "PSHARED_COND_CRASH_SMOKE_ELF_PATH",
+    );
     // A real standalone userland utility (embedded into oxfs's own /bin below, not a test) --
     // same category as ring3-smoke/musl-smoke above, not a BusyBox applet. Lists OxideBSD's own
     // loaded kernel modules by reading the real /proc/modules this pass added to modules/oxfs.
@@ -184,6 +192,14 @@ fn main() {
     // Real cross-process named-semaphore coordination -- see userland/sem-open-smoke/main.c's own
     // doc comment.
     let sem_open_smoke_elf_path = build_sem_open_smoke(&musl_sysroot);
+
+    // Isolated pthread_cancel/5-1.c crash-then-wedge repro -- see userland/pthread-cancel-crash/
+    // main.c's own doc comment.
+    let pthread_cancel_crash_elf_path = build_pthread_cancel_crash(&musl_sysroot);
+
+    // Isolated pthread_cond_broadcast/1-2.c real-cross-process-stall repro -- see
+    // userland/pshared-cond-crash/main.c's own doc comment.
+    let pshared_cond_crash_elf_path = build_pshared_cond_crash(&musl_sysroot);
 
     // TinyCC: OxideBSD's first on-target C compiler -- see CLAUDE.md's TinyCC section and
     // `build_tinycc`'s own doc comment. The `tcc` binary itself is embedded into oxfs's `/bin`
@@ -306,6 +322,14 @@ fn main() {
         (
             "OXFS_SEM_OPEN_SMOKE_ELF_PATH",
             sem_open_smoke_elf_path.to_str().unwrap(),
+        ),
+        (
+            "OXFS_PTHREAD_CANCEL_CRASH_ELF_PATH",
+            pthread_cancel_crash_elf_path.to_str().unwrap(),
+        ),
+        (
+            "OXFS_PSHARED_COND_CRASH_ELF_PATH",
+            pshared_cond_crash_elf_path.to_str().unwrap(),
         ),
         ("OXFS_LSOXMOD_ELF_PATH", lsoxmod_elf_path.to_str().unwrap()),
         ("OXFS_TCC_ELF_PATH", tcc_elf_path.to_str().unwrap()),
@@ -556,6 +580,74 @@ fn build_sem_open_smoke(sysroot: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("failed to run musl-gcc for sem-open-smoke: {e}"));
     if !status.success() {
         panic!("building sem-open-smoke failed: {status}");
+    }
+    out
+}
+
+/// Reproduces the Open POSIX Test Suite's own `pthread_cancel/5-1.c` scenario in isolation -- see
+/// `userland/pthread-cancel-crash/main.c`'s own doc comment for why (a real, expected crash inside
+/// that pilot file seemed to leave the whole kernel wedged for the rest of a full-corpus boot; this
+/// isolates the crash from the ~1700-file harness to find out why). Same `build_musl_smoke` recipe
+/// `build_pthread_smoke` above already establishes (needs `-pthread` for the same reason that one
+/// does -- real `pthread_create`/`pthread_join`/`pthread_cancel`), one slot further along
+/// (`0x8180000`, clear of `sem-open-smoke`'s own `0x8140000`).
+fn build_pthread_cancel_crash(sysroot: &Path) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest_dir).join("userland/pthread-cancel-crash/main.c");
+    let target_dir = Path::new(manifest_dir).join("target/pthread-cancel-crash");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/pthread-cancel-crash");
+    let out = target_dir.join("pthread-cancel-crash");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let musl_gcc = sysroot.join("bin/musl-gcc");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg("-pthread")
+        .arg("-Wl,-Ttext-segment=0x8180000")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for pthread-cancel-crash: {e}"));
+    if !status.success() {
+        panic!("building pthread-cancel-crash failed: {status}");
+    }
+    out
+}
+
+/// Isolates the real cross-process `pthread_mutex`/`pthread_cond` (`PTHREAD_PROCESS_SHARED`)
+/// mechanism from the Open POSIX Test Suite's own `pthread_cond_broadcast/1-2.c`, which appears to
+/// genuinely stall somewhere in its real `fork==1` scenarios during a full pilot run -- see
+/// `userland/pshared-cond-crash/main.c`'s own doc comment for the exact narrower scenario this
+/// reproduces (one forked child, not up to `MAX_PROCESS_CHILDREN = 200`). Same `build_musl_smoke`
+/// recipe (needs `-pthread`), one slot further along (`0x81c0000`, clear of
+/// `pthread-cancel-crash`'s own `0x8180000`).
+fn build_pshared_cond_crash(sysroot: &Path) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest_dir).join("userland/pshared-cond-crash/main.c");
+    let target_dir = Path::new(manifest_dir).join("target/pshared-cond-crash");
+    std::fs::create_dir_all(&target_dir).expect("failed to create target/pshared-cond-crash");
+    let out = target_dir.join("pshared-cond-crash");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let musl_gcc = sysroot.join("bin/musl-gcc");
+    let status = Command::new(&musl_gcc)
+        .arg("-static")
+        .arg("-no-pie")
+        .arg("-pthread")
+        .arg("-Wl,-Ttext-segment=0x81c0000")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run musl-gcc for pshared-cond-crash: {e}"));
+    if !status.success() {
+        panic!("building pshared-cond-crash failed: {status}");
     }
     out
 }

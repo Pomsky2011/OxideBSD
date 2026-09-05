@@ -300,6 +300,14 @@ name = "proc-smoke"
 version = "0.1.0"
 
 [[package]]
+name = "pshared-cond-crash-smoke"
+version = "0.1.0"
+
+[[package]]
+name = "pthread-cancel-crash-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "pthread-syscall-smoke"
 version = "0.1.0"
 

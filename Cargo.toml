@@ -39,6 +39,8 @@ members = [
   "userland/clone-syscall-smoke",
   "userland/pthread-syscall-smoke",
   "userland/sem-open-syscall-smoke",
+  "userland/pthread-cancel-crash-smoke",
+  "userland/pshared-cond-crash-smoke",
   "userland/posix-conformance-driver",
   "userland/lsoxmod",
   "modules/hello",
@@ -256,6 +258,14 @@ harness = false
 
 [[test]]
 name = "sem_open_syscall_smoke"
+harness = false
+
+[[test]]
+name = "pthread_cancel_crash_smoke"
+harness = false
+
+[[test]]
+name = "pshared_cond_crash_smoke"
 harness = false
 
 [[test]]

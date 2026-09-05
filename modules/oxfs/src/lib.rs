@@ -5976,6 +5976,27 @@ fn format_fresh_filesystem() -> bool {
         include_bytes!(env!("OXFS_SEM_OPEN_SMOKE_ELF_PATH")),
     );
 
+    // Isolated repro of the real Open POSIX Test Suite `pthread_cancel/5-1.c` crash-then-wedge
+    // investigation -- see `userland/pthread-cancel-crash/main.c`'s own doc comment for the exact
+    // scenario (pthread_create/pthread_join/pthread_cancel-on-a-just-joined-thread, a real,
+    // expected SIGSEGV via a write through memory `pthread_join`'s own real `munmap` already
+    // freed). Driven by `tests/pthread_cancel_crash_smoke.rs`.
+    ok &= seed_file(
+        root,
+        b"pthread-cancel-crash.elf",
+        include_bytes!(env!("OXFS_PTHREAD_CANCEL_CRASH_ELF_PATH")),
+    );
+
+    // Isolated repro of the real Open POSIX Test Suite `pthread_cond_broadcast/1-2.c` real
+    // cross-process stall -- see `userland/pshared-cond-crash/main.c`'s own doc comment for the
+    // exact narrower scenario (one forked child using a real `PTHREAD_PROCESS_SHARED` mutex/cond
+    // in a real file-backed `MAP_SHARED` region). Driven by `tests/pshared_cond_crash_smoke.rs`.
+    ok &= seed_file(
+        root,
+        b"pshared-cond-crash.elf",
+        include_bytes!(env!("OXFS_PSHARED_COND_CRASH_ELF_PATH")),
+    );
+
     // A real fixture for exercising the compiler end to end (`tcc -static -o hello.elf hello.c`,
     // by hand at the hush prompt or via `tests/tcc_syscall_smoke.rs`) -- a real `printf`, not a
     // bare `return`, so it exercises musl's stdio/writev path, not just process exit.

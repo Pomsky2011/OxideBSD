@@ -1293,30 +1293,64 @@ isolated git worktree — the happy path is unaffected; the OOM path itself has 
 regression test (would need a real way to force frame exhaustion on demand, not attempted here).
 
 **A much bigger, separate discovery running a fresh full-corpus supervised pilot** (`scripts/
-run_posix_pilot_supervised.sh --reset`) to establish a post-session baseline: the naive "exclude
-whatever file didn't get a classification line, retry" heuristic doesn't converge on this corpus
-at all. 23 iterations (~90 real minutes) each excluded exactly one file and stalled again almost
-immediately — most of those exclusions were **wrong**: `pthread_atfork/3-3.c`/
-`pthread_attr_destroy/1-1.c`/`pthread_attr_init/2-1.c` (all independently reconfirmed `PASS` in
-isolation earlier the same session) got excluded anyway, because they merely happened to sit
-immediately after whichever file actually broke the boot. The real pattern, found by reading
-`supervised_iter23`'s own log directly: `pthread_cancel/5-1.c` (real `pthread_cancel(3)` isn't
-implemented) genuinely crashes with `CRASH(139)` (a real `SIGSEGV` inside that one pilot binary) —
-and after that single crash, `[diag] tick=table_len=` goes flat and **no further file ever gets a
-classification for the rest of that boot**. A real per-process fault is already supposed to
-terminate just the faulting process (see "Real ring-3 fault-to-signal delivery" above) — something
-about this specific crash shape instead leaves the whole kernel wedged for everything that runs
-afterward in the same boot, a real robustness gap distinct from (and likely affecting many more
-files across) both `fork/8-1.c`'s own standalone-hang mystery and the `[diag-thread]` print-storm
-bug above. The very first stall (iteration 1, no `CRASH` line before it at all) looks like it may
-be a second, genuinely-standalone hang rather than this same crash-wedge shape — not disambiguated
-before the run was stopped. **Not investigated further this session** — the run was killed rather
-than let continue burning iterations against a systematically wrong exclude list; a real fix needs
-root-causing why a crashed pilot child doesn't leave the rest of the boot able to proceed (a stuck
-lock, an unreaped zombie exhausting some resource, or a genuine kernel-level deadlock the crash
-itself triggers) before another full-corpus run is worth attempting. `target/
-posix_supervised_run.log`/`target/posix-pilot-logs/supervised_iter*.log` from this run are kept as
-the first real evidence trail.
+run_posix_pilot_supervised.sh --reset`), since root-caused and fixed: the naive "exclude whatever
+file didn't get a classification line, retry" heuristic doesn't converge on this corpus at all. 23
+iterations (~90 real minutes) each excluded exactly one file and stalled again almost immediately —
+most of those exclusions were **wrong**: `pthread_atfork/3-3.c`/`pthread_attr_destroy/1-1.c`/
+`pthread_attr_init/2-1.c` (all independently reconfirmed `PASS` in isolation earlier the same
+session) got excluded anyway, because they merely happened to sit immediately after whichever file
+actually broke the boot.
+
+The trail: reading `supervised_iter23`'s own log showed `pthread_cancel/5-1.c` (real
+`pthread_cancel(3)` isn't implemented) genuinely crashing with `CRASH(139)`, immediately followed
+by the boot going silent for good. **First theory, disproven**: that this specific crash somehow
+wedged the whole kernel. A dedicated isolated repro (`userland/pthread-cancel-crash/main.c` +
+`tests/pthread_cancel_crash_smoke.rs`, reproducing `pthread_cancel/5-1.c`'s own exact scenario —
+`pthread_join()`'s real `munmap()` of a joined thread's own stack, then `pthread_cancel()`
+unconditionally writing through the now-freed handle) showed the crash recovering *perfectly
+cleanly* — a real, unrelated binary ran fine immediately afterward. So the crash was a red herring:
+the real manifest showed `pthread_cond_broadcast/1-2.c` sitting just seven files later, already
+known from this same session's `KernelStack::new` investigation to stall with a suspiciously flat,
+non-growing process table — the actual, silent (no `CRASH` line at all) stuck point, misattributed
+to its more dramatic upstream neighbor the same way the wrongly-excluded `pthread_atfork`/
+`pthread_attr_*` files were.
+
+**Root cause, confirmed via `userland/pshared-cond-crash/main.c` + `tests/
+pshared_cond_crash_smoke.rs`**: a real, previously-undiscovered bug in this project's own musl fork
+(`third_party/musl`, commit `665bc49f` on the `oxidebsd` branch) — not a kernel bug. A minimal
+repro (real `PTHREAD_PROCESS_SHARED` mutex/cond in a file-backed `MAP_SHARED` region) passed with
+one forked child, and even with a concurrently-running second thread alone, but hung as soon as
+**both** were combined: two or more real forked children genuinely contending the shared mutex,
+forked from a process that already had a second live thread. A one-off `[diag-thread]` dump
+(temporarily reintroduced for this one investigation, small process count so the earlier
+performance concern didn't apply) showed both stuck children blocked on a real, *private*-scoped
+futex at the identical address across both — decoded via `nm` to musl's own internal `ofl_lock`
+(the stdio "open file list" lock), not any address of the test's own shared struct.
+
+The actual bug: real, upstream `fork()` (`third_party/musl/src/process/fork.c`) takes a real
+`LOCK()` on several internal locks, including `ofl_lock`, in the parent *before* the real fork
+syscall, whenever the process is genuinely multi-threaded (`libc.need_locks > 0`) — real, correct,
+unmodified musl behavior. But `_Fork.c`'s own `reset_stdio_locks_in_child` — **this project's own
+earlier fix for a *different* permanent hang** (`fork/11-1.c`, see "POSIX pilot: full corpus
+expansion" above) — unconditionally calls `__ofl_lock()` again to safely walk the open-FILE list.
+The child inherits `ofl_lock` in a genuinely *locked* state (copied byte-for-byte from the parent's
+own real lock acquisition moments before the fork syscall), so this second `__ofl_lock()` call
+self-deadlocks immediately: the child's one surviving thread waits forever on a lock nothing will
+ever release. Only reproduces with the exact combination this investigation found by bisection
+(2+ real contending children *and* a real second thread already running at fork time) — the
+`fork/11-1.c` fix's own original validation never exercised that combination. Fixed the same way
+`fork()`'s own child-side atfork cleanup already treats every other lock in this exact situation: a
+raw store back to unlocked immediately before ever trying to acquire it, since a freshly forked
+child is always, unconditionally, the sole surviving thread — any inherited "locked" state is never
+real contention.
+
+**Verified**: the full N=10-children-plus-timer-thread repro, which hung indefinitely before the
+fix, now passes cleanly; the existing regression suite (`fork_wait`, `clone_syscall_smoke`,
+`pthread_syscall_smoke`, `sysv_sem_syscall_smoke`, `sem_open_syscall_smoke`,
+`pthread_cancel_crash_smoke`, `mmap_syscall_smoke`, `dynlink_syscall_smoke`) all still pass after
+the musl bump. `fork/8-1.c`'s own separate, still-genuinely-open CPU-timing mystery
+(`POSIX_KNOWN_HANGS`) is unrelated to any of this and remains unresolved. A fresh full-corpus
+supervised run to fold this fix into an official baseline number hasn't been done yet.
 
 **A real, separate staleness bug found auditing `build.rs`'s own exclusion bookkeeping**:
 `pthread_atfork/3-3.c`/`pthread_attr_destroy/1-1.c` were marked "historical markers only, still
