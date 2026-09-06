@@ -343,6 +343,11 @@ const ESRCH: i64 = 3;
 /// musl's own header actually defines the symbolic name as). Returned when `resolve_path_impl`'s
 /// own symlink-following recursion exceeds `MAX_SYMLINK_DEPTH`.
 const ELOOP: i64 = 40;
+/// Real value, no Linux/BSD divergence -- returned when a real, whole path argument exceeds
+/// `OXFS_PATH_MAX` (see that constant's own doc comment). Distinct from `NAME_MAX`'s own
+/// per-component `InvalidPath`/`EINVAL` check in `resolve_parent` below -- real POSIX uses
+/// `ENAMETOOLONG` specifically for *this* case.
+const ENAMETOOLONG: i64 = 36;
 /// Real value, no Linux/BSD divergence -- returned by any mutating real-filesystem operation
 /// (`mkdir`/`unlink`/`rmdir`/`rename`) attempted relative to a synthetic `/proc` cwd (see
 /// `real_cwd_for_mutation`'s own doc comment).
@@ -571,6 +576,26 @@ const DIR_LISTING_BUFFER: usize = 4096;
 
 const MAX_CWD_PATH: usize = 256;
 const MAX_CWD_DEPTH: usize = 32;
+
+/// Real POSIX `{PATH_MAX}` (musl's own compiled value, `third_party/musl/include/limits.h`) --
+/// the real whole-path-length limit, real `ENAMETOOLONG` when exceeded. Distinct from `NAME_MAX`'s
+/// own per-*component* check in `resolve_parent` below (`InvalidPath`/`EINVAL`) -- this is real
+/// POSIX text for the *whole* path, not any one component of it. Bigger than `MAX_CWD_PATH` (256,
+/// a real but much smaller internal buffer for formatting *this filesystem's own* absolute cwd
+/// string) -- the two serve unrelated purposes and were never meant to be the same number.
+///
+/// **Does not close `shm_open/39-2.c`/`shm_unlink/10-2.c`** (Open POSIX Test Suite pilot), the two
+/// tests that originally flagged this gap -- investigated, not a kernel bug: both construct a name
+/// with *embedded* `/` characters to build a genuinely `PATH_MAX`-length string, but real, upstream
+/// musl's own `__shm_mapname()` (`third_party/musl/src/mman/shm_open.c`) rejects any embedded `/`
+/// as `EINVAL` *before* ever checking length -- real POSIX explicitly leaves embedded-slash
+/// handling in a `shm_open()` name implementation-defined, so this is legitimate, spec-legal musl
+/// behavior, not a bug to patch around. This check is still real and correct for what it actually
+/// covers: an ordinary, non-shm path (a plain `open()`/`unlink()`/`mkdir()`/... on a genuinely
+/// too-long path with no embedded weirdness) now gets the real `ENAMETOOLONG` POSIX requires,
+/// where it previously fell through to whatever `resolve_parent`'s own component walk happened to
+/// produce instead.
+const OXFS_PATH_MAX: usize = 4096;
 
 const BIG_FILE_LEN: usize = 5000;
 
@@ -1345,6 +1370,8 @@ enum OxfsError {
     /// symlink loop (or just a chain too long to be a real mistake), never actually exercised by
     /// this kernel's own seed data.
     TooManyLinks,
+    /// A real, whole path argument exceeded `OXFS_PATH_MAX` -- see that constant's own doc comment.
+    NameTooLong,
 }
 
 fn errno_for(e: OxfsError) -> i64 {
@@ -1354,6 +1381,7 @@ fn errno_for(e: OxfsError) -> i64 {
         OxfsError::InvalidPath => EINVAL,
         OxfsError::DiskFull => ENOSPC,
         OxfsError::TooManyLinks => ELOOP,
+        OxfsError::NameTooLong => ENAMETOOLONG,
     }
 }
 
@@ -1568,6 +1596,13 @@ fn resolve_path_impl(
     if depth > MAX_SYMLINK_DEPTH {
         return Err(OxfsError::TooManyLinks);
     }
+    // Real POSIX `ENAMETOOLONG` -- see `OXFS_PATH_MAX`'s own doc comment. Only checked for the
+    // real, outermost caller-supplied path (`depth == 0`) -- a symlink target's own recursive
+    // resolution (`depth > 0`) is already bounded well under this by `MAX_CWD_PATH` (256) at the
+    // read site just below, so re-checking there would be redundant, not more correct.
+    if depth == 0 && path.len() > OXFS_PATH_MAX {
+        return Err(OxfsError::NameTooLong);
+    }
     let mut current = if path.first() == Some(&b'/') {
         root_inode
     } else {
@@ -1643,6 +1678,13 @@ fn resolve_path_nofollow_last(cwd_inode: u32, path: &[u8]) -> Result<u32, OxfsEr
 /// renames a name (`open` with `O_CREAT`, `mkdir`, `unlink`, `rmdir`, `rename`), since those need
 /// to mutate the parent's own directory records rather than just look the target up.
 fn resolve_parent(cwd_inode: u32, path: &[u8]) -> Result<(u32, &[u8]), OxfsError> {
+    // Real POSIX `ENAMETOOLONG` -- see `OXFS_PATH_MAX`'s own doc comment. Checked against the
+    // real, whole, original path (not the leaf-trimmed `head` computed below): `resolve_path`'s
+    // own recursive call further down only ever sees the *parent* prefix, which could be under
+    // this limit even when the full path (parent + leaf) isn't.
+    if path.len() > OXFS_PATH_MAX {
+        return Err(OxfsError::NameTooLong);
+    }
     let mut end = path.len();
     while end > 0 && path[end - 1] == b'/' {
         end -= 1;

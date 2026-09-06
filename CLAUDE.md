@@ -2090,9 +2090,42 @@ blocked by that exact critical section.
   future canary-tally shift isn't mistaken for a new regression.
 - **Verified**: `mmap_syscall_smoke` (all 13 parts, including its own `SIGBUS`/`SIGSEGV` default-
   terminate exercises), `pthread_cancel_crash_smoke`, and `pshared_cond_crash_smoke` (all real
-  fault-to-signal/thread-crash exercises) all still pass clean. A fresh full-corpus run to fold this
-  fix into an updated official baseline number (expected to improve slightly on the 84.1%/87.8%
-  figure above, since this crash no longer needs excluding) hasn't been done yet.
+  fault-to-signal/thread-crash exercises) all still pass clean.
+- **A fresh full-corpus run, folding this fix in**: `1418 PASS / 131 UNSUPPORTED / 68 UNTESTED /
+  26 UNRESOLVED / 19 FAIL / 13 CRASH / 12 TIMEOUT` across all 1687 files, `POSIX_KNOWN_HANGS` empty
+  -- **84.1% raw / 87.6% excluding UNTESTED**, essentially flat against the prior 84.1%/87.8%
+  figure (expected: `pthread_kill/6-1.c` was already being excluded from that count, so including
+  it as a real, contained `CRASH` instead doesn't move the aggregate -- the real win is qualitative,
+  a full run no longer needs any exclusion at all to complete). The small remaining shifts
+  (`PASS` 1419→1418, `TIMEOUT` 10→12) are ordinary run-to-run variance, not new regressions --
+  matches the `pthread_cond_init/4-2.c`/`timer_settime/2-1.c` flakiness already documented above.
+
+## A real (if narrowly-scoped) `ENAMETOOLONG` gap closed, and why two tests that originally flagged it still can't pass (`modules/oxfs/src/lib.rs`)
+
+`shm_open/39-2.c`/`shm_unlink/10-2.c` (noted as a known, unfixed gap in the "global-fd-table
+exhaustion cascade" section above) check that a real, whole path exceeding `{PATH_MAX}` gets
+`ENAMETOOLONG` -- oxfs had no such check at all, only `NAME_MAX`'s own per-*component* limit.
+
+- **Fixed for real**: `OXFS_PATH_MAX = 4096` (musl's own real compiled `PATH_MAX`), checked against
+  the real, whole, original path in `resolve_parent` (covers `open`/`unlink`/`mkdir`/`rmdir`/
+  `rename`/`symlink`) and in `resolve_path_impl` guarded to `depth == 0` (covers `stat`/`lstat`/
+  `chdir`/`readlink`, but not a symlink target's own recursive re-resolution, already bounded well
+  under this by `MAX_CWD_PATH`'s own 256-byte buffer regardless) -- real `ENAMETOOLONG` for an
+  ordinary, non-shm path that's genuinely too long, where none existed before.
+- **Does not close the two tests that flagged the gap, and never can without a real musl bug**:
+  both construct a name with *embedded* `/` characters to build a genuinely `PATH_MAX`-length
+  string -- but real, upstream musl's own `__shm_mapname()` (`third_party/musl/src/mman/
+  shm_open.c`) rejects any embedded `/` as `EINVAL` *before* ever checking length. Real POSIX
+  explicitly leaves embedded-slash interpretation in a `shm_open()` name implementation-defined, so
+  this is legitimate, spec-legal musl behavior (confirmed via a live diagnostic: both tests report
+  `EINVAL`/`ENOENT`, never reaching the kernel's own new check at all), not a bug to route around --
+  an existing comment in `shm_unlink.c` itself, from an earlier session, already reached the same
+  conclusion for `shm_unlink`'s own half of this. Both files remain the same accepted, understood
+  `FAIL` they already were; the new check is still real and correct for the case it actually covers.
+- **Verified**: `mmap_syscall_smoke`, `fork_wait`, `tcc_syscall_smoke` (real heavy path/file usage
+  through the exact resolvers this touches), and the 79-file standing canary suite (matching its
+  established baseline exactly, `shm_open/39-2.c`/`shm_unlink/10-2.c` still `FAIL` as expected, no
+  new regressions) all pass clean.
 
 ## Dependency notes
 
