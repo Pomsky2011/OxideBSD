@@ -44,6 +44,23 @@ fn compiler_invocation(compiler: &Path) -> Vec<String> {
     }
 }
 
+/// Real host parallelism to use for every C-side build fanout (musl's own `make -j`, BusyBox's
+/// per-applet worker pool, the POSIX pilot's per-file worker pool). Reads cargo's own `NUM_JOBS`
+/// env var -- set by cargo for every build script invocation to whatever job count *this specific
+/// build* is actually using (`cargo build -j N`, or a `[build] jobs = N` in `.cargo/config.toml`/
+/// `CARGO_BUILD_JOBS`, or the real host core count if the caller never configured one) -- rather
+/// than hardcoding a number here: this file is shared/committed, so a fixed cap picked for one
+/// contributor's own machine would wrongly under- or over-subscribe everyone else's. A contributor
+/// who wants these C-side builds to leave real headroom for other work should set their own `jobs`
+/// via one of those normal cargo mechanisms; this just relays whatever that resolves to. Falls back
+/// to real host parallelism only if `NUM_JOBS` is somehow absent (a raw `rustc`/non-cargo build).
+fn build_jobs() -> usize {
+    std::env::var("NUM_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 // `BUSYBOX_APPLETS`/`BUSYBOX_APPLETS_PASS2`/`build_busybox_applet`/`configure_busybox_single_applet`/
 // `resolve_busybox_new_config_options` -- split into their own file specifically so unrelated
 // edits to *this* file don't invalidate every cached BusyBox applet binary. See
@@ -249,7 +266,7 @@ fn main() {
         .copied()
         .chain(BUSYBOX_APPLETS_PASS2.iter().copied())
         .collect();
-    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = build_jobs();
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..jobs {
@@ -458,7 +475,7 @@ fn build_musl_sysroot() -> PathBuf {
         }
     }
 
-    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = build_jobs();
     let status = Command::new("make")
         .current_dir(&musl_dir)
         .args(["-j", &jobs.to_string()])
@@ -747,7 +764,7 @@ fn build_musl_sysroot_shared() -> PathBuf {
         }
     }
 
-    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = build_jobs();
     let status = Command::new("make")
         .current_dir(&musl_dir)
         .args(["-j", &jobs.to_string()])
@@ -1784,7 +1801,7 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
     // (`testfrmw.c`/`coverage.c`) and a handful of genuine upstream oddities (see
     // `discover_posix_test_files`'s own doc comment) -- a build failure here is expected, routine
     // signal for *some* files, not a build-breaking bug.
-    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = build_jobs();
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let built: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
     let skipped: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
