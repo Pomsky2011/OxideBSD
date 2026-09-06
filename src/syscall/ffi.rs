@@ -303,6 +303,19 @@ pub(crate) fn sys_kill(pid: u64, sig: u64) -> Result<u64, u64> {
 /// validated — this ABI always treats a signal set as a single `u64`, matching what musl's own
 /// `_NSIG/8` happens to already be on this ABI). `SIGKILL`/`SIGSTOP` can never be caught, matching
 /// real `sigaction()`'s own `EINVAL` for them.
+///
+/// **`1..=34`, not `1..=31`** -- a real bug, found live via `pthread_cancel/5-2.c` going
+/// `UNRESOLVED`: `32..=34` (`SIGTIMER`/`SIGCANCEL`/`SIGSYNCCALL`) are real, valid signal numbers
+/// from a kernel's own point of view, "permanently unclaimed" only as a *libc-level* convention
+/// (real glibc/musl reserve them for internal NPTL-style machinery, not a POSIX or Linux
+/// kernel-enforced restriction). Real, unmodified musl's own `init_cancellation()`
+/// (`third_party/musl/src/thread/pthread_cancel.c`) genuinely calls `sigaction(SIGCANCEL=33,
+/// ...)` -- rejecting it here as `EINVAL` (silently, since that call's own return value is never
+/// checked) left no real handler ever installed for `SIGCANCEL`, so the *actual* visible failure
+/// surfaced one level up, at `pthread_cancel`'s own `pthread_kill(t, SIGCANCEL)` call hitting the
+/// identical range check in `process::do_kill` (see that function's own doc comment for the
+/// matching fix). Both call sites needed the same fix -- this one is necessary but not
+/// sufficient on its own.
 pub(crate) fn sys_sigaction(
     sig: u64,
     act_ptr: u64,
@@ -310,7 +323,7 @@ pub(crate) fn sys_sigaction(
     sigsetsize: u64,
 ) -> Result<u64, u64> {
     let _ = sigsetsize;
-    let in_range = (1..=31).contains(&sig)
+    let in_range = (1..=34).contains(&sig)
         || (crate::process::SIGRTMIN..=crate::process::SIGRTMAX).contains(&sig);
     if !in_range || sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
         return Err(EINVAL);
@@ -906,7 +919,11 @@ pub(crate) fn write_zeroed_rusage(ptr: u64) {
 /// `third_party/musl/src/misc/getrusage.c`, already issues a plain 2-argument raw syscall with a
 /// bare pointer, no length-prefixing involved, so no call-site patch was needed beyond the usual
 /// number remap). `who` (`RUSAGE_SELF`/`RUSAGE_CHILDREN`) makes no difference to the answer -- see
-/// `RawRusage`'s own doc comment for why.
+/// `RawRusage`'s own doc comment for why. **Same latent staleness `sys_times` had until its own
+/// fix** (this call site also predates `Process::cpu_ticks`) -- `ru_utime`/`ru_stime` could be
+/// derived from `cpu_ticks`/`child_cpu_ticks` the same way, but nothing currently depends on it
+/// (unlike `times(2)`, which `fork/8-1.c` needed real values from to avoid a permanent hang) --
+/// left as an honest all-zero placeholder, a known follow-up, not silently forgotten.
 pub(crate) fn sys_getrusage(who: u64, rusage_ptr: u64) -> Result<u64, u64> {
     let _ = who;
     write_zeroed_rusage(rusage_ptr);
@@ -930,18 +947,44 @@ const _: () = assert!(core::mem::size_of::<RawTms>() == 32);
 /// `docs/MISSING_POSIX_SYSCALLS.md` redirected it off its previous accidental home at
 /// `SYS_MMAP = 100`) -- matches real `times(2)`'s exact `(tms_ptr)` wire format
 /// (`third_party/musl/src/time/times.c` is a bare `__syscall(SYS_times, tms)`, no call-site patch
-/// needed). The `tms` fields are an honest all-zero placeholder, same tier and same reasoning as
-/// `RawRusage` above -- this kernel tracks no per-process CPU time at all, so a real per-field
-/// breakdown would just be a fabricated number. The return value (real `times(2)`'s "clock ticks
-/// since an arbitrary point in the past") is `crate::cpu::interrupts::ticks()` itself, the same
-/// real `TIMER_HZ`-cadence counter `sys_clock_gettime`'s own `CLOCK_MONOTONIC` arm already uses --
-/// an honest, non-fabricated value, just not tied to any particular epoch (matching the standard's
-/// own "arbitrary point" wording).
+/// needed). The return value (real `times(2)`'s "clock ticks since an arbitrary point in the
+/// past") is `crate::cpu::interrupts::ticks()` itself, the same real `TIMER_HZ`-cadence counter
+/// `sys_clock_gettime`'s own `CLOCK_MONOTONIC` arm already uses -- an honest, non-fabricated
+/// value, just not tied to any particular epoch (matching the standard's own "arbitrary point"
+/// wording).
+///
+/// **`tms_utime`/`tms_cutime` are real, not fabricated** -- `Process::cpu_ticks`/`child_cpu_ticks`
+/// (see each field's own doc comment), the same real per-process CPU-time counter
+/// `CLOCK_PROCESS_CPUTIME_ID` already reads. **Was previously an unconditional all-zero
+/// placeholder** (this call site predates `cpu_ticks`, added later purely for
+/// `clock_gettime`, and was never revisited) -- a real, permanent hang, found live via
+/// `fork/8-1.c`: its child thread busy-loops forever on `while ((tms_utime + tms_stime) <= 0)`,
+/// which an always-zero `tms_utime` can never satisfy, and its parent separately checks
+/// `tms_cutime`/`tms_cstime` become nonzero after `waitpid` reaps that child. **`tms_stime`/
+/// `tms_cstime` stay honest zero** -- this kernel tracks one undifferentiated per-process tick
+/// counter, not a real user/kernel split (same tier `cpu_ticks`'s own doc comment already
+/// establishes); putting the whole count in the `u`-side buckets (time spent running the
+/// process's own code) is the more accurate choice for what actually gets measured here than
+/// splitting it arbitrarily. `getrusage(2)`'s own `ru_utime`/`ru_stime` have the identical latent
+/// staleness (see `sys_getrusage`'s own doc comment) -- not fixed here, since nothing currently
+/// depends on it the way this hang did.
 pub(crate) fn sys_times(tms_ptr: u64) -> Result<u64, u64> {
     if tms_ptr != 0 {
+        let proc = crate::process::table()
+            .lock()
+            .get(&crate::process::scheduler::current_pid())
+            .map(|p| (p.cpu_ticks, p.child_cpu_ticks));
+        let (cpu_ticks, child_cpu_ticks) = proc.unwrap_or((0, 0));
         // SAFETY: same known pointer-validation gap every other user-memory write in this file
         // already has.
-        unsafe { (tms_ptr as *mut RawTms).write_unaligned(RawTms::default()) };
+        unsafe {
+            (tms_ptr as *mut RawTms).write_unaligned(RawTms {
+                tms_utime: cpu_ticks as i64,
+                tms_stime: 0,
+                tms_cutime: child_cpu_ticks as i64,
+                tms_cstime: 0,
+            })
+        };
     }
     Ok(crate::cpu::interrupts::ticks())
 }

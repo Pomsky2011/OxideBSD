@@ -1220,18 +1220,18 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // SIGALRM)`, arm a real timer via `alarm()`/`timer_settime()`, then `sigwait()` for it) --
     // exactly the delivery path that fix closed. Removed from this list entirely.
     //
-    // `fork/8-1.c`: a `do { cur = times(&t); } while (cur - start < sysconf(_SC_CLK_TCK))` busy
-    // loop that should take ~1 real second under KVM (`_SC_CLK_TCK` is musl's own compile-time
-    // `100`, matching this kernel's real `TIMER_HZ`) but instead ran 9+ real minutes at ~90% CPU
-    // (a genuine spin, not a block -- `ticks()` itself must be advancing correctly or the busy
-    // loop the timer handler is fighting for CPU against would never make *any* progress).
-    // **Confirmed still genuinely stuck** (re-tested via an isolated canary run after removing
-    // the unrelated `[diag-thread]` per-process print-storm below, which was the real bug behind
-    // a *different* file's own apparent hang, `pthread_cond_broadcast/1-2.c` -- this file's own
-    // process table stayed flat at 4 entries for 500+ real seconds with zero progress, ruling
-    // that theory out for this file specifically). Still needs a live dispatch trace, not more
-    // source-reading -- same class of open item `sched_setparam/9-1,10-1.c` already is.
-    "fork/8-1.c",
+    // `fork/8-1.c`: **FIXED**, removed from this list entirely. The real busy loop wasn't the
+    // parent's own `do { cur = times(&t); } while (cur - start < sysconf(_SC_CLK_TCK))` (its
+    // return value, `crate::cpu::interrupts::ticks()`, was always real) -- it was the *child*'s
+    // own `while ((child_tms.tms_utime + child_tms.tms_stime) <= 0)`, which an unconditionally
+    // all-zero `tms` struct (`sys_times`'s own doc comment in `src/syscall/ffi.rs` explains why --
+    // that call site predated `Process::cpu_ticks`, added later purely for `clock_gettime`, and
+    // was never revisited) could never satisfy. Root cause found by tracing the test's own actual
+    // blocking primitive, same as the `pthread_cond_timedwait` fixes above -- not the live
+    // dispatch trace this entry previously called for. Fixed by wiring real `cpu_ticks`/a new
+    // `Process::child_cpu_ticks` accumulator (folded in by `do_wait4` at reap time, for real
+    // `tms_cutime`/`tms_cstime`) into `sys_times`. Confirmed via an isolated canary run: `PASS`,
+    // full 74-file standing canary suite otherwise unchanged.
     // `pthread_atfork/3-3.c`/`pthread_attr_destroy/1-1.c`: both **FIXED** (root causes: real
     // thread-group-wide `kill(getpid(), sig)` delivery for the former, the `SYS_EXIT_GROUP`/
     // `pthread_attr_init/2-1.c` fix for the latter -- see git history for the full write-up this
@@ -1328,32 +1328,27 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // is what actually stops the cascade at its root; fixing the underlying gap for real would mean
     // a genuine per-process (or per-tgid) fd quota, out of scope for this pass.
     "shm_open/23-1.c",
-    // `pthread_attr_setstacksize/2-1.c`: a real, genuine, permanent hang -- confirmed via an
-    // isolated canary run immediately after this session's scheduler-quantum + thread-group-leader
-    // signal-termination fix (see CLAUDE.md's "closing a real scheduler race..." section), so it's
-    // NOT another instance of that same bug. The worker thread's own `pthread_getattr_np()` call
-    // (a real, non-POSIX GNU/NPTL extension this test uses to read back its own attr) either reads
-    // its already-known `stack`/`stack_size` fields directly (the common, fast path -- no syscalls
-    // at all) or, if those are somehow unset, falls into real musl's own retry loop calling
-    // `mremap()` repeatedly until it stops failing with `ENOMEM` specifically -- `mremap` isn't
-    // registered in this kernel's syscall table at all, so an unregistered-syscall `ENOSYS` should
-    // make that loop exit on its very first iteration, not spin forever, so the *literal* line
-    // hanging isn't pinned down yet. Needs a live dispatch trace, not more source-reading -- same
-    // class of open item `fork/8-1.c`/`sched_setparam/9-1,10-1.c` already are.
-    "pthread_attr_setstacksize/2-1.c",
-    // `pthread_cancel/5-2.c`: a real, genuine, permanent hang, confirmed via the same isolated
-    // canary session as `pthread_attr_setstacksize/2-1.c` just above (also not another instance of
-    // this session's scheduler/signal-termination fix). Calls `pthread_cancel()` on a target thread
-    // in a tight loop for a full real second, while that thread only ever spins on `sched_yield()`
-    // -- never at a real POSIX cancellation point. Real musl's own `cancel_handler` (`third_party/
-    // musl/src/thread/pthread_cancel.c`) is *designed* to keep re-sending `SIGCANCEL` to the target
-    // via a raw `tkill` syscall whenever the interrupted PC isn't inside its own `__cp_begin`/
-    // `__cp_end` range -- a real, legitimate (if wasteful) userspace resend loop on any correct
-    // system, not itself a bug. Suspected but unconfirmed: something about this exact repeated
-    // real-time self-directed-signal-storm pattern (`pthread_kill`/`tkill` targeting one specific
-    // thread over and over) trips a genuine kernel-side issue distinct from today's fixes -- needs
-    // a live dispatch trace, not more source-reading.
-    "pthread_cancel/5-2.c",
+    // `pthread_attr_setstacksize/2-1.c`/`pthread_cancel/5-2.c`: **neither was ever a real permanent
+    // hang** -- both removed from this list entirely. The original full-corpus supervised run's own
+    // "exclude whatever file happened to be running when a stall was detected" heuristic
+    // misattributed some *other* file's real stall to these two, the same failure mode
+    // `pthread_atfork/3-3.c` suffered before it (see this array's own doc comment on that historical
+    // pattern). Confirmed by testing each in genuine, complete isolation (`POSIX_PILOT_CANARY_ONLY`
+    // narrowed to just the one file): both run to completion in seconds/within `t0`'s own bound.
+    // `pthread_attr_setstacksize/2-1.c` reports a real, narrow `FAIL` (real, unmodified musl's own
+    // `pthread_create.c` rounds a requested stack size up to a page boundary plus TLS/TSD overhead
+    // before storing it, so `pthread_getattr_np()` reporting back the *exact* raw
+    // `PTHREAD_STACK_MIN` this test requested essentially never happens on musl at all -- not an
+    // OxideBSD bug, not chased further). `pthread_cancel/5-2.c` surfaced two real, since-fixed
+    // kernel bugs along the way (see `process::do_kill`'s own doc comment for the real `SIGCANCEL`
+    // signal-range fix and `ThreadGroupShared::sigactions`'s own doc comment for the real
+    // cross-thread signal-disposition-sharing fix this exposed) before settling on a clean, bounded
+    // `TIMEOUT` -- one thread genuinely livelocks in musl's own real `SIGCANCEL`-resend-via-`tkill`
+    // retry loop (intentional musl behavior for a target that never reaches an actual POSIX
+    // cancellation point), a separate, deep single-core scheduling question not chased further here,
+    // but a bounded `TIMEOUT` doesn't threaten to cascade into the rest of a full-corpus run the way
+    // an actual unbounded hang does. Both kept in the `POSIX_PILOT_CANARY_ONLY` standing regression
+    // suite below.
     // `pthread_cond_timedwait/{2-5,4-1}.c`: both were real, genuine, permanent hangs -- `t0`'s own
     // 40s rescue alarm never fired for either, unlike the `pthread_cond_broadcast`/
     // `pthread_cond_destroy` files this session's scheduler/signal-termination fix already closed.
@@ -1399,17 +1394,15 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above (5 files, all with a live effect -- no historical-marker-only
-///   or stale entries any more, see that array's own doc comment): `fork/8-1.c` (a genuinely
-///   unresolved busy-loop timing anomaly), `sched_yield/1-1.c` (needs real SMP, out of scope until
-///   then), `shm_open/23-1.c` (an unbounded global-fd-table leak from the test's own orphaned,
-///   never-closing children -- not a hang, but left running it cascades into misclassifying
-///   hundreds of unrelated later files, see that entry's own doc comment), and two still-unresolved
-///   real hangs found chasing a fresh full-corpus supervised run after this session's
-///   scheduler/signal-termination fix: `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`
-///   (see each entry's own doc comment -- not the same bug as each other, or as that fix).
-///   `pthread_cond_timedwait/{2-5,4-1}.c`, found in that same run, are no longer here -- both fixed
-///   (see this array's own doc comment on those two entries for the real root causes).
+/// - **`POSIX_KNOWN_HANGS`** above (2 files, both with a live effect -- no historical-marker-only
+///   or stale entries any more, see that array's own doc comment): `sched_yield/1-1.c` (needs real
+///   SMP, out of scope until then) and `shm_open/23-1.c` (an unbounded global-fd-table leak from
+///   the test's own orphaned, never-closing children -- not a hang, but left running it cascades
+///   into misclassifying hundreds of unrelated later files, see that entry's own doc comment).
+///   Every other file a fresh full-corpus supervised run once flagged here -- `fork/8-1.c`,
+///   `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`, `pthread_cond_timedwait/{2-5,4-1}.c`
+///   -- is no longer here: all fixed, or (the latter two) confirmed to have never actually been real
+///   hangs at all (see this array's own doc comment on those entries for the full story).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1582,6 +1575,41 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "pthread_cond_timedwait/4-1.c",
             "pthread_cond_timedwait/4-2.c",
             "pthread_cond_timedwait/4-3.c",
+            // `fork/8-1.c`: real regression coverage for the `sys_times`/`child_cpu_ticks` fix --
+            // see `POSIX_KNOWN_HANGS`'s own doc comment above (used to be a permanent hang listed
+            // there) and `src/syscall/ffi.rs::sys_times` for the real fix. Confirmed `PASS`.
+            "fork/8-1.c",
+            // `pthread_attr_setstacksize/2-1.c`: **was never actually a hang** -- confirmed via a
+            // genuinely isolated single-file canary run (the full-corpus supervised run that
+            // originally flagged it as a permanent hang misattributed the real stall to this file,
+            // the same class of misattribution `pthread_atfork/3-3.c` suffered before it). Runs to
+            // completion in seconds, reporting a real, narrow `FAIL` (`ssize != stack_size`):
+            // real, unmodified musl's own `pthread_create.c` rounds a requested stack size up to a
+            // page boundary and folds in TLS/TSD overhead before storing `stack_size`, so
+            // `pthread_getattr_np()` reporting back the *exact* raw `PTHREAD_STACK_MIN` this test
+            // requested essentially never happens on musl at all -- not an OxideBSD-specific bug,
+            // not chased further. Removed from `POSIX_KNOWN_HANGS` entirely (it never needed to be
+            // there); kept here as regression coverage against a real reintroduced hang.
+            "pthread_attr_setstacksize/2-1.c",
+            // `pthread_cancel/5-2.c`: not a permanent hang either, once two real bugs it surfaced
+            // were fixed (see `process::do_kill`'s own doc comment for the `SIGCANCEL`/signal-range
+            // fix and `ThreadGroupShared::sigactions`'s own doc comment for the real cross-thread
+            // signal-disposition-sharing fix) -- confirmed via isolated canary runs at each step:
+            // `UNRESOLVED` (real `EINVAL` from the signal-range bug) -> `CRASH(161)` (real
+            // cross-thread sigaction-sharing bug, `SIGCANCEL`'s handler installed on the wrong
+            // thread) -> a clean, bounded `TIMEOUT`. That last `TIMEOUT` is real and not chased
+            // further here: one thread genuinely livelocks in musl's own `cancel_handler` real
+            // `SIGCANCEL`-resend-via-`tkill` retry loop (intentional, real musl behavior for a
+            // target thread that never reaches an actual POSIX cancellation point -- this test's
+            // own target spins on bare `sched_yield()`, which isn't one) -- on real multi-core
+            // hardware the target thread's own userspace code still gets scheduling gaps to notice
+            // `do_it==0` between resends; whether a resumed thread on this single-core kernel
+            // always gets at least one real instruction before an immediately-redeliverable signal
+            // redirects it again is a genuinely separate, deep scheduling question, not something
+            // to chase inside this same investigation. Removed from `POSIX_KNOWN_HANGS` entirely --
+            // a bounded `TIMEOUT` doesn't threaten to cascade into the rest of a full-corpus run the
+            // way an actual unbounded hang does.
+            "pthread_cancel/5-2.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

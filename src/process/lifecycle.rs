@@ -129,12 +129,12 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
             mmap_file_regions: Vec::new(),
             mlockall_future: false,
             locked_bytes: 0,
+            sigactions: [SigAction::DEFAULT; (SIGRTMAX + 1) as usize],
         })),
         fs_base: 0,
         clear_child_tid: 0,
         pending_signals: 0,
         blocked_signals: 0,
-        sigactions: [SigAction::DEFAULT; (SIGRTMAX + 1) as usize],
         signal_stack: Vec::new(),
         altstack: AltStack::default(),
         on_altstack: false,
@@ -160,10 +160,11 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         sigsuspend_restore_mask: None,
         sysv_sem_undo: Vec::new(),
         sysv_shm_attach: Vec::new(),
-        pending_siginfo: [QueuedSigInfo::default(); 32],
+        pending_siginfo: [QueuedSigInfo::default(); 35],
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: crate::cpu::fpu::clean_state(),
         cpu_ticks: 0,
+        child_cpu_ticks: 0,
         // A fresh process/thread always starts with a full quantum -- see `Process::
         // quantum_ticks_left`'s own doc comment.
         quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
@@ -291,7 +292,6 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         parent_pgid,
         parent_sid,
         parent_blocked_signals,
-        parent_sigactions,
         parent_signal_stack,
         parent_altstack,
         parent_comm,
@@ -349,6 +349,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
                 // POSIX mlockall()/fork() semantics).
                 mlockall_future: false,
                 locked_bytes: 0,
+                // Real fork() semantics: signal disposition is copied (see ThreadGroupShared::
+                // sigactions's own doc comment for why this field lives here, not on Process).
+                sigactions: parent_shared.sigactions,
             }))
         };
         (
@@ -364,7 +367,6 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
             // copy of that same in-progress-handler bookkeeping (each entry is plain data, no
             // pointers into the parent's own address space beyond what `saved` already carries).
             parent.blocked_signals,
-            parent.sigactions,
             parent.signal_stack.clone(),
             // Real fork() semantics: the alt stack's own address stays valid in the child (the
             // whole address space is duplicated) -- see AltStack's own doc comment.
@@ -425,7 +427,6 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         clear_child_tid: 0,
         pending_signals: 0,
         blocked_signals: parent_blocked_signals,
-        sigactions: parent_sigactions,
         signal_stack: parent_signal_stack,
         altstack: parent_altstack,
         // Not inherited -- see Process::on_altstack's own doc comment.
@@ -462,13 +463,16 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         sysv_shm_attach: Vec::new(),
         // Not inherited -- see this field's own doc comment (pending_signals itself starts at 0
         // for a forked child too, so there's nothing meaningful to carry over).
-        pending_siginfo: [QueuedSigInfo::default(); 32],
+        pending_siginfo: [QueuedSigInfo::default(); 35],
         // Not inherited -- same reasoning as pending_siginfo above.
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: parent_fpu_state,
         // Not inherited -- real POSIX: a forked child's own CPU time starts at 0, it hasn't run
         // yet (see this field's own doc comment on Process).
         cpu_ticks: 0,
+        // Not inherited -- a fresh child hasn't reaped any children of its own yet (see this
+        // field's own doc comment on Process).
+        child_cpu_ticks: 0,
         // A fresh process/thread always starts with a full quantum -- see `Process::
         // quantum_ticks_left`'s own doc comment.
         quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
@@ -587,7 +591,6 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         parent_pgid,
         parent_sid,
         parent_blocked_signals,
-        parent_sigactions,
         parent_signal_stack,
         parent_altstack,
         parent_comm,
@@ -622,7 +625,6 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
             caller.pgid,
             caller.sid,
             caller.blocked_signals,
-            caller.sigactions,
             caller.signal_stack.clone(),
             caller.altstack,
             caller.comm.clone(),
@@ -668,7 +670,6 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         clear_child_tid: ctid,
         pending_signals: 0,
         blocked_signals: parent_blocked_signals,
-        sigactions: parent_sigactions,
         signal_stack: parent_signal_stack,
         altstack: parent_altstack,
         // Not inherited -- see Process::on_altstack's own doc comment.
@@ -694,10 +695,14 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         sigsuspend_restore_mask: None,
         sysv_sem_undo: Vec::new(),
         sysv_shm_attach: Vec::new(),
-        pending_siginfo: [QueuedSigInfo::default(); 32],
+        pending_siginfo: [QueuedSigInfo::default(); 35],
         rt_queue: core::array::from_fn(|_| Vec::new()),
         fpu_state: parent_fpu_state,
         cpu_ticks: 0,
+        // A `clone(2)`-created thread never becomes an independent `wait4` target (see
+        // `do_clone`'s own doc comment) and never reaps children of its own -- starts at 0, same
+        // reasoning as `do_fork_from_current`'s own copy of this field.
+        child_cpu_ticks: 0,
         // A fresh process/thread always starts with a full quantum -- see `Process::
         // quantum_ticks_left`'s own doc comment.
         quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
@@ -1079,7 +1084,7 @@ pub fn do_execve(
         // program image, so it resets to SIG_DFL; SIG_IGN and already-SIG_DFL entries are left
         // alone (both are position-independent of any particular program's own code), and so is
         // pending_signals/blocked_signals -- both persist across execve on a real system too.
-        for action in me.sigactions.iter_mut() {
+        for action in me.shared.lock().sigactions.iter_mut() {
             if action.handler > 1 {
                 *action = SigAction::DEFAULT;
             }
@@ -1219,11 +1224,14 @@ pub fn do_wait4(
                 // the way to reap (e.g. a genuinely still-running self-exit whose own
                 // `queue_thread_reap` hasn't drained yet by the time this reap runs).
                 reaped_address_space = removed.address_space;
-                table
-                    .get_mut(&caller_pid)
-                    .unwrap()
-                    .children
-                    .retain(|&c| c != child_pid);
+                // Real `times(2)`/`tms_cutime`/`tms_cstime` accumulation -- see
+                // `Process::child_cpu_ticks`'s own doc comment for why this is transitive (folds in
+                // whatever the child itself had already accumulated from its own reaped children,
+                // not just its direct `cpu_ticks`) without any extra recursion needed here.
+                let child_total = removed.cpu_ticks + removed.child_cpu_ticks;
+                let parent = table.get_mut(&caller_pid).unwrap();
+                parent.child_cpu_ticks += child_total;
+                parent.children.retain(|&c| c != child_pid);
                 Some(Reported::Exited(child_pid, code))
             } else if options & WUNTRACED != 0
                 && let Some(&child_pid) = children
@@ -1573,7 +1581,7 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
         .get(&pid)
         .and_then(|me| me.parent)
         .and_then(|parent_pid| table.get(&parent_pid))
-        .is_some_and(|parent| parent.sigactions[SIGCHLD as usize].flags & SA_NOCLDWAIT != 0);
+        .is_some_and(|parent| parent.shared.lock().sigactions[SIGCHLD as usize].flags & SA_NOCLDWAIT != 0);
     if auto_reap {
         let parent_pid = table.get(&pid).unwrap().parent;
         if let Some(parent_pid) = parent_pid

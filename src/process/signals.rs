@@ -108,8 +108,23 @@ fn route_signal_target(table: &BTreeMap<Pid, Box<Process>>, target: Pid, sig: u6
     }
 }
 
-/// `SYS_KILL`'s real logic. Signals `1..=31` (standard) or `SIGRTMIN..=SIGRTMAX` (real-time) only;
-/// anything else is `EINVAL`, matching real `kill()`'s own validation. Real permission checking now
+/// `SYS_KILL`'s real logic. Signals `1..=34` (standard -- see this range's own note just below) or
+/// `SIGRTMIN..=SIGRTMAX` (real-time) only; anything else is `EINVAL`, matching real `kill()`'s own
+/// validation.
+///
+/// **`32..=34` (`SIGTIMER`/`SIGCANCEL`/`SIGSYNCCALL`) are real, valid signal numbers here, not a
+/// gap** -- a real bug, found live via `pthread_cancel/5-2.c` going `UNRESOLVED`: this range is
+/// "permanently unclaimed" only as a *libc-level* convention (real glibc/musl reserve it for their
+/// own internal NPTL-style machinery so application code doesn't collide with it) -- it is not a
+/// real POSIX or Linux *kernel*-level restriction. Real, unmodified musl's own `pthread_cancel.c`
+/// genuinely calls `sigaction(SIGCANCEL=33, ...)` and `pthread_kill(t, SIGCANCEL)` through the
+/// exact same raw syscalls any other signal uses -- rejecting them here as `EINVAL` broke real
+/// `pthread_cancel(3)` for every caller, not just this one test (`init_cancellation`'s own
+/// `sigaction` call ignores its return value, so the *first* visible symptom was always
+/// `pthread_cancel`'s own `pthread_kill` call surfacing the swallowed `EINVAL`). See
+/// `sys_sigaction`'s own doc comment in `src/syscall/ffi.rs` for the matching fix on that call
+/// site -- `init_cancellation`'s `sigaction(SIGCANCEL, ...)` needed it too, not just this
+/// function's own `pthread_kill` path. Real permission checking now
 /// exists (`has_signal_permission`) for the single-target case -- `target_pid == 0`/`< 0` are
 /// real POSIX process-group broadcasts
 /// (`0` = the caller's own group, `< 0` = group `|target_pid|`) — see the `target_pid <= 0` branch
@@ -143,7 +158,7 @@ fn route_signal_target(table: &BTreeMap<Pid, Box<Process>>, target: Pid, sig: u6
 ///   has. `SIGCONT` gets its own pre-dispatch step *before* any of the above: an actually-`Stopped`
 ///   target always resumes regardless of its own `SIGCONT` disposition, real POSIX semantics.
 pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
-    if !((0..=31).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
+    if !((0..=34).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
         return Err(EINVAL);
     }
     let caller_uid = oxidebsd_current_uid() as u32;
@@ -275,7 +290,7 @@ pub fn do_kill(caller_pid: Pid, target_pid: i64, sig: i64) -> Result<u64, u64> {
         // (Terminate) right there, silently killing the child instead of waking its sigwait --
         // this is a general gap, not specific to that one test or that one signal.
         let is_blocked = proc.blocked_signals & (1 << (sig - 1)) != 0;
-        match proc.sigactions[sig as usize].handler {
+        match proc.shared.lock().sigactions[sig as usize].handler {
             1 => Action::Discard, // SIG_IGN
             0 if is_blocked => Action::SetPending,
             0 => match default_disposition(sig) {
@@ -381,7 +396,7 @@ pub fn signal_foreground_group(pgid: Pid, sig: u64) {
                 // never resolve its default disposition immediately, even with no handler
                 // installed.
                 let is_blocked = proc.blocked_signals & (1 << (sig - 1)) != 0;
-                let action = match proc.sigactions[sig as usize].handler {
+                let action = match proc.shared.lock().sigactions[sig as usize].handler {
                     1 => Action::Discard, // SIG_IGN
                     0 if is_blocked => Action::SetPending,
                     0 => match default_disposition(sig) {
@@ -620,7 +635,7 @@ pub(crate) fn notify_parent_sigchld(
     let Some(parent) = table.get_mut(&parent_pid) else {
         return;
     };
-    if code == CLD_STOPPED && parent.sigactions[SIGCHLD as usize].flags & SA_NOCLDSTOP != 0 {
+    if code == CLD_STOPPED && parent.shared.lock().sigactions[SIGCHLD as usize].flags & SA_NOCLDSTOP != 0 {
         return;
     }
     let _ = record_pending(parent, SIGCHLD, code, child_pid, child_uid, status);
@@ -785,7 +800,7 @@ pub fn do_sigaction(pid: Pid, sig: u64, act_ptr: u64, oldact_ptr: u64) -> Result
         .expect("sigaction: current process missing from table");
 
     if oldact_ptr != 0 {
-        let old = proc.sigactions[sig as usize];
+        let old = proc.shared.lock().sigactions[sig as usize];
         let raw = RawSigAction {
             handler: old.handler,
             flags: old.flags,
@@ -798,7 +813,7 @@ pub fn do_sigaction(pid: Pid, sig: u64, act_ptr: u64, oldact_ptr: u64) -> Result
     if act_ptr != 0 {
         // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
         let raw = unsafe { &*(act_ptr as *const RawSigAction) };
-        proc.sigactions[sig as usize] = SigAction {
+        proc.shared.lock().sigactions[sig as usize] = SigAction {
             handler: raw.handler,
             flags: raw.flags,
             restorer: raw.restorer,
@@ -954,7 +969,7 @@ pub(crate) fn take_deliverable_signal(pid: Pid) -> Option<SignalDelivery> {
             proc.pending_siginfo[signum as usize]
         };
 
-        let action = proc.sigactions[signum as usize];
+        let action = proc.shared.lock().sigactions[signum as usize];
         match action.handler {
             1 => continue, // SIG_IGN
             0 => match default_disposition(signum) {
@@ -1203,9 +1218,10 @@ pub fn do_sigtimedwait(pid: Pid, mask_ptr: u64, info_ptr: u64, ts_ptr: u64) -> R
 /// `kill(pid, 0)` already establishes (musl's `sigqueue(3)` wrapper places no extra restriction on
 /// `sig` beyond what a real signal number check would already reject) -- no signal is actually
 /// queued, `Err(EPERM)`/`Err(ESRCH)` via `has_signal_permission`/table lookup exactly mirrors
-/// `do_kill`'s own `sig == 0` branch.
+/// `do_kill`'s own `sig == 0` branch. Range extended to `1..=34` for the same real reason
+/// `do_kill`'s own doc comment explains -- `32..=34` are real, valid signal numbers, not a gap.
 pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64) -> Result<u64, u64> {
-    if sig != 0 && !((1..=31).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
+    if sig != 0 && !((1..=34).contains(&sig) || (SIGRTMIN as i64..=SIGRTMAX as i64).contains(&sig)) {
         return Err(EINVAL);
     }
     if target_pid <= 0 {
@@ -1287,7 +1303,7 @@ pub fn do_sigqueue(caller_pid: Pid, target_pid: i64, sig: i64, siginfo_ptr: u64)
         // (Terminate) right there, silently killing the child instead of waking its sigwait --
         // this is a general gap, not specific to that one test or that one signal.
         let is_blocked = proc.blocked_signals & (1 << (sig - 1)) != 0;
-        match proc.sigactions[sig as usize].handler {
+        match proc.shared.lock().sigactions[sig as usize].handler {
             1 => Action::Discard, // SIG_IGN
             0 if is_blocked => Action::SetPending,
             0 => match default_disposition(sig) {

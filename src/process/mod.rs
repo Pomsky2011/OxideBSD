@@ -688,6 +688,24 @@ pub struct ThreadGroupShared {
     /// against `mlockall(MCL_FUTURE)`'s own implicit one. Same fork/execve treatment as
     /// `mlockall_future` above.
     pub locked_bytes: u64,
+    /// Indexed `1..=64` (index `0` unused) -- see `SigAction`'s own doc comment. **Lives here, not
+    /// on `Process`, because real POSIX signal disposition is a property of the whole process,
+    /// shared by every thread** -- `sigaction()` called on any one `CLONE_THREAD` sibling must be
+    /// visible to every other sibling and to whichever one a signal actually lands on. **A real,
+    /// found-live bug this fixed**: before this field moved here, each thread (each separate
+    /// `Process` table entry sharing a `tgid`) had its own fully independent `sigactions` copy --
+    /// installing a handler on one thread never took effect for signals delivered to a sibling.
+    /// Found via `pthread_cancel/5-2.c`: real, unmodified musl's own `init_cancellation()`
+    /// (`third_party/musl/src/thread/pthread_cancel.c`) installs `SIGCANCEL`'s handler on whichever
+    /// thread happens to call `pthread_cancel()` first, then `pthread_kill()`s the *target* thread
+    /// -- which, with a per-thread `sigactions`, still had `SIG_DFL` for `SIGCANCEL`, so the target
+    /// was unconditionally terminated (`CRASH(161)` = `128 + SIGCANCEL`) instead of the handler ever
+    /// running. Real `fork()` semantics unaffected by this move: `do_fork_from_current` still builds
+    /// a genuinely fresh `ThreadGroupShared` (copying this field's *value* from the parent's, not
+    /// `Arc::clone`ing it) since a forked child is a real, independent process, never a thread
+    /// sibling — only `do_clone`'s own pre-existing `Arc::clone(&caller.shared)` for real
+    /// `CLONE_THREAD` sharing needed no change at all to pick this field up automatically.
+    pub sigactions: [SigAction; (SIGRTMAX + 1) as usize],
 }
 
 pub struct Process {
@@ -783,8 +801,6 @@ pub struct Process {
     /// `stash_signal_context` for the duration of a handler's own execution (restored by
     /// `take_signal_saved_frame` on `sigreturn`).
     pub blocked_signals: u64,
-    /// Indexed `1..=64` (index `0`, and `32..=34`, unused) — see `SigAction`'s own doc comment.
-    pub sigactions: [SigAction; (SIGRTMAX + 1) as usize],
     /// A real signal stack, not a single snapshot: each `Handler`-disposition delivery pushes one
     /// entry (`stash_signal_context`), and each `sigreturn` (`take_signal_saved_frame`) pops
     /// exactly one, restoring its `saved` frame and `blocked_before` mask. Empty whenever this
@@ -945,13 +961,21 @@ pub struct Process {
     /// unreachable): matches real Linux, where `execve(2)` destroying the old address space is
     /// itself a real implicit detach of everything that was attached to it.
     pub sysv_shm_attach: Vec<(u64, i32)>,
-    /// Real per-standard-signal-number sender identity/payload, indexed `1..=31` same as
+    /// Real per-standard-signal-number sender identity/payload, indexed `1..=34` same as
     /// `sigactions` (index `0` unused) -- see `QueuedSigInfo`'s own doc comment. Not copied by
     /// `fork` (a forked child starts with `pending_signals == 0` too, so there's nothing
     /// meaningful to carry over); untouched by `execve` (same "leave it alone" treatment
     /// `pending_signals`/`blocked_signals` already get there). Real-time signals use `rt_queue`
-    /// below instead -- this array is never indexed past `31`.
-    pub pending_siginfo: [QueuedSigInfo; 32],
+    /// below instead -- this array is never indexed past `34` (`record_pending`'s own `sig >=
+    /// SIGRTMIN` branch diverts anything `35` or above to `rt_queue` before ever reaching this
+    /// one). **Was `32` elements** (valid indices `0..=31`) until a real, kernel-panic-shaped bug
+    /// this exact staleness caused: widening `do_kill`/`do_sigaction`/`do_sigqueue`'s own valid
+    /// range to include `32..=34` (`SIGTIMER`/`SIGCANCEL`/`SIGSYNCCALL`, see `do_kill`'s own doc
+    /// comment for why) without also widening this array would have turned a real
+    /// `pthread_cancel(3)` call's `pthread_kill(t, SIGCANCEL=33)` into an out-of-bounds
+    /// `pending_siginfo[33]` panic instead of the userspace `EINVAL` it used to (silently) get —
+    /// caught before ever shipping, not found live.
+    pub pending_siginfo: [QueuedSigInfo; 35],
     /// Real per-real-time-signal-number FIFO queue, indexed `sig - SIGRTMIN` (`0..RT_SIGNAL_COUNT`).
     /// Unlike `pending_siginfo` above, a real-time signal must not collapse multiple queued
     /// instances into one -- POSIX explicitly requires `sigqueue`/`raise` against an already-pending
@@ -995,6 +1019,20 @@ pub struct Process {
     /// a forked child (real POSIX: a process's own CPU time never carries over from a parent);
     /// preserved by `execve` (the same process, still accumulating, just running a new image).
     pub cpu_ticks: u64,
+    /// Real `times(2)`'s `tms_cutime`/`tms_cstime` backing store -- the accumulated `cpu_ticks`
+    /// (own plus already-accumulated grandchildren) of every child this process has ever reaped
+    /// via `do_wait4` (`src/process/lifecycle.rs`), folded in at reap time before the child's own
+    /// `Process` entry is dropped. Real POSIX semantics: transitive (a reaped child's own
+    /// `tms_cutime`/`tms_cstime` -- descendants it had already reaped itself -- count too, not just
+    /// its direct `tms_utime`/`tms_stime`), which is exactly what adding `child.cpu_ticks +
+    /// child.child_cpu_ticks` at each reap produces without any extra recursion. Not inherited by
+    /// `fork` (a fresh child hasn't reaped anything yet); preserved by `execve` (same reasoning as
+    /// `cpu_ticks` above -- still the same process, still accumulating). See `sys_times`'s own doc
+    /// comment for why this field exists at all: `fork/8-1.c`'s own child busy-loops forever on
+    /// `tms_utime + tms_stime > 0`, and its parent separately checks `tms_cutime`/`tms_cstime`
+    /// become nonzero after `waitpid` -- both were impossible before `cpu_ticks` (added for
+    /// `CLOCK_PROCESS_CPUTIME_ID`, see that field's own doc comment) ever got wired into `times(2)`.
+    pub child_cpu_ticks: u64,
     /// Real per-process round-robin quantum, replacing a purely global-clock-phase preemption
     /// check (`now.is_multiple_of(PREEMPT_QUANTUM_TICKS)` in `interrupts::timer_interrupt_handler`)
     /// that used to let a process's actual remaining time before preemption be pure luck -- 1 to

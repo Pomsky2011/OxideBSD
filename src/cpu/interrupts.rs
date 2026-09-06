@@ -327,20 +327,6 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
     // code this interrupt could actually preempt.
     {
         let mut table = crate::process::table().lock();
-        // TEMPORARY diagnostic for the POSIX pilot full-corpus run: printed every ~10 real
-        // seconds to check whether the process table grows unboundedly over a long boot with
-        // hundreds of fork/exec/exit cycles (suspected live while chasing a `fork/8-1.c` busy-loop
-        // that took 9+ minutes instead of ~1s under KVM) -- remove once that's resolved one way or
-        // the other.
-        if now % 1000 == 0 {
-            crate::serial_println!("[diag] tick={} table_len={}", now, table.len());
-            // The matching `[diag-thread]` per-process state dump (a TEMPORARY diagnostic, most
-            // recently for the `pthread_attr_setdetachstate/2-1.c` race/hang investigation -- see
-            // CLAUDE.md's "closing a real scheduler race and a real thread-group-leader signal
-            // termination bug" section) is removed: that investigation is done, and an
-            // O(table_len) full scan-and-print *every 10 real seconds* is a genuine, unbounded
-            // performance hazard for any real workload with many live processes/threads.
-        }
         // Real per-process CPU-time accounting (`Process::cpu_ticks`, see its own doc comment) --
         // the process this tick actually interrupted is the one that was consuming the CPU for it.
         // `current_pid() == 0` only at boot, before any real process exists.

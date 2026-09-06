@@ -1820,6 +1820,96 @@ bugs, not one.
   `POSIX_PILOT_CANARY_ONLY` standing regression suite. A fresh full-corpus supervised run to fold
   this into an official baseline number hasn't been done yet.
 
+## Real per-process `times(2)`, and closing the last two `POSIX_KNOWN_HANGS` entries from a prior session's pthread investigation (`src/syscall/ffi.rs`, `src/process/mod.rs`, `src/process/lifecycle.rs`, `src/process/signals.rs`, `build.rs`)
+
+Continuing the same hunt as the section above: `fork/8-1.c`, `pthread_attr_setstacksize/2-1.c`, and
+`pthread_cancel/5-2.c` were the three remaining entries from a prior session's "four newly-found
+pthread hangs" list. All three closed — two were real bugs, one was never actually a hang at all.
+
+- **`fork/8-1.c`**: `sys_times` wrote an unconditionally all-zero `tms` struct — the doc comment
+  claimed "this kernel tracks no per-process CPU time at all," but that predated `Process::
+  cpu_ticks` (added later, purely for `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`) and was never
+  revisited. The test's child thread busy-loops forever on `while ((tms_utime + tms_stime) <= 0)`,
+  which an always-zero `tms_utime` can never satisfy — a real, permanent hang, not the parent's own
+  `do { ... } while (cur - start < CLK_TCK)` loop a prior session's own notes suspected (that one's
+  return value, `ticks()`, was always real). **Fixed**: `sys_times` now reads real `cpu_ticks` into
+  `tms_utime` and a new `Process::child_cpu_ticks` accumulator into `tms_cutime` (folded in by
+  `do_wait4` at reap time — transitive, since it adds `child.cpu_ticks + child.child_cpu_ticks`, so
+  a grandchild's usage flows up automatically). `tms_stime`/`tms_cstime` stay honest zero — no
+  separate user/kernel split is tracked, same tier `cpu_ticks`'s own doc comment already
+  establishes. `getrusage(2)`'s `ru_utime`/`ru_stime` have the identical latent staleness, noted but
+  not fixed (nothing currently depends on it the way this hang did).
+- **`pthread_attr_setstacksize/2-1.c` and `pthread_cancel/5-2.c`: neither was ever a real hang.**
+  The original full-corpus supervised run's own "exclude whatever file happened to be running when
+  a stall was detected" heuristic misattributed some *other* file's real stall to these two — the
+  same failure mode `pthread_atfork/3-3.c` suffered before it (see `build.rs`'s own `POSIX_KNOWN_
+  HANGS` doc comment). Confirmed by testing each in genuine, complete isolation
+  (`POSIX_PILOT_CANARY_ONLY` narrowed to exactly one file) — both run to completion in seconds.
+  `pthread_attr_setstacksize/2-1.c` reports a real, narrow `FAIL`: real, unmodified musl's own
+  `pthread_create.c` rounds a requested stack size up to a page boundary and folds in TLS/TSD
+  overhead before storing `stack_size`, so `pthread_getattr_np()` reporting back the *exact* raw
+  `PTHREAD_STACK_MIN` this test requested essentially never happens on musl at all — not an
+  OxideBSD bug, not chased further.
+- **`pthread_cancel/5-2.c` surfaced two real, since-fixed kernel bugs before settling on a clean,
+  bounded `TIMEOUT`**:
+  1. **Signals `32..=34` (`SIGTIMER`/`SIGCANCEL`/`SIGSYNCCALL`) were wrongly rejected as `EINVAL`**
+     in `do_kill`/`do_sigaction`/`do_sigqueue`. That range is "permanently unclaimed" only as a
+     *libc-level* convention (real glibc/musl reserve it for internal NPTL-style machinery so
+     application code doesn't collide with it) — not a real POSIX or Linux kernel-level
+     restriction. Real, unmodified musl's own `pthread_cancel.c` genuinely calls
+     `sigaction(SIGCANCEL=33, ...)` and `pthread_kill(t, SIGCANCEL)` through the exact same raw
+     syscalls any other signal uses. Rejecting them broke real `pthread_cancel(3)` for every
+     caller, not just this test — `init_cancellation()`'s own `sigaction` call ignores its return
+     value, so the first visible symptom was always the `pthread_kill` call surfacing the swallowed
+     `EINVAL` as `pthread_cancel`'s own return value (`UNRESOLVED` here). **Fixed**: widened the
+     valid range to `0..=34`/`1..=34` at all three call sites. **A second, more serious latent bug
+     this exposed before it could ship**: `Process::pending_siginfo` was only a 32-element array
+     (`[QueuedSigInfo; 32]`), indexed directly by signal number — accepting signal 33 without
+     widening this too would have turned a userspace `EINVAL` into a real out-of-bounds kernel
+     panic at `record_pending`'s `proc.pending_siginfo[sig as usize] = info`. Fixed alongside (now
+     35 elements, covering `0..=34` — real-time signals `35..=64` use `rt_queue` instead and never
+     reach this array).
+  2. **`sigaction()` disposition wasn't shared across threads in the same process** — a real,
+     pre-existing threading gap, found once the range fix let `SIGCANCEL` actually reach the
+     kernel: `Process::sigactions` lived directly on `Process`, not in the `Arc<Mutex<>>`-shared
+     `ThreadGroupShared`, so each `CLONE_THREAD` sibling had its own fully independent copy —
+     violating real POSIX (`sigaction()` disposition must be process-wide). `init_cancellation()`
+     installs `SIGCANCEL`'s handler on whichever thread calls `pthread_cancel()` first, then
+     `pthread_kill()`s the *target* thread — which, with a per-thread `sigactions`, still had
+     `SIG_DFL`, so the target was unconditionally terminated (`CRASH(161)` = `128 + SIGCANCEL`)
+     instead of the handler ever running. **Fixed**: moved `sigactions` into `ThreadGroupShared`.
+     `do_fork_from_current` still builds a genuinely fresh `ThreadGroupShared` (copying the
+     *value*, real POSIX fork semantics: a forked child is an independent process, never a thread
+     sibling); `do_clone`'s own pre-existing `Arc::clone(&caller.shared)` for real `CLONE_THREAD`
+     sharing needed no change at all to pick this field up automatically. Every direct
+     `proc.sigactions[...]` access site across `signals.rs`/`lifecycle.rs` (9 sites) now goes
+     through `proc.shared.lock().sigactions[...]`, respecting the existing "`PROCESS_TABLE` first,
+     `ThreadGroupShared` second, never across `schedule()`" lock-ordering rule unchanged.
+  3. **Residual, not chased further**: after both fixes, `pthread_cancel/5-2.c` settles at a clean,
+     bounded `TIMEOUT` instead of any kind of crash or permanent hang. One thread genuinely
+     livelocks in musl's own real `cancel_handler`'s `SIGCANCEL`-resend-via-`tkill` retry loop —
+     intentional musl behavior for a target thread that never reaches an actual POSIX cancellation
+     point (this test's own target spins on bare `sched_yield()`, which isn't one). Diagnostic
+     tracing (`[diag-thread]`, temporarily reinstated for this investigation, removed after) showed
+     the same thread `Running` with an identical `pending`/`blocked` signature across four
+     consecutive 10-second snapshots — a genuine livelock, not forward progress. On real multi-core
+     hardware the target thread's own userspace code still gets real scheduling gaps to notice
+     `do_it==0` between resends; whether a resumed thread on this single-core kernel always gets at
+     least one real instruction before an immediately-redeliverable signal redirects it again is a
+     separate, deep scheduling question, out of scope for this investigation. A bounded `TIMEOUT`
+     doesn't cascade into the rest of a full-corpus run the way an actual unbounded hang does, so
+     this doesn't block anything.
+- **`POSIX_KNOWN_HANGS` down to exactly two genuine, permanent, deliberately-out-of-scope
+  exclusions**: `sched_yield/1-1.c` (needs real SMP) and `shm_open/23-1.c` (an architectural
+  mismatch between oxfs's 128 KiB-per-open-fd write-buffer design and this test's own
+  1000-concurrent-process fd-leak stress shape — a real fix means redesigning oxfs's write path to
+  stop costing memory per open fd, scoped as a separate, future effort, not attempted here).
+- **Verified**: full 76-file standing canary suite (`POSIX_PILOT_CANARY_ONLY=1`, both new entries
+  folded in) — `53P/3F/1U/14UT/4TO/1CR`, exactly the prior 74-file baseline plus the two new,
+  expected outcomes (`pthread_attr_setstacksize/2-1.c` `FAIL`, `pthread_cancel/5-2.c` `TIMEOUT`) —
+  zero regressions. A fresh full-corpus supervised run to fold all of this into an official
+  baseline number hasn't been done yet.
+
 ## Dependency notes
 
 - `x86_64` crate: `default-features = false, features = ["instructions", "abi_x86_interrupt"]` —
