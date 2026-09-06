@@ -1845,11 +1845,18 @@ pthread hangs" list. All three closed — two were real bugs, one was never actu
   same failure mode `pthread_atfork/3-3.c` suffered before it (see `build.rs`'s own `POSIX_KNOWN_
   HANGS` doc comment). Confirmed by testing each in genuine, complete isolation
   (`POSIX_PILOT_CANARY_ONLY` narrowed to exactly one file) — both run to completion in seconds.
-  `pthread_attr_setstacksize/2-1.c` reports a real, narrow `FAIL`: real, unmodified musl's own
+  `pthread_attr_setstacksize/2-1.c` reported a real, narrow `FAIL`: real, unmodified musl's own
   `pthread_create.c` rounds a requested stack size up to a page boundary and folds in TLS/TSD
-  overhead before storing `stack_size`, so `pthread_getattr_np()` reporting back the *exact* raw
-  `PTHREAD_STACK_MIN` this test requested essentially never happens on musl at all — not an
-  OxideBSD bug, not chased further.
+  overhead before storing `stack_size`, so `pthread_getattr_np()` never round-tripped the *exact*
+  raw `PTHREAD_STACK_MIN` this test requested. **Since fixed** on the `oxidebsd` musl branch — but
+  only after confirming, live against the host's own real glibc, that this genuinely passes there
+  (so it wasn't a bogus/upstream-broken test): `struct pthread` gained a `requested_stack_size`
+  field, set once at real thread-creation time to the caller's actual logical request (or the
+  implementation default), independent of the real allocator-padded extent `stack_size` still
+  tracks for its own (unrelated) purposes. `pthread_getattr_np()` now reports the new field
+  instead of deriving a size from `stack - stack_limit` — doesn't touch the actual stack
+  allocation/layout algorithm at all, so the one real consumer of `stack_size` itself
+  (`map_size`/`map_base` for `munmap` at join/exit) is untouched. Now `PASS`.
 - **`pthread_cancel/5-2.c` surfaced two real, since-fixed kernel bugs before settling on a clean,
   bounded `TIMEOUT`**:
   1. **Signals `32..=34` (`SIGTIMER`/`SIGCANCEL`/`SIGSYNCCALL`) were wrongly rejected as `EINVAL`**
@@ -1907,7 +1914,10 @@ pthread hangs" list. All three closed — two were real bugs, one was never actu
 - **Verified**: full 76-file standing canary suite (`POSIX_PILOT_CANARY_ONLY=1`, both new entries
   folded in) — `53P/3F/1U/14UT/4TO/1CR`, exactly the prior 74-file baseline plus the two new,
   expected outcomes (`pthread_attr_setstacksize/2-1.c` `FAIL`, `pthread_cancel/5-2.c` `TIMEOUT`) —
-  zero regressions. A fresh full-corpus supervised run to fold all of this into an official
+  zero regressions. **`pthread_attr_setstacksize/2-1.c`'s own `FAIL` since fixed too** (real musl
+  `requested_stack_size` patch, see this section's own note above) — re-verified: `54P/2F/1U/14UT/
+  4TO/1CR`, the `FAIL` count's only change. A fresh full-corpus supervised run to fold all of this
+  into an official
   baseline number hasn't been done yet.
 
 ## Dependency notes

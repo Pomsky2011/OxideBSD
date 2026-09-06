@@ -1335,11 +1335,15 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // `pthread_atfork/3-3.c` suffered before it (see this array's own doc comment on that historical
     // pattern). Confirmed by testing each in genuine, complete isolation (`POSIX_PILOT_CANARY_ONLY`
     // narrowed to just the one file): both run to completion in seconds/within `t0`'s own bound.
-    // `pthread_attr_setstacksize/2-1.c` reports a real, narrow `FAIL` (real, unmodified musl's own
+    // `pthread_attr_setstacksize/2-1.c` reported a real, narrow `FAIL`: real, unmodified musl's own
     // `pthread_create.c` rounds a requested stack size up to a page boundary plus TLS/TSD overhead
-    // before storing it, so `pthread_getattr_np()` reporting back the *exact* raw
-    // `PTHREAD_STACK_MIN` this test requested essentially never happens on musl at all -- not an
-    // OxideBSD bug, not chased further). `pthread_cancel/5-2.c` surfaced two real, since-fixed
+    // before storing it, so `pthread_getattr_np()` never round-tripped the *exact* raw
+    // `PTHREAD_STACK_MIN` this test requested. **Since fixed on the `oxidebsd` musl branch**
+    // (confirmed live against the host's own real glibc first: this test genuinely passes there,
+    // so it wasn't a bogus test) -- `struct pthread` gained a `requested_stack_size` field, set
+    // once at creation to the real logical size the caller asked for, independent of the actual
+    // allocator-padded extent; `pthread_getattr_np()` reports that instead of deriving it from
+    // `stack - stack_limit`. Now `PASS`. `pthread_cancel/5-2.c` surfaced two real, since-fixed
     // kernel bugs along the way (see `process::do_kill`'s own doc comment for the real `SIGCANCEL`
     // signal-range fix and `ThreadGroupShared::sigactions`'s own doc comment for the real
     // cross-thread signal-disposition-sharing fix this exposed) before settling on a clean, bounded
@@ -1582,14 +1586,14 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // `pthread_attr_setstacksize/2-1.c`: **was never actually a hang** -- confirmed via a
             // genuinely isolated single-file canary run (the full-corpus supervised run that
             // originally flagged it as a permanent hang misattributed the real stall to this file,
-            // the same class of misattribution `pthread_atfork/3-3.c` suffered before it). Runs to
-            // completion in seconds, reporting a real, narrow `FAIL` (`ssize != stack_size`):
-            // real, unmodified musl's own `pthread_create.c` rounds a requested stack size up to a
-            // page boundary and folds in TLS/TSD overhead before storing `stack_size`, so
-            // `pthread_getattr_np()` reporting back the *exact* raw `PTHREAD_STACK_MIN` this test
-            // requested essentially never happens on musl at all -- not an OxideBSD-specific bug,
-            // not chased further. Removed from `POSIX_KNOWN_HANGS` entirely (it never needed to be
-            // there); kept here as regression coverage against a real reintroduced hang.
+            // the same class of misattribution `pthread_atfork/3-3.c` suffered before it). Its own
+            // real, narrow `FAIL` (`ssize != stack_size`, real, unmodified musl's own
+            // `pthread_create.c` rounding a requested stack size up to a page boundary plus TLS/TSD
+            // overhead before storing `stack_size`) is now also fixed on the `oxidebsd` musl branch
+            // (`struct pthread`'s own `requested_stack_size` field, see that field's own doc
+            // comment) -- confirmed live against the host's own real glibc first that this wasn't a
+            // bogus test. Now `PASS`. Removed from `POSIX_KNOWN_HANGS` entirely (it never needed to
+            // be there); kept here as regression coverage.
             "pthread_attr_setstacksize/2-1.c",
             // `pthread_cancel/5-2.c`: not a permanent hang either, once two real bugs it surfaced
             // were fixed (see `process::do_kill`'s own doc comment for the `SIGCANCEL`/signal-range
