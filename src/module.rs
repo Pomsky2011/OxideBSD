@@ -882,6 +882,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         }
         "oxidebsd_sys_reboot" => Some(crate::syscall::oxidebsd_sys_reboot as *const () as u64),
         "oxidebsd_sys_futex" => Some(crate::syscall::oxidebsd_sys_futex as *const () as u64),
+        "oxidebsd_sys_futex_requeue" => {
+            Some(crate::syscall::oxidebsd_sys_futex_requeue as *const () as u64)
+        }
         "oxidebsd_sys_getrusage" => {
             Some(crate::syscall::oxidebsd_sys_getrusage as *const () as u64)
         }

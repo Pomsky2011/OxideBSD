@@ -580,6 +580,74 @@ pub fn do_futex(pid: Pid, addr: u64, op: u64, val: u64, to: u64) -> Result<u64, 
     Ok(0)
 }
 
+/// `SYS_FUTEX_REQUEUE` (OxideBSD's own invented number, `557` -- continuing right past
+/// `SYS_EXIT_GROUP=556`, the current highest assigned number as of this addition). Real Linux's
+/// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` op doesn't fit this ABI's plain `SYS_FUTEX` wire format --
+/// real `futex(2)` needs 6 real args for this op (`uaddr`, `op`, `val`/nr_wake, `val2`/nr_requeue
+/// in the timeout slot, `uaddr2`, `val3`/a value check for `CMP_REQUEUE` only), but this ABI's
+/// syscall entry only ever forwards 4 real registers. The one real caller in this musl fork,
+/// `pthread_cond_timedwait.c`'s own `unlock_requeue` (reachable only from the *private*,
+/// non-pshared condvar wake path -- `__pthread_cond_timedwait`'s shared/pshared branch jumps
+/// straight to `relock` and never builds a waiter node at all), was patched on the `oxidebsd` musl
+/// branch to call this syscall directly with exactly the 4 real args it needs (`uaddr`, `uaddr2`,
+/// `nr_wake`, `nr_requeue`) instead of overloading `SYS_FUTEX`. No `CMP_REQUEUE`-style value check
+/// is needed -- the one real call site never uses it.
+///
+/// **Real bug this closes**: without this, `FUTEX_REQUEUE` was a silent no-op (`do_futex`'s own
+/// fallthrough `Ok(0)` for any op besides `WAIT`/`WAKE`). A contended condvar with more than one
+/// waiter queued (any real multi-thread `pthread_cond_broadcast`/repeated-`pthread_cond_signal`
+/// stress test -- found live via `pthread_cond_timedwait/2-5.c`'s 100-thread, two-mutex handoff)
+/// hands a waiting thread off from the condvar's own internal barrier word onto the mutex's futex
+/// word via exactly this call. The target thread is already genuinely blocked in a real kernel
+/// `FUTEX_WAIT` on the *old* address by the time this runs (past `__wait`'s own 100-iteration
+/// userspace spin) -- without an actual requeue (or an actual wake), nothing would ever re-check
+/// its condition again: a silent, permanent hang with no `t0` alarm rescue, since the thread is
+/// genuinely parked, not spinning.
+///
+/// This kernel has no literal ordered wait-queue data structure to requeue between (`do_futex`'s
+/// `WaitingForFutex` is a plain per-process block-reason, scanned fresh by `wake_futex`/the timer
+/// IRQ's own deadline sweep -- not a linked list). "Moving" a waiter is therefore just overwriting
+/// its own `BlockReason::WaitingForFutex`'s `(scope, key)` fields in place -- exactly equivalent in
+/// effect: a later real `FUTEX_WAKE` targeting the new address finds it, and the timer IRQ's own
+/// deadline-expiry scan keeps working unmodified (it only reads `deadline`, left untouched).
+///
+/// Both addresses are resolved as **private** unconditionally -- the one real call site never
+/// reaches this function for a pshared condvar (see above), so there's no live case needing the
+/// shared/physical-address resolution `futex_key`'s own `private` parameter otherwise provides.
+pub fn do_futex_requeue(
+    pid: Pid,
+    addr: u64,
+    addr2: u64,
+    nr_wake: u64,
+    nr_requeue: u64,
+) -> Result<u64, u64> {
+    let (scope, key) = futex_key(pid, addr, true)?;
+    let (scope2, key2) = futex_key(pid, addr2, true)?;
+
+    let woken = wake_futex(scope, key, nr_wake);
+
+    let mut requeued: u64 = 0;
+    if nr_requeue > 0 {
+        let mut table = PROCESS_TABLE.lock();
+        for proc in table.values_mut() {
+            if requeued >= nr_requeue {
+                break;
+            }
+            if let ProcState::Blocked(BlockReason::WaitingForFutex(wscope, wkey, deadline)) =
+                proc.state
+                && wscope == scope
+                && wkey == key
+            {
+                proc.state =
+                    ProcState::Blocked(BlockReason::WaitingForFutex(scope2, key2, deadline));
+                requeued += 1;
+            }
+        }
+    }
+
+    Ok(woken + requeued)
+}
+
 /// Resolves the real `(scope, key)` pair `do_futex`'s `FUTEX_WAIT`/`FUTEX_WAKE` match on -- real
 /// Linux's own `get_futex_key` (`kernel/futex/core.c`) never keys a *shared* (non-
 /// `FUTEX_PRIVATE`) futex on a bare virtual address either, for exactly the reason this function

@@ -629,6 +629,26 @@ pub(crate) fn sys_futex(addr: u64, op: u64, val: u64, to: u64) -> Result<u64, u6
     crate::process::do_futex(crate::process::scheduler::current_pid(), addr, op, val, to)
 }
 
+/// `SYS_FUTEX_REQUEUE` (`557`, OxideBSD's own invention — real Linux's `FUTEX_REQUEUE` op doesn't
+/// fit `SYS_FUTEX`'s plain 4-register wire format, see `process::do_futex_requeue`'s own doc
+/// comment). `(uaddr, uaddr2, nr_wake, nr_requeue)` — exactly this ABI's 4 real registers, the
+/// exact set of args the one real call site (`pthread_cond_timedwait.c`'s `unlock_requeue`, patched
+/// on the `oxidebsd` musl branch to call this syscall directly) ever needs.
+pub(crate) fn sys_futex_requeue(
+    addr: u64,
+    addr2: u64,
+    nr_wake: u64,
+    nr_requeue: u64,
+) -> Result<u64, u64> {
+    crate::process::do_futex_requeue(
+        crate::process::scheduler::current_pid(),
+        addr,
+        addr2,
+        nr_wake,
+        nr_requeue,
+    )
+}
+
 /// Real Linux/generic `ioctl` request codes (`third_party/musl`'s `arch/generic/bits/ioctl.h`) --
 /// this ABI's `SYS_IOCTL` reuses these verbatim as its own `request` argument values (they're
 /// already architecture-generic constants, not syscall numbers, so there's nothing to remap the
@@ -1537,6 +1557,15 @@ pub(crate) extern "C" fn oxidebsd_sys_reboot(cmd: u64) -> i64 {
 
 pub(crate) extern "C" fn oxidebsd_sys_futex(addr: u64, op: u64, val: u64, to: u64) -> i64 {
     result_to_ffi(sys_futex(addr, op, val, to))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_futex_requeue(
+    addr: u64,
+    addr2: u64,
+    nr_wake: u64,
+    nr_requeue: u64,
+) -> i64 {
+    result_to_ffi(sys_futex_requeue(addr, addr2, nr_wake, nr_requeue))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {

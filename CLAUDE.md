@@ -185,7 +185,8 @@ uname/clock_gettime/nanosleep/socket family/poll/socketpair/set_tid_address/fcnt
 readlink/symlink/setitimer/getitimer/uid-gid family/chmod/chown), then `SYS_FSYNC=471` through
 `SYS_FSTATFS=477`, `SYS_PRLIMIT64=478` through `SYS_REBOOT=486`, `SYS_UMASK=487`, `SYS_LINK=488`,
 `SYS_MKNOD=489`, `SYS_CHROOT=490`, `SYS_GETRUSAGE=491`, `SYS_MPROTECT=492`, the pre-reserved
-`526`-`553` POSIX/SysV batch (see that section), `SYS_FAULT_PUMP=554`, `SYS_CLONE=555`; plus real
+`526`-`553` POSIX/SysV batch (see that section), `SYS_FAULT_PUMP=554`, `SYS_CLONE=555`,
+`SYS_EXIT_GROUP=556`, `SYS_FUTEX_REQUEUE=557`; plus real
 Linux numbers reused directly where confirmed dead in this musl fork (`fchmod=91`,
 `sched_getaffinity=204`, `futex=202`). **Check `src/syscall/` and module sources for the current
 highest number before assigning a new one.**
@@ -1773,6 +1774,51 @@ entirely — structurally incapable of working here, not "not started yet" — s
 doesn't vendor, 25 need a companion Kconfig option a single-symbol flip didn't resolve, 3 were
 docs/example files mismatched by candidate-extraction, 1 (`lzopcat`) is a genuine link error. See
 `docs/BUSYBOX_APPLETS.md` for the full breakdown.
+
+## Closing two `pthread_cond_timedwait` hangs: a `terminate_thread_group` leader-ordering bug and real `FUTEX_REQUEUE` (`src/process/lifecycle.rs`, `src/process/limits.rs`, `third_party/musl`, `build.rs`)
+
+Both `pthread_cond_timedwait/{2-5,4-1}.c` were real, permanent hangs (`t0`'s own 40s rescue alarm
+never fired for either) left open by the previous session's scheduler/signal-termination work.
+Traced each to its own actual blocking primitive rather than more source-reading; two independent
+bugs, not one.
+
+- **`4-1.c`** (a plain single `pthread_create`, no `PTHREAD_PROCESS_SHARED`): the worker thread
+  calls a real `exit()` (== `exit_group`) after its own timed condvar wait, while the main thread
+  (the real thread-group *leader*) sits blocked in `pthread_join()`'s own futex wait.
+  `terminate_thread_group`'s loop used to kill every "sibling" (everyone but the caller) first,
+  then the caller itself last — correct only when the caller happens to *be* the leader. Here the
+  caller is the non-leader worker and the leader is one of the "siblings", so the leader got
+  processed while the worker (the caller, not yet reached in the loop) was still alive —
+  `terminate_process`'s own `other_thread_alive` check saw that and wrongly treated the *leader* as
+  a disposable non-leader thread, silently stranding it with no parent notification (the same
+  underlying failure mode `pthread_attr_setdetachstate/2-1.c`'s fix closed for the direct-call-site
+  version of this bug, just reached via a different ordering inside `terminate_thread_group` itself
+  that fix didn't touch). **Fixed**: every non-leader group member is terminated first, the leader
+  (`pid == tgid`) always last, regardless of whether it's the original caller or one of its
+  "siblings" — by the time the leader's own `terminate_process` call runs, every other real member
+  is already `Zombie`, so `other_thread_alive` correctly reads `false`.
+- **`2-5.c`** (100 threads, two mutexes, real contended condvar hand-off): musl's own
+  `pthread_cond_timedwait.c::unlock_requeue` moves a waiting thread from the condvar's internal
+  barrier word onto the mutex's futex word via real `FUTEX_REQUEUE` whenever more than one waiter
+  is queued — `do_futex` treated that op (and `FUTEX_CMP_REQUEUE`) as a silent no-op, so a thread
+  already blocked in a real kernel `FUTEX_WAIT` on the old address had nothing left to ever wake
+  it. Real `FUTEX_REQUEUE` doesn't fit this ABI's plain 4-register `SYS_FUTEX` wire format (real
+  `futex(2)` needs 6 args for this op: `uaddr`, `op`, `val`/nr_wake, `val2`/nr_requeue in the
+  timeout slot, `uaddr2`, `val3`). **Fixed** with a dedicated `SYS_FUTEX_REQUEUE=557` taking
+  exactly the 4 real args the one real call site needs (`uaddr`, `uaddr2`, `nr_wake`,
+  `nr_requeue`); `unlock_requeue` patched on the `oxidebsd` musl branch to call it directly instead
+  of overloading `SYS_futex`. This kernel has no literal wait-queue data structure to requeue
+  between (`WaitingForFutex` is a plain per-process block-reason, not a linked list) — "moving" a
+  waiter is just overwriting its own `(scope, key)` fields in place, exactly equivalent in effect.
+  Doesn't make `2-5.c` fully `PASS` (it now reaches a real `UNRESOLVED` from something else in its
+  own giant pshared/altclock scenario matrix, not a hang), but it's no longer a permanent hang, and
+  its previously-unreachable neighbors `4-2.c`/`4-3.c` — blocked from ever running by whichever of
+  `2-5.c`/`4-1.c` hung first — both now cleanly `PASS`.
+- **Verified**: isolated canary run (`POSIX_PILOT_CANARY_ONLY=1`) — `4-1.c`/`4-2.c`/`4-3.c` `PASS`,
+  `2-5.c` `UNRESOLVED` (no longer a hang), full 73-file standing regression suite otherwise
+  unchanged (52P/2F/1U/14UT/3TO/1CR). Both files removed from `POSIX_KNOWN_HANGS`, added to the
+  `POSIX_PILOT_CANARY_ONLY` standing regression suite. A fresh full-corpus supervised run to fold
+  this into an official baseline number hasn't been done yet.
 
 ## Dependency notes
 

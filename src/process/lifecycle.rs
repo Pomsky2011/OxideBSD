@@ -1370,6 +1370,26 @@ pub fn do_exit_group(caller_pid: Pid, code: i32) -> ! {
 /// `pthread_detach()` against an already-detached thread deliberately executes `a_crash()` (a raw
 /// ring-3 `hlt`, `#GP`-faulting into a self-`SIGSEGV`) — reaching exactly this path, on a process
 /// that, in this exact test, still has one live sibling thread at that moment.
+///
+/// **A second, distinct ordering bug in this exact function, since also fixed**: the loop used to
+/// terminate every "sibling" (everyone but `target_pid`) first, then `target_pid` itself last —
+/// this doc comment's own "by then `other_thread_alive` is false for the caller" reasoning only
+/// actually holds when `target_pid` happens to *be* the group's leader. If `target_pid` is a
+/// non-leader thread (any thread besides the main one can legally call `exit()`) and the leader is
+/// one of the *siblings*, the leader gets processed before `target_pid` — at that exact moment
+/// `target_pid` is still alive and not yet `Zombie`, so `terminate_process(leader)` sees
+/// `other_thread_alive == true` and wrongly takes the disposable non-leader path on the *leader*
+/// itself — the same silent-stranding bug described just above, just reached via a different call
+/// order. Found live via `pthread_cond_timedwait/4-1.c`: a `pthread_create`d worker thread calls
+/// `exit()` after a timed condvar wait while the main thread (the real leader) sits blocked in its
+/// own `pthread_join()` futex wait — the leader was a "sibling" here, terminated ahead of the
+/// actual `target_pid`, and was silently marked `Zombie` with no parent notification, hanging the
+/// parent's `wait4()` forever. Fixed by terminating every non-leader member of the group first
+/// (`target_pid` included, if it isn't the leader), then the leader (`pid == tgid`) always last,
+/// regardless of whether it's `target_pid` itself or one of its "siblings" — by the time the
+/// leader's own `terminate_process` call runs, every other real member of the group is already
+/// `Zombie`, so `other_thread_alive` correctly reads `false` and it takes the real, wait4-visible
+/// final-teardown path.
 pub(crate) fn terminate_thread_group(target_pid: Pid, code: i32) {
     let tgid = {
         let table = PROCESS_TABLE.lock();
@@ -1390,10 +1410,12 @@ pub(crate) fn terminate_thread_group(target_pid: Pid, code: i32) {
             .map(|(&pid, _)| pid)
             .collect()
     };
-    for sibling in siblings {
-        terminate_process(sibling, code);
+    for pid in siblings.into_iter().chain(core::iter::once(target_pid)) {
+        if pid != tgid {
+            terminate_process(pid, code);
+        }
     }
-    terminate_process(target_pid, code);
+    terminate_process(tgid, code);
 }
 
 /// The actual state transition `do_exit` (the caller terminating itself) and `do_kill` (one
