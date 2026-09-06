@@ -1422,21 +1422,46 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     //     permanent hang, and its previously-unreachable neighbors `4-2.c`/`4-3.c` -- blocked from
     //     ever running by whichever of `2-5.c`/`4-1.c` hung first -- both now cleanly `PASS`.
     //
-    // `pthread_kill/6-1.c`: **not confirmed a hang** -- a real, unbounded-VM-halting `EXCEPTION:
-    // INVALID OPCODE` at the real fault-trampoline's own `ud2` sentinel (`VirtAddr(
-    // 0x1ffffffff011)`), found live 2026-09-06 chasing the real `do_munmap` frame-leak fix (see
-    // CLAUDE.md's own section on that fix): fixing the leak let a full-corpus run finally get past
-    // its old ~1/3-of-the-way exhaustion point for the first time, reaching this file (previously
-    // always masked). Genuinely new territory, not caused by that fix -- this file (`pthread_kill()`
-    // on an already-joined, no-longer-existent tid, expecting real `ESRCH`) has nothing to do with
-    // mmap/munmap at all, so the bug was always here, just unreachable before. Excluded rather than
-    // investigated in the same sitting: an unbounded `EXCEPTION`-triggered reboot takes the whole
-    // boot down the same way a genuine kernel-level hang does, so it has to be excluded to get a
-    // real full-corpus tally at all. Root cause not yet chased -- most likely somewhere in cross-
-    // thread signal-target resolution given a `pthread_kill`-shaped target that no longer exists in
-    // the table at all (distinct from every existing `route_signal_target`/`resolve_signal_
-    // recipient` case, all of which assume the target pid is still present) -- next real
-    // investigation target, same "found live, fixed forward" treatment as everything above.
+    // `pthread_kill/6-1.c`: **FIXED, removed from this list entirely.** Was a real, unbounded-
+    // VM-halting `EXCEPTION: INVALID OPCODE` at the real fault-trampoline's own `ud2` sentinel
+    // (`VirtAddr(0x1ffffffff011)`), found live 2026-09-06 chasing the real `do_munmap` frame-leak
+    // fix -- fixing that leak let a full-corpus run finally get past its old exhaustion point for
+    // the first time, reaching this file (previously always masked; genuinely unrelated to the
+    // munmap fix itself). Root cause: this file calls `pthread_kill()` on an already-joined,
+    // no-longer-existent tid, whose real musl implementation dereferences it -- a genuine page
+    // fault into memory `pthread_join()`'s own real stack `munmap()` already freed, occurring
+    // *while* musl's own `__block_all_sigs()` had `SIGSEGV` blocked (real, unmodified musl's own
+    // `pthread_kill()`/`pthread_cancel()` mask every signal for a short internal critical section).
+    // `interrupts::page_fault_handler`'s own ring-3 fault-to-signal redirect used to record this
+    // exactly like an ordinary async `kill()` self-signal -- respecting the target's own blocked-
+    // signal mask, correct for `kill()` but wrong for a *synchronously*-generated fault signal,
+    // which real POSIX documents as undefined behavior to block and real Linux resolves via
+    // `force_sig()`'s own "unblock this one signal, then queue it" semantics. With `SIGSEGV`
+    // blocked, `deliver_pending_signal`'s own `take_deliverable_signal` correctly refused to act on
+    // it, leaving the trampoline's own `SYS_FAULT_PUMP` dispatch with nothing to deliver -- falling
+    // through to `ud2`. Fixed via `process::signals::force_fault_signal` (used by both
+    // `page_fault_handler` and `general_protection_fault_handler`'s identical self-signal call):
+    // force-clears just the one bit being delivered from `blocked_signals` before recording it,
+    // matching real Linux's own scope (every *other* signal `pthread_kill()`'s own critical section
+    // blocked stays blocked). Confirmed fixed: this file now cleanly `CRASH(139)`s (a real, normal,
+    // per-process `SIGSEGV` termination -- accessing already-`munmap()`'d memory via a stale
+    // `pthread_t` is genuine real-world undefined behavior a real system might also crash on;
+    // what mattered was containing it to one process instead of halting the whole VM) instead of
+    // taking the whole boot down. `mmap_syscall_smoke`/`pthread_cancel_crash_smoke`/
+    // `pshared_cond_crash_smoke` (all real fault-to-signal exercises) confirmed still passing clean.
+    //
+    // `pthread_cond_init/4-2.c` and `timer_settime/2-1.c`: **not regressions, real, pre-existing
+    // flakiness** -- found live re-running the standing canary suite right after the fix above.
+    // `pthread_cond_init/4-2.c`: 2 of 3 isolated re-runs `PASS`, 1 `CRASH(139)`, same file, same
+    // build, no source changes between runs -- unrelated to `force_fault_signal` (never calls
+    // `pthread_kill`/`pthread_cancel`), most likely a genuine timing-dependent race in real thread
+    // creation/destruction, the same *class* `pthread_attr_setdetachstate/2-1.c` had before its own
+    // fix made it deterministic. `timer_settime/2-1.c`: one `FAIL` then 3/3 clean `PASS` in
+    // isolation immediately after -- real-time-based tests are sensitive to host-load-induced QEMU/
+    // TCG timing variance, matching this project's own established precedent for this exact test
+    // family. Neither excluded (both are normal, contained, non-hanging outcomes) or chased
+    // further tonight -- noted here so a future "why did the canary tally shift slightly" isn't
+    // mistaken for a new regression.
 ];
 
 /// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
@@ -1449,19 +1474,20 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above -- **one live exclusion as of 2026-09-06**: `pthread_kill/6-1.c`
-///   (a real, unbounded-VM-halting `EXCEPTION: INVALID OPCODE`, found live only once the real
-///   `do_munmap` frame-leak fix let a full-corpus run get past its old exhaustion point far enough
-///   to reach it for the first time -- see that entry's own doc comment; not yet root-caused).
-///   Every *other* file this array or a fresh full-corpus supervised run has ever flagged --
-///   `fork/8-1.c`, `sched_yield/1-1.c`, `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`,
-///   `pthread_cond_timedwait/{2-5,4-1}.c`, and `shm_open/23-1.c` (the last to go: a real global-fd-
-///   table-exhaustion cascade, fixed by moving `OpenFile::Write`'s content buffer out of
-///   `modules/oxfs`'s `OPEN_FILES` table into its own separate, lazily-claimed `WRITE_BUFFERS`
-///   pool -- see that pool's own doc comment) -- is confirmed either genuinely fixed or to have
-///   never actually been a real hang at all (see this array's own doc comment on each entry for the
-///   full story -- `sched_yield/1-1.c` in particular was excluded on a claim ("needs real SMP")
-///   that was simply never re-verified against the test's own source until it was re-checked).
+/// - **`POSIX_KNOWN_HANGS`** above -- **empty again as of 2026-09-06** (kept as an array, not
+///   deleted, purely as a landing spot for the next real one). Every file this array or a fresh
+///   full-corpus supervised run has ever flagged -- `fork/8-1.c`, `sched_yield/1-1.c`,
+///   `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`, `pthread_cond_timedwait/
+///   {2-5,4-1}.c`, `shm_open/23-1.c` (a real global-fd-table-exhaustion cascade, fixed by moving
+///   `OpenFile::Write`'s content buffer out of `modules/oxfs`'s `OPEN_FILES` table into its own
+///   separate, lazily-claimed `WRITE_BUFFERS` pool -- see that pool's own doc comment), and
+///   `pthread_kill/6-1.c` (the last to go: a real fault-to-signal-delivery bug, a synchronously-
+///   generated `SIGSEGV` occurring while blocked -- fixed via `process::signals::
+///   force_fault_signal`, see that entry's own doc comment) -- is confirmed either genuinely fixed
+///   or to have never actually been a real hang at all (see this array's own doc comment on each
+///   entry for the full story -- `sched_yield/1-1.c` in particular was excluded on a claim ("needs
+///   real SMP") that was simply never re-verified against the test's own source until it was
+///   re-checked).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1669,6 +1695,10 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // source instead of repeating an old, never-re-verified claim. See `POSIX_KNOWN_HANGS`'s
             // own doc comment above for the full story. Confirmed `PASS` via an isolated canary run.
             "sched_yield/1-1.c",
+            // `pthread_kill/6-1.c`: real regression coverage for `process::signals::
+            // force_fault_signal` -- see `POSIX_KNOWN_HANGS`'s own doc comment above (used to be a
+            // whole-VM-halting `EXCEPTION: INVALID OPCODE`, now a clean, contained `CRASH(139)`).
+            "pthread_kill/6-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
