@@ -111,6 +111,8 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         // pid 1's own thread group of one -- see Process::tgid's own doc comment.
         tgid: pid,
         parent,
+        // pid 1 has no parent to ever be orphaned from.
+        adopted: false,
         children: Vec::new(),
         state: ProcState::Ready,
         address_space: Some(address_space),
@@ -412,6 +414,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // parent's. See Process::tgid's own doc comment.
         tgid: child_pid,
         parent: Some(caller_pid),
+        // A freshly forked child's real parent is alive right now, by definition -- see
+        // `Process::adopted`'s own doc comment.
+        adopted: false,
         children: Vec::new(),
         state: ProcState::Ready,
         address_space: Some(child_address_space),
@@ -654,6 +659,9 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         pid: child_pid,
         tgid,
         parent: parent_field,
+        // A freshly cloned thread's real parent is alive right now -- see `Process::adopted`'s
+        // own doc comment.
+        adopted: false,
         children: Vec::new(),
         state: ProcState::Ready,
         address_space: Some(child_address_space),
@@ -1435,7 +1443,44 @@ pub(crate) fn terminate_thread_group(target_pid: Pid, code: i32) {
 /// process is ever `Running` at a time on this cooperatively-scheduled kernel, so `target !=
 /// caller` always means "not the one currently executing") must not, since the calling process
 /// itself is still running and hasn't blocked or exited.
+/// Real pid 1 -- `init` in every real Unix, `hush` here (see `spawn`'s own doc comment). The one
+/// process every real orphan gets reparented to.
+const INIT_PID: Pid = 1;
+
+/// Real orphan reparenting: any still-living child of `pid` gets handed to `INIT_PID` rather than
+/// left permanently parentless -- see `Process::adopted`'s own doc comment for why this exists and
+/// why an adopted orphan's own later exit needs different handling than an ordinary child's.
+/// Real POSIX behavior (a real orphan's own `getppid()` genuinely reads back `1`), not just
+/// internal bookkeeping. No-op if `pid` is `INIT_PID` itself (nothing left to reparent *to* if
+/// init exits) or has no live children.
+fn reparent_orphans(pid: Pid) {
+    if pid == INIT_PID {
+        return;
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let Some(children) = table.get_mut(&pid).map(|me| core::mem::take(&mut me.children)) else {
+        return;
+    };
+    if children.is_empty() {
+        return;
+    }
+    for &child_pid in &children {
+        if let Some(child) = table.get_mut(&child_pid) {
+            child.parent = Some(INIT_PID);
+            child.adopted = true;
+        }
+    }
+    if let Some(init) = table.get_mut(&INIT_PID) {
+        init.children.extend(children);
+    }
+}
+
 pub(crate) fn terminate_process(pid: Pid, code: i32) {
+    // Real orphan reparenting -- see `reparent_orphans`'s own doc comment. Runs unconditionally,
+    // before any of the branches below, since even a non-leader `CLONE_THREAD` sibling (the
+    // `other_thread_alive` branch just below) can have forked real children of its own under its
+    // own real pid.
+    reparent_orphans(pid);
     // Real CLONE_THREAD semantics: only the whole thread group ever generates a wait4-visible
     // zombie, not each individual thread (a real pthread_join never goes through wait4 at all --
     // see process::lifecycle::do_clone's own doc comment). A plain scan for any *other* live
@@ -1577,11 +1622,17 @@ pub(crate) fn terminate_process(pid: Pid, code: i32) {
     // notify_parent_sigchld calls above, not instead of them. Detaches from the parent's
     // `children` list immediately either way, so a parent with no other children gets a real
     // `ECHILD` on its very next `wait()` call instead of blocking forever.
-    let auto_reap = table
-        .get(&pid)
-        .and_then(|me| me.parent)
-        .and_then(|parent_pid| table.get(&parent_pid))
-        .is_some_and(|parent| parent.shared.lock().sigactions[SIGCHLD as usize].flags & SA_NOCLDWAIT != 0);
+    //
+    // Also true for a real adopted orphan (`Process::adopted`, see its own doc comment) exiting --
+    // reuses this exact same immediate-detach-and-reap path, since nothing is ever really going to
+    // `wait4()` it either: pid 1 (`hush`) here only waits on pids its own userspace job control
+    // remembers explicitly forking, never a generic "reap anything adopted" loop a real init has.
+    let auto_reap = table.get(&pid).is_some_and(|me| me.adopted)
+        || table
+            .get(&pid)
+            .and_then(|me| me.parent)
+            .and_then(|parent_pid| table.get(&parent_pid))
+            .is_some_and(|parent| parent.shared.lock().sigactions[SIGCHLD as usize].flags & SA_NOCLDWAIT != 0);
     if auto_reap {
         let parent_pid = table.get(&pid).unwrap().parent;
         if let Some(parent_pid) = parent_pid

@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
+    FrameAllocator, FrameDeallocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
 use x86_64::structures::paging::mapper::TranslateResult;
 
@@ -778,15 +778,39 @@ pub fn do_munmap(caller_pid: Pid, addr: u64, len: u64) -> Result<u64, u64> {
         // every other process, not just this one. `addr`/`len` are entirely caller-controlled with
         // no prior validation that they ever came from a real `mmap()` return value, so this check
         // is the only thing standing between a wild `munmap()` call and exactly that.
-        let is_user_page = matches!(
-            mapper.translate(page.start_address()),
-            TranslateResult::Mapped { flags, .. } if flags.contains(PageTableFlags::USER_ACCESSIBLE)
-        );
+        //
+        // Real frame reclaim, found live chasing the POSIX conformance pilot's own full-corpus
+        // frame exhaustion: `Mapper::unmap` hands back the exact frame it just unmapped, but this
+        // used to discard it (`(_, flush)`) instead of ever returning it to the frame allocator --
+        // a genuine, permanent leak of every page any real `munmap()` call ever unmapped, distinct
+        // from (and far more common than) the already-documented "no frame dealloc for module/
+        // SysV-shm/MAP_SHARED-owned frames" gap. Real musl's own `pthread_join()`/`__munmap`
+        // unmaps a joined thread's stack on every single join, and the POSIX pilot's own `mmap/
+        // munmap` directories call this directly too -- both silently leaked one frame per unmapped
+        // page forever. `SHARED_LEAF` frames (fd-backed `MAP_SHARED`) are the one real exception,
+        // same as `AddressSpace::teardown`'s own walk -- that content is owned by
+        // `MMAP_FILE_CACHE`, released via `release_mmap_file_ref` below instead, never by this
+        // per-page free.
+        let translated = mapper.translate(page.start_address());
+        let (is_user_page, is_shared_leaf) = match translated {
+            TranslateResult::Mapped { flags, .. } => (
+                flags.contains(PageTableFlags::USER_ACCESSIBLE),
+                flags.contains(memory::address_space::SHARED_LEAF),
+            ),
+            _ => (false, false),
+        };
         if !is_user_page {
             continue;
         }
-        if let Ok((_, flush)) = mapper.unmap(page) {
+        if let Ok((frame, flush)) = mapper.unmap(page) {
             flush.flush();
+            if !is_shared_leaf {
+                // SAFETY: this frame was exclusively backing this one now-removed mapping (a
+                // private/anonymous page, never a SHARED_LEAF one, checked above) -- no other
+                // page table can be viewing it, same ownership guarantee `AddressSpace::teardown`'s
+                // own per-leaf free already relies on.
+                with_frame_allocator(|fa| unsafe { fa.deallocate_frame(frame) });
+            }
         }
     }
 

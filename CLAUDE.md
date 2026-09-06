@@ -1971,6 +1971,65 @@ table exhaustion cascade..." above) needed up to 1000 real simultaneous `OPEN_FI
   still pass cleanly; the full canary regression suite (78 files, `shm_open/23-1.c` now included)
   matches the expected baseline with zero regressions.
 
+## Real orphan reparenting, and a real `do_munmap` frame leak found chasing full-corpus physical-frame exhaustion (`src/process/{mod,lifecycle}.rs`, `src/process/mm.rs`)
+
+Running the full, un-curated ~1687-file POSIX pilot corpus (no `POSIX_PILOT_CANARY_ONLY` subset)
+for the first time surfaced a real, severe cascade: a fresh `--reset` run reported only 354 `PASS`
+against 1196 `UNRESOLVED` (out of 1687) — every file past a point roughly 1/3 through the corpus
+(first hit around `pthread_cond_timedwait/1-1.c`) came back `UNRESOLVED`, each one completing
+suspiciously fast rather than running its real workload. `run-out.txt`'s own content (temporarily
+echoed to serial for diagnosis) showed why: `hush: can't execute 'cat': No memory` — real `ENOMEM`
+on `fork()`/`execve()`, not a hang or a crash.
+
+- **First hypothesis, real but not the dominant cause**: this codebase never reparents an orphan
+  to a pid-1 "init" (a known, already-documented accepted gap — see `do_wait4`'s own doc comment
+  history above). A never-`wait4()`'d child's table entry — including its own `kernel_stack` (a
+  real 512 KiB-scaled heap allocation on a RAM-rich boot, not the 128 KiB floor) — survives forever
+  once orphaned, unlike its address space (already freed immediately at exit regardless, since the
+  "Real zombie address-space frame reclaim" fix). **Fixed for real** (`Process::adopted`,
+  `process::lifecycle::reparent_orphans`/`INIT_PID`): any process's still-living children are
+  reparented to pid 1 on exit, exactly like real Unix (`getppid()` on an orphan genuinely reads
+  back `1`); an *adopted* orphan's own later exit is treated exactly like `SA_NOCLDWAIT` (immediate
+  detach-and-reap), since pid 1 here (`hush`) has no generic "reap anything adopted" loop the way a
+  real init does. A real, worthwhile fix in its own right — but rerunning the full corpus with only
+  this fix landed produced **byte-for-byte identical** results to the run without it, proving it
+  wasn't the actual mechanism behind this specific cascade (most of this corpus's tests do properly
+  reap their own children or go through real `exit_group()` cleanup; kernel-stack-sized orphan
+  leaks are real but comparatively rare).
+- **Root cause, found via direct instrumentation, not guesswork**: added temporary counters to
+  `BootInfoFrameAllocator` (live frames-in-use) and a read-only mirror of `AddressSpace::teardown`'s
+  own walk (counts every frame reachable in a table without freeing anything), then compared
+  "frames allocated building this address space" against "frames reachable in its own table" for
+  every real `fork()`/`execve()` in the corpus — **zero mismatch, every single time** (295 execve
+  samples, 165 fork samples, all `diff=0`). This ruled out both construction (over-allocating
+  orphaned, never-linked frames) and destruction (`teardown()`'s own walk, confirmed via a separate
+  per-call "frames freed" counter to correctly free everything reachable) as sources of the leak —
+  both halves of the address-space lifecycle are individually exact. The actual bug was a third,
+  previously unconsidered path: **`do_munmap`'s own unmap loop discarded the frame `Mapper::unmap`
+  handed back** (`if let Ok((_, flush)) = mapper.unmap(page)`) instead of ever returning it to the
+  frame allocator — a permanent, silent leak of every page any real `munmap()` call ever unmapped.
+  Real musl's own `pthread_join()` munmaps a joined thread's stack on every single join, and the
+  pilot's own `mmap`/`munmap` directories call this directly too — both leaked one physical frame
+  per unmapped page, forever, invisible to both the construction and destruction checks above since
+  the frame was already gone from the page table (and thus from `teardown`'s own later view) well
+  before either process ever exited. **Fixed**: capture the returned frame and, unless it carries
+  `SHARED_LEAF` (a real fd-backed `MAP_SHARED` mapping, whose content is owned by `MMAP_FILE_CACHE`
+  and released via `release_mmap_file_ref` instead — same exemption `AddressSpace::teardown`'s own
+  walk already makes), return it to the frame allocator via `FrameDeallocator::deallocate_frame`.
+  `src/fs/sysv_shm.rs`'s own near-identical-looking `shmdt` unmap loop was checked too and left
+  alone — every page there is unconditionally shared (owned by `SEGMENTS`), so discarding the frame
+  there is already correct, not the same bug.
+- **Verified**: `mmap_syscall_smoke` (real, heavy `munmap` exercise) still passes all 13 parts
+  clean; the 78-file standing canary regression suite matches its established baseline exactly
+  (`55P/2F/1U/14UT/5TO/1CR`) with the fix in place. **Not yet done**: a fresh full-corpus run to
+  measure the real, corrected pass rate — the munmap fix let the corpus run much further than
+  before (real workloads instead of instant `ENOMEM` fails) and surfaced a **new**, likely
+  pre-existing crash around `pthread_kill/3-1.c` (`EXCEPTION: INVALID OPCODE` at the real
+  fault-trampoline's own `ud2` sentinel, `VirtAddr(0x1ffffffff011)`) that was previously masked by
+  the frame-exhaustion cascade happening first — a separate, not-yet-investigated bug, most likely
+  in cross-thread/cross-process signal delivery given where it landed, next in line for the same
+  "found live, fixed forward" treatment.
+
 ## Dependency notes
 
 - `x86_64` crate: `default-features = false, features = ["instructions", "abi_x86_interrupt"]` —
