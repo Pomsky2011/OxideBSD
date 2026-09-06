@@ -48,7 +48,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use spin::Mutex;
 
 use crate::process::scheduler;
-use crate::syscall::EBADF;
+use crate::syscall::{EBADF, ESPIPE};
 
 /// Matches `syscall::SyscallHandler`'s own FFI convention (negative = `-errno`, non-negative =
 /// success value) for the same reason — see that type's doc comment. Kept as a separate type
@@ -57,6 +57,19 @@ use crate::syscall::EBADF;
 /// happen to coincide.
 pub(crate) type FdReadWrite = extern "C" fn(u64, u64, u64) -> i64;
 pub(crate) type FdClose = extern "C" fn(u64) -> i64;
+/// Real `pread(2)`/`pwrite(2)`: `(real_fd, ptr, len, offset)` — like `FdReadWrite` above, but with
+/// an explicit offset that (per real POSIX) neither reads nor updates the fd's own current file
+/// position, unlike plain `read`/`write`. Optional per fd kind (defaults to `no_pread_pwrite`,
+/// below) since most registered fd kinds (pipes, sockets, mqueues, devices) have no real seekable
+/// position at all — only `modules/oxfs`'s own real, on-disk-backed `OpenFile` variants register
+/// real implementations (see `oxidebsd_set_fd_pread_pwrite`).
+pub(crate) type FdReadWriteAt = extern "C" fn(u64, u64, u64, u64) -> i64;
+
+/// Default `pread`/`pwrite` callback for any fd kind that never calls `oxidebsd_set_fd_pread_pwrite`
+/// — real POSIX `ESPIPE`, matching what `lseek(2)` on the same kind of fd already reports.
+extern "C" fn no_pread_pwrite(_real_fd: u64, _ptr: u64, _len: u64, _offset: u64) -> i64 {
+    -(ESPIPE as i64)
+}
 
 /// `content_id`'s shape — real Linux/POSIX has no analogous concept at the syscall boundary, this
 /// is purely internal plumbing for `crate::process::mm::do_mmap`'s fd-backed `MAP_SHARED` support:
@@ -79,6 +92,8 @@ struct FdOps {
     write: FdReadWrite,
     close: FdClose,
     content_id: FdContentId,
+    pread: FdReadWriteAt,
+    pwrite: FdReadWriteAt,
     /// The fd this entry's callbacks are actually invoked with — itself for a fresh registration,
     /// or another entry's own `real_fd` for a `dup2`/`fork_inherit`-created alias (see this file's
     /// module doc comment). Chains never nest more than one level deep in practice, but every alias
@@ -229,10 +244,29 @@ fn register(
             write,
             close,
             content_id,
+            pread: no_pread_pwrite,
+            pwrite: no_pread_pwrite,
             real_fd: fd,
         },
     );
     *REFCOUNTS.lock().entry(fd).or_insert(0) += 1;
+}
+
+/// Overrides `real_fd`'s `pread`/`pwrite` callbacks after the fact — a separate setter, not a
+/// parameter on `register`/`oxidebsd_register_fd_ops*`, so every existing fd-registering call site
+/// (pipes, sockets, mqueues, ttys, ...) needed zero changes; they keep the `no_pread_pwrite`
+/// default `register` already sets. Exported to modules (`crate::module`'s kernel API table) as
+/// `oxidebsd_set_fd_pread_pwrite` — `modules/oxfs` is the one real caller today, right after
+/// `register_open_file` for its own real, on-disk-backed `OpenFile` variants.
+pub(crate) extern "C" fn oxidebsd_set_fd_pread_pwrite(
+    fd: u64,
+    pread: FdReadWriteAt,
+    pwrite: FdReadWriteAt,
+) {
+    if let Some(ops) = TABLE.lock().get_mut(&(scheduler::current_tgid(), fd)) {
+        ops.pread = pread;
+        ops.pwrite = pwrite;
+    }
 }
 
 /// Removes the calling process's own `fd` from the registry; only actually invokes the underlying
@@ -404,6 +438,27 @@ pub(crate) fn write(fd: u64, ptr: u64, len: u64) -> Option<i64> {
         return Some(0);
     }
     Some((ops.write)(ops.real_fd, ptr, len))
+}
+
+/// Real `pread(2)` — like `read` above, but never touches the fd's own current file position (real
+/// POSIX: `pread`/`pwrite` are independent of, and don't affect, `lseek`'s own cursor). `None` if
+/// `fd` isn't registered at all (`EBADF`, matching `read`/`write`'s own convention); `-ESPIPE` (via
+/// `no_pread_pwrite`) for any fd kind with no real seekable position.
+pub(crate) fn pread(fd: u64, ptr: u64, len: u64, offset: u64) -> Option<i64> {
+    let ops = *TABLE.lock().get(&(scheduler::current_tgid(), fd))?;
+    if len == 0 {
+        return Some(0);
+    }
+    Some((ops.pread)(ops.real_fd, ptr, len, offset))
+}
+
+/// Real `pwrite(2)` — see `pread`'s own doc comment just above.
+pub(crate) fn pwrite(fd: u64, ptr: u64, len: u64, offset: u64) -> Option<i64> {
+    let ops = *TABLE.lock().get(&(scheduler::current_tgid(), fd))?;
+    if len == 0 {
+        return Some(0);
+    }
+    Some((ops.pwrite)(ops.real_fd, ptr, len, offset))
 }
 
 /// Looks up the calling process's own `fd` and returns its `real_fd` — the underlying resource
@@ -595,6 +650,8 @@ pub fn init() {
             write: stdout_write,
             close: stdio_close,
             content_id: no_content_id,
+            pread: no_pread_pwrite,
+            pwrite: no_pread_pwrite,
             real_fd: 1,
         },
     );

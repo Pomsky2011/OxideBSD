@@ -88,6 +88,10 @@ use crate::process::RawSiginfo;
 pub(crate) const EBADF: u64 = 9;
 pub(crate) const EINVAL: u64 = 22;
 pub(crate) const ENOSYS: u64 = 38;
+/// Identical on Linux and the BSDs. Real POSIX `pread`/`pwrite`'s own documented errno for a fd
+/// that "is associated with a pipe, FIFO, or socket" (or, in this codebase, any other fd kind with
+/// no real seekable position) -- see `crate::fs::fd::FdReadWriteAt`'s own doc comment.
+pub(crate) const ESPIPE: u64 = 29;
 /// Identical on Linux and the BSDs. This codebase's usual convention for a bad user pointer is to
 /// let the real dereference page-fault and go through the real ring-3 fault-to-signal path (see
 /// CLAUDE.md's "Real ring-3 fault-to-signal delivery" section) rather than pre-validate — but a

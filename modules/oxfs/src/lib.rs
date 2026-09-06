@@ -103,6 +103,15 @@ unsafe extern "C" {
     /// -- see `crate::fs::fd::oxidebsd_set_fd_cloexec`'s own doc comment (kernel tree). `oxfs_open`
     /// is the one caller here, right after a successful real `O_CLOEXEC` open.
     fn oxidebsd_set_fd_cloexec(fd: u64, on: u64) -> i64;
+    /// Overrides `fd`'s real `pread`/`pwrite` callbacks -- see
+    /// `crate::fs::fd::oxidebsd_set_fd_pread_pwrite`'s own doc comment (kernel tree).
+    /// `register_open_file` is the one caller here, right after every fresh fd's ordinary
+    /// `read`/`write`/`close`/`content_id` registration.
+    fn oxidebsd_set_fd_pread_pwrite(
+        fd: u64,
+        pread: extern "C" fn(u64, u64, u64, u64) -> i64,
+        pwrite: extern "C" fn(u64, u64, u64, u64) -> i64,
+    );
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
     fn oxidebsd_get_root() -> u64;
@@ -268,6 +277,10 @@ const O_CREAT: u64 = 0o100;
 /// before: every open of an existing path used to always end up read-only regardless of what the
 /// caller actually asked for).
 const O_ACCMODE: u64 = 0o3;
+/// Real generic `open(2)` `O_RDWR` value -- see `OpenFile::Write`'s own `readwrite`/`position`
+/// fields for what this actually unlocks (real bidirectional read/write/seek through one fd,
+/// found missing live via the Open POSIX Test Suite's `aio_read`/`aio_write`/`lio_listio` pilot).
+const O_RDWR: u64 = 0o2;
 /// Real generic `open(2)` `O_EXCL` value -- combined with `O_CREAT`, real POSIX requires
 /// `open()` to fail `EEXIST` when the target name already exists (regardless of what it resolves
 /// to -- a symlink, a directory, an existing regular file all count), rather than transparently
@@ -1080,6 +1093,51 @@ fn resize_inode_data(inode_num: u32, new_size: usize) -> bool {
     }
     let mut inode = read_inode(inode_num);
     inode.size = new_size as u32;
+    let now = unsafe { oxidebsd_unix_time() };
+    inode.mtime = now;
+    inode.ctime = now;
+    write_inode(inode_num, inode);
+    true
+}
+
+/// Real `pwrite(2)`'s own logic: writes `data` directly into `inode_num`'s real blocks starting at
+/// `position`, without ever materializing the file's complete old-or-new content in one buffer --
+/// same block-by-block approach `resize_inode_data` already uses, extended to write real content
+/// instead of zeros. A gap between the file's current real size and `position` (real POSIX: writing
+/// past EOF creates a hole that reads back as zero) is zero-filled first via `resize_inode_data`
+/// itself, reusing its own already-correct real "grow into a hole" logic rather than duplicating
+/// it. Load-bearing for the same reason `resize_inode_data` is: this filesystem's per-file cap is
+/// ~4 MiB, far past what a 128 KiB kernel stack could hold as one local buffer -- and, unlike
+/// `OpenFile::Write`'s own `WRITE_BUFFERS` pool (bounded to `MAX_WRITE_BUFFER` = 128 KiB per fd),
+/// this has no buffer-size ceiling at all short of the filesystem's own real per-file cap. See
+/// `oxfs_pwrite`'s own doc comment for the real caller (`SYS_PWRITE`, found live via the Open POSIX
+/// Test Suite's `aio_write`/`lio_listio` pilot -- `lio_listio/1-1.c` alone needs a real 1 MiB
+/// `pwrite()`, far past what the pooled buffer could ever hold).
+fn write_inode_at(inode_num: u32, position: usize, data: &[u8]) -> bool {
+    let old_size = read_inode(inode_num).size as usize;
+    if position > old_size && !resize_inode_data(inode_num, position) {
+        return false;
+    }
+    let mut pos = position;
+    let mut written = 0;
+    while written < data.len() {
+        let block_index = pos / BLOCK_SIZE;
+        let in_block_off = pos % BLOCK_SIZE;
+        let Some(blk) = inode_ensure_block_at(inode_num, block_index) else {
+            return false;
+        };
+        let mut block = read_block(blk);
+        let chunk = (data.len() - written).min(BLOCK_SIZE - in_block_off);
+        block[in_block_off..in_block_off + chunk]
+            .copy_from_slice(&data[written..written + chunk]);
+        write_block(blk, &block);
+        pos += chunk;
+        written += chunk;
+    }
+    let mut inode = read_inode(inode_num);
+    if pos > inode.size as usize {
+        inode.size = pos as u32;
+    }
     let now = unsafe { oxidebsd_unix_time() };
     inode.mtime = now;
     inode.ctime = now;
@@ -2163,6 +2221,23 @@ enum OpenFile {
         /// (which never gated on it at all, unlike the existing-path branch's own `want_write`
         /// check).
         readonly: bool,
+        /// Real `O_RDWR` (as opposed to `O_WRONLY`) at `open()` time -- unlocks real `read()`/
+        /// `lseek()`/`pread()`/`pwrite()` support directly against this same fd's own pending (or
+        /// already-committed, via `resolve_write_fd_inode`'s forced early commit) content, on top
+        /// of the ordinary write-then-commit-at-close path every `Write` fd already has -- see
+        /// `oxfs_read`/`oxfs_lseek`/`oxfs_pread`/`oxfs_pwrite`'s own doc comments. `false` (the
+        /// existing, unchanged behavior: `read()`/`lseek()` are `EBADF`/`ESPIPE`) for a plain
+        /// `O_WRONLY` fd -- found missing live via the Open POSIX Test Suite's `aio_read`/
+        /// `aio_write`/`lio_listio` pilot, all three of which `open(O_CREAT|O_RDWR)` then read back
+        /// through the very same fd they just wrote.
+        readwrite: bool,
+        /// Real `read()`/`lseek()` cursor -- meaningful only when `readwrite` is `true` (an
+        /// ordinary `O_WRONLY` fd has no real seekable position at all, see `readonly`'s sibling
+        /// `readwrite` field above). Distinct from `len` (this fd's own pending-write-buffer
+        /// extent, still used exactly as before for the write side) since a real caller can
+        /// `lseek()` this back to an earlier position without discarding what's already been
+        /// written.
+        position: usize,
         /// The real requested creation mode (`open(O_CREAT, mode)`'s own `mode` argument, masked
         /// to `0o777`) -- only meaningful when `existing_inode` is still `None` at `commit_write_
         /// buffer` time (a brand-new inode is being allocated, and this is what its own `mode`
@@ -2246,7 +2321,11 @@ fn register_open_file(open_file: OpenFile) -> i64 {
             oxfs_write,
             oxfs_close,
             oxfs_content_id,
-        )
+        );
+        // Always registered, unconditionally -- same "the callback itself discriminates by
+        // variant" reasoning `oxfs_content_id` above already established. See `oxfs_pread`/
+        // `oxfs_pwrite`'s own doc comments for what each real variant actually supports.
+        oxidebsd_set_fd_pread_pwrite(fd, oxfs_pread, oxfs_pwrite);
     };
     fd as i64
 }
@@ -2988,6 +3067,8 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                         resized_directly: false,
                         unlinked: false,
                         readonly: false, // this whole arm only runs when want_write is true
+                        readwrite: flags & O_ACCMODE == O_RDWR,
+                        position: len,
                         // Unused: `commit_write_buffer`'s `existing_inode: Some(_)` branch never
                         // touches `inode.mode` -- overwriting/appending to a file that already
                         // exists never changes its own real, already-stored permission bits.
@@ -3024,6 +3105,8 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                 // gated on it before (see `readonly`'s own doc comment for the real bug this
                 // closes).
                 readonly: flags & O_ACCMODE == 0,
+                readwrite: flags & O_ACCMODE == O_RDWR,
+                position: 0,
                 // Real requested creation mode -- see `oxfs_open`'s own `mode` parameter doc
                 // comment for the wire-format history (this ABI's `open(2)` used to have no way
                 // to carry `mode` at all, so every `O_CREAT` file silently got `FIXED_PERM`
@@ -3050,6 +3133,28 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
 }
 
 extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
+    // Real `O_RDWR` support: force an early real commit (if this fd hasn't already committed --
+    // see `resolve_write_fd_inode`'s own doc comment) so this read sees whatever's been written so
+    // far, then read from the real inode directly. A separate, sequential lookup rather than a
+    // branch inside the match below: `resolve_write_fd_inode` does its own fresh `find_open_file`
+    // call internally, which would alias the `&mut OpenFile` a single enclosing match already
+    // holds (both ultimately borrow the same `static mut OPEN_FILES` slot).
+    if matches!(find_open_file(fd), Some(OpenFile::Write { readwrite: true, .. })) {
+        let Some(inode) = resolve_write_fd_inode(fd) else {
+            return -EIO;
+        };
+        let Some(OpenFile::Write { position, .. }) = find_open_file(fd) else {
+            return -EBADF;
+        };
+        // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+        let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+        let n = read_inode_at(inode, *position, out);
+        *position += n;
+        if n > 0 {
+            touch_atime(inode);
+        }
+        return n as i64;
+    }
     let Some(file) = find_open_file(fd) else {
         return -EBADF;
     };
@@ -3198,6 +3303,8 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         resized_directly,
         unlinked,
         readonly: _,
+        readwrite: _,
+        position: _,
         mode,
     } = file
     else {
@@ -4607,18 +4714,46 @@ extern "C" fn oxfs_fstat(fd: u64, buf_ptr: u64, _a2: u64, _a3: u64) -> i64 {
 /// `offset`/`whence` arrive as real `u64` register values -- `offset` is reinterpreted as `i64`
 /// (real `lseek(2)`'s own signed-offset convention; musl's `off_t` is 64-bit on this arch, so no
 /// truncation). Real `SEEK_SET=0`/`SEEK_CUR=1`/`SEEK_END=2` -- no divergence to remap. Only the
-/// `{FileRead,DirListing,ProcRead,ProcDir}` variants have a real `position`/size to seek within;
-/// `Write` (an in-progress accumulate-then-commit buffer, not a real random-access file -- see
-/// `OpenFile::Write`'s own doc comment) and the synthetic `/dev/*` variants report `ESPIPE`, the
-/// real POSIX answer for "this fd has no seekable position", rather than silently accepting a seek
-/// that would never actually change what a later `read`/`write` sees.
+/// `{FileRead,DirListing,ProcRead,ProcDir}` variants have a real `position`/size to seek within,
+/// plus now `Write` fds with real `readwrite` support (see that field's own doc comment) -- a
+/// plain `O_WRONLY` `Write` fd (an in-progress accumulate-then-commit buffer, not a real
+/// random-access file) and the synthetic `/dev/*` variants still report `ESPIPE`, the real POSIX
+/// answer for "this fd has no seekable position", rather than silently accepting a seek that would
+/// never actually change what a later `read`/`write` sees.
 extern "C" fn oxfs_lseek(fd: u64, offset: u64, whence: u64, _a3: u64) -> i64 {
     // SAFETY: FFI call to a kernel-exported function, matching its declared signature exactly.
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
         return -EBADF;
     }
-    let Some(open_file) = find_open_file(real_fd as u64) else {
+    let real_fd = real_fd as u64;
+    // Real `O_RDWR` support: a separate, sequential lookup rather than a branch inside the match
+    // below -- see `oxfs_read`'s own doc comment for why (`resolve_write_fd_inode` needs its own
+    // fresh `find_open_file` call, which would alias the match's own `&mut OpenFile`). Forces an
+    // early real commit so `size` reflects everything written so far, not just this fd's own
+    // still-pending buffer.
+    if matches!(find_open_file(real_fd), Some(OpenFile::Write { readwrite: true, .. })) {
+        let Some(inode) = resolve_write_fd_inode(real_fd) else {
+            return -EIO;
+        };
+        let size = read_inode(inode).size as i64;
+        let Some(OpenFile::Write { position, .. }) = find_open_file(real_fd) else {
+            return -EBADF;
+        };
+        let offset = offset as i64;
+        let new_pos = match whence {
+            0 => offset,
+            1 => *position as i64 + offset,
+            2 => size + offset,
+            _ => return -EINVAL,
+        };
+        if new_pos < 0 {
+            return -EINVAL;
+        }
+        *position = new_pos as usize;
+        return new_pos;
+    }
+    let Some(open_file) = find_open_file(real_fd) else {
         return -EBADF;
     };
     let offset = offset as i64;
@@ -4644,6 +4779,69 @@ extern "C" fn oxfs_lseek(fd: u64, offset: u64, whence: u64, _a3: u64) -> i64 {
     }
     *position = new_pos as usize;
     new_pos
+}
+
+/// Registered (via `oxidebsd_set_fd_pread_pwrite`) as every oxfs fd's `pread` callback -- real
+/// `pread(2)`: like `oxfs_read`, but at an explicit `offset` that neither reads nor updates this
+/// fd's own `position` (real POSIX: `pread`/`pwrite` are independent of `lseek`'s cursor). A plain
+/// `FileRead` fd (`O_RDONLY`, or an existing path opened `O_RDWR` -- see `oxfs_open`'s own
+/// existing-path branch) already has a real, committed inode to read directly; a `Write` fd needs
+/// real `readwrite` (`O_RDWR`) support and the same forced-early-commit `oxfs_read`/`oxfs_lseek`
+/// already use. Every other variant (directories, `/proc`, `/dev/*`, and a plain `O_WRONLY`
+/// `Write` fd) has no real seekable position at all -- `ESPIPE`, matching `oxfs_lseek`'s own answer
+/// for the same fd kinds.
+extern "C" fn oxfs_pread(real_fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
+    let inode = match find_open_file(real_fd) {
+        Some(OpenFile::FileRead { inode, .. }) => *inode,
+        Some(OpenFile::Write { readwrite: true, .. }) => match resolve_write_fd_inode(real_fd) {
+            Some(inode) => inode,
+            None => return -EIO,
+        },
+        Some(_) => return -ESPIPE,
+        None => return -EBADF,
+    };
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+    let n = read_inode_at(inode, offset as usize, out);
+    if n > 0 {
+        touch_atime(inode);
+    }
+    n as i64
+}
+
+/// Registered (via `oxidebsd_set_fd_pread_pwrite`) as every oxfs fd's `pwrite` callback -- real
+/// `pwrite(2)`, writing directly into the fd's own real inode blocks via `write_inode_at` (bypassing
+/// `OpenFile::Write`'s own pooled `WRITE_BUFFERS` slot and its `MAX_WRITE_BUFFER` = 128 KiB ceiling
+/// entirely -- found live via `lio_listio/1-1.c`, the Open POSIX Test Suite pilot, which needs a
+/// real 1 MiB `pwrite()`). Unlike `oxfs_pread`, this works for **any** fd open for writing --
+/// `O_WRONLY` included, not just `readwrite` (`O_RDWR`) -- matching real POSIX: `pwrite()` only
+/// requires the fd be open for writing, never O_RDWR specifically. Forces the same real early
+/// commit `resolve_write_fd_inode` already provides (a fd that's never had a plain `write()` yet
+/// still needs a real inode to write into directly), then sets `resized_directly` -- reusing the
+/// exact guard `SYS_FTRUNCATE`/`SYS_FALLOCATE` already established (see that field's own doc
+/// comment) -- so a later `close()`/`fsync()` with no intervening plain `write()` doesn't stomp
+/// this real, already-committed content with an empty/stale pending buffer.
+extern "C" fn oxfs_pwrite(real_fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
+    match find_open_file(real_fd) {
+        Some(OpenFile::Write { readonly: false, .. }) => {}
+        Some(_) => return -EBADF,
+        None => return -EBADF,
+    }
+    let Some(inode) = resolve_write_fd_inode(real_fd) else {
+        return -EIO;
+    };
+    // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
+    let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    if !write_inode_at(inode, offset as usize, data) {
+        return -EIO;
+    }
+    if let Some(OpenFile::Write {
+        resized_directly, ..
+    }) = find_open_file(real_fd)
+    {
+        *resized_directly = true;
+    }
+    len as i64
 }
 
 /// Writes `value`'s decimal digits (no leading zeros; `0` prints as `"0"`) into `buf`, returning

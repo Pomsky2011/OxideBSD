@@ -35,6 +35,28 @@ pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
     }
 }
 
+/// Real `SYS_PREAD=17`/`SYS_PWRITE=18` -- real, unremapped x86_64 Linux `__NR_pread64`/
+/// `__NR_pwrite64` values (confirmed unclaimed: no prior pass in this ABI ever registered them, and
+/// musl's own `pread()`/`pwrite()` -- `third_party/musl/src/unistd/{pread,pwrite}.c` -- already
+/// issue these exact numbers directly with no OxideBSD-side remap needed, unlike almost every other
+/// ported syscall; `pwrite()` first tries `SYS_pwritev2` for real `RWF_NOAPPEND` support, which
+/// naturally `ENOSYS`'s here (never registered) and falls through to this same plain `pwrite`
+/// call). See `crate::fs::fd::pread`/`pwrite`'s own doc comments -- unlike `sys_read`/`sys_write`,
+/// these never touch the fd's own current file position.
+pub(crate) fn sys_pread(fd: u64, ptr: u64, len: u64, offset: u64) -> Result<u64, u64> {
+    match crate::fs::fd::pread(fd, ptr, len, offset) {
+        Some(raw) => ffi_result_to_result(raw),
+        None => Err(EBADF),
+    }
+}
+
+pub(crate) fn sys_pwrite(fd: u64, ptr: u64, len: u64, offset: u64) -> Result<u64, u64> {
+    match crate::fs::fd::pwrite(fd, ptr, len, offset) {
+        Some(raw) => ffi_result_to_result(raw),
+        None => Err(EBADF),
+    }
+}
+
 /// `SYS_WRITEV = 104` — OxideBSD's own invention, added specifically because musl's *entire*
 /// stdio write path goes through `writev`, never plain `write` (see `third_party/musl`'s
 /// `src/stdio/__stdio_write.c`) — without this, `printf` et al. silently produce no output at all.
@@ -1367,6 +1389,14 @@ pub extern "C" fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
 
 pub extern "C" fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
     result_to_ffi(sys_write(fd, ptr, len))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_pread(fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
+    result_to_ffi(sys_pread(fd, ptr, len, offset))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_pwrite(fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
+    result_to_ffi(sys_pwrite(fd, ptr, len, offset))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {

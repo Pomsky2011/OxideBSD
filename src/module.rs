@@ -729,6 +729,8 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         }
         "oxidebsd_sys_writev" => Some(crate::syscall::oxidebsd_sys_writev as *const () as u64),
         "oxidebsd_sys_readv" => Some(crate::syscall::oxidebsd_sys_readv as *const () as u64),
+        "oxidebsd_sys_pread" => Some(crate::syscall::oxidebsd_sys_pread as *const () as u64),
+        "oxidebsd_sys_pwrite" => Some(crate::syscall::oxidebsd_sys_pwrite as *const () as u64),
         "oxidebsd_sys_pipe" => Some(crate::syscall::oxidebsd_sys_pipe as *const () as u64),
         "oxidebsd_sys_dup2" => Some(crate::syscall::oxidebsd_sys_dup2 as *const () as u64),
         "oxidebsd_alloc_fd" => Some(crate::fs::fd::oxidebsd_alloc_fd as *const () as u64),
@@ -742,6 +744,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_close_fd" => Some(crate::fs::fd::oxidebsd_close_fd as *const () as u64),
         "oxidebsd_set_fd_cloexec" => {
             Some(crate::fs::fd::oxidebsd_set_fd_cloexec as *const () as u64)
+        }
+        "oxidebsd_set_fd_pread_pwrite" => {
+            Some(crate::fs::fd::oxidebsd_set_fd_pread_pwrite as *const () as u64)
         }
         "oxidebsd_get_cwd" => Some(crate::process::oxidebsd_get_cwd as *const () as u64),
         "oxidebsd_set_cwd" => Some(crate::process::oxidebsd_set_cwd as *const () as u64),

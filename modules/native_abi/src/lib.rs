@@ -47,6 +47,15 @@
 //! live fd-backed `MAP_SHARED` region back to its file on demand -- see that function's own doc
 //! comment for why this went from a structural non-issue to a genuine gap once real fd-backed
 //! `MAP_SHARED` mmap landed.
+//!
+//! `SYS_PREAD = 17`/`SYS_PWRITE = 18` are real x86_64 Linux's own `__NR_pread64`/`__NR_pwrite64`,
+//! unremapped -- see `SYS_PREAD`'s own doc comment below. Real logic
+//! (`crate::fs::fd::pread`/`pwrite`, kernel tree) is a pure registry lookup, the exact same shape
+//! `sys_read`/`sys_write` already are, just with an explicit offset that bypasses the fd's own
+//! current file position -- `modules/oxfs`'s own real, on-disk-backed `OpenFile::Write` variant
+//! (its `readwrite`/`position` fields) is the one real implementation today (found live via the
+//! Open POSIX Test Suite's `aio_read`/`aio_write`/`lio_listio` pilot: musl's own threads-based
+//! `aio.c` calls `pread`/`pwrite` directly for any seekable fd).
 #![no_std]
 
 unsafe extern "C" {
@@ -58,6 +67,8 @@ unsafe extern "C" {
     fn oxidebsd_sys_exit_group(code: u64) -> !;
     fn oxidebsd_sys_read(fd: u64, ptr: u64, len: u64) -> i64;
     fn oxidebsd_sys_write(fd: u64, ptr: u64, len: u64) -> i64;
+    fn oxidebsd_sys_pread(fd: u64, ptr: u64, len: u64, offset: u64) -> i64;
+    fn oxidebsd_sys_pwrite(fd: u64, ptr: u64, len: u64, offset: u64) -> i64;
     fn oxidebsd_sys_fork() -> i64;
     fn oxidebsd_sys_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64) -> i64;
     fn oxidebsd_sys_execve(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64;
@@ -79,6 +90,15 @@ const SYS_EXIT: u64 = 1;
 const SYS_FORK: u64 = 2;
 const SYS_READ: u64 = 3;
 const SYS_WRITE: u64 = 4;
+/// Real, unremapped x86_64 Linux `__NR_pread64`/`__NR_pwrite64` values -- confirmed unclaimed
+/// (grepped every already-registered syscall number in this ABI) and, unlike almost every other
+/// ported syscall, need zero musl-side remap at all: `third_party/musl/src/unistd/{pread,
+/// pwrite}.c` already issue these exact numbers directly with a real 4-argument shape
+/// (`fd, buf, count, offset`) that fits this ABI's own 4-register max with no packing tricks. See
+/// `oxidebsd_sys_pread`'s own doc comment (kernel tree) for why `pwrite()` needs both this and a
+/// harmless `SYS_pwritev2` `ENOSYS` first.
+const SYS_PREAD: u64 = 17;
+const SYS_PWRITE: u64 = 18;
 const SYS_WAIT4: u64 = 7;
 const SYS_GETPID: u64 = 20;
 const SYS_EXECVE: u64 = 59;
@@ -125,6 +145,16 @@ extern "C" fn handle_read(fd: u64, ptr: u64, len: u64, _arg3: u64) -> i64 {
 
 extern "C" fn handle_write(fd: u64, ptr: u64, len: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_write(fd, ptr, len) }
+}
+
+/// One of two handlers in this module that actually read their 4th argument (`offset`, via `R10`)
+/// -- see `handle_execve`'s own doc comment above for the general rule.
+extern "C" fn handle_pread(fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
+    unsafe { oxidebsd_sys_pread(fd, ptr, len, offset) }
+}
+
+extern "C" fn handle_pwrite(fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
+    unsafe { oxidebsd_sys_pwrite(fd, ptr, len, offset) }
 }
 
 extern "C" fn handle_fork(_arg0: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
@@ -202,6 +232,8 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_EXIT_GROUP, handle_exit_group);
         oxidebsd_register_syscall(SYS_READ, handle_read);
         oxidebsd_register_syscall(SYS_WRITE, handle_write);
+        oxidebsd_register_syscall(SYS_PREAD, handle_pread);
+        oxidebsd_register_syscall(SYS_PWRITE, handle_pwrite);
         oxidebsd_register_syscall(SYS_FORK, handle_fork);
         oxidebsd_register_syscall(SYS_CLONE, handle_clone);
         oxidebsd_register_syscall(SYS_WAIT4, handle_wait4);
