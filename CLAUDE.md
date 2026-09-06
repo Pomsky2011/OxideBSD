@@ -1501,9 +1501,50 @@ scheduler-level, one signal-delivery-level — behind what looked like one flaky
   `pthread_cancel_crash_smoke`, `pshared_cond_crash_smoke`, `mmap_syscall_smoke`,
   `dynlink_syscall_smoke`) still passes, including every fault-to-signal and cross-process-kill
   path this change touches. `pthread_attr_setdetachstate/2-1.c` added to the `POSIX_PILOT_CANARY_ONLY`
-  standing regression suite. Other files found stalling in the same supervised run
-  (`pthread_cond_broadcast/2-3.c`/`4-2.c`, `pthread_cond_destroy/2-1.c`) are separate, not yet
-  investigated — a fresh full-corpus run hasn't been done yet.
+  standing regression suite.
+
+## A fresh full-corpus run confirms the fix, plus four newly-found, genuinely distinct pthread hangs (`build.rs`)
+
+A fresh `--reset` full-corpus supervised run, after the fix above, confirmed it working exactly as
+intended: `pthread_cond_broadcast/2-3.c`/`4-2.c`, `pthread_cond_destroy/2-1.c`, and
+`pthread_cond_init/4-2.c` (all separately flagged stalling in earlier runs, before ever being
+individually investigated) now all either `PASS` or cleanly `TIMEOUT` (`t0`-rescued) — the same fix
+closed all of them, not just the one file it was built against. All four added to the
+`POSIX_PILOT_CANARY_ONLY` standing regression suite.
+
+The run also surfaced a fresh cluster of stalls in `pthread_attr_setstacksize`/`pthread_cancel`/
+`pthread_cond_timedwait` territory. Triaged each individually via isolated canary runs (not the
+naive supervisor exclude-and-retry loop, which hit the same non-convergence trap as before —
+misattributing a stall to whatever file happened to be running when the *build itself*, now over a
+minute for this corpus size, ate into the supervisor's 120s stall-detection window before QEMU even
+booted; `pthread_cond_timedwait/4-2.c`/`4-3.c`'s own transient exclusions during that run were pure
+build-time false positives, not real findings, and were reverted). Verified findings:
+
+- **`pthread_attr_setstacksize/2-1.c`**: a real, genuine, permanent hang — **not** another instance
+  of the fix above. The worker thread's own `pthread_getattr_np()` call (a real GNU/NPTL extension)
+  should hit a fast, syscall-free path reading its own already-known `stack`/`stack_size` fields;
+  the fallback path (calling real musl's own `mremap()`-retry loop) doesn't obviously explain a
+  permanent hang either, since `mremap` isn't even registered in this kernel's syscall table (an
+  unregistered-syscall `ENOSYS` should make that specific loop exit on its first try, not spin).
+  Root cause not yet found — added to `POSIX_KNOWN_HANGS`.
+- **`pthread_cancel/5-2.c`**: a real, genuine, permanent hang, also unrelated to the fix above.
+  Calls `pthread_cancel()` on a target thread in a tight loop for a full real second while that
+  thread only ever spins on `sched_yield()` — never at a real POSIX cancellation point. Real musl's
+  own `cancel_handler` (`third_party/musl/src/thread/pthread_cancel.c`) is *designed* to keep
+  re-sending `SIGCANCEL` to the target via a raw `tkill` syscall in exactly this situation — a real,
+  legitimate (if wasteful) userspace resend loop on any correct system, not itself a bug. Suspected
+  but unconfirmed: something about this specific repeated real-time self-directed-signal-storm
+  pattern (`pthread_kill`/`tkill` retargeting one specific thread over and over) trips a genuine
+  kernel-side issue. Added to `POSIX_KNOWN_HANGS`.
+- **`pthread_cond_timedwait/2-5.c`** and **`4-1.c`**: both real, genuine, permanent hangs — `t0`'s
+  own 40s rescue alarm never fires for either (unlike every file the fix above actually closed,
+  which now cleanly `TIMEOUT`). Structurally quite different from each other (`2-5.c` uses real
+  `PTHREAD_PROCESS_SHARED` mutex/cond across multiple threads; `4-1.c` is a plain single
+  `pthread_create`) — the one thing they share is calling `pthread_cond_timedwait` itself, the more
+  likely common root cause than either file's own surrounding setup. `4-2.c`/`4-3.c` (same
+  directory) remain unverified — each attempt to test them got blocked by whichever of these two
+  hung first. Both `2-5.c` and `4-1.c` added to `POSIX_KNOWN_HANGS`; `pthread_cond_timedwait` itself
+  is the most promising next investigation target, given it's implicated in two independent hangs.
 
 ## SIGCHLD delivery, real `sched_setparam(2)`, and four more mmap conformance fixes (`src/process/`, `modules/oxfs/`, `modules/posix_compat/`)
 

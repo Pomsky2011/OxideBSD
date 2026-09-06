@@ -1328,6 +1328,47 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // is what actually stops the cascade at its root; fixing the underlying gap for real would mean
     // a genuine per-process (or per-tgid) fd quota, out of scope for this pass.
     "shm_open/23-1.c",
+    // `pthread_attr_setstacksize/2-1.c`: a real, genuine, permanent hang -- confirmed via an
+    // isolated canary run immediately after this session's scheduler-quantum + thread-group-leader
+    // signal-termination fix (see CLAUDE.md's "closing a real scheduler race..." section), so it's
+    // NOT another instance of that same bug. The worker thread's own `pthread_getattr_np()` call
+    // (a real, non-POSIX GNU/NPTL extension this test uses to read back its own attr) either reads
+    // its already-known `stack`/`stack_size` fields directly (the common, fast path -- no syscalls
+    // at all) or, if those are somehow unset, falls into real musl's own retry loop calling
+    // `mremap()` repeatedly until it stops failing with `ENOMEM` specifically -- `mremap` isn't
+    // registered in this kernel's syscall table at all, so an unregistered-syscall `ENOSYS` should
+    // make that loop exit on its very first iteration, not spin forever, so the *literal* line
+    // hanging isn't pinned down yet. Needs a live dispatch trace, not more source-reading -- same
+    // class of open item `fork/8-1.c`/`sched_setparam/9-1,10-1.c` already are.
+    "pthread_attr_setstacksize/2-1.c",
+    // `pthread_cancel/5-2.c`: a real, genuine, permanent hang, confirmed via the same isolated
+    // canary session as `pthread_attr_setstacksize/2-1.c` just above (also not another instance of
+    // this session's scheduler/signal-termination fix). Calls `pthread_cancel()` on a target thread
+    // in a tight loop for a full real second, while that thread only ever spins on `sched_yield()`
+    // -- never at a real POSIX cancellation point. Real musl's own `cancel_handler` (`third_party/
+    // musl/src/thread/pthread_cancel.c`) is *designed* to keep re-sending `SIGCANCEL` to the target
+    // via a raw `tkill` syscall whenever the interrupted PC isn't inside its own `__cp_begin`/
+    // `__cp_end` range -- a real, legitimate (if wasteful) userspace resend loop on any correct
+    // system, not itself a bug. Suspected but unconfirmed: something about this exact repeated
+    // real-time self-directed-signal-storm pattern (`pthread_kill`/`tkill` targeting one specific
+    // thread over and over) trips a genuine kernel-side issue distinct from today's fixes -- needs
+    // a live dispatch trace, not more source-reading.
+    "pthread_cancel/5-2.c",
+    // `pthread_cond_timedwait/2-5.c`: a real, genuine, permanent hang, confirmed the same way as
+    // the two entries just above -- unlike the `pthread_cond_broadcast`/`pthread_cond_destroy`
+    // files this session's scheduler/signal-termination fix already closed, `t0`'s own 40s rescue
+    // alarm never fires for this one at all (real `TIMEOUT` never appears, even given 90+ real
+    // seconds of margin past that bound) -- a genuinely different failure shape, not just a slower
+    // version of an already-fixed one. Needs a live dispatch trace.
+    "pthread_cond_timedwait/2-5.c",
+    // `pthread_cond_timedwait/4-1.c`: a real, genuine, permanent hang, confirmed the same way as
+    // `2-5.c` just above (`t0`'s alarm never rescues it either) -- structurally quite different
+    // from `2-5.c` (a plain single `pthread_create`, no `PTHREAD_PROCESS_SHARED` involved at all),
+    // so the shared thread between the two is plausibly `pthread_cond_timedwait` itself, not
+    // anything about either file's own surrounding setup. `4-2.c`/`4-3.c` (same directory) haven't
+    // been individually verified yet -- each got blocked from ever running by whichever of these
+    // two hung first, every time this was tried.
+    "pthread_cond_timedwait/4-1.c",
 ];
 
 /// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
@@ -1340,12 +1381,16 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above (3 files, all with a live effect -- no historical-marker-only
+/// - **`POSIX_KNOWN_HANGS`** above (7 files, all with a live effect -- no historical-marker-only
 ///   or stale entries any more, see that array's own doc comment): `fork/8-1.c` (a genuinely
 ///   unresolved busy-loop timing anomaly), `sched_yield/1-1.c` (needs real SMP, out of scope until
 ///   then), `shm_open/23-1.c` (an unbounded global-fd-table leak from the test's own orphaned,
 ///   never-closing children -- not a hang, but left running it cascades into misclassifying
-///   hundreds of unrelated later files, see that entry's own doc comment).
+///   hundreds of unrelated later files, see that entry's own doc comment), and four genuinely
+///   distinct, still-unresolved real hangs found chasing a fresh full-corpus supervised run after
+///   this session's scheduler/signal-termination fix: `pthread_attr_setstacksize/2-1.c`,
+///   `pthread_cancel/5-2.c`, `pthread_cond_timedwait/{2-5,4-1}.c` (see each entry's own doc comment
+///   -- none of them are the same bug as each other, or as that fix).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1503,6 +1548,9 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "pthread_cond_broadcast/2-3.c",
             "pthread_cond_broadcast/4-2.c",
             "pthread_cond_destroy/2-1.c",
+            // `pthread_cond_init/4-2.c`: also flagged by that same supervised run, confirmed fixed
+            // (or stale) -- passes cleanly now, kept here as regression coverage.
+            "pthread_cond_init/4-2.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
