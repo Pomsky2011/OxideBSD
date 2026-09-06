@@ -1492,6 +1492,17 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // thread raced that thread's own exit (`__unmapself` unmapping the very memory holding
             // `detach_state`) badly enough to flakily `CRASH`/hang before that fix.
             "pthread_attr_setdetachstate/2-1.c",
+            // `pthread_cond_broadcast/2-3.c,4-2.c`/`pthread_cond_destroy/2-1.c`: also permanently
+            // hung (not just this one file) in the same supervised run before the fix above --
+            // confirmed via this exact canary mechanism to be the *same* underlying bug, not three
+            // separate ones. Now genuinely `TIMEOUT`s (real, bounded, `t0`-rescued) instead of
+            // freezing the whole boot -- a legitimate outcome in its own right (these are heavier
+            // real cross-process/multi-thread stress tests this kernel doesn't finish inside `t0`'s
+            // 40s bound), not something to chase further right now. Kept here specifically to catch
+            // any future regression back to a real, permanent hang.
+            "pthread_cond_broadcast/2-3.c",
+            "pthread_cond_broadcast/4-2.c",
+            "pthread_cond_destroy/2-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
