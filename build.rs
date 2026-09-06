@@ -1421,6 +1421,22 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     //     in its own giant pshared/altclock scenario matrix, not a hang), but it's no longer a
     //     permanent hang, and its previously-unreachable neighbors `4-2.c`/`4-3.c` -- blocked from
     //     ever running by whichever of `2-5.c`/`4-1.c` hung first -- both now cleanly `PASS`.
+    //
+    // `pthread_kill/6-1.c`: **not confirmed a hang** -- a real, unbounded-VM-halting `EXCEPTION:
+    // INVALID OPCODE` at the real fault-trampoline's own `ud2` sentinel (`VirtAddr(
+    // 0x1ffffffff011)`), found live 2026-09-06 chasing the real `do_munmap` frame-leak fix (see
+    // CLAUDE.md's own section on that fix): fixing the leak let a full-corpus run finally get past
+    // its old ~1/3-of-the-way exhaustion point for the first time, reaching this file (previously
+    // always masked). Genuinely new territory, not caused by that fix -- this file (`pthread_kill()`
+    // on an already-joined, no-longer-existent tid, expecting real `ESRCH`) has nothing to do with
+    // mmap/munmap at all, so the bug was always here, just unreachable before. Excluded rather than
+    // investigated in the same sitting: an unbounded `EXCEPTION`-triggered reboot takes the whole
+    // boot down the same way a genuine kernel-level hang does, so it has to be excluded to get a
+    // real full-corpus tally at all. Root cause not yet chased -- most likely somewhere in cross-
+    // thread signal-target resolution given a `pthread_kill`-shaped target that no longer exists in
+    // the table at all (distinct from every existing `route_signal_target`/`resolve_signal_
+    // recipient` case, all of which assume the target pid is still present) -- next real
+    // investigation target, same "found live, fixed forward" treatment as everything above.
 ];
 
 /// Walks `conformance/interfaces/` and returns every real assertion file's path relative to
@@ -1433,10 +1449,12 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above -- **empty as of 2026-09-05**, no live exclusions left at all
-///   (kept as an array, not deleted, purely as a landing spot for the next real one). Every file
-///   this array or a fresh full-corpus supervised run has ever flagged -- `fork/8-1.c`,
-///   `sched_yield/1-1.c`, `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`,
+/// - **`POSIX_KNOWN_HANGS`** above -- **one live exclusion as of 2026-09-06**: `pthread_kill/6-1.c`
+///   (a real, unbounded-VM-halting `EXCEPTION: INVALID OPCODE`, found live only once the real
+///   `do_munmap` frame-leak fix let a full-corpus run get past its old exhaustion point far enough
+///   to reach it for the first time -- see that entry's own doc comment; not yet root-caused).
+///   Every *other* file this array or a fresh full-corpus supervised run has ever flagged --
+///   `fork/8-1.c`, `sched_yield/1-1.c`, `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`,
 ///   `pthread_cond_timedwait/{2-5,4-1}.c`, and `shm_open/23-1.c` (the last to go: a real global-fd-
 ///   table-exhaustion cascade, fixed by moving `OpenFile::Write`'s content buffer out of
 ///   `modules/oxfs`'s `OPEN_FILES` table into its own separate, lazily-claimed `WRITE_BUFFERS`
