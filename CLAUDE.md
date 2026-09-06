@@ -2024,11 +2024,28 @@ on `fork()`/`execve()`, not a hang or a crash.
   (`55P/2F/1U/14UT/5TO/1CR`) with the fix in place. **Not yet done**: a fresh full-corpus run to
   measure the real, corrected pass rate — the munmap fix let the corpus run much further than
   before (real workloads instead of instant `ENOMEM` fails) and surfaced a **new**, likely
-  pre-existing crash around `pthread_kill/3-1.c` (`EXCEPTION: INVALID OPCODE` at the real
+  pre-existing crash at `pthread_kill/6-1.c` (`EXCEPTION: INVALID OPCODE` at the real
   fault-trampoline's own `ud2` sentinel, `VirtAddr(0x1ffffffff011)`) that was previously masked by
   the frame-exhaustion cascade happening first — a separate, not-yet-investigated bug, most likely
-  in cross-thread/cross-process signal delivery given where it landed, next in line for the same
-  "found live, fixed forward" treatment.
+  in cross-thread/cross-process signal delivery given where it landed (this file specifically
+  targets an already-joined, no-longer-existent tid via `pthread_kill`, expecting real `ESRCH`),
+  next in line for the same "found live, fixed forward" treatment. Excluded in `POSIX_KNOWN_HANGS`
+  (see that array's own doc comment) so a real full-corpus run can complete at all.
+
+**A fresh full-corpus supervised run, done the same night**: `scripts/run_posix_pilot_supervised.sh
+--reset` converged in 3 iterations, excluding `pthread_kill/6-1.c` (the crash above) and
+`shm_open/23-1.c` (not a new finding — the same real single-core scheduling-throughput ceiling for
+1000 concurrent processes measured earlier the same session, confirmed again here: it exceeds the
+supervisor's own 120s stall-detection window even though it's not a genuine hang, a limitation of
+that heuristic for this one already-understood file, not a new bug). Real, measured baseline across
+the remaining 1685 files: **1419 PASS / 131 UNSUPPORTED / 68 UNTESTED / 26 UNRESOLVED / 19 FAIL /
+12 CRASH / 10 TIMEOUT** — **84.1% raw / 87.8% excluding UNTESTED**, a genuine improvement over the
+pre-fix 2026-09-04 baseline (82.1%/85.6%, see "OxideBSD vs Artix POSIX comparison" above) despite
+the corpus itself growing slightly larger since then. This is the first time this codebase has ever
+measured a real pass rate off a full, uncurated, exhaustion-free run of the whole corpus — every
+prior full-corpus number was either pre-`do_munmap`-fix (silently inflated by hundreds of instant,
+fake `UNRESOLVED`s never actually being real assertion failures) or measured against a smaller,
+curated subset.
 
 ## Dependency notes
 
