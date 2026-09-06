@@ -1245,12 +1245,19 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // marker, a filter below still catches it" entry needs to be re-verified against the filter
     // it names actually still existing, not trusted at face value.**
     //
-    // `sched_yield/1-1.c`: forks `ncpu-1` children and has a real `while(1);` busy-spin thread,
-    // expecting genuine multi-core scheduling fairness to observe `sched_yield()`'s effect --
-    // fundamentally assumes real SMP, which this kernel doesn't have (single-core only, see
-    // CLAUDE.md). Hung with real, sustained CPU usage (~41%). Not a bug to fix so much as a
-    // structural test-vs-kernel mismatch -- worth revisiting only if/when real SMP ever lands.
-    "sched_yield/1-1.c",
+    // `sched_yield/1-1.c`: **FIXED, or rather, never actually needed SMP at all** -- a real,
+    // long-standing staleness bug in this exclusion's own reasoning, caught by simply re-reading
+    // the test's own source before repeating the old claim. The test forks `ncpu-1` CPU-blocking
+    // children specifically to *reserve* every core but one -- on a genuinely single-core report
+    // (`ncpu == 1`, which `sysconf(_SC_NPROCESSORS_ONLN)` already correctly derives from
+    // `sched_getaffinity`'s real single-bit mask), that loop forks *zero* children. What's left is
+    // two equal-priority (`SCHED_FIFO`) threads round-robining via `sched_yield()` against each
+    // other -- a real, single-core-achievable scheduling property, not an SMP one at all. Confirmed
+    // via an isolated canary run: clean `PASS` (a harmless `unrecognized syscall number 203` --
+    // `sched_setaffinity`, which the test's own affinity helper only `perror()`s on failure and
+    // continues past -- doesn't affect the outcome). The original "hung with ~41% CPU usage"
+    // observation this entry used to cite was never re-verified after later scheduler/threading
+    // fixes landed; it's removed from this list entirely rather than left as a stale claim.
     // Real, multi-*process* named-semaphore coordination (`sem_open` + real `fork()`), **FIXED**:
     // `sem_unlink/{2-2,3-1}.c`/`sem_wait/7-1.c` all confirmed PASS via an isolated canary run
     // (`POSIX_PILOT_CANARY_ONLY=1`); `sem_post/8-1.c` confirmed clean `UNTESTED` (it early-returns
@@ -1398,15 +1405,16 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above (2 files, both with a live effect -- no historical-marker-only
-///   or stale entries any more, see that array's own doc comment): `sched_yield/1-1.c` (needs real
-///   SMP, out of scope until then) and `shm_open/23-1.c` (an unbounded global-fd-table leak from
-///   the test's own orphaned, never-closing children -- not a hang, but left running it cascades
-///   into misclassifying hundreds of unrelated later files, see that entry's own doc comment).
-///   Every other file a fresh full-corpus supervised run once flagged here -- `fork/8-1.c`,
-///   `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`, `pthread_cond_timedwait/{2-5,4-1}.c`
-///   -- is no longer here: all fixed, or (the latter two) confirmed to have never actually been real
-///   hangs at all (see this array's own doc comment on those entries for the full story).
+/// - **`POSIX_KNOWN_HANGS`** above (1 file, with a live effect -- no historical-marker-only or
+///   stale entries any more, see that array's own doc comment): `shm_open/23-1.c` (an unbounded
+///   global-fd-table leak from the test's own orphaned, never-closing children -- not a hang, but
+///   left running it cascades into misclassifying hundreds of unrelated later files, see that
+///   entry's own doc comment). Every other file this array or a fresh full-corpus supervised run
+///   ever flagged -- `fork/8-1.c`, `sched_yield/1-1.c`, `pthread_attr_setstacksize/2-1.c`,
+///   `pthread_cancel/5-2.c`, `pthread_cond_timedwait/{2-5,4-1}.c` -- is no longer here: all fixed,
+///   or confirmed to have never actually been real hangs at all (see this array's own doc comment
+///   on each entry for the full story -- `sched_yield/1-1.c` in particular was excluded on a claim
+///   ("needs real SMP") that was simply never re-verified against the test's own source until now).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1614,6 +1622,11 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // a bounded `TIMEOUT` doesn't threaten to cascade into the rest of a full-corpus run the
             // way an actual unbounded hang does.
             "pthread_cancel/5-2.c",
+            // `sched_yield/1-1.c`: **never actually needed SMP** -- a real, long-standing staleness
+            // bug in this project's own exclusion reasoning, caught by re-reading the test's own
+            // source instead of repeating an old, never-re-verified claim. See `POSIX_KNOWN_HANGS`'s
+            // own doc comment above for the full story. Confirmed `PASS` via an isolated canary run.
+            "sched_yield/1-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

@@ -1906,19 +1906,28 @@ pthread hangs" list. All three closed — two were real bugs, one was never actu
      separate, deep scheduling question, out of scope for this investigation. A bounded `TIMEOUT`
      doesn't cascade into the rest of a full-corpus run the way an actual unbounded hang does, so
      this doesn't block anything.
-- **`POSIX_KNOWN_HANGS` down to exactly two genuine, permanent, deliberately-out-of-scope
-  exclusions**: `sched_yield/1-1.c` (needs real SMP) and `shm_open/23-1.c` (an architectural
-  mismatch between oxfs's 128 KiB-per-open-fd write-buffer design and this test's own
-  1000-concurrent-process fd-leak stress shape — a real fix means redesigning oxfs's write path to
-  stop costing memory per open fd, scoped as a separate, future effort, not attempted here).
-- **Verified**: full 76-file standing canary suite (`POSIX_PILOT_CANARY_ONLY=1`, both new entries
-  folded in) — `53P/3F/1U/14UT/4TO/1CR`, exactly the prior 74-file baseline plus the two new,
-  expected outcomes (`pthread_attr_setstacksize/2-1.c` `FAIL`, `pthread_cancel/5-2.c` `TIMEOUT`) —
-  zero regressions. **`pthread_attr_setstacksize/2-1.c`'s own `FAIL` since fixed too** (real musl
-  `requested_stack_size` patch, see this section's own note above) — re-verified: `54P/2F/1U/14UT/
-  4TO/1CR`, the `FAIL` count's only change. A fresh full-corpus supervised run to fold all of this
-  into an official
-  baseline number hasn't been done yet.
+- **`sched_yield/1-1.c` also turned out to never need SMP at all** — a real, long-standing
+  staleness bug in this project's own exclusion reasoning ("assumes real SMP fairness this
+  single-core kernel can't provide"), caught by simply re-reading the test's own source instead of
+  repeating an old, never-re-verified claim across several sessions. The test forks `ncpu-1`
+  CPU-blocking children specifically to *reserve* every core but one before testing
+  `sched_yield()`'s effect between two other threads — on a genuinely single-core report (`ncpu ==
+  1`, which real `sysconf(_SC_NPROCESSORS_ONLN)` already correctly derives from
+  `sched_getaffinity`'s real single-bit mask), that loop forks *zero* children. What's left is two
+  equal-priority (`SCHED_FIFO`) threads round-robining via `sched_yield()` against each other — a
+  real, single-core-achievable property, not an SMP one. Confirmed via an isolated canary run:
+  clean `PASS` (a harmless `unrecognized syscall number 203` — `sched_setaffinity`, which the
+  test's own affinity helper only `perror()`s on failure and continues past — doesn't affect the
+  outcome). Removed from `POSIX_KNOWN_HANGS` entirely, added to the standing canary suite.
+- **`POSIX_KNOWN_HANGS` down to exactly one genuine, permanent, deliberately-out-of-scope
+  exclusion**: `shm_open/23-1.c` (an architectural mismatch between oxfs's 128 KiB-per-open-fd
+  write-buffer design and this test's own 1000-concurrent-process fd-leak stress shape — a real fix
+  means redesigning oxfs's write path to stop costing memory per open fd, scoped as a separate,
+  future effort, not attempted here).
+- **Verified**: full 77-file standing canary suite (`POSIX_PILOT_CANARY_ONLY=1`, all new entries
+  folded in) — `55P/2F/1U/14UT/4TO/1CR`, exactly the prior 76-file baseline (`54P/2F/1U/14UT/4TO/
+  1CR`) plus `sched_yield/1-1.c`'s own `PASS` — zero regressions. A fresh full-corpus supervised
+  run to fold all of this into an official baseline number hasn't been done yet.
 
 ## Dependency notes
 
