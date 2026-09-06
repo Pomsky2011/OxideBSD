@@ -1372,7 +1372,8 @@ value — the canary mechanism (`POSIX_PILOT_CANARY_ONLY=1`, see `build.rs`'s ow
 kept as a standing regression suite covering all ten of these fixes plus the four `sem_*` ones, not
 emptied out after use, specifically to make catching this kind of drift cheap going forward.
 **Stale as of the next section below**: `POSIX_KNOWN_HANGS` gained a third live exclusion,
-`shm_open/23-1.c`, for an unrelated reason (a global-fd-table leak cascade, not a hang).
+`shm_open/23-1.c`, for an unrelated reason (a global-fd-table leak cascade, not a hang) — since
+fixed for real, see "oxfs write path..." further below; `POSIX_KNOWN_HANGS` is empty again.
 
 ## A global-fd-table exhaustion cascade misclassifying hundreds of unrelated tests as `sigaction/1-N.c` FAILs, `MAX_OPEN_FILES` bumped, `shm_open/23-1.c` excluded (`modules/oxfs/src/lib.rs`, `build.rs`)
 
@@ -1923,11 +1924,52 @@ pthread hangs" list. All three closed — two were real bugs, one was never actu
   exclusion**: `shm_open/23-1.c` (an architectural mismatch between oxfs's 128 KiB-per-open-fd
   write-buffer design and this test's own 1000-concurrent-process fd-leak stress shape — a real fix
   means redesigning oxfs's write path to stop costing memory per open fd, scoped as a separate,
-  future effort, not attempted here).
+  future effort, not attempted here). **Since fixed** — see "oxfs write path..." further below;
+  `POSIX_KNOWN_HANGS` is empty again (though `shm_open/23-1.c` itself still doesn't `PASS`, for an
+  unrelated, deeper reason that section covers).
 - **Verified**: full 77-file standing canary suite (`POSIX_PILOT_CANARY_ONLY=1`, all new entries
   folded in) — `55P/2F/1U/14UT/4TO/1CR`, exactly the prior 76-file baseline (`54P/2F/1U/14UT/4TO/
   1CR`) plus `sched_yield/1-1.c`'s own `PASS` — zero regressions. A fresh full-corpus supervised
   run to fold all of this into an official baseline number hasn't been done yet.
+
+## oxfs write path: `OpenFile::Write`'s buffer moved to a separate pool, closing the last `POSIX_KNOWN_HANGS` entry (`modules/oxfs/src/lib.rs`, `build.rs`)
+
+Closes the architectural gap flagged in the previous section: `shm_open/23-1.c` (see "A global-fd-
+table exhaustion cascade..." above) needed up to 1000 real simultaneous `OPEN_FILES` slots (one per
+`shm_open`'d name, held open until each holding process's own loop finishes) — far more than any
+`MAX_OPEN_FILES` bump could affordably give it, since every slot embedded a full, unconditional
+`MAX_WRITE_BUFFER` (128 KiB) regardless of whether that fd was ever actually written to.
+
+- **The real fix**: `OpenFile::Write`'s own `buffer: [u8; MAX_WRITE_BUFFER]` field moved out of the
+  enum entirely into a separate, smaller, lazily-claimed `WRITE_BUFFERS`/`WRITE_BUFFER_USED` pool
+  (`MAX_WRITE_BUFFERS = 256`, unchanged from the old total capacity) — `OpenFile::Write` now carries
+  only `buf_slot: Option<usize>`, an index into that pool, claimed only by the first real `write()`
+  call (or, for `O_APPEND`, eagerly at `open()` time, since that path must preserve the file's real
+  existing content even if nothing new is ever written — see `buf_slot`'s own doc comment for why
+  this one path can't be lazy). A `shm_open(O_RDONLY|O_CREAT, ...)`-shaped fd (this test's own
+  entire workload) never touches the pool at all. This dropped `OPEN_FILES`'s own per-slot cost from
+  ~128 KiB to ~4 KiB (`DirListing`/`ProcDir`'s `DIR_LISTING_BUFFER` is now the enum's largest
+  variant), letting `MAX_OPEN_FILES` scale **256 → 2048** while *lowering* total static cost (~8 MiB
+  vs. the old ~32 MiB for 256 slots).
+- **`shm_open/23-1.c` removed from `POSIX_KNOWN_HANGS` entirely** — confirmed via an isolated canary
+  run with this file restored alongside every other `shm_open`/`shm_unlink` file and
+  `sigaction/1-{1,2}.c` (the exact combination that originally exposed the cascade): the cascade is
+  gone (`sigaction/1-1.c`/`1-2.c` and every file after `shm_open/23-1.c` again get their own correct,
+  individual classification), and the full 78-file tally (`55P/2F/1U/14UT/5TO/1CR`) matches the prior
+  77-file baseline exactly plus this file's own legitimate `TIMEOUT`.
+- **`shm_open/23-1.c` itself still doesn't `PASS`, and this fix was never going to make it** — a
+  genuine, confirmed `TIMEOUT`, not a fd-table symptom: re-run with `t0`'s own alarm manually raised
+  from 40s to 180s (4.5x), it *still* timed out. The real remaining bottleneck is raw scheduling
+  throughput for 1000 concurrent forked processes under this kernel's single-core, TCG-emulated
+  execution — a separate, much deeper problem (likely the scheduler's own per-tick process-table
+  scan cost, or eager-copy `fork()`'s per-call cost, multiplied 1000x) than anything the write path
+  itself could fix. Not chased further here; `shm_open/23-1.c` is a legitimate, bounded `TIMEOUT` in
+  a normal full-corpus run now, same as several other heavy stress tests, rather than a permanent
+  exclusion.
+- **Verified**: `mmap_syscall_smoke`/`tcc_syscall_smoke` (both exercise the write path heavily —
+  fd-backed mmap's own commit-on-demand path, and TinyCC's real multi-file compile+link+run) both
+  still pass cleanly; the full canary regression suite (78 files, `shm_open/23-1.c` now included)
+  matches the expected baseline with zero regressions.
 
 ## Dependency notes
 

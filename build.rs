@@ -1309,32 +1309,43 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
     // (see this array's own doc comment above) is the same story -- also removed entirely, also
     // outside that prefix filter.
     //
-    // `shm_open/23-1.c`: **not a hang** (it correctly `TIMEOUT`s at `t0`'s own 40s bound, never
-    // wedges the boot) but genuinely needs excluding anyway -- added 2026-09-05 chasing a report
-    // that 210 of a full pilot run's 268 FAILs were all `sigaction/1-N.c`, individually confirmed
-    // `PASS` in isolation. Root cause traced to this file specifically, not `sigaction` at all: it
-    // forks `NPROCESS=1000` children, each looping `NLOOP=1000` times calling
-    // `shm_open(name, O_RDONLY|O_CREAT|O_EXCL, ...)` with **no `close(fd)` anywhere in the loop** --
-    // a real bug in the test's own child_func on any system, but harmless on real POSIX platforms
-    // since fd exhaustion there is scoped *per-process* (bounded by that one process's own
-    // `RLIMIT_NOFILE`, ~1024) -- once a child's own descriptor table fills, only *that child's*
-    // later `shm_open` calls start failing, `*create_cnt != NLOOP`, and the test correctly reports
-    // `PTS_FAIL` for itself alone. `modules/oxfs`'s `OPEN_FILES` table (`MAX_OPEN_FILES`, see that
-    // constant's own doc comment) is **global**, not per-process -- a known, accepted architectural
-    // gap (no VFS-level per-process fd quota exists anywhere in this kernel), but this is the first
-    // test to actually depend on real per-process isolation to stay self-contained. `sleep(1)` plus
-    // a random 0-20ms `nanosleep` between iterations means these 1000 children keep running and
-    // leaking new global fd-table entries for a real, sustained stretch of wall-clock time (not a
-    // one-shot cost) -- `MAX_OPEN_FILES` was bumped 8 -> 256 alongside this exclusion (see that
-    // constant's own doc comment) as a genuine, worthwhile improvement in its own right, but 256 (or
-    // any single static bump) only delays this file's own exhaustion, it can't survive an unbounded
-    // leak given enough wall-clock time in a full ~1700-file run -- confirmed live: with the bump
-    // alone (no exclusion), `timer_settime/{2-1,6-1,9-1}.c` -- many files later, well past this
-    // file's own classification -- still hit the identical "No file descriptors available" cascade
-    // once these orphans had leaked enough over the intervening real time. Excluding this one file
-    // is what actually stops the cascade at its root; fixing the underlying gap for real would mean
-    // a genuine per-process (or per-tgid) fd quota, out of scope for this pass.
-    "shm_open/23-1.c",
+    // `shm_open/23-1.c`: **FIXED, removed from this list entirely (2026-09-05)** -- was never a
+    // real hang (it correctly `TIMEOUT`s at `t0`'s own 40s bound), but the fd leak it caused used
+    // to cascade into misclassifying hundreds of unrelated later files as FAIL (a full pilot run
+    // once reported 210 of 268 FAILs as `sigaction/1-N.c`, individually confirmed `PASS` in
+    // isolation -- root-caused to this file, not `sigaction` at all). It forks `NPROCESS=1000`
+    // children, each looping `NLOOP=1000` times calling `shm_open(name, O_RDONLY|O_CREAT|O_EXCL,
+    // ...)` with **no `close(fd)` anywhere in the loop** -- a real bug in the test's own
+    // `child_func` on any system, but harmless on real POSIX platforms since fd exhaustion there is
+    // scoped *per-process* (bounded by that process's own `RLIMIT_NOFILE`). `modules/oxfs`'s
+    // `OPEN_FILES` table (`MAX_OPEN_FILES`) was **global**, not per-process, and every slot paid a
+    // full `MAX_WRITE_BUFFER` (128 KiB) regardless of use -- so even a generous static bump (8 ->
+    // 256) only delayed exhaustion, it couldn't survive this test's up-to-1000-simultaneous-real-
+    // objects peak without an unaffordable memory cost.
+    //
+    // **The real fix**: `OpenFile::Write`'s own content buffer moved out of the `OPEN_FILES` enum
+    // entirely into a separate, smaller `WRITE_BUFFERS` pool, claimed lazily only by a fd that
+    // actually calls `write()` (see that pool's own doc comment in `modules/oxfs/src/lib.rs`) --
+    // most concurrently-open fds across this whole corpus, including every one of this test's own
+    // 1000 objects (`O_RDONLY`, never written to), never touch it at all. This let `MAX_OPEN_FILES`
+    // scale 256 -> 2048 while *lowering* total static memory cost (~8 MiB vs. the old ~32 MiB for
+    // 256 slots) -- see `MAX_OPEN_FILES`'s own doc comment for the concrete numbers.
+    //
+    // **Confirmed via an isolated canary run** (`POSIX_PILOT_CANARY_ONLY=1`, this file included
+    // alongside every other `shm_open`/`shm_unlink` file and `sigaction/1-{1,2}.c` -- the exact
+    // combination that originally exposed the cascade): `shm_open/23-1.c` itself still `TIMEOUT`s
+    // (confirmed genuine and not just "needs a bit more time" -- re-run with `t0`'s own alarm
+    // manually raised to 180s, 4.5x its normal 40s bound, and it *still* timed out; the real
+    // remaining bottleneck is raw scheduling throughput for 1000 concurrent forked processes under
+    // this kernel's single-core, TCG-emulated execution, a separate, much deeper problem this fix
+    // was never going to solve), but every file after it -- `shm_open/24-1.c` through
+    // `shm_unlink/*.c` and, critically, `sigaction/1-1.c`/`1-2.c` themselves -- gets its own
+    // correct, individual classification again, with zero cascade. Full 78-file tally
+    // (`55P/2F/1U/14UT/5TO/1CR`) matches the pre-existing 77-file baseline exactly plus this file's
+    // own legitimate `TIMEOUT`. Kept in the `POSIX_PILOT_CANARY_ONLY` standing regression suite
+    // below as `shm_open/23-1.c` itself, no longer needing a `POSIX_KNOWN_HANGS` entry at all --
+    // it's now safe to include in a normal full-corpus run, contributing one bounded `TIMEOUT`
+    // like any other heavy stress test rather than corrupting everything that runs after it.
     // `pthread_attr_setstacksize/2-1.c`/`pthread_cancel/5-2.c`: **neither was ever a real permanent
     // hang** -- both removed from this list entirely. The original full-corpus supervised run's own
     // "exclude whatever file happened to be running when a stall was detected" heuristic
@@ -1405,16 +1416,17 @@ const POSIX_KNOWN_HANGS: &[&str] = &[
 ///   unconditionally, adding no real signal. `sigaltstack/9-buildonly.c` is the one exception：
 ///   still excluded from *this* list, but built and seeded separately just below (`9-1.c`'s own
 ///   real assertion `execl()`s into it directly by its literal upstream path).
-/// - **`POSIX_KNOWN_HANGS`** above (1 file, with a live effect -- no historical-marker-only or
-///   stale entries any more, see that array's own doc comment): `shm_open/23-1.c` (an unbounded
-///   global-fd-table leak from the test's own orphaned, never-closing children -- not a hang, but
-///   left running it cascades into misclassifying hundreds of unrelated later files, see that
-///   entry's own doc comment). Every other file this array or a fresh full-corpus supervised run
-///   ever flagged -- `fork/8-1.c`, `sched_yield/1-1.c`, `pthread_attr_setstacksize/2-1.c`,
-///   `pthread_cancel/5-2.c`, `pthread_cond_timedwait/{2-5,4-1}.c` -- is no longer here: all fixed,
-///   or confirmed to have never actually been real hangs at all (see this array's own doc comment
-///   on each entry for the full story -- `sched_yield/1-1.c` in particular was excluded on a claim
-///   ("needs real SMP") that was simply never re-verified against the test's own source until now).
+/// - **`POSIX_KNOWN_HANGS`** above -- **empty as of 2026-09-05**, no live exclusions left at all
+///   (kept as an array, not deleted, purely as a landing spot for the next real one). Every file
+///   this array or a fresh full-corpus supervised run has ever flagged -- `fork/8-1.c`,
+///   `sched_yield/1-1.c`, `pthread_attr_setstacksize/2-1.c`, `pthread_cancel/5-2.c`,
+///   `pthread_cond_timedwait/{2-5,4-1}.c`, and `shm_open/23-1.c` (the last to go: a real global-fd-
+///   table-exhaustion cascade, fixed by moving `OpenFile::Write`'s content buffer out of
+///   `modules/oxfs`'s `OPEN_FILES` table into its own separate, lazily-claimed `WRITE_BUFFERS`
+///   pool -- see that pool's own doc comment) -- is confirmed either genuinely fixed or to have
+///   never actually been a real hang at all (see this array's own doc comment on each entry for the
+///   full story -- `sched_yield/1-1.c` in particular was excluded on a claim ("needs real SMP")
+///   that was simply never re-verified against the test's own source until it was re-checked).
 ///
 /// Deliberately **not** filtered by "references `pthread_create`/`testfrmw.h`" any more -- real
 /// `clone(2)`/`pthread_create`/`pthread_join` landed (see CLAUDE.md's "Real threading" section),
@@ -1467,20 +1479,14 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // futex/threading/fork/signal-delivery/timer/fd-table change, not emptied out:
     // `fork/11-1.c`/`pthread_attr_destroy/1-1.c`/`pthread_atfork/3-3.c` (real thread-group signal
     // delivery + `exit_group(2)`), the four named-semaphore files (real physical-address-keyed
-    // shared-futex, `process::limits::futex_key` in `src/process/limits.rs`),
-    // `sigwait/4-1.c`/`timer_settime/{2-1,6-1,9-1}.c` (real timer-expiry signal wake,
-    // `wake_if_sigwaiting`), and the `shm_open`+`shm_unlink`+`sigaction/1-{1,2}.c` block minus
-    // `shm_open/23-1.c` itself (real `MAX_OPEN_FILES` global-fd-table-exhaustion cascade fix,
-    // `modules/oxfs/src/lib.rs`; `shm_open/23-1.c` is deliberately *not* included here even though
-    // it's what originally exposed the bug -- it's now a permanent `POSIX_KNOWN_HANGS` exclusion
-    // (see that entry's own doc comment: an unbounded, ongoing global-fd leak, not a one-shot cost
-    // any static `MAX_OPEN_FILES` bump can absorb) and never runs in a real full-corpus build
-    // either, so keeping it here would make this suite fail on its own downstream neighbors
-    // forever regardless of kernel correctness -- not a useful regression signal). Repoint at
-    // whatever's actually being investigated next (`fork/8-1.c`'s CPU-timing anomaly is the
-    // remaining genuinely-open item in `POSIX_KNOWN_HANGS`) when that starts, but there's no need
-    // to remove these first -- add to this list, don't just replace it, so a real regression gets
-    // caught immediately.
+    // shared-futex, `process::limits::futex_key` in `src/process/limits.rs`), `sigwait/4-1.c`/
+    // `timer_settime/{2-1,6-1,9-1}.c` (real timer-expiry signal wake, `wake_if_sigwaiting`), and
+    // the full `shm_open`+`shm_unlink`+`sigaction/1-{1,2}.c` block **including** `shm_open/23-1.c`
+    // itself (the real `MAX_OPEN_FILES`/`WRITE_BUFFERS` global-fd-table-exhaustion-cascade fix,
+    // `modules/oxfs/src/lib.rs` -- `shm_open/23-1.c` no longer needs excluding at all, see
+    // `POSIX_KNOWN_HANGS`'s own doc comment; its own `TIMEOUT` here is a real, expected, bounded
+    // outcome, not a symptom of the bug this block regression-tests). Add to this list, don't just
+    // replace it, so a real regression gets caught immediately.
     //
     // `rerun-if-env-changed`, not just relying on the file-content watch above: plain
     // `std::env::var` reads aren't tracked by cargo at all on their own -- toggling this var on/off
@@ -1519,6 +1525,7 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "shm_open/20-3.c",
             "shm_open/21-1.c",
             "shm_open/22-1.c",
+            "shm_open/23-1.c",
             "shm_open/24-1.c",
             "shm_open/25-1.c",
             "shm_open/26-1.c",

@@ -532,27 +532,41 @@ const CWD_PROC_KIND_TASKLIST: u64 = 2 << CWD_PROC_KIND_SHIFT;
 const CWD_PROC_KIND_FDLIST: u64 = 3 << CWD_PROC_KIND_SHIFT;
 const CWD_PROC_PID_MASK: u64 = 0xFFFF_FFFF;
 
-/// **Bumped 8 -> 256 (2026-09-05), root cause found chasing a pilot-run cascade**: this table is
-/// *global*, not per-process, and this kernel has no orphan-reaping mechanism (see `do_wait4`'s
-/// own doc comment) -- a process whose real parent already exited (or that itself gets stuck)
-/// leaves any fd it opened here permanently leaked. The POSIX pilot's own `shm_open/23-1.c` (up to
-/// 1000 processes x 1000 loop iterations, each a real `shm_open(..., O_CREAT|O_EXCL, ...)` that
-/// never closes the fd) drove this straight to exhaustion at just 8 slots -- and because the table
-/// is global, that exhaustion didn't just fail `shm_open/23-1.c` itself, it made `hush` (pid 1)
-/// unable to open *its own* redirect file for every single test that ran afterward, silently
-/// misclassifying hundreds of unrelated, individually-correct tests as FAIL for the rest of the
-/// boot. `shm_open/23-1.c` is still expected to fail/timeout on its own terms (a legitimate,
-/// extreme stress test this kernel was never going to fully pass) -- 256 just gives enough
-/// headroom that one extreme test can't cascade into corrupting everything that runs after it.
-/// Each slot costs `MAX_WRITE_BUFFER` bytes regardless of use (see that constant's own doc
-/// comment) -- 256 slots is ~32 MiB, a safe, cheap increase.
-const MAX_OPEN_FILES: usize = 256;
+/// **Bumped 8 -> 256 -> 2048 (2026-09-05)**. First bumped 8->256 chasing a pilot-run cascade: this
+/// table is *global*, not per-process, and this kernel has no orphan-reaping mechanism (see
+/// `do_wait4`'s own doc comment) -- a process whose real parent already exited (or that itself
+/// gets stuck) leaves any fd it opened here permanently leaked. The POSIX pilot's own `shm_open/
+/// 23-1.c` (up to 1000 processes x 1000 loop iterations, each a real `shm_open(..., O_CREAT|
+/// O_EXCL, ...)` that never closes the fd until its own process exits) drove this straight to
+/// exhaustion at just 8 slots -- and because the table is global, that exhaustion didn't just fail
+/// `shm_open/23-1.c` itself, it made `hush` (pid 1) unable to open *its own* redirect file for
+/// every single test that ran afterward, silently misclassifying hundreds of unrelated,
+/// individually-correct tests as FAIL for the rest of the boot. At the time, each slot cost a full
+/// `MAX_WRITE_BUFFER` regardless of use (`OpenFile::Write` was the enum's dominant variant), so 256
+/// was chosen as "enough headroom to stop the cascade, cheap enough to afford" -- not enough to
+/// let `shm_open/23-1.c` itself actually pass (it needs up to 1000 real objects live at once, one
+/// per `shm_open`'d name, held open until each holding process's own loop finishes).
+///
+/// **Bumped again to 2048 once the real fix landed**: `OpenFile::Write`'s buffer moved out of the
+/// enum entirely into its own separate, smaller `WRITE_BUFFERS` pool (see that pool's own doc
+/// comment) -- a slot's cost is no longer `MAX_WRITE_BUFFER` regardless of use, just the enum's new
+/// largest variant (`DirListing`/`ProcDir`'s `DIR_LISTING_BUFFER`, ~4 KiB). 2048 slots now costs
+/// **less** total memory than the old 256 did (~8 MiB vs. ~32 MiB) while giving `shm_open/23-1.c`
+/// real headroom past its own 1000-object peak.
+const MAX_OPEN_FILES: usize = 2048;
 /// Write-side accumulator cap (see `OpenFile::Write`'s own doc comment) -- comfortably past
 /// today's largest embedded binary (`sh.elf`, ~102 KB). Matches `modules/fat32`'s own final,
-/// proven-sufficient `MAX_FILE_BUFFER` value exactly (rather than something bigger): `OpenFile`'s
-/// `Write` variant is the largest in the enum, so every `OPEN_FILES` slot reserves this much
-/// space regardless of what it actually holds -- no reason to size it past what's actually needed.
+/// proven-sufficient `MAX_FILE_BUFFER` value exactly (rather than something bigger).
 const MAX_WRITE_BUFFER: usize = 131072;
+/// How many `WRITE_BUFFERS` slots exist -- **not** the same as `MAX_OPEN_FILES` any more (see that
+/// constant's own doc comment for the split this enables). Sized to the real concurrent-*writer*
+/// count this kernel has ever actually needed (the old `MAX_OPEN_FILES = 256` figure, before it
+/// had to also cover every non-writing open), not the much larger total-open-fd count `shm_open/
+/// 23-1.c` needs -- most concurrently-open fds across this whole codebase's own test corpus never
+/// call `write()` at all (plain reads, directory listings, and any `O_CREAT`-but-never-written
+/// object like `shm_open/23-1.c`'s own 1000 objects, real POSIX `shm_open(O_RDONLY|O_CREAT, ...)`
+/// use).
+const MAX_WRITE_BUFFERS: usize = 256;
 const DIR_LISTING_BUFFER: usize = 4096;
 
 const MAX_CWD_PATH: usize = 256;
@@ -695,6 +709,44 @@ static mut BLOCKS: [[u8; BLOCK_SIZE]; TOTAL_BLOCKS] = [[0; BLOCK_SIZE]; TOTAL_BL
 static mut BLOCK_USED: [bool; TOTAL_BLOCKS] = [false; TOTAL_BLOCKS];
 static mut INODES: [Inode; TOTAL_INODES] = [Inode::FREE; TOTAL_INODES];
 static mut OPEN_FILES: [Option<(u64, OpenFile)>; MAX_OPEN_FILES] = [None; MAX_OPEN_FILES];
+
+/// Real per-open-file write-accumulation buffers, pooled separately from `OPEN_FILES` itself --
+/// see `MAX_WRITE_BUFFERS`'s own doc comment for why this split exists. `OpenFile::Write::buf_slot`
+/// is `None` until the first real `write()` call (or, for `O_APPEND`, until `open()`'s own
+/// preload -- see that call site) actually needs somewhere to put bytes; a fd that's opened but
+/// never written to (a plain read, or a real POSIX `shm_open(O_RDONLY|O_CREAT, ...)`) never
+/// touches this pool at all.
+static mut WRITE_BUFFERS: [[u8; MAX_WRITE_BUFFER]; MAX_WRITE_BUFFERS] =
+    [[0; MAX_WRITE_BUFFER]; MAX_WRITE_BUFFERS];
+static mut WRITE_BUFFER_USED: [bool; MAX_WRITE_BUFFERS] = [false; MAX_WRITE_BUFFERS];
+
+/// Claims a free `WRITE_BUFFERS` slot, `None` if the pool is exhausted (a real, if unlikely,
+/// resource limit -- surfaces to a caller as `ENOSPC`, same errno `oxfs_write` already returns for
+/// "this fd's own buffer is full").
+fn alloc_write_buffer() -> Option<usize> {
+    let used = unsafe { &mut *core::ptr::addr_of_mut!(WRITE_BUFFER_USED) };
+    let idx = used.iter().position(|&u| !u)?;
+    used[idx] = true;
+    Some(idx)
+}
+
+/// Releases a `WRITE_BUFFERS` slot back to the pool -- called once, from `oxfs_close`, once a
+/// fd's own final commit (if any) has already consumed its content. Doesn't zero the slot's old
+/// content -- matches this module's existing "unlink/close never scrubs stale data" convention
+/// (`BLOCKS`/`INODES` don't either); a later `alloc_write_buffer` caller always overwrites
+/// `buffer[..len]` from its own fresh `len = 0` before ever reading any of it back.
+fn free_write_buffer(idx: usize) {
+    let used = unsafe { &mut *core::ptr::addr_of_mut!(WRITE_BUFFER_USED) };
+    used[idx] = false;
+}
+
+/// Real, `'static` access to one `WRITE_BUFFERS` slot's full backing array -- callers slice it to
+/// whatever length they actually need (`oxfs_write` writes into it; `commit_write_buffer` reads
+/// `[..len]` back out).
+fn write_buffer(idx: usize) -> &'static mut [u8; MAX_WRITE_BUFFER] {
+    let bufs = unsafe { &mut *core::ptr::addr_of_mut!(WRITE_BUFFERS) };
+    &mut bufs[idx]
+}
 
 const LOCK_SH: u64 = 1;
 const LOCK_EX: u64 = 2;
@@ -1970,11 +2022,15 @@ fn build_cwd_path(inode_num: u32, out: &mut [u8; MAX_CWD_PATH]) -> usize {
     len
 }
 
-/// An open file's own state, keyed by fd in `OPEN_FILES`. `Write`'s buffer dwarfs the other two
-/// variants -- deliberate, not overlooked: modules can't use `alloc`/`Box`, so every `OPEN_FILES`
-/// slot has to be sized for the worst case regardless (the same "no allocator, so every slot pays
-/// the largest variant's cost" shape `modules/fat32`'s own `OpenFile` already has, just with more
-/// size variance here since `FileRead` no longer carries a buffer at all).
+/// An open file's own state, keyed by fd in `OPEN_FILES`. `DirListing`/`ProcDir`'s own
+/// `DIR_LISTING_BUFFER` (4 KiB) is the largest embedded buffer here now that `Write`'s own
+/// (formerly `OPEN_FILES`-dominating, `MAX_WRITE_BUFFER` = 128 KiB) content buffer lives in the
+/// separate `WRITE_BUFFERS` pool instead (`buf_slot`, an index, not the content itself) -- see
+/// that pool's own doc comment for why: modules can't use `alloc`/`Box`, so every `OPEN_FILES`
+/// slot still has to be sized for its own worst case, but decoupling the one genuinely huge,
+/// rarely-simultaneously-needed buffer from the fixed per-slot cost lets `MAX_OPEN_FILES` scale far
+/// higher without a matching memory cost (see `MAX_OPEN_FILES`'s own doc comment for the concrete
+/// before/after numbers).
 #[derive(Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
 enum OpenFile {
@@ -2005,7 +2061,11 @@ enum OpenFile {
         parent_inode: u32,
         name: [u8; NAME_MAX],
         name_len: u8,
-        buffer: [u8; MAX_WRITE_BUFFER],
+        /// Index into the separate `WRITE_BUFFERS` pool holding this fd's accumulated content --
+        /// `None` until something actually needs to buffer real bytes (see `WRITE_BUFFERS`'s own
+        /// doc comment for why this is pooled separately from `OpenFile` rather than embedded
+        /// inline the way it used to be). Real invariant: `len == 0` whenever this is `None`.
+        buf_slot: Option<usize>,
         len: usize,
         /// The caller's own uid at `open(O_CREAT)` time -- real Unix ownership semantics (a
         /// freshly created file is owned by its creator, not always root) -- captured here rather
@@ -2852,23 +2912,26 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                 _ if want_write => {
                     let mut name = [0u8; NAME_MAX];
                     name[..leaf.len()].copy_from_slice(leaf);
-                    let mut buffer = [0u8; MAX_WRITE_BUFFER];
+                    let mut buf_slot = None;
                     let mut len = 0;
                     // O_APPEND: start from the file's real existing content, so subsequent writes
                     // land after it rather than replacing it -- otherwise (plain O_WRONLY/O_RDWR)
                     // start empty, real POSIX truncate-on-write-open semantics (this filesystem
                     // has no way to write only *part* of a file in place -- see
                     // write_inode_data's own doc comment -- so there's no separate "O_WRONLY
-                    // without O_TRUNC" case to support here).
-                    //
-                    // A real, explicit `O_TRUNC` additionally resizes the underlying inode to zero
-                    // *immediately*, not merely once this fd's own write buffer eventually commits
-                    // at `close()` (which may never happen, if the caller never calls `write()` --
-                    // real POSIX still requires the truncation to be visible right away, e.g. to a
-                    // `fstat()` on this same fd before any write). Found live via `shm_open/25-1.c`
-                    // (Open POSIX Test Suite pilot).
+                    // without O_TRUNC" case to support here). This is the one path that has to
+                    // claim a real `WRITE_BUFFERS` slot eagerly, right here at `open()` time,
+                    // rather than lazily on first `write()` like every other path below: a fd that
+                    // never gets written to must still commit its *unchanged* real content at
+                    // `close()`, not silently truncate to empty (see `commit_write_buffer`'s own
+                    // `buf_slot: None` handling) -- so the preloaded original bytes have to live
+                    // somewhere from the start.
                     if flags & O_APPEND != 0 {
-                        len = read_inode_at(resolved, 0, &mut buffer);
+                        let Some(idx) = alloc_write_buffer() else {
+                            return -ENOSPC;
+                        };
+                        len = read_inode_at(resolved, 0, write_buffer(idx));
+                        buf_slot = Some(idx);
                     } else if flags & O_TRUNC != 0 {
                         resize_inode_data(resolved, 0);
                     }
@@ -2876,7 +2939,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                         parent_inode: parent,
                         name,
                         name_len: leaf.len() as u8,
-                        buffer,
+                        buf_slot,
                         len,
                         owner_uid: inode.uid,
                         existing_inode: Some(resolved),
@@ -2907,7 +2970,7 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                 parent_inode: parent,
                 name,
                 name_len: leaf.len() as u8,
-                buffer: [0; MAX_WRITE_BUFFER],
+                buf_slot: None,
                 len: 0,
                 owner_uid: uid as u32,
                 existing_inode: None,
@@ -3021,7 +3084,7 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
     };
     match file {
         OpenFile::Write {
-            buffer,
+            buf_slot,
             len: buf_len,
             resized_directly,
             readonly,
@@ -3030,9 +3093,26 @@ extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
             if *readonly {
                 return -EBADF;
             }
+            // Real POSIX zero-length write: succeeds trivially, no buffer needed -- checked before
+            // the lazy `alloc_write_buffer` below so a fd that only ever does zero-length writes
+            // never claims a real `WRITE_BUFFERS` slot at all.
+            if len == 0 {
+                return 0;
+            }
+            let idx = match *buf_slot {
+                Some(idx) => idx,
+                None => match alloc_write_buffer() {
+                    Some(idx) => {
+                        *buf_slot = Some(idx);
+                        idx
+                    }
+                    None => return -ENOSPC,
+                },
+            };
+            let buffer = write_buffer(idx);
             let available = MAX_WRITE_BUFFER - *buf_len;
             let n = available.min(len as usize);
-            if n == 0 && len > 0 {
+            if n == 0 {
                 return -ENOSPC;
             }
             // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
@@ -3069,7 +3149,7 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         parent_inode,
         name,
         name_len,
-        buffer,
+        buf_slot,
         len,
         owner_uid,
         existing_inode,
@@ -3080,6 +3160,14 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     } = file
     else {
         return 0;
+    };
+    // `buf_slot: None` means nothing ever actually buffered real bytes (the invariant `len == 0`
+    // whenever `buf_slot` is `None` -- see that field's own doc comment) -- an empty slice, not a
+    // pool lookup, matching exactly what the old inline-buffer scheme's own `buffer[..len]` would
+    // have yielded for the same never-written fd (an all-zero buffer sliced to `len == 0`).
+    let content: &[u8] = match *buf_slot {
+        Some(idx) => &write_buffer(idx)[..*len],
+        None => &[],
     };
     // Overwriting/appending to a file that already exists: write the new content into its own
     // existing inode -- same inode number, same directory entry, same owner/mode -- rather
@@ -3094,7 +3182,7 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         if *resized_directly {
             return 0;
         }
-        return if write_inode_data(inode_num, &buffer[..*len]) {
+        return if write_inode_data(inode_num, content) {
             0
         } else {
             -EIO
@@ -3112,7 +3200,7 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     inode.uid = *owner_uid;
     inode.mode = *mode;
     write_inode(new_inode, inode);
-    if !write_inode_data(new_inode, &buffer[..*len]) {
+    if !write_inode_data(new_inode, content) {
         return -EIO;
     }
     // Real Unix semantics: this fd's own name was already unlinked before it ever got the chance
@@ -3148,7 +3236,20 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
         return -EBADF;
     };
     let (_, mut file) = slot.take().expect("just matched Some above");
-    commit_write_buffer(&mut file)
+    let result = commit_write_buffer(&mut file);
+    // Release this fd's own `WRITE_BUFFERS` slot back to the pool, if it ever claimed one --
+    // safe only here (not in `commit_write_buffer` itself, also called by `fsync`/`sync` without
+    // closing the fd): a still-open fd may see more `write()` calls after an `fsync()`, and
+    // `write_inode_data` always treats the buffer as the file's *complete* content from byte 0,
+    // so it has to survive until the fd is genuinely gone.
+    if let OpenFile::Write {
+        buf_slot: Some(idx),
+        ..
+    } = file
+    {
+        free_write_buffer(idx);
+    }
+    result
 }
 
 /// Registered for `SYS_CLOSE`. Delegates to the kernel's own `oxidebsd_close_fd`, which removes
