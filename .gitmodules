@@ -13,4 +13,5 @@
 	branch = oxidebsd
 [submodule "third_party/posixtestsuite"]
 	path = third_party/posixtestsuite
-	url = https://github.com/emscripten-core/posixtestsuite
+	url = https://github.com/Pomsky2011/posixtestsuite.git
+	branch = oxidebsd
