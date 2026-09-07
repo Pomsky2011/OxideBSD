@@ -60,11 +60,15 @@ for rel in $(cat /posix-tests/manifest.txt); do
     # PASS), so they need nothing from this script. `sched_setparam/26-1.c` is the one exception in
     # this pilot's own corpus: its own hand-written `getuid() == 0` check has no `set_nonroot()`
     # fallback at all -- it just bails `PTS_UNTESTED` unconditionally under root, real assertion
-    # never reached. Patching that check into the test itself was deliberately rejected: unlike
-    # musl/BusyBox/TinyCC (personal forks on an `oxidebsd` branch, real patches allowed and
-    # documented), `third_party/posixtestsuite` is a plain submodule of the real upstream mirror --
-    # editing its own test source would quietly narrow what this pilot is actually verifying.
-    # Fixed instead from *outside* the test, the same way a real user would run it non-interactively
+    # never reached. Patching that check into the test itself was deliberately rejected: even
+    # though `third_party/posixtestsuite` is now (like musl/BusyBox/TinyCC) a personal fork on an
+    # `oxidebsd` branch -- Pomsky2011/posixtestsuite, carrying one real, upstream-filed fix
+    # (emscripten-core/posixtestsuite#16, a stale `_POSIX_ASYNCHRONOUS_IO` version-gate bug, not an
+    # OxideBSD-specific accommodation) -- silently rewriting a test's own assertion logic to make it
+    # pass would still quietly narrow what this pilot is actually verifying. The fork exists to host
+    # real, independently-justifiable, upstream-worthy test-suite bugs, not to paper over a real
+    # OxideBSD gap by changing what the test checks. Fixed instead from *outside* the test, the same
+    # way a real user would run it non-interactively
     # as a regular account: `su`'s own real, already-working root-skips-password path (see CLAUDE.md's
     # "Session, controlling-tty, and login authentication" section) execs a real `/bin/sh -c CMD` as
     # uid 1000 (the seeded `user` account) *before* the test binary itself ever starts, so its own
