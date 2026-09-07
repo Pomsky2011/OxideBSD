@@ -544,7 +544,20 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
     // Ring check via the CPU's own saved CS RPL bits (`& 0x3`), not e.g. `scheduler::current_pid()`
     // state -- see this function's own doc comment for why ring-3-only is the deliberate scope.
     let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
-    if interrupted_ring3 {
+    // A thread caught mid-`fault_trampoline` (its own store into the *shared-per-address-space*
+    // `RAX_SCRATCH_OFFSET` cell, immediately followed by the `syscall` that reads it back) must
+    // never be preempted -- doing so lets a sibling `CLONE_THREAD` thread interleave its own pass
+    // through the same physical page before this one resumes, clobbering the stashed `rax` with
+    // the sibling's own value. See `fault_trampoline::RAX_SCRATCH_OFFSET`'s own doc comment for the
+    // real bug this closes (`pthread_mutex_trylock/4-3.c`, a genuine `CRASH(139)` this caused).
+    // Deferring for one tick is enough: by the next tick the thread has long since finished this
+    // 19-byte, few-cycle sequence and is safe to preempt/redirect normally again.
+    let mid_fault_trampoline = interrupted_ring3
+        && (crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA
+            ..crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA
+                + crate::process::fault_trampoline::CODE_LEN)
+            .contains(&stack_frame.instruction_pointer.as_u64());
+    if interrupted_ring3 && !mid_fault_trampoline {
         // Real `SCHED_FIFO`/`SCHED_RR` priority preemption: checked on *every* tick, not gated on
         // the quantum below -- a higher-`sched_priority` process becoming Ready must preempt within
         // about one tick, not wait up to a full `PREEMPT_QUANTUM_TICKS` quantum. Every `SCHED_OTHER`

@@ -64,11 +64,56 @@ use crate::memory::with_frame_allocator;
 /// `lifecycle::INTERP_LOAD_BASE`, `fs::sysv_shm::SHM_REGION_BASE`).
 pub const FAULT_TRAMPOLINE_VA: u64 = 0x_1FFF_FFFF_F000;
 
+/// Real length, in bytes, of the trampoline's own instruction sequence (`map`'s own `code` array
+/// below) -- `interrupts::timer_interrupt_handler` uses this to recognize "currently mid-trampoline"
+/// and defer preemption/redirect decisions until the thread has actually left this tiny window; see
+/// `RAX_SCRATCH_OFFSET`'s own doc comment for why that matters now.
+pub const CODE_LEN: u64 = 19;
+
 /// Offset within the trampoline's own page where the real, pre-clobber `RAX` is stashed -- well
 /// past the ~19 bytes of real code, arbitrary otherwise (nothing else ever lives on this page).
-/// One frame per address space (see `map`'s own doc comment on why this page is never shared
-/// across processes), so no cross-process race is possible; single-core, so no cross-thread one
-/// either.
+/// One frame per address space, so no cross-*process* race is possible.
+///
+/// **Was documented (wrongly, once real threading landed) as also race-free across threads** --
+/// "single-core, so no cross-thread race is possible". True only while every `AddressSpace` was
+/// exclusive to one schedulable entity; real `CLONE_THREAD` (see "Real threading") makes this page
+/// the *same physical frame* for every thread sharing that address space (`AddressSpace::share`'s
+/// `Arc::clone`), and single-core doesn't prevent two threads from *interleaving* through it via
+/// preemption -- only from running it *simultaneously*. A thread preempted between its own
+/// `mov [scratch],rax` and `syscall` leaves a live, unconsumed value sitting in this shared cell;
+/// if a sibling thread of the same tgid enters the trampoline before the first one resumes and
+/// reads it back, the sibling's own store clobbers it, and the first thread resumes with the
+/// *sibling's* `rax` instead of its own. Found live via `pthread_mutex_trylock/4-3.c` (a real
+/// `CRASH(139)` on OxideBSD that runs clean on real musl+Linux): three threads of one process
+/// hammering `kill()`-driven `SIGUSR1`/`SIGUSR2` at high frequency for a full second gave enough
+/// timer ticks landing mid-trampoline for this to actually happen -- a stray corrupted `rax`
+/// resuming right where a compiled array-index computation (`count_ope % (NSCENAR+2)`) was about
+/// to turn into a pointer, producing a wild `pthread_mutex_t*` and a real page fault one call
+/// later. Confirmed by temporarily disabling `timer_interrupt_handler`'s whole async-redirect path:
+/// the crash became a clean `TIMEOUT` instead (the signal simply never got delivered), ruling out
+/// every other candidate.
+///
+/// **Mitigated, not fixed outright** -- not by giving each thread its own scratch cell, but by
+/// never letting a thread be preempted while `rip` is inside `[FAULT_TRAMPOLINE_VA,
+/// FAULT_TRAMPOLINE_VA + CODE_LEN)` in the first place, closing *this exact* interleaving (this
+/// shared cell, this window) at its source -- see `timer_interrupt_handler`'s own guard. A 16-run
+/// A/B batch of `pthread_mutex_trylock/4-3.c` in isolation confirms a real, measured improvement:
+/// 10/16 (62.5%) `CRASH(139)` *without* this guard,
+/// 6/16 (37.5%) *with* it -- real, but leaves a second, unisolated interleaving path into this
+/// same bug class. A live-traced instance of the residual crash showed a plausible, non-garbage
+/// restored `rax` from this exact redirect/restore mechanism, followed *much* later (after several
+/// further, individually-correct redirect/handler/sigreturn cycles logged in between) by a fault
+/// with a corrupted `rdi` holding what looks like a stray code address -- meaning the residual
+/// corruption isn't this same mechanism recurring, and doesn't come from `do_clone` remapping this
+/// page either (confirmed it doesn't -- `AddressSpace::share`'s `Arc::clone` is the only sharing
+/// mechanism, exactly as assumed above). Every GPR round-trips correctly through `syscall_entry`'s
+/// own push/pop sequence and `SyscallFrame`'s whole-struct copy in `stash_signal_context`/
+/// `take_signal_saved_frame` (both independently verified by direct reading, not just inference) --
+/// so the remaining corruption source is still open. Left for a follow-up investigation with more
+/// live tracing (a full GPR dump spanning several complete `deliver_pending_signal`
+/// handler-invoke-and-return cycles leading up to a caught crash would be the next step, ideally
+/// with minimal added instrumentation -- extra `serial_println!` calls measurably perturb timing
+/// enough to mask the race in smaller batches) rather than guessed at further here.
 pub const RAX_SCRATCH_OFFSET: u64 = 0x100;
 
 /// Maps `FAULT_TRAMPOLINE_VA` into `mapper`'s own (not-yet-active) address space with real
@@ -129,6 +174,7 @@ pub fn map(mapper: &mut impl Mapper<Size4KiB>, phys_offset: VirtAddr) -> Result<
             0x0F, 0x05,                           // syscall
             0x0F, 0x0B,                           // ud2 -- see this module's own doc comment
         ];
+        assert_eq!(code.len() as u64, CODE_LEN, "CODE_LEN drifted from the real trampoline encoding");
         // SAFETY: frame_ptr points at the whole, just-allocated, not-yet-active 4096-byte frame.
         unsafe {
             core::ptr::write_bytes(frame_ptr, 0, 4096);

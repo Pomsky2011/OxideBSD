@@ -94,17 +94,23 @@ sequential releases — each ships standalone rather than bundling everything in
 
 - **v0.2.0 — POSIX pilot compliance.** The current focus. Close as much of the gap as practical
   between OxideBSD's own Open POSIX Test Suite pilot run and a mature glibc/Linux baseline, using
-  the full ~1673-file corpus (not a curated subset — see `CLAUDE.md`'s "POSIX pilot: full corpus
-  expansion" section) as the measuring stick. Latest measured baseline (2026-09-04): OxideBSD
-  **82.1%** raw pass rate / **85.6%** excluding UNTESTED, vs. a real, apples-to-apples run of the
-  identical suite on a mature glibc/Linux host at **86.7%** / **89.7%** (`scripts/
-  run_posix_pilot_host.sh` reproduces the host side, `scripts/run_posix_pilot_supervised.sh` the
-  OxideBSD side — see CLAUDE.md's "Real zombie address-space frame reclaim..." section for the full
-  per-category table). Closing this ~4-point gap means triaging the full corpus's own remaining
-  FAIL/UNRESOLVED set, not growing the corpus further — it's already complete. **Full POSIX syscall
-  coverage** (every POSIX-mandated syscall, even where this ABI's own number/shape — see
-  `CLAUDE.md`'s Syscall ABI section — diverges from Linux's or any real BSD's; not a promise to
-  match Linux/BSD numbering or wire format) falls out of this same push, not a separate goal.
+  the full ~1687-file corpus (not a curated subset — see `CLAUDE.md`'s "POSIX pilot: full corpus
+  expansion" section) as the measuring stick. Latest measured OxideBSD baseline (2026-09-07, a
+  fresh `--reset` full-corpus run, `scripts/run_posix_pilot_supervised.sh`): **87.4%** raw pass
+  rate / **92.8%** excluding UNTESTED (1474 PASS / 1686 total; 22 FAIL / 39 UNRESOLVED / 14 CRASH /
+  11 TIMEOUT / 29 UNSUPPORTED / 97 UNTESTED — `shm_open/23-1.c` needed excluding again, a known,
+  real single-core scheduling-throughput limit, not a new bug). Last real host-side comparison
+  (2026-09-06, not re-run this session — `scripts/run_posix_pilot_host.sh`, manual/root-only): a
+  mature glibc/Linux host at **89.5%** / **94.3%**, a ~2-point gap. Closing it means triaging the
+  full corpus's own remaining FAIL/UNRESOLVED set, not growing the corpus further — it's already
+  complete. Two clusters ruled out this session as real bugs (see `CLAUDE.md`'s own history and
+  session memory for detail): `sigaction/17-{2,10,20,25,26}.c`'s FAILs were transient host-load
+  timing flakiness (all 5 clean `PASS` in this same fresh run); `aio_suspend`'s 6 and `aio_cancel`'s
+  4 UNRESOLVED are a real oxfs file-size-cap gap and an inherent test-timing race respectively,
+  neither a quick fix. **Full POSIX syscall coverage** (every POSIX-mandated syscall, even where
+  this ABI's own number/shape — see `CLAUDE.md`'s Syscall ABI section — diverges from Linux's or
+  any real BSD's; not a promise to match Linux/BSD numbering or wire format) falls out of this same
+  push, not a separate goal.
 - **v0.3.0 — GCC and Clang self-hosted ports.** What v0.2.0 used to target before the 2026-09-04
   re-scope (see `CLAUDE.md`'s TinyCC section for why this is a much bigger lift than TinyCC — real
   subprocess pipelines, likely real dynamic linking and threads beyond what exists today):
