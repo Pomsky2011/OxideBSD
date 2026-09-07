@@ -43,7 +43,17 @@ pub(crate) fn sys_write(fd: u64, ptr: u64, len: u64) -> Result<u64, u64> {
 /// naturally `ENOSYS`'s here (never registered) and falls through to this same plain `pwrite`
 /// call). See `crate::fs::fd::pread`/`pwrite`'s own doc comments -- unlike `sys_read`/`sys_write`,
 /// these never touch the fd's own current file position.
+/// Real POSIX `pread`/`pwrite`: `[EINVAL] The offset argument is invalid` (`offset < 0`) --
+/// checked here, once, for both, rather than in every fd kind's own callback (`offset` arrives as
+/// a raw `u64` register value; reinterpreting it as `i64` matches real `off_t`'s own signed
+/// convention, same as `oxfs_lseek` already does for its own offset argument). Found live via the
+/// Open POSIX Test Suite's `aio_read/11-1.c`/`aio_write/9-1.c`: a real `aio_offset = -1` reached
+/// `oxfs_pread`/`oxfs_pwrite` as `u64::MAX`, read as "so far past EOF" (silently 0 bytes) instead
+/// of a real, reportable error.
 pub(crate) fn sys_pread(fd: u64, ptr: u64, len: u64, offset: u64) -> Result<u64, u64> {
+    if (offset as i64) < 0 {
+        return Err(EINVAL);
+    }
     match crate::fs::fd::pread(fd, ptr, len, offset) {
         Some(raw) => ffi_result_to_result(raw),
         None => Err(EBADF),
@@ -51,6 +61,9 @@ pub(crate) fn sys_pread(fd: u64, ptr: u64, len: u64, offset: u64) -> Result<u64,
 }
 
 pub(crate) fn sys_pwrite(fd: u64, ptr: u64, len: u64, offset: u64) -> Result<u64, u64> {
+    if (offset as i64) < 0 {
+        return Err(EINVAL);
+    }
     match crate::fs::fd::pwrite(fd, ptr, len, offset) {
         Some(raw) => ffi_result_to_result(raw),
         None => Err(EBADF),
