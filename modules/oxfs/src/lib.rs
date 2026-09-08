@@ -26,10 +26,11 @@
 //!
 //! **Storage**, all fixed-size `static mut` arrays (modules can't use `alloc`/`Vec`/`BTreeMap` --
 //! see CLAUDE.md's module-loading section): a flat pool of `NUM_BLOCKS` `BLOCK_SIZE`-byte blocks
-//! (`BLOCKS`/`BLOCK_USED`), and a flat table of `MAX_INODES` inodes (`INODES`). An inode holds up
-//! to `DIRECT_BLOCKS` block numbers directly plus one single-indirect block (another
-//! `BLOCK_SIZE / 4` pointers) -- max file size is bounded only by the block pool, not by an
-//! arbitrary per-file cap.
+//! (`BLOCKS`/`BLOCK_USED`), and a flat table of `MAX_INODES` inodes (`INODES`). An inode addresses
+//! its data via `DIRECT_BLOCKS` direct block numbers, one single-indirect block, and one
+//! double-indirect block (see `Inode::double_indirect`'s own doc comment) -- `MAX_FILE_SIZE` (~4.1
+//! GiB) is a real architectural ceiling on any *one* file, distinct from the real pool's own total
+//! free space (a much smaller, honest `ENOSPC` limit shared across every file combined).
 //!
 //! **Directories are ordinary inodes** whose data blocks hold fixed `DIR_RECORD_SIZE`-byte records
 //! (`{ used: u8, name_len: u8, inode: u32, name: [u8; NAME_MAX] }`, `NAME_MAX = 40`,
@@ -413,7 +414,34 @@ const BLOCK_SIZE: usize = 4096;
 /// existing BusyBox applet roster's own footprint -- the ~14 MiB of headroom left at 8192 blocks
 /// (32 MiB total, minus BusyBox's own ~18 MiB) wasn't enough. 16384 blocks (64 MiB) leaves real
 /// headroom again, not just enough to exactly fit.
-const NUM_BLOCKS: usize = 65536;
+///
+/// **Raised again, 65536 -> 262144 (256 MiB -> 1 GiB), alongside the real per-file addressing fix**
+/// (`Inode::double_indirect`, see that field's own doc comment): a per-file cap of ~4 MiB was the
+/// binding constraint before, so the real pool's own size never mattered much past "bigger than
+/// the seeded content." Once a single file can address up to ~4.1 GiB, the pool itself becomes the
+/// real, honest ceiling on how big any file can actually get -- 1 GiB gives genuinely useful
+/// headroom for that without exhausting this project's own hard `MODULE_REGION_CEILING` VA budget
+/// (`src/module.rs`; ~1.5 GiB total, shared by *every* kernel module -- this module is already by
+/// far the largest consumer of it, and the only one with any large static pools at all). A real 4
+/// GiB file is structurally impossible regardless of this number: the whole pool is a fixed
+/// `static mut` array baked directly into this module's own image, eagerly mapped as real physical
+/// RAM the instant it loads (see this constant's own opening paragraph) -- it can never itself
+/// reach anywhere near 4 GiB without either blowing the VA budget outright or costing more real
+/// RAM than this kernel has ever assumed a single module would need. A file's real achievable size
+/// is bounded by whatever of this pool is actually still free (an honest `ENOSPC` once it isn't),
+/// exactly like any real filesystem whose maximum file size (a property of its own addressing
+/// scheme) can exceed its disk's real free space.
+///
+/// **Found live alongside this bump, a real pre-existing bug**: `persist_bitmap_if_ready`/
+/// `mount_from_disk`/`flush_all_to_disk` packed the *entire* block-used bitmap into a single
+/// `BLOCK_SIZE`-byte buffer (`i / 8` indexing it directly) -- correct only while `NUM_BLOCKS` fits
+/// in `BLOCK_SIZE * 8` bits (32768). This constant had already silently exceeded that bound at
+/// 65536 blocks before this pass (a real, guaranteed out-of-bounds panic -- fatal to this module,
+/// see `module::CURRENT_MODULE_FATAL` -- the moment any real write happened against a real,
+/// persisted disk past boot), just never hit because this pass is what actually exercises real
+/// disk persistence hard enough to surface it. Fixed by spreading the bitmap across
+/// `BITMAP_BLOCKS` real blocks instead of a hardcoded one -- see that constant's own doc comment.
+const NUM_BLOCKS: usize = 262144;
 /// Raised from 64 alongside `NUM_BLOCKS` above, same reason -- ~300 applets plus root/`hello.txt`/
 /// `big.txt`/the self-check's own `/gdtest` fixtures need comfortably more than 64 inode slots.
 /// Raised again, 512 -> 1024, once TinyCC (`third_party/tinycc`, see CLAUDE.md's TinyCC section)
@@ -432,6 +460,21 @@ const NUM_BLOCKS: usize = 65536;
 const MAX_INODES: usize = 8192;
 const DIRECT_BLOCKS: usize = 12;
 const PTRS_PER_INDIRECT: usize = BLOCK_SIZE / 4;
+/// A double-indirect block's own fan-out: `PTRS_PER_INDIRECT` pointers to *index* blocks, each in
+/// turn holding `PTRS_PER_INDIRECT` pointers to real data blocks -- `1024 * 1024 = 1,048,576` data
+/// blocks reachable through one double-indirect pointer, i.e. exactly `1024^2 * BLOCK_SIZE` = 4
+/// GiB. See `Inode::double_indirect`'s own doc comment for why this (and not a bigger, triple-
+/// indirect scheme) is the right amount of addressing to add.
+const PTRS_PER_DOUBLE_INDIRECT: usize = PTRS_PER_INDIRECT * PTRS_PER_INDIRECT;
+/// Real per-file addressing ceiling once `Inode::double_indirect` is in play: `DIRECT_BLOCKS` +
+/// one single-indirect block's worth + one double-indirect block's worth of data blocks, all
+/// `BLOCK_SIZE` bytes each -- `(12 + 1024 + 1048576) * 4096` = 4,299,198,464 bytes, ~4.1 GiB.
+/// Informational only (nothing indexes by it directly; `inode_block_at`/`inode_ensure_block_at`
+/// derive the same three tiers from `DIRECT_BLOCKS`/`PTRS_PER_INDIRECT`/`PTRS_PER_DOUBLE_INDIRECT`
+/// directly) -- kept as a single named place this file's own doc comments can point at.
+#[allow(dead_code)]
+const MAX_FILE_SIZE: usize =
+    (DIRECT_BLOCKS + PTRS_PER_INDIRECT + PTRS_PER_DOUBLE_INDIRECT) * BLOCK_SIZE;
 /// Sentinel for "no block"/"no indirect block" -- block numbers are plain indices into `BLOCKS`
 /// starting at `0` (unlike FAT32's cluster numbering, which reserves `0`/`1`), so `0` itself can't
 /// double as the sentinel the way it does there.
@@ -459,20 +502,31 @@ const TMPFS_MAX_INODES: usize = 128;
 // --- Real disk persistence (see src/ata.rs) --------------------------------------------------
 //
 // Physical disk block layout: block `0` is the superblock, `[INODE_TABLE_START,
-// INODE_TABLE_START + INODE_TABLE_BLOCKS)` is the packed inode table, `BITMAP_BLOCK` is the
-// block-used bitmap, and real data starts at `DATA_BLOCK_OFFSET` -- this module's own in-memory
-// block number `i` maps to physical disk block `DATA_BLOCK_OFFSET + i`. Sizing: 512 inodes at a
-// fixed 128-byte stride (real content is 74 bytes -- 1 tag + 4 size + 48 direct + 4 indirect + 2
-// mode + 4 uid + 4 gid + 2 nlink + 4 rdev + 1 device_char -- rounded up to a power-of-two stride
-// that divides BLOCK_SIZE evenly,
-// leaving headroom for future fields) is exactly 16 4096-byte blocks; `NUM_BLOCKS` (8192) bits is
-// exactly 1. Total metadata region: 18 blocks.
+// INODE_TABLE_START + INODE_TABLE_BLOCKS)` is the packed inode table, `[BITMAP_START,
+// BITMAP_START + BITMAP_BLOCKS)` is the block-used bitmap, and real data starts at
+// `DATA_BLOCK_OFFSET` -- this module's own in-memory block number `i` maps to physical disk block
+// `DATA_BLOCK_OFFSET + i`. Sizing (as of `SUPERBLOCK_VERSION = 2`): `MAX_INODES` inodes at a fixed
+// 128-byte stride (real packed content is 106 bytes -- 1 tag + 8 size + 48 direct + 4 indirect + 4
+// double_indirect + 2 mode + 4 uid + 4 gid + 2 nlink + 4 rdev + 1 device_char + 8 mtime + 8 ctime +
+// 8 atime -- rounded up to a power-of-two stride that divides BLOCK_SIZE evenly, leaving headroom
+// for future fields); `BITMAP_BLOCKS` bitmap blocks, one bit per real block (`NUM_BLOCKS`, no
+// longer assumed to fit a single block -- see that constant's own doc comment for the real bug
+// this fixed). `INODE_TABLE_BLOCKS`/`BITMAP_BLOCKS`/`DATA_BLOCK_OFFSET` are all real, derived
+// consts, not hand-computed numbers -- see each one's own definition below.
 
 /// Marks a real, formatted oxfs disk. Absence/mismatch (an unformatted/all-zero disk, or one some
 /// other filesystem wrote) means the same thing either way: format fresh rather than try to
 /// interpret unknown content -- see `mount_from_disk`.
 const SUPERBLOCK_MAGIC: [u8; 4] = *b"OXFS";
-const SUPERBLOCK_VERSION: u32 = 1;
+/// Bumped 1 -> 2 for the real max-file-size redesign: `Inode`'s own packed on-disk shape changed
+/// (`size` widened to 64-bit, a new `double_indirect` block pointer added -- see that field's own
+/// doc comment), and the block-used bitmap's own on-disk span changed (`BITMAP_BLOCKS`, no longer
+/// hardcoded to one block). A disk formatted under version 1 has the wrong bytes at every offset
+/// this build now expects -- `mount_from_disk`'s own layout check (below) already treats any
+/// mismatch here exactly like a `NUM_BLOCKS`/`MAX_INODES` change: a clean, automatic reformat, not
+/// a crash or silent misread. Any content on an existing `target/oxfs_disk.img` besides the
+/// seeded-at-boot roster (BusyBox/musl/TinyCC/POSIX corpus, all reseeded fresh on format) is lost.
+const SUPERBLOCK_VERSION: u32 = 2;
 
 const INODE_TABLE_START: u32 = 1;
 /// Real packed size (see the section doc comment above) -- **never** a raw transmute/memcpy of
@@ -483,8 +537,14 @@ const INODE_TABLE_START: u32 = 1;
 const INODE_STRIDE: usize = 128;
 const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_STRIDE;
 const INODE_TABLE_BLOCKS: u32 = ((MAX_INODES * INODE_STRIDE + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-const BITMAP_BLOCK: u32 = INODE_TABLE_START + INODE_TABLE_BLOCKS;
-const DATA_BLOCK_OFFSET: u32 = BITMAP_BLOCK + 1;
+/// How many physical blocks the block-used bitmap spans -- one bit per real (non-tmpfs) block,
+/// `BLOCK_SIZE * 8` bits per physical block. **Must be a real, computed span, not a hardcoded
+/// single block** -- see `NUM_BLOCKS`'s own doc comment for the real, previously-live bug this
+/// fixes (a `NUM_BLOCKS` past `BLOCK_SIZE * 8` = 32768 already silently exceeded a single block's
+/// worth of bits before this pass).
+const BITMAP_BLOCKS: u32 = ((NUM_BLOCKS + BLOCK_SIZE * 8 - 1) / (BLOCK_SIZE * 8)) as u32;
+const BITMAP_START: u32 = INODE_TABLE_START + INODE_TABLE_BLOCKS;
+const DATA_BLOCK_OFFSET: u32 = BITMAP_START + BITMAP_BLOCKS;
 
 /// Gates `write_block`/`write_inode`/`set_block_used`'s own write-through persistence (see those
 /// functions below). Deliberately `false` for the *entire* duration of `format_fresh_filesystem`
@@ -572,19 +632,31 @@ const CWD_PROC_PID_MASK: u64 = 0xFFFF_FFFF;
 /// **less** total memory than the old 256 did (~8 MiB vs. ~32 MiB) while giving `shm_open/23-1.c`
 /// real headroom past its own 1000-object peak.
 const MAX_OPEN_FILES: usize = 2048;
-/// Write-side accumulator cap (see `OpenFile::Write`'s own doc comment) -- comfortably past
-/// today's largest embedded binary (`sh.elf`, ~102 KB). Matches `modules/fat32`'s own final,
-/// proven-sufficient `MAX_FILE_BUFFER` value exactly (rather than something bigger).
-const MAX_WRITE_BUFFER: usize = 131072;
+/// Write-side flush-window size (see `OpenFile::Write`'s own doc comment). Raised 128 KiB -> 16
+/// MiB alongside the real max-file-size redesign: this used to be a hard *whole-file* cap (every
+/// `close()` replaced a file's complete content with exactly this buffer, see `commit_write_buffer`'s
+/// pre-redesign doc comment) -- now it's just how much a `write()` loop can accumulate before this
+/// module flushes it into the real inode's own block chain and keeps accepting more, so a real
+/// file built via ordinary sequential `write()` calls is no longer capped at this number at all
+/// (only by `MAX_FILE_SIZE`/the real pool's own free space). 16 MiB is chosen directly to satisfy
+/// that flush-window requirement, not tuned against any specific real workload the way the old 128
+/// KiB figure was.
+const MAX_WRITE_BUFFER: usize = 16 * 1024 * 1024;
 /// How many `WRITE_BUFFERS` slots exist -- **not** the same as `MAX_OPEN_FILES` any more (see that
-/// constant's own doc comment for the split this enables). Sized to the real concurrent-*writer*
-/// count this kernel has ever actually needed (the old `MAX_OPEN_FILES = 256` figure, before it
-/// had to also cover every non-writing open), not the much larger total-open-fd count `shm_open/
-/// 23-1.c` needs -- most concurrently-open fds across this whole codebase's own test corpus never
-/// call `write()` at all (plain reads, directory listings, and any `O_CREAT`-but-never-written
-/// object like `shm_open/23-1.c`'s own 1000 objects, real POSIX `shm_open(O_RDONLY|O_CREAT, ...)`
-/// use).
-const MAX_WRITE_BUFFERS: usize = 256;
+/// constant's own doc comment for the split this enables). Lowered 256 -> 16 alongside
+/// `MAX_WRITE_BUFFER`'s own 128x bump (128 KiB -> 16 MiB): holding the total pool cost
+/// (`MAX_WRITE_BUFFERS * MAX_WRITE_BUFFER`) roughly flat, rather than multiplying it out to 4 GiB,
+/// is required, not just frugal -- this pool, like `BLOCKS`, is a real, always-resident static
+/// array inside this module's own image, sharing the same hard ~1.5 GiB `MODULE_REGION_CEILING`
+/// VA budget every other kernel module draws from too (see `NUM_BLOCKS`'s own doc comment for the
+/// same constraint on the block pool). 16 slots * 16 MiB = 256 MiB, comfortably inside what's left
+/// after `NUM_BLOCKS`'s own 1 GiB bump, and still real headroom past the concurrent-*writer* count
+/// (as opposed to total open-fd count, see this constant's own prior note) this kernel has ever
+/// actually needed -- most concurrently-open fds across this whole codebase's own test corpus
+/// never call `write()` at all (plain reads, directory listings, and any `O_CREAT`-but-never-
+/// written object like `shm_open/23-1.c`'s own 1000 objects, real POSIX
+/// `shm_open(O_RDONLY|O_CREAT, ...)` use).
+const MAX_WRITE_BUFFERS: usize = 16;
 const DIR_LISTING_BUFFER: usize = 4096;
 
 const MAX_CWD_PATH: usize = 256;
@@ -633,9 +705,28 @@ enum InodeKind {
 #[derive(Clone, Copy)]
 struct Inode {
     kind: InodeKind,
-    size: u32,
+    /// Real content length in bytes. Widened `u32` -> `u64` alongside `double_indirect` below --
+    /// `MAX_FILE_SIZE` (~4.1 GiB) exceeds `u32::MAX` by design (a 4 GiB file wouldn't otherwise be
+    /// representable at all), so this has to grow with the addressing scheme it now needs to
+    /// describe.
+    size: u64,
     direct: [u32; DIRECT_BLOCKS],
     indirect: u32,
+    /// Real double-indirect block pointer, added alongside `size`'s widening to close this
+    /// filesystem's real max-file-size gap: `direct` + `indirect` alone address only
+    /// `(DIRECT_BLOCKS + PTRS_PER_INDIRECT) * BLOCK_SIZE` ~= 4.04 MiB per file -- an arbitrary,
+    /// far-too-low architectural cap unrelated to how much of the real block pool is actually
+    /// free. One double-indirect pointer (an index block of `PTRS_PER_INDIRECT` pointers, each to
+    /// its own index block of `PTRS_PER_INDIRECT` pointers to real data blocks) adds exactly
+    /// `PTRS_PER_INDIRECT^2 * BLOCK_SIZE` = 4 GiB of further addressable space -- chosen
+    /// specifically because `1024^2` (`PTRS_PER_INDIRECT` squared) lands on exactly 4 GiB with
+    /// this filesystem's existing `BLOCK_SIZE`/4-byte-pointer shape, satisfying "at least 4 GiB"
+    /// with one added tier rather than needing a third, triple-indirect one. See
+    /// `inode_block_at`/`inode_ensure_block_at` for how the three tiers (direct, single-, double-
+    /// indirect) are actually walked/allocated, and `MAX_FILE_SIZE`'s own doc comment for the real,
+    /// combined total. `NO_BLOCK` until a file's own content actually reaches past the single-
+    /// indirect tier -- the overwhelming majority of real files here never allocate this at all.
+    double_indirect: u32,
     /// Real per-inode permission bits (12 bits would cover setuid/setgid/sticky too, but nothing
     /// in this port's roster sets or checks those, so only the low 9 POSIX rwxrwxrwx bits are ever
     /// written -- `oxfs_chmod` masks its input to `0o777`). Defaults to `FIXED_PERM` (`0o755`),
@@ -704,6 +795,7 @@ impl Inode {
         size: 0,
         direct: [NO_BLOCK; DIRECT_BLOCKS],
         indirect: NO_BLOCK,
+        double_indirect: NO_BLOCK,
         mode: FIXED_PERM as u16,
         uid: 0,
         gid: 0,
@@ -722,6 +814,7 @@ impl Inode {
             size: 0,
             direct: [NO_BLOCK; DIRECT_BLOCKS],
             indirect: NO_BLOCK,
+            double_indirect: NO_BLOCK,
             mode: FIXED_PERM as u16,
             uid: 0,
             gid: 0,
@@ -839,7 +932,7 @@ fn block_used(n: u32) -> bool {
 
 fn set_block_used(n: u32, used: bool) {
     unsafe { (*core::ptr::addr_of_mut!(BLOCK_USED))[n as usize] = used };
-    persist_bitmap_if_ready();
+    persist_bitmap_if_ready(n);
 }
 
 fn read_inode(n: u32) -> Inode {
@@ -851,13 +944,32 @@ fn write_inode(n: u32, inode: Inode) {
     persist_inode_block_if_ready(n);
 }
 
-/// Linear scan for the first free block -- fine at this module's scale (`NUM_BLOCKS = 1024`), same
-/// "simplicity over a free list" choice `modules/fat32`'s own `allocate_cluster` already makes.
+/// Resume-scan cursor for `alloc_block` -- see that function's own doc comment for why a bare
+/// linear-from-`0` scan (this module's original design) stopped being viable once `NUM_BLOCKS`
+/// grew large enough for real big-file writes to actually matter.
+static mut NEXT_FREE_BLOCK: u32 = 0;
+
+/// Finds and claims the first free real (non-tmpfs) block, starting from `NEXT_FREE_BLOCK` rather
+/// than always rescanning from `0` -- this module's blocks are **never freed** in normal operation
+/// (`unlink`/`rmdir` only clear a directory record's `used` byte, matching this module's own
+/// blanket "no deallocation anywhere" stance; the one exception, `reset_real_pool_for_fresh_format`,
+/// resets this cursor back to `0` in the same pass, see that function's own doc comment) -- so once
+/// this cursor passes a block, no future call can ever need to look at it again, making this a real
+/// bump allocator in practice (the loop below only ever iterates more than once during whatever
+/// startup seeding leaves a stale cursor behind, e.g. right after `mount_from_disk` loads a bitmap
+/// with a real prefix already marked used). A bare rescan-from-`0` scan (this function's original
+/// design, "fine at this module's scale" when `NUM_BLOCKS` was in the low thousands) becomes a real
+/// `O(n^2)` cost filling the whole pool once `NUM_BLOCKS` is large enough for a genuinely big real
+/// file to matter -- the same class of bug `memory::BootInfoFrameAllocator`'s own doc comment
+/// already warns about for the physical frame allocator, fixed here the same way: cursor state, not
+/// a rebuilt-each-call scan.
 fn alloc_block() -> Option<u32> {
-    for i in 0..NUM_BLOCKS as u32 {
+    let start = unsafe { *core::ptr::addr_of!(NEXT_FREE_BLOCK) };
+    for i in start..NUM_BLOCKS as u32 {
         if !block_used(i) {
             set_block_used(i, true);
             write_block(i, &[0u8; BLOCK_SIZE]);
+            unsafe { *core::ptr::addr_of_mut!(NEXT_FREE_BLOCK) = i + 1 };
             return Some(i);
         }
     }
@@ -922,22 +1034,45 @@ fn alloc_inode_in(parent: u32) -> Option<u32> {
     }
 }
 
-/// Reads the block number backing `inode`'s logical block `index` (direct or, past
-/// `DIRECT_BLOCKS`, via the single-indirect block), or `None` if that block was never allocated.
+/// Reads a real block-number pointer out of index block `ib_num` at slot `slot` -- the same
+/// 4-byte-little-endian-pointer decoding `inode_block_at`/`inode_ensure_block_at` need at every
+/// indirection tier (a single-indirect block's own slots, and both levels of a double-indirect
+/// block's own two-level slot chain), factored out once there were three call sites instead of one.
+fn read_index_ptr(ib_num: u32, slot: usize) -> u32 {
+    let ib = read_block(ib_num);
+    let off = slot * 4;
+    u32::from_le_bytes([ib[off], ib[off + 1], ib[off + 2], ib[off + 3]])
+}
+
+/// Reads the block number backing `inode`'s logical block `index` -- direct, then (past
+/// `DIRECT_BLOCKS`) via the single-indirect block, then (past that) via the double-indirect block
+/// (see `Inode::double_indirect`'s own doc comment for the three-tier addressing scheme this
+/// implements) -- or `None` if that block was never allocated.
 fn inode_block_at(inode: &Inode, index: usize) -> Option<u32> {
     if index < DIRECT_BLOCKS {
         let b = inode.direct[index];
-        (b != NO_BLOCK).then_some(b)
-    } else {
-        let indirect_index = index - DIRECT_BLOCKS;
-        if inode.indirect == NO_BLOCK || indirect_index >= PTRS_PER_INDIRECT {
+        return (b != NO_BLOCK).then_some(b);
+    }
+    let index = index - DIRECT_BLOCKS;
+    if index < PTRS_PER_INDIRECT {
+        if inode.indirect == NO_BLOCK {
             return None;
         }
-        let ib = read_block(inode.indirect);
-        let off = indirect_index * 4;
-        let b = u32::from_le_bytes([ib[off], ib[off + 1], ib[off + 2], ib[off + 3]]);
-        (b != NO_BLOCK).then_some(b)
+        let b = read_index_ptr(inode.indirect, index);
+        return (b != NO_BLOCK).then_some(b);
     }
+    let index = index - PTRS_PER_INDIRECT;
+    if inode.double_indirect == NO_BLOCK || index >= PTRS_PER_DOUBLE_INDIRECT {
+        return None;
+    }
+    let outer_slot = index / PTRS_PER_INDIRECT;
+    let inner_slot = index % PTRS_PER_INDIRECT;
+    let inner_block = read_index_ptr(inode.double_indirect, outer_slot);
+    if inner_block == NO_BLOCK {
+        return None;
+    }
+    let b = read_index_ptr(inner_block, inner_slot);
+    (b != NO_BLOCK).then_some(b)
 }
 
 /// Like `inode_block_at`, but allocates a fresh block (and, if needed, a fresh indirect block)
@@ -964,11 +1099,8 @@ fn inode_ensure_block_at(inode_num: u32, index: usize) -> Option<u32> {
             };
         }
         Some(inode.direct[index])
-    } else {
+    } else if index - DIRECT_BLOCKS < PTRS_PER_INDIRECT {
         let indirect_index = index - DIRECT_BLOCKS;
-        if indirect_index >= PTRS_PER_INDIRECT {
-            return None;
-        }
         if inode.indirect == NO_BLOCK {
             inode.indirect = if tmpfs {
                 alloc_tmpfs_indirect_block()?
@@ -976,24 +1108,64 @@ fn inode_ensure_block_at(inode_num: u32, index: usize) -> Option<u32> {
                 alloc_indirect_block()?
             };
         }
-        let mut ib = read_block(inode.indirect);
-        let off = indirect_index * 4;
-        let existing = u32::from_le_bytes([ib[off], ib[off + 1], ib[off + 2], ib[off + 3]]);
-        if existing == NO_BLOCK {
-            let nb = if tmpfs {
-                alloc_tmpfs_block()?
-            } else {
-                alloc_block()?
-            };
-            ib[off..off + 4].copy_from_slice(&nb.to_le_bytes());
-            write_block(inode.indirect, &ib);
-            Some(nb)
-        } else {
-            Some(existing)
+        ensure_index_slot(inode.indirect, indirect_index, tmpfs)
+    } else {
+        // Double-indirect tier -- see `Inode::double_indirect`'s own doc comment. `outer_slot`
+        // picks (allocating if needed) the one inner index block covering `inner_slot`'s own
+        // range, then `ensure_index_slot` does the same real-block allocation `inode_ensure_block_
+        // at`'s single-indirect branch above already does, just one level deeper.
+        let index = index - DIRECT_BLOCKS - PTRS_PER_INDIRECT;
+        if index >= PTRS_PER_DOUBLE_INDIRECT {
+            return None;
         }
+        let outer_slot = index / PTRS_PER_INDIRECT;
+        let inner_slot = index % PTRS_PER_INDIRECT;
+        if inode.double_indirect == NO_BLOCK {
+            inode.double_indirect = if tmpfs {
+                alloc_tmpfs_indirect_block()?
+            } else {
+                alloc_indirect_block()?
+            };
+        }
+        let mut outer = read_block(inode.double_indirect);
+        let outer_off = outer_slot * 4;
+        let mut inner_block = u32::from_le_bytes(
+            outer[outer_off..outer_off + 4].try_into().unwrap(),
+        );
+        if inner_block == NO_BLOCK {
+            inner_block = if tmpfs {
+                alloc_tmpfs_indirect_block()?
+            } else {
+                alloc_indirect_block()?
+            };
+            outer[outer_off..outer_off + 4].copy_from_slice(&inner_block.to_le_bytes());
+            write_block(inode.double_indirect, &outer);
+        }
+        ensure_index_slot(inner_block, inner_slot, tmpfs)
     };
     write_inode(inode_num, inode);
     result
+}
+
+/// Shared by `inode_ensure_block_at`'s single-indirect branch and its double-indirect branch's own
+/// inner tier: reads index block `ib_num`'s pointer at `slot`, allocating (from the real or tmpfs
+/// pool, per `tmpfs`) and writing back a fresh real data-block pointer if that slot is still
+/// `NO_BLOCK`.
+fn ensure_index_slot(ib_num: u32, slot: usize, tmpfs: bool) -> Option<u32> {
+    let mut ib = read_block(ib_num);
+    let off = slot * 4;
+    let existing = u32::from_le_bytes(ib[off..off + 4].try_into().unwrap());
+    if existing != NO_BLOCK {
+        return Some(existing);
+    }
+    let nb = if tmpfs {
+        alloc_tmpfs_block()?
+    } else {
+        alloc_block()?
+    };
+    ib[off..off + 4].copy_from_slice(&nb.to_le_bytes());
+    write_block(ib_num, &ib);
+    Some(nb)
 }
 
 /// Reads up to `out.len()` bytes starting at `position` within `inode_num`'s data, honoring its
@@ -1022,9 +1194,12 @@ fn read_inode_at(inode_num: u32, position: usize, out: &mut [u8]) -> usize {
     written
 }
 
-/// Writes `content` as `inode_num`'s complete contents, allocating whatever blocks are needed and
-/// setting `size` -- the only write primitive this module has (matching `modules/fat32`'s own
-/// "writes only ever create/replace a file's complete contents in one operation" simplification).
+/// Writes `content` as `inode_num`'s complete contents (replacing whatever was there before),
+/// allocating whatever blocks are needed and setting `size`. **No longer `OpenFile::Write`'s own
+/// commit primitive** (that path now flushes positionally/additively via `write_inode_at`, see
+/// `commit_write_buffer`'s own doc comment) -- this whole-content-replace shape is still exactly
+/// right for its one remaining real caller, `oxfs_inode_content_write` (real fd-backed `MAP_SHARED`
+/// mmap writeback, which always supplies a mapping's complete current content).
 fn write_inode_data(inode_num: u32, content: &[u8]) -> bool {
     let block_count = content.len().div_ceil(BLOCK_SIZE);
     for i in 0..block_count {
@@ -1038,7 +1213,7 @@ fn write_inode_data(inode_num: u32, content: &[u8]) -> bool {
         write_block(blk, &buf);
     }
     let mut inode = read_inode(inode_num);
-    inode.size = content.len() as u32;
+    inode.size = content.len() as u64;
     let now = unsafe { oxidebsd_unix_time() };
     inode.mtime = now;
     inode.ctime = now;
@@ -1070,8 +1245,9 @@ fn touch_atime(inode_num: u32) {
 /// past the new `size` simply become unreachable -- `read_inode_at` already never reads past
 /// `inode.size`, and a later grow back past the old size would zero-fill over them again, matching
 /// real POSIX "grow into a hole reads as zero" semantics either way). Load-bearing for staying
-/// off the stack: this filesystem's per-file cap is ~4 MiB (see `Inode`'s own doc comment), far
-/// past what this kernel's 128 KiB kernel-stack floor could ever hold as one local buffer.
+/// off the stack: this filesystem's real per-file addressing ceiling is `MAX_FILE_SIZE` (~4.1
+/// GiB, see `Inode::double_indirect`'s own doc comment), far past what this kernel's 128 KiB
+/// kernel-stack floor could ever hold as one local buffer.
 fn resize_inode_data(inode_num: u32, new_size: usize) -> bool {
     let old_size = read_inode(inode_num).size as usize;
     if new_size > old_size {
@@ -1092,7 +1268,7 @@ fn resize_inode_data(inode_num: u32, new_size: usize) -> bool {
         }
     }
     let mut inode = read_inode(inode_num);
-    inode.size = new_size as u32;
+    inode.size = new_size as u64;
     let now = unsafe { oxidebsd_unix_time() };
     inode.mtime = now;
     inode.ctime = now;
@@ -1106,10 +1282,12 @@ fn resize_inode_data(inode_num: u32, new_size: usize) -> bool {
 /// instead of zeros. A gap between the file's current real size and `position` (real POSIX: writing
 /// past EOF creates a hole that reads back as zero) is zero-filled first via `resize_inode_data`
 /// itself, reusing its own already-correct real "grow into a hole" logic rather than duplicating
-/// it. Load-bearing for the same reason `resize_inode_data` is: this filesystem's per-file cap is
-/// ~4 MiB, far past what a 128 KiB kernel stack could hold as one local buffer -- and, unlike
-/// `OpenFile::Write`'s own `WRITE_BUFFERS` pool (bounded to `MAX_WRITE_BUFFER` = 128 KiB per fd),
-/// this has no buffer-size ceiling at all short of the filesystem's own real per-file cap. See
+/// it. Load-bearing for the same reason `resize_inode_data` is: this filesystem's real per-file
+/// addressing ceiling is `MAX_FILE_SIZE` (~4.1 GiB), far past what a 128 KiB kernel stack could
+/// hold as one local buffer -- and, unlike `OpenFile::Write`'s own `WRITE_BUFFERS` pool (a bounded
+/// `MAX_WRITE_BUFFER`-sized flush window, not a whole-file cap any more -- see that constant's own
+/// doc comment), this has no buffer-size ceiling at all short of the filesystem's own real
+/// addressing/pool limits. See
 /// `oxfs_pwrite`'s own doc comment for the real caller (`SYS_PWRITE`, found live via the Open POSIX
 /// Test Suite's `aio_write`/`lio_listio` pilot -- `lio_listio/1-1.c` alone needs a real 1 MiB
 /// `pwrite()`, far past what the pooled buffer could ever hold).
@@ -1136,7 +1314,7 @@ fn write_inode_at(inode_num: u32, position: usize, data: &[u8]) -> bool {
     }
     let mut inode = read_inode(inode_num);
     if pos > inode.size as usize {
-        inode.size = pos as u32;
+        inode.size = pos as u64;
     }
     let now = unsafe { oxidebsd_unix_time() };
     inode.mtime = now;
@@ -2155,18 +2333,40 @@ enum OpenFile {
         position: usize,
         dirent_pos: usize,
     },
-    /// A file opened for writing -- accumulates across possibly-multiple `write` calls, committed
-    /// only at `close` time (same all-at-once-on-close model `modules/fat32` already uses).
+    /// A file opened for writing. **Real streaming write-back, not a whole-file staging buffer**:
+    /// `write()` accumulates into `WRITE_BUFFERS[buf_slot]` up to `MAX_WRITE_BUFFER` (a flush
+    /// *window*, not a file-size cap any more), at which point (or at `close()`/`fsync()`/any
+    /// forced early commit) `commit_write_buffer` appends whatever's buffered onto the real inode
+    /// at `write_pos` and keeps going -- so a real file built via an ordinary sequential `write()`
+    /// loop is bounded only by `MAX_FILE_SIZE`/the real pool's own free space, never by this
+    /// buffer's own size. Replaces the old "buffer holds the file's *entire* content, replaced
+    /// wholesale at `close()`" model (still `modules/fat32`'s own design), which is what capped a
+    /// written-from-scratch file at `MAX_WRITE_BUFFER` no matter how it was written.
     Write {
         parent_inode: u32,
         name: [u8; NAME_MAX],
         name_len: u8,
-        /// Index into the separate `WRITE_BUFFERS` pool holding this fd's accumulated content --
-        /// `None` until something actually needs to buffer real bytes (see `WRITE_BUFFERS`'s own
-        /// doc comment for why this is pooled separately from `OpenFile` rather than embedded
-        /// inline the way it used to be). Real invariant: `len == 0` whenever this is `None`.
+        /// Index into the separate `WRITE_BUFFERS` pool holding this fd's *currently unflushed*
+        /// content -- `None` until something actually needs to buffer real bytes (see
+        /// `WRITE_BUFFERS`'s own doc comment for why this is pooled separately from `OpenFile`
+        /// rather than embedded inline). Real invariant: `len == 0` whenever this is `None`. Once
+        /// `commit_write_buffer` flushes `buffer[..len]` onto the real inode, `len` resets to `0`
+        /// (the slot itself stays claimed until `close()` -- see `free_write_buffer`'s own call
+        /// site) and more bytes can accumulate from there; the slot is never required to hold a
+        /// whole file's content at once any more.
         buf_slot: Option<usize>,
         len: usize,
+        /// Absolute file offset the *next* flush will write `buffer[..len]` at -- advances by
+        /// `len` every time `commit_write_buffer` actually flushes something. Set once at `open()`
+        /// time: `0` for a brand-new file or a plain overwrite (real POSIX: a write-mode open
+        /// without `O_APPEND` starts at file position `0`, regardless of the file's own prior
+        /// size), or the file's real current size for `O_APPEND` (so buffered writes land after
+        /// existing content without ever having to copy that content through this buffer at all --
+        /// see this field's own history: the old design *preloaded* `O_APPEND`'s existing bytes
+        /// into the buffer itself, silently losing everything past the buffer's own then-128-KiB
+        /// capacity for any append target bigger than that, since the old whole-file-replace
+        /// commit only ever wrote back whatever fit).
+        write_pos: u64,
         /// The caller's own uid at `open(O_CREAT)` time -- real Unix ownership semantics (a
         /// freshly created file is owned by its creator, not always root) -- captured here rather
         /// than re-queried at `close` time since a real program can `open` in one process and
@@ -2174,28 +2374,14 @@ enum OpenFile {
         /// for a fresh file) when `existing_inode` is `Some` -- overwriting/appending to a file
         /// that already exists never changes its owner, matching real POSIX `open()`/`write()`.
         owner_uid: u32,
-        /// `None`: no inode exists yet for `name` -- `close` allocates a fresh one and inserts it
-        /// (the original, only-ever-create behavior this filesystem had before real O_TRUNC/
-        /// O_APPEND/O_WRONLY support on an *existing* path existed). `Some(inode)`: `name` already
-        /// resolves to `inode` -- `close` overwrites that inode's own content in place via
-        /// `write_inode_data` instead of allocating a second inode and re-inserting the directory
-        /// entry (which would either collide with or orphan the original). Real POSIX overwrite/
-        /// append semantics for an existing file need this distinction: same inode number, same
-        /// owner/mode, same directory entry, just new content.
+        /// `None`: no inode exists yet for `name` -- the first real flush (a full buffer during
+        /// `write()`, or `close()`/`fsync()`/any forced early commit) allocates a fresh one and
+        /// inserts it (the original, only-ever-create behavior this filesystem had before real
+        /// O_TRUNC/O_APPEND/O_WRONLY support on an *existing* path existed). `Some(inode)`: `name`
+        /// already resolves to `inode` -- flushes write directly into that same inode's real
+        /// blocks via `write_inode_at` (positional, additive -- see `write_pos`'s own doc comment),
+        /// never allocating a second inode or re-inserting the directory entry.
         existing_inode: Option<u32>,
-        /// Set by a successful `SYS_FTRUNCATE`/`SYS_FALLOCATE` on this fd, cleared by any `write()`
-        /// call that actually buffers real bytes -- tells `commit_write_buffer` whether the real
-        /// resize `resize_inode_data` already performed should be left alone at `close()`/`fsync()`
-        /// time, or overwritten by this fd's own write buffer as usual. Found live: real BusyBox
-        /// `truncate FILE` (`open(O_CREAT) -> ftruncate(fd, size) -> close(fd)`, no `write()` call
-        /// at all) had its real resize silently undone the instant `close()` ran -- `commit_write_
-        /// buffer`'s existing-inode branch unconditionally re-committed `buffer[..len]`, and `len`
-        /// was still `0` (no `write()` ever happened), truncating the file straight back to empty.
-        /// A later `write()` on the same fd still wins over an earlier `ftruncate()`, matching real
-        /// Unix's own ordering (see `oxfs_ftruncate`'s own doc comment) -- this flag only guards
-        /// the specific case of `close()`/`fsync()` running with *zero* real `write()` calls ever
-        /// having happened on this fd.
-        resized_directly: bool,
         /// Set by `oxfs_unlink` when it's called against `(parent_inode, name)` before this fd's
         /// first commit -- i.e. while `existing_inode` is still `None`, so there's no directory
         /// entry yet for `unlink` to actually remove. Found live via `mmap/12-1.c` (the POSIX
@@ -2439,7 +2625,7 @@ fn open_dir_listing(dir_inode: u32) -> i64 {
                     out.push_bytes(b"  <DIR>\n");
                 } else {
                     out.push_bytes(b"  ");
-                    out.push_decimal(child_inode.size);
+                    out.push_decimal_u64(child_inode.size);
                     out.push_bytes(b"\n");
                 }
             }
@@ -3033,42 +3219,54 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                 _ if want_write => {
                     let mut name = [0u8; NAME_MAX];
                     name[..leaf.len()].copy_from_slice(leaf);
-                    let mut buf_slot = None;
-                    let mut len = 0;
-                    // O_APPEND: start from the file's real existing content, so subsequent writes
-                    // land after it rather than replacing it -- otherwise (plain O_WRONLY/O_RDWR)
-                    // start empty, real POSIX truncate-on-write-open semantics (this filesystem
-                    // has no way to write only *part* of a file in place -- see
-                    // write_inode_data's own doc comment -- so there's no separate "O_WRONLY
-                    // without O_TRUNC" case to support here). This is the one path that has to
-                    // claim a real `WRITE_BUFFERS` slot eagerly, right here at `open()` time,
-                    // rather than lazily on first `write()` like every other path below: a fd that
-                    // never gets written to must still commit its *unchanged* real content at
-                    // `close()`, not silently truncate to empty (see `commit_write_buffer`'s own
-                    // `buf_slot: None` handling) -- so the preloaded original bytes have to live
-                    // somewhere from the start.
-                    if flags & O_APPEND != 0 {
-                        let Some(idx) = alloc_write_buffer() else {
-                            return -ENOSPC;
-                        };
-                        len = read_inode_at(resolved, 0, write_buffer(idx));
-                        buf_slot = Some(idx);
-                    } else if flags & O_TRUNC != 0 {
+                    // O_APPEND: buffered writes flush after the file's real existing content --
+                    // `write_pos` starts at the file's own real current size, with **no need to
+                    // preload that content into the buffer at all** (real streaming flushes are
+                    // positional/additive via `write_inode_at`, see `write_pos`'s own doc comment)
+                    // -- fixes a real, previously-live bug: the old design preloaded existing
+                    // content into the write buffer itself, silently losing everything past the
+                    // buffer's own capacity (128 KiB at the time) for any append target bigger
+                    // than that, since the old whole-file-replace commit only ever wrote back
+                    // whatever fit.
+                    //
+                    // Plain O_WRONLY (no O_APPEND), or an explicit O_TRUNC regardless of access
+                    // mode: this filesystem's own established, tested behavior (`module_init`'s
+                    // self-check, "O_WRONLY overwrite did not truncate correctly") is that a plain
+                    // O_WRONLY reopen of an existing file replaces its *entire* content with
+                    // whatever gets written -- real POSIX would only overwrite the bytes actually
+                    // touched, leaving any untouched tail alone, but a plain write-only fd can
+                    // never observe that tail anyway (no real read-back path), and this matches
+                    // `modules/fat32`'s own established precedent (see `write_inode_data`'s own
+                    // doc comment). Resizes to `0` immediately, exactly like a real `O_TRUNC`
+                    // (whether or not the caller actually passed one for the O_WRONLY case).
+                    //
+                    // Real O_RDWR *without* O_TRUNC is the one case that keeps existing content:
+                    // a genuine read-modify-write fd needs to see what's already there via its own
+                    // real `read()`/`pread()` support (see `readwrite`'s own doc comment) --
+                    // buffered writes still flush positionally/additively from file offset `0`
+                    // (this filesystem's only write primitive), so bytes never actually written
+                    // keep their old content, matching real POSIX for this one case.
+                    let write_pos = if flags & O_APPEND != 0 {
+                        inode.size
+                    } else if flags & O_ACCMODE != O_RDWR || flags & O_TRUNC != 0 {
                         resize_inode_data(resolved, 0);
-                    }
+                        0
+                    } else {
+                        0
+                    };
                     register_open_file(OpenFile::Write {
                         parent_inode: parent,
                         name,
                         name_len: leaf.len() as u8,
-                        buf_slot,
-                        len,
+                        buf_slot: None,
+                        len: 0,
+                        write_pos,
                         owner_uid: inode.uid,
                         existing_inode: Some(resolved),
-                        resized_directly: false,
                         unlinked: false,
                         readonly: false, // this whole arm only runs when want_write is true
                         readwrite: flags & O_ACCMODE == O_RDWR,
-                        position: len,
+                        position: write_pos as usize,
                         // Unused: `commit_write_buffer`'s `existing_inode: Some(_)` branch never
                         // touches `inode.mode` -- overwriting/appending to a file that already
                         // exists never changes its own real, already-stored permission bits.
@@ -3095,9 +3293,9 @@ extern "C" fn oxfs_open(path_ptr: u64, path_len: u64, flags: u64, mode: u64) -> 
                 name_len: leaf.len() as u8,
                 buf_slot: None,
                 len: 0,
+                write_pos: 0,
                 owner_uid: uid as u32,
                 existing_inode: None,
-                resized_directly: false,
                 unlinked: false,
                 // Real O_RDONLY is 0 -- "anything but that" in the low two bits means
                 // O_WRONLY/O_RDWR, same real-access-mode convention the existing-path branch
@@ -3225,72 +3423,103 @@ extern "C" fn oxfs_read(fd: u64, ptr: u64, len: u64) -> i64 {
     }
 }
 
+/// Real streaming write: accumulates into the fd's own `WRITE_BUFFERS` window
+/// (`MAX_WRITE_BUFFER` bytes), flushing to the real inode via `commit_write_buffer` whenever that
+/// window fills up and continuing to accept more -- so a real file built via a sequential `write()`
+/// loop is bounded only by `MAX_FILE_SIZE`/the real pool's own free space, never by the buffer's
+/// own size (see `OpenFile::Write`'s own doc comment for the whole-file-replace model this
+/// replaces). May flush more than once for one large `len`; each flush re-fetches `find_open_file`
+/// immediately before/after rather than holding a field-level borrow across it, the same
+/// aliasing-avoidance discipline `oxfs_read`'s own `readwrite` handling already establishes.
 extern "C" fn oxfs_write(fd: u64, ptr: u64, len: u64) -> i64 {
-    let Some(file) = find_open_file(fd) else {
-        return -EBADF;
-    };
-    match file {
-        OpenFile::Write {
+    match find_open_file(fd) {
+        Some(OpenFile::Write { readonly: true, .. }) => return -EBADF,
+        Some(OpenFile::Write { .. }) => {}
+        Some(OpenFile::DevRandom | OpenFile::DevNull | OpenFile::DevZero) => {
+            // Matches real /dev/null's and /dev/zero's own write behavior (accept and discard);
+            // real /dev/urandom also accepts writes (mixing them into the entropy pool) -- this
+            // kernel has no such pool to mix into, so accept-and-discard is the honest
+            // simplification here too.
+            return len as i64;
+        }
+        _ => return -EBADF,
+    }
+    // Real POSIX zero-length write: succeeds trivially, no buffer needed -- checked before ever
+    // touching `WRITE_BUFFERS` so a fd that only ever does zero-length writes never claims a slot.
+    if len == 0 {
+        return 0;
+    }
+    let requested = len as usize;
+    let mut written = 0usize;
+    while written < requested {
+        let Some(file) = find_open_file(fd) else {
+            break;
+        };
+        let full = matches!(
+            file,
+            OpenFile::Write { buf_slot: Some(_), len: l, .. } if *l >= MAX_WRITE_BUFFER
+        );
+        if full {
+            if commit_write_buffer(file) != 0 {
+                break;
+            }
+            continue;
+        }
+        let OpenFile::Write {
             buf_slot,
             len: buf_len,
-            resized_directly,
-            readonly,
             ..
-        } => {
-            if *readonly {
-                return -EBADF;
-            }
-            // Real POSIX zero-length write: succeeds trivially, no buffer needed -- checked before
-            // the lazy `alloc_write_buffer` below so a fd that only ever does zero-length writes
-            // never claims a real `WRITE_BUFFERS` slot at all.
-            if len == 0 {
-                return 0;
-            }
-            let idx = match *buf_slot {
-                Some(idx) => idx,
-                None => match alloc_write_buffer() {
-                    Some(idx) => {
-                        *buf_slot = Some(idx);
-                        idx
-                    }
-                    None => return -ENOSPC,
-                },
-            };
-            let buffer = write_buffer(idx);
-            let available = MAX_WRITE_BUFFER - *buf_len;
-            let n = available.min(len as usize);
-            if n == 0 {
-                return -ENOSPC;
-            }
-            // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length.
-            let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, n) };
-            buffer[*buf_len..*buf_len + n].copy_from_slice(src);
-            *buf_len += n;
-            // A real write() reasserts the normal buffer-wins-at-close behavior -- matches real
-            // Unix's own "whichever happens last" ordering between ftruncate() and write() (see
-            // `resized_directly`'s own doc comment).
-            if n > 0 {
-                *resized_directly = false;
-            }
-            n as i64
-        }
-        // Matches real /dev/null's and /dev/zero's own write behavior (accept and discard); real
-        // /dev/urandom also accepts writes (mixing them into the entropy pool) -- this kernel has
-        // no such pool to mix into, so accept-and-discard is the honest simplification here too.
-        OpenFile::DevRandom | OpenFile::DevNull | OpenFile::DevZero => len as i64,
-        _ => -EBADF,
+        } = file
+        else {
+            break;
+        };
+        let idx = match *buf_slot {
+            Some(idx) => idx,
+            None => match alloc_write_buffer() {
+                Some(idx) => {
+                    *buf_slot = Some(idx);
+                    idx
+                }
+                None => break,
+            },
+        };
+        let available = MAX_WRITE_BUFFER - *buf_len;
+        let n = available.min(requested - written);
+        let buffer = write_buffer(idx);
+        // SAFETY: same trust boundary as elsewhere -- caller-owned pointer/length, offset by what
+        // this call has already consumed.
+        let src = unsafe { core::slice::from_raw_parts((ptr as *const u8).add(written), n) };
+        buffer[*buf_len..*buf_len + n].copy_from_slice(src);
+        *buf_len += n;
+        written += n;
+    }
+    if written > 0 {
+        written as i64
+    } else {
+        -ENOSPC
     }
 }
 
-/// Shared by `oxfs_close` (which then discards the slot entirely) and `oxfs_fsync`/`oxfs_sync`
-/// (which force this same commit early, without closing the fd -- see `SYS_FSYNC`'s own doc
-/// comment for why this filesystem's normal commit-only-at-close write model otherwise makes
-/// `fsync()` a lie). A no-op (`0`) for any non-`Write` variant -- nothing to flush for a read or
-/// directory-listing fd. For a brand-new file (`existing_inode` still `None`), allocates the real
-/// inode and inserts its directory entry *now*, then records that new inode back into
-/// `existing_inode` -- idempotent: a second `commit_write_buffer` call on the same still-open fd
-/// (a `write()` then another `fsync()`, or `fsync()` then `close()`) takes the `Some(inode_num)`
-/// branch instead of re-allocating and double-inserting.
+/// Shared by `oxfs_write` (once `buf_slot`'s window fills up), `oxfs_close` (which then discards
+/// the slot entirely), and `oxfs_fsync`/`oxfs_sync`/`resolve_write_fd_inode`'s own forced-early-
+/// commit call sites -- real streaming write-back, not a whole-file replace: flushes whatever's
+/// currently buffered onto the real inode at `write_pos`, positionally and *additively*
+/// (`write_inode_at`, the same primitive `pwrite(2)` uses) rather than replacing the file's
+/// complete content the way this function used to (see `OpenFile::Write`'s own doc comment for why
+/// that capped every written-from-scratch file at the buffer's own size). A no-op (`0`) for any
+/// non-`Write` variant, or a `Write` fd with nothing currently buffered (`len == 0` -- covers a
+/// never-written fd, and a fd whose buffer was already flushed and has nothing new since,
+/// including the specific case `resized_directly` used to guard: a `SYS_FTRUNCATE`/`SYS_FALLOCATE`
+/// resize with no `write()` since needs no flush at all to stay intact, since there's nothing
+/// buffered to flush over it -- no separate flag needed under this design).
+///
+/// For a brand-new file (`existing_inode` still `None`), allocates the real inode and inserts its
+/// directory entry *now*, then records that new inode back into `existing_inode` -- idempotent: a
+/// second call on the same still-open fd (a `write()` then another `fsync()`, or `fsync()` then
+/// `close()`) takes the `Some(inode_num)` branch instead of re-allocating and double-inserting.
+/// This inode-allocation step happens even when there's nothing to flush yet (an empty-but-real
+/// `open(O_CREAT)` forced to commit early by `SYS_FTRUNCATE`/`SYS_FSTAT`/mmap) -- only the actual
+/// content flush below is skipped when the buffer is empty.
 fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     let OpenFile::Write {
         parent_inode,
@@ -3298,9 +3527,9 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
         name_len,
         buf_slot,
         len,
+        write_pos,
         owner_uid,
         existing_inode,
-        resized_directly,
         unlinked,
         readonly: _,
         readwrite: _,
@@ -3310,63 +3539,51 @@ fn commit_write_buffer(file: &mut OpenFile) -> i64 {
     else {
         return 0;
     };
-    // `buf_slot: None` means nothing ever actually buffered real bytes (the invariant `len == 0`
-    // whenever `buf_slot` is `None` -- see that field's own doc comment) -- an empty slice, not a
-    // pool lookup, matching exactly what the old inline-buffer scheme's own `buffer[..len]` would
-    // have yielded for the same never-written fd (an all-zero buffer sliced to `len == 0`).
-    let content: &[u8] = match *buf_slot {
-        Some(idx) => &write_buffer(idx)[..*len],
-        None => &[],
-    };
-    // Overwriting/appending to a file that already exists: write the new content into its own
-    // existing inode -- same inode number, same directory entry, same owner/mode -- rather
-    // than allocating a second inode and re-inserting the name (which would either collide
-    // with or orphan the original entry; see OpenFile::Write's own doc comment).
-    //
-    // Skipped entirely when `resized_directly` is still set (a `SYS_FTRUNCATE`/`SYS_FALLOCATE`
-    // already resized this same inode for real, and no `write()` has happened since to justify
-    // overwriting it with -- ordinarily empty -- buffer content) -- see that field's own doc
-    // comment for the real bug this guards against.
-    if let Some(inode_num) = *existing_inode {
-        if *resized_directly {
-            return 0;
+    // Ensure a real inode exists for this fd, independent of whether there's anything to flush --
+    // see this function's own doc comment.
+    let inode_num = match *existing_inode {
+        Some(inode_num) => inode_num,
+        None => {
+            // A new file created inside a tmpfs-mounted directory must itself come from the tmpfs
+            // pool -- see `alloc_inode_in` below for why this is the one call site of the three
+            // "create a new named entry" ones (mkdir/open-O_CREAT/symlink) that had a live bug
+            // here (found via `tests/mount_syscall_smoke.rs`): the other two check `parent`/`cwd`
+            // directly, but this one only learns `parent_inode` this late, at first-flush time.
+            let Some(new_inode) = alloc_inode_in(*parent_inode) else {
+                return -ENOSPC;
+            };
+            let mut inode = Inode::new(InodeKind::File);
+            inode.uid = *owner_uid;
+            inode.mode = *mode;
+            write_inode(new_inode, inode);
+            // Real Unix semantics: this fd's own name was already unlinked before it ever got the
+            // chance to name anything (see `unlinked`'s own doc comment) -- a real inode still
+            // gets allocated, so the fd (and any mmap of it) keeps working, but no directory entry
+            // is ever inserted for it.
+            if *unlinked {
+                *existing_inode = Some(new_inode);
+            } else if let Err(e) = dir_insert(*parent_inode, &name[..*name_len as usize], new_inode)
+            {
+                return errno_for(e);
+            } else {
+                *existing_inode = Some(new_inode);
+            }
+            new_inode
         }
-        return if write_inode_data(inode_num, content) {
-            0
-        } else {
-            -EIO
-        };
-    }
-    // A new file created inside a tmpfs-mounted directory must itself come from the tmpfs
-    // pool -- see `alloc_inode_in` below for why this is the one call site of the three
-    // "create a new named entry" ones (mkdir/open-O_CREAT/symlink) that had a live bug here
-    // (found via `tests/mount_syscall_smoke.rs`): the other two check `parent`/`cwd` directly,
-    // but this one only learns `parent_inode` this late, at commit time.
-    let Some(new_inode) = alloc_inode_in(*parent_inode) else {
-        return -ENOSPC;
     };
-    let mut inode = Inode::new(InodeKind::File);
-    inode.uid = *owner_uid;
-    inode.mode = *mode;
-    write_inode(new_inode, inode);
-    if !write_inode_data(new_inode, content) {
+    // Flush whatever's currently buffered (if anything) -- `buf_slot: None` and `len == 0` are
+    // both "nothing to flush" (the real invariant `len == 0` whenever `buf_slot` is `None` still
+    // holds, see that field's own doc comment).
+    let content: &[u8] = match *buf_slot {
+        Some(idx) if *len > 0 => &write_buffer(idx)[..*len],
+        _ => return 0,
+    };
+    if !write_inode_at(inode_num, *write_pos as usize, content) {
         return -EIO;
     }
-    // Real Unix semantics: this fd's own name was already unlinked before it ever got the chance
-    // to name anything (see `unlinked`'s own doc comment) -- a real inode still gets allocated and
-    // populated, so the fd (and any mmap of it) keeps working, but no directory entry is ever
-    // inserted for it.
-    if *unlinked {
-        *existing_inode = Some(new_inode);
-        return 0;
-    }
-    match dir_insert(*parent_inode, &name[..*name_len as usize], new_inode) {
-        Ok(()) => {
-            *existing_inode = Some(new_inode);
-            0
-        }
-        Err(e) => errno_for(e),
-    }
+    *write_pos += *len as u64;
+    *len = 0;
+    0
 }
 
 /// Registered as `fd`'s close callback via `oxidebsd_register_fd_ops`. For a file opened for
@@ -3388,9 +3605,9 @@ extern "C" fn oxfs_close(fd: u64) -> i64 {
     let result = commit_write_buffer(&mut file);
     // Release this fd's own `WRITE_BUFFERS` slot back to the pool, if it ever claimed one --
     // safe only here (not in `commit_write_buffer` itself, also called by `fsync`/`sync` without
-    // closing the fd): a still-open fd may see more `write()` calls after an `fsync()`, and
-    // `write_inode_data` always treats the buffer as the file's *complete* content from byte 0,
-    // so it has to survive until the fd is genuinely gone.
+    // closing the fd): a still-open fd may see more `write()` calls after an `fsync()`, which need
+    // the same slot (and its own `write_pos` bookkeeping) to keep flushing into, so it has to
+    // survive until the fd is genuinely gone.
     if let OpenFile::Write {
         buf_slot: Some(idx),
         ..
@@ -3500,14 +3717,16 @@ fn ftruncate_blocked_readonly(real_fd: u64) -> bool {
     )
 }
 
-/// Registered for `SYS_FTRUNCATE`. Resizes the fd's real inode directly (`resize_inode_data`) --
-/// if this fd is also still mid-write (an existing file opened `O_WRONLY`, not yet `close()`d),
-/// a later `write()`/`close()` on it will still overwrite this content again as usual, matching
-/// real Unix's own "whichever happens last wins" ordering between `ftruncate()` and `write()`.
-/// Marks the fd's own `resized_directly` (if it's a `Write` fd at all -- `resolve_write_fd_inode`
-/// also resolves plain read fds via `inode_of_open_file`, which have no such flag to set) so a
-/// later `close()`/`fsync()` with no intervening `write()` doesn't undo this resize -- see that
-/// field's own doc comment for the real bug this closes.
+/// Registered for `SYS_FTRUNCATE`. Resizes the fd's real inode directly (`resize_inode_data`), via
+/// `resolve_write_fd_inode`'s own forced early flush/commit -- by the time this resize runs, any
+/// content already buffered on this fd (if it's also still mid-write, e.g. an existing file
+/// opened `O_WRONLY`, not yet `close()`d) is already durably flushed onto the same inode this
+/// resizes, and `commit_write_buffer` skips flushing anything more at `close()`/`fsync()` time
+/// while the buffer stays empty (see that function's own doc comment) -- so this resize simply
+/// sticks unless a genuinely new `write()` happens afterward, matching real Unix's own "whichever
+/// happens last wins" ordering between `ftruncate()` and `write()` without needing a separate flag
+/// to guard it (a real, previously-live bug this closes -- see `OpenFile::Write`'s own doc
+/// comment's history for the old whole-file-replace design this flag used to compensate for).
 extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
@@ -3526,22 +3745,15 @@ extern "C" fn oxfs_ftruncate(fd: u64, len: u64, _a2: u64, _a3: u64) -> i64 {
     if !resize_inode_data(inode_num, len as usize) {
         return -ENOSPC;
     }
-    if let Some(OpenFile::Write {
-        resized_directly, ..
-    }) = find_open_file(real_fd)
-    {
-        *resized_directly = true;
-    }
     0
 }
 
 /// Registered for `SYS_FALLOCATE`. `mode` is ignored -- always behaves like the default (no
 /// `FALLOC_FL_KEEP_SIZE`/`FALLOC_FL_PUNCH_HOLE`/... flag support, a known simplification no
 /// applet in this port's roster needs past). Zero-extends the file to `offset + len` if it's
-/// currently shorter; otherwise a real no-op (real `fallocate()` never shrinks a file). Marks the
-/// fd's own `resized_directly` on an actual resize -- see `oxfs_ftruncate`'s own doc comment for
-/// why (same real bug, same fix, shared with that syscall). Same real `EINVAL`-if-not-open-for-
-/// writing check as `oxfs_ftruncate` (`ftruncate_blocked_readonly`).
+/// currently shorter; otherwise a real no-op (real `fallocate()` never shrinks a file). Same real
+/// `EINVAL`-if-not-open-for-writing check as `oxfs_ftruncate` (`ftruncate_blocked_readonly`), and
+/// the same "this resize simply sticks" reasoning -- see that function's own doc comment.
 extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 {
     let real_fd = unsafe { oxidebsd_real_fd_of(fd) };
     if real_fd < 0 {
@@ -3564,12 +3776,6 @@ extern "C" fn oxfs_fallocate(fd: u64, _mode: u64, offset: u64, len: u64) -> i64 
     }
     if !resize_inode_data(inode_num, target) {
         return -ENOSPC;
-    }
-    if let Some(OpenFile::Write {
-        resized_directly, ..
-    }) = find_open_file(real_fd)
-    {
-        *resized_directly = true;
     }
     0
 }
@@ -4811,16 +5017,16 @@ extern "C" fn oxfs_pread(real_fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
 
 /// Registered (via `oxidebsd_set_fd_pread_pwrite`) as every oxfs fd's `pwrite` callback -- real
 /// `pwrite(2)`, writing directly into the fd's own real inode blocks via `write_inode_at` (bypassing
-/// `OpenFile::Write`'s own pooled `WRITE_BUFFERS` slot and its `MAX_WRITE_BUFFER` = 128 KiB ceiling
+/// `OpenFile::Write`'s own pooled `WRITE_BUFFERS` slot and its `MAX_WRITE_BUFFER` flush-window
 /// entirely -- found live via `lio_listio/1-1.c`, the Open POSIX Test Suite pilot, which needs a
 /// real 1 MiB `pwrite()`). Unlike `oxfs_pread`, this works for **any** fd open for writing --
 /// `O_WRONLY` included, not just `readwrite` (`O_RDWR`) -- matching real POSIX: `pwrite()` only
 /// requires the fd be open for writing, never O_RDWR specifically. Forces the same real early
 /// commit `resolve_write_fd_inode` already provides (a fd that's never had a plain `write()` yet
-/// still needs a real inode to write into directly), then sets `resized_directly` -- reusing the
-/// exact guard `SYS_FTRUNCATE`/`SYS_FALLOCATE` already established (see that field's own doc
-/// comment) -- so a later `close()`/`fsync()` with no intervening plain `write()` doesn't stomp
-/// this real, already-committed content with an empty/stale pending buffer.
+/// still needs a real inode to write into directly) -- no separate flag needed afterward: a later
+/// `close()`/`fsync()` with no intervening plain `write()` finds nothing buffered (`len == 0`) and
+/// flushes nothing, leaving this real, already-committed content alone (see
+/// `commit_write_buffer`'s own doc comment).
 extern "C" fn oxfs_pwrite(real_fd: u64, ptr: u64, len: u64, offset: u64) -> i64 {
     match find_open_file(real_fd) {
         Some(OpenFile::Write { readonly: false, .. }) => {}
@@ -4834,12 +5040,6 @@ extern "C" fn oxfs_pwrite(real_fd: u64, ptr: u64, len: u64, offset: u64) -> i64 
     let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     if !write_inode_at(inode, offset as usize, data) {
         return -EIO;
-    }
-    if let Some(OpenFile::Write {
-        resized_directly, ..
-    }) = find_open_file(real_fd)
-    {
-        *resized_directly = true;
     }
     len as i64
 }
@@ -5042,11 +5242,18 @@ impl ByteBuf<'_> {
     }
 
     fn push_decimal(&mut self, value: u32) {
+        self.push_decimal_u64(value as u64);
+    }
+
+    /// `push_decimal`'s 64-bit counterpart -- needed once `Inode::size` widened to `u64` (a real
+    /// file can now legitimately report a size past `u32::MAX`), see this method's one real caller
+    /// (`oxfs_getdents`'s human-readable directory listing).
+    fn push_decimal_u64(&mut self, value: u64) {
         if value == 0 {
             self.push_bytes(b"0");
             return;
         }
-        let mut digits = [0u8; 10];
+        let mut digits = [0u8; 20];
         let mut count = 0;
         let mut remaining = value;
         while remaining > 0 {
@@ -5075,14 +5282,21 @@ fn pack_inode(inode: &Inode, out: &mut [u8]) {
         InodeKind::Symlink => 3,
         InodeKind::Device => 4,
     };
-    out[1..5].copy_from_slice(&inode.size.to_le_bytes());
+    // `size` widened 4 -> 8 bytes (real `u64`, see `Inode::size`'s own doc comment) -- every offset
+    // from here on shifts +4 relative to `SUPERBLOCK_VERSION`'s prior (version 1) on-disk shape.
+    out[1..9].copy_from_slice(&inode.size.to_le_bytes());
     for (i, d) in inode.direct.iter().enumerate() {
-        let off = 5 + i * 4;
+        let off = 9 + i * 4;
         out[off..off + 4].copy_from_slice(&d.to_le_bytes());
     }
-    let indirect_off = 5 + DIRECT_BLOCKS * 4;
+    let indirect_off = 9 + DIRECT_BLOCKS * 4;
     out[indirect_off..indirect_off + 4].copy_from_slice(&inode.indirect.to_le_bytes());
-    let mode_off = indirect_off + 4;
+    // New field (see `Inode::double_indirect`'s own doc comment) -- inserted right after
+    // `indirect`, shifting every following offset +4 again relative to version 1.
+    let double_indirect_off = indirect_off + 4;
+    out[double_indirect_off..double_indirect_off + 4]
+        .copy_from_slice(&inode.double_indirect.to_le_bytes());
+    let mode_off = double_indirect_off + 4;
     out[mode_off..mode_off + 2].copy_from_slice(&inode.mode.to_le_bytes());
     let uid_off = mode_off + 2;
     out[uid_off..uid_off + 4].copy_from_slice(&inode.uid.to_le_bytes());
@@ -5114,20 +5328,27 @@ fn unpack_inode(data: &[u8]) -> Inode {
         4 => InodeKind::Device,
         _ => InodeKind::Free,
     };
-    let size = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+    let size = u64::from_le_bytes(data[1..9].try_into().unwrap());
     let mut direct = [NO_BLOCK; DIRECT_BLOCKS];
     for (i, d) in direct.iter_mut().enumerate() {
-        let off = 5 + i * 4;
+        let off = 9 + i * 4;
         *d = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
     }
-    let indirect_off = 5 + DIRECT_BLOCKS * 4;
+    let indirect_off = 9 + DIRECT_BLOCKS * 4;
     let indirect = u32::from_le_bytes([
         data[indirect_off],
         data[indirect_off + 1],
         data[indirect_off + 2],
         data[indirect_off + 3],
     ]);
-    let mode_off = indirect_off + 4;
+    let double_indirect_off = indirect_off + 4;
+    let double_indirect = u32::from_le_bytes([
+        data[double_indirect_off],
+        data[double_indirect_off + 1],
+        data[double_indirect_off + 2],
+        data[double_indirect_off + 3],
+    ]);
+    let mode_off = double_indirect_off + 4;
     let mode = u16::from_le_bytes([data[mode_off], data[mode_off + 1]]);
     let uid_off = mode_off + 2;
     let uid = u32::from_le_bytes([
@@ -5168,6 +5389,7 @@ fn unpack_inode(data: &[u8]) -> Inode {
         size,
         direct,
         indirect,
+        double_indirect,
         mode,
         uid,
         gid,
@@ -5226,21 +5448,34 @@ fn persist_inode_block_if_ready(n: u32) {
     }
 }
 
-/// Write-through hook for `set_block_used` -- repacks the *entire* bitmap from the in-memory
-/// `BLOCK_USED` array and writes it whole, same "memory is the complete source of truth, no
-/// read-modify-write needed" reasoning as `persist_inode_block_if_ready`.
-fn persist_bitmap_if_ready() {
-    if !persistence_ready() || !block_device_present() {
+/// Write-through hook for `set_block_used` -- repacks and writes only the *one* physical bitmap
+/// block covering `n`, from the in-memory `BLOCK_USED` array, same "memory is the complete source
+/// of truth, no read-modify-write needed" reasoning as `persist_inode_block_if_ready`. **Used to
+/// repack and write the *entire* multi-block bitmap on every single call** -- harmless at the old,
+/// much smaller `NUM_BLOCKS`, but with the pool now spanning `BITMAP_BLOCKS` real physical blocks
+/// (see that constant's own doc comment), rewriting every one of them on every single block
+/// allocation would turn a real, big sequential file write into thousands of redundant PIO-under-
+/// emulation sector transfers (see CLAUDE.md's own "Real disk persistence" gotcha on this exact
+/// cost) for exactly one call site: the file's own already-correct data-block writes, which each
+/// already write independently via `persist_data_block_if_ready`. Scoped to one block the same way
+/// that function (and `persist_inode_block_if_ready`) already are.
+fn persist_bitmap_if_ready(n: u32) {
+    if n >= NUM_BLOCKS as u32 || !persistence_ready() || !block_device_present() {
         return;
     }
+    let bits_per_block = (BLOCK_SIZE * 8) as u32;
+    let bitmap_block_idx = n / bits_per_block;
+    let base = bitmap_block_idx * bits_per_block;
+    let end = (base + bits_per_block).min(NUM_BLOCKS as u32);
     let mut block = [0u8; BLOCK_SIZE];
-    for i in 0..NUM_BLOCKS {
-        if block_used(i as u32) {
-            block[i / 8] |= 1 << (i % 8);
+    for i in base..end {
+        if block_used(i) {
+            let rel = (i - base) as usize;
+            block[rel / 8] |= 1 << (rel % 8);
         }
     }
     unsafe {
-        oxidebsd_block_write(BITMAP_BLOCK as u64, block.as_ptr() as u64);
+        oxidebsd_block_write((BITMAP_START + bitmap_block_idx) as u64, block.as_ptr() as u64);
     }
 }
 
@@ -5287,6 +5522,9 @@ fn reset_real_pool_for_fresh_format() {
     for i in 0..MAX_INODES as u32 {
         write_inode(i, Inode::FREE);
     }
+    // A pristine, all-free state means `alloc_block`'s own resume cursor (see `NEXT_FREE_BLOCK`'s
+    // own doc comment) has nothing behind it to skip past either.
+    unsafe { *core::ptr::addr_of_mut!(NEXT_FREE_BLOCK) = 0 };
 }
 
 /// Attempts to mount an already-formatted disk: reads the superblock, and if its magic matches,
@@ -5311,7 +5549,7 @@ fn mount_from_disk() -> bool {
 
     // Layout check, not just a magic check -- a disk formatted under a previous `NUM_BLOCKS`/
     // `MAX_INODES`/`SUPERBLOCK_VERSION` has the right magic but real, physically different bytes
-    // at every block-offset this build's own `INODE_TABLE_START`/`BITMAP_BLOCK`/
+    // at every block-offset this build's own `INODE_TABLE_START`/`BITMAP_START`/
     // `DATA_BLOCK_OFFSET` expect (all derived from these same constants -- see this file's own
     // "Real disk persistence" section). Before this check, a stale disk merely *usually* failed
     // loudly partway through the loops below (see `reset_real_pool_for_fresh_format`'s own doc
@@ -5329,14 +5567,24 @@ fn mount_from_disk() -> bool {
         return false;
     }
 
-    let mut bitmap_block = [0u8; BLOCK_SIZE];
-    if unsafe { oxidebsd_block_read(BITMAP_BLOCK as u64, bitmap_block.as_mut_ptr() as u64) } != 0 {
-        log("[oxfs] mount: failed to read block-used bitmap -- falling back to format\n");
-        return false;
-    }
-    for i in 0..NUM_BLOCKS {
-        let used = (bitmap_block[i / 8] >> (i % 8)) & 1 != 0;
-        set_block_used(i as u32, used);
+    // Real, multi-block bitmap read (`BITMAP_BLOCKS` physical blocks, not a hardcoded one -- see
+    // that constant's own doc comment for the real bug this fixes). Each block covers its own real
+    // `BLOCK_SIZE * 8`-bit range of the pool.
+    let bits_per_block = BLOCK_SIZE * 8;
+    for bitmap_block_idx in 0..BITMAP_BLOCKS as usize {
+        let mut bitmap_block = [0u8; BLOCK_SIZE];
+        let phys = BITMAP_START as u64 + bitmap_block_idx as u64;
+        if unsafe { oxidebsd_block_read(phys, bitmap_block.as_mut_ptr() as u64) } != 0 {
+            log("[oxfs] mount: failed to read block-used bitmap -- falling back to format\n");
+            return false;
+        }
+        let base = bitmap_block_idx * bits_per_block;
+        let end = (base + bits_per_block).min(NUM_BLOCKS);
+        for i in base..end {
+            let rel = i - base;
+            let used = (bitmap_block[rel / 8] >> (rel % 8)) & 1 != 0;
+            set_block_used(i as u32, used);
+        }
     }
 
     for block_idx in 0..INODE_TABLE_BLOCKS as usize {
@@ -5391,14 +5639,23 @@ fn mount_from_disk() -> bool {
 fn flush_all_to_disk() {
     write_superblock();
 
-    let mut bitmap_block = [0u8; BLOCK_SIZE];
-    for i in 0..NUM_BLOCKS {
-        if block_used(i as u32) {
-            bitmap_block[i / 8] |= 1 << (i % 8);
+    // Real, multi-block bitmap write -- see `mount_from_disk`'s own matching read loop and
+    // `BITMAP_BLOCKS`'s own doc comment.
+    let bits_per_block = BLOCK_SIZE * 8;
+    for bitmap_block_idx in 0..BITMAP_BLOCKS as usize {
+        let mut bitmap_block = [0u8; BLOCK_SIZE];
+        let base = bitmap_block_idx * bits_per_block;
+        let end = (base + bits_per_block).min(NUM_BLOCKS);
+        for i in base..end {
+            if block_used(i as u32) {
+                let rel = i - base;
+                bitmap_block[rel / 8] |= 1 << (rel % 8);
+            }
         }
-    }
-    unsafe {
-        oxidebsd_block_write(BITMAP_BLOCK as u64, bitmap_block.as_ptr() as u64);
+        let phys = BITMAP_START as u64 + bitmap_block_idx as u64;
+        unsafe {
+            oxidebsd_block_write(phys, bitmap_block.as_ptr() as u64);
+        }
     }
 
     for block_idx in 0..INODE_TABLE_BLOCKS as usize {

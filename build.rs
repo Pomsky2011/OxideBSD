@@ -2472,12 +2472,17 @@ const OXFS_BLOCK_SIZE: u64 = 4096;
 // compiled-binary weight directly (~34 KiB average per pilot ELF over a 495-file sample) before
 // picking these -- generous headroom over the ~60 MiB the full corpus's own binaries alone need,
 // not a guess.
-const OXFS_NUM_BLOCKS: u64 = 65536;
+//
+// 65536 -> 262144 (256 MiB -> 1 GiB) alongside the real max-file-size redesign (`Inode::
+// double_indirect` in `modules/oxfs/src/lib.rs`, see that field's own doc comment) -- see that
+// constant's own doc comment for why 1 GiB, not something bigger or smaller.
+const OXFS_NUM_BLOCKS: u64 = 262144;
 const OXFS_MAX_INODES: u64 = 8192;
 const OXFS_INODE_STRIDE: u64 = 128;
 /// 1 superblock + inode-table blocks (`OXFS_MAX_INODES` inodes at `OXFS_INODE_STRIDE` bytes each,
-/// rounded up to a whole block) + 1 block-used bitmap -- computed from the same real inputs
-/// `modules/oxfs/src/lib.rs`'s own `INODE_TABLE_BLOCKS` is, not a separately hand-picked number.
+/// rounded up to a whole block) + `OXFS_BITMAP_BLOCKS` block-used bitmap blocks -- computed from
+/// the same real inputs `modules/oxfs/src/lib.rs`'s own `INODE_TABLE_BLOCKS`/`BITMAP_BLOCKS` are,
+/// not separately hand-picked numbers.
 /// **Found live as a real, hand-duplicated staleness bug, not just a theoretical risk this comment
 /// warns about**: this constant was left at its old value (a literal `18`, correct only for the
 /// pre-TinyCC `MAX_INODES = 512`) when that constant was bumped to `1024` (see CLAUDE.md's TinyCC
@@ -2488,8 +2493,16 @@ const OXFS_INODE_STRIDE: u64 = 128;
 /// last ~16 real data blocks physically don't exist in a file sized this way), which is what first
 /// surfaced this bug — see `reset_real_pool_for_fresh_format`'s own doc comment in
 /// `modules/oxfs/src/lib.rs` for the *other* real bug that same failure mode exposed.
+///
+/// **A second, real instance of this exact staleness class, found alongside the max-file-size
+/// redesign**: this hardcoded a flat `1` block for the bitmap, correct only while `OXFS_NUM_BLOCKS`
+/// fit within `OXFS_BLOCK_SIZE * 8` (32768) bits -- already silently wrong the moment
+/// `OXFS_NUM_BLOCKS` first passed that (65536, well before this pass's own further bump to
+/// 262144). Fixed the same way `modules/oxfs/src/lib.rs`'s own `BITMAP_BLOCKS` was: a real,
+/// computed span, not a hand-picked one.
+const OXFS_BITMAP_BLOCKS: u64 = (OXFS_NUM_BLOCKS * 8).div_ceil(OXFS_BLOCK_SIZE * 8);
 const OXFS_METADATA_BLOCKS: u64 =
-    1 + (OXFS_MAX_INODES * OXFS_INODE_STRIDE).div_ceil(OXFS_BLOCK_SIZE) + 1;
+    1 + (OXFS_MAX_INODES * OXFS_INODE_STRIDE).div_ceil(OXFS_BLOCK_SIZE) + OXFS_BITMAP_BLOCKS;
 const OXFS_DISK_IMAGE_BYTES: u64 = (OXFS_METADATA_BLOCKS + OXFS_NUM_BLOCKS) * OXFS_BLOCK_SIZE;
 
 /// Writes the two raw disk images `Cargo.toml`'s `run-args`/`test-args` attach to QEMU as
