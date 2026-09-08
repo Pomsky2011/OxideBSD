@@ -441,9 +441,9 @@ non-relocatable `ET_EXEC` binary with zero relocations) — this is the largest 
 **`modules/oxfs/`** is the live filesystem — a real Unix-shaped inode/block filesystem. In-memory
 by default, with real optional persistence to an attached ATA disk (see "Real disk persistence").
 Fixed-size `static mut` pools: `NUM_BLOCKS=16384` × `BLOCK_SIZE=4096` (64 MiB), `MAX_INODES=2048`,
-each inode with 12 direct blocks + one single-indirect block (max **single-file** size ~4 MiB,
-independent of `NUM_BLOCKS` — a known, accepted cap smaller than FAT32's, revisit via indirect
-blocks/block-size bump if it starts mattering). `NO_BLOCK = u32::MAX` is the "unallocated"
+each inode with 12 direct blocks + one single-indirect + one double-indirect block (max
+**single-file** size ~4.1 GiB; real pool now 1 GiB, so actual max is pool free space — see "oxfs
+max-file-size and streaming write-buffer redesign" below). `NO_BLOCK = u32::MAX` is the "unallocated"
 sentinel. Directories are ordinary inodes holding fixed 32-byte records (real names,
 `NAME_MAX=26`) that grow additional blocks on demand. `unlink`/`rmdir` only clear a record's
 `used` byte (no dealloc). Root is fixed inode `0`, self-referencing `.`/`..`.
@@ -2126,6 +2126,19 @@ exhaustion cascade" section above) check that a real, whole path exceeding `{PAT
   through the exact resolvers this touches), and the 79-file standing canary suite (matching its
   established baseline exactly, `shm_open/39-2.c`/`shm_unlink/10-2.c` still `FAIL` as expected, no
   new regressions) all pass clean.
+
+## oxfs max-file-size and streaming write-buffer redesign, plus a musl `PTHREAD_STACK_MIN` fix
+
+`Inode` gained a `double_indirect` block pointer (~4 MiB/file → ~4.1 GiB addressable; real ceiling
+is pool free space, now 1 GiB not 256 MiB). `OpenFile::Write` no longer buffers a whole file and
+replaces it at `close()` — it streams to real blocks once `MAX_WRITE_BUFFER` (now 16 MiB) fills.
+Found and fixed along the way: the on-disk bitmap was hardcoded to one block (broken past
+`NUM_BLOCKS=32768`), and the block allocator was an O(n²) rescan. `SUPERBLOCK_VERSION` bumped.
+
+Also bumped musl's `PTHREAD_STACK_MIN` 2048 → 65536 (a real page-size multiple, for future
+16K/64K-page ports) plus a companion `sysconf.c` widening (`short`→`int` table) it needed to
+actually take effect — closed 15 real `pthread_*` conformance files that were bailing `UNTESTED`.
+Surfaced two new, not-yet-root-caused `CRASH` bugs in `pthread_detach`. Full corpus: 87.5%→88.4%.
 
 ## Dependency notes
 
