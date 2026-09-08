@@ -1699,6 +1699,43 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // force_fault_signal` -- see `POSIX_KNOWN_HANGS`'s own doc comment above (used to be a
             // whole-VM-halting `EXCEPTION: INVALID OPCODE`, now a clean, contained `CRASH(139)`).
             "pthread_kill/6-1.c",
+            // `pthread_detach/{1-2,4-3}.c`: both started hitting a real `CRASH(139)` once the musl
+            // `PTHREAD_STACK_MIN` fix unmasked them from `UNTESTED` -- decoded directly from the
+            // cross-compiled test ELFs' own disassembly (no host repro needed: a native from-scratch
+            // build of this exact musl fork turned out to be a broken comparison baseline on its own
+            // -- even a trivial `int main(){return 0;}` segfaulted at `__init_tls`, an unrelated
+            // host-toolchain issue).
+            // `1-2.c`: `main()` deliberately calls `pthread_join()` on a thread that already
+            // self-detached and exited (its own explicit test design) -- a real, genuinely
+            // undetectable use-after-free in musl's `__pthread_timedjoin_np`, reading
+            // `t->detach_state` from the target's own TCB after its `__unmapself` already freed
+            // that memory. Same documented-UB class already established for
+            // `pthread_attr_setdetachstate/2-1.c` -- `CRASH(139)` remains the correct, expected
+            // outcome; not fixable without a much larger design change (keeping every detached
+            // thread's TCB reserved indefinitely, which musl doesn't do).
+            // `4-3.c`: was a *different*, actually-fixable case -- real, unmodified musl's own
+            // `pthread_detach()` (`third_party/musl/src/thread/pthread_detach.c`) unconditionally
+            // fell back to an internal `__pthread_join(t, 0)` call whenever its own
+            // `a_cas(&t->detach_state, DT_JOINABLE, DT_DETACHED)` failed, even when the failure
+            // meant "already detached, not exiting" -- a case it could detect directly from the
+            // CAS's own return value. This file's `threaded()` unconditionally calls
+            // `pthread_detach(pthread_self())` even for scenarios whose attribute already created
+            // the thread `PTHREAD_CREATE_DETACHED`, so the CAS reliably failed that way and musl's
+            // own join fallback hit `__pthread_timedjoin_np`'s internal `a_crash()` (a raw ring-3
+            // `hlt`, real Linux's own `#GP`-to-`SIGSEGV` translation applies identically) --
+            // confirmed via a `[diag-fault]` per-tgid process-table dump (temporarily added, removed
+            // after) that the faulting pid really was one of `test()`'s own short-lived worker
+            // threads, not a misattribution. Unlike `1-2.c`, this case is memory-safe to detect
+            // directly (the target is always `pthread_self()`, so its TCB is guaranteed still
+            // resident) and POSIX's own error contract explicitly wants `EINVAL` here -- **fixed**
+            // on the `oxidebsd` musl branch: `pthread_detach()` now returns `EINVAL` directly for
+            // this exact case instead of ever reaching `__pthread_join()`. Confirmed via an isolated
+            // canary run: `4-3.c` now cleanly `TIMEOUT`s instead of crashing (a real, heavy
+            // thread-creation-plus-signal-storm workload hitting `t0`'s 40s bound under this
+            // kernel's own thread-creation throughput ceiling -- same accepted class as
+            // `shm_open/23-1.c`), with zero regressions across the rest of this canary suite.
+            "pthread_detach/1-2.c",
+            "pthread_detach/4-3.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

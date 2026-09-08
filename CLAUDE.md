@@ -2138,7 +2138,18 @@ Found and fixed along the way: the on-disk bitmap was hardcoded to one block (br
 Also bumped musl's `PTHREAD_STACK_MIN` 2048 → 65536 (a real page-size multiple, for future
 16K/64K-page ports) plus a companion `sysconf.c` widening (`short`→`int` table) it needed to
 actually take effect — closed 15 real `pthread_*` conformance files that were bailing `UNTESTED`.
-Surfaced two new, not-yet-root-caused `CRASH` bugs in `pthread_detach`. Full corpus: 87.5%→88.4%.
+Surfaced two new `CRASH` bugs in `pthread_detach`, root-caused as two *different* real musl issues,
+not OxideBSD bugs. `1-2.c`: joins an already-exited self-detached thread — a real, genuinely
+undetectable UAF in `__pthread_timedjoin_np` reading a freed TCB, same documented-UB class as
+`pthread_attr_setdetachstate/2-1.c` — left as an accepted `CRASH(139)`, not fixable without a much
+bigger design change. `4-3.c`: `pthread_detach()` on a thread already created
+`PTHREAD_CREATE_DETACHED` — real, unmodified musl's own `pthread_detach()` had the information (its
+own `a_cas()` result) to detect this and return `EINVAL`, but instead unconditionally fell back to
+`__pthread_join()`, hitting that function's own internal `a_crash()`. Unlike `1-2.c`, this case is
+memory-safe to detect directly (target is always `pthread_self()`) — **fixed** on the `oxidebsd`
+musl branch: `pthread_detach()` now returns `EINVAL` here instead of ever reaching
+`__pthread_join()`. `4-3.c` now cleanly `TIMEOUT`s (a real, heavy workload hitting `t0`'s bound, same
+class as `shm_open/23-1.c`) instead of crashing. Full corpus: 87.5%→88.4%.
 
 ## Dependency notes
 
