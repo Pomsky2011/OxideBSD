@@ -92,7 +92,9 @@ not instead of, eventually closing this loop for `rustc`/`cargo` themselves.
 As of 2026-09-04, the old single "v0.2.x goals" bucket below is split into three separate,
 sequential releases — each ships standalone rather than bundling everything into one v0.2.0:
 
-- **v0.2.0 — POSIX pilot compliance.** The current focus. Close as much of the gap as practical
+- **v0.2.0 — POSIX pilot compliance.** The current focus. **Concrete target (set 2026-09-08):
+  >91% raw pass rate, >95% excluding UNTESTED**, on the full corpus via
+  `scripts/run_posix_pilot_supervised.sh`. Close as much of the gap as practical
   between OxideBSD's own Open POSIX Test Suite pilot run and a real Unix baseline, using the full
   ~1687-file corpus (not a curated subset — see `CLAUDE.md`'s "POSIX pilot: full corpus expansion"
   section) as the measuring stick. **The real comparison target is literal UNIX and the BSDs

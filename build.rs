@@ -1813,6 +1813,53 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "pthread_attr_setstack/4-1.c",
             "pthread_attr_setstack/6-1.c",
             "pthread_attr_setstack/7-1.c",
+            // `pthread_rwlock_rdlock/2-{1,2,3}.c`: found chasing these -- `do_sched_setscheduler`
+            // returning the former policy (not `0`) on success broke `pthread_setschedparam()`'s
+            // own real, unmodified internal `-__syscall(...)` negation idiom whenever a caller's
+            // own prior policy was already non-`SCHED_OTHER`. Fixed in `src/process/limits.rs` --
+            // see `do_sched_setscheduler`'s own doc comment for the real host-verified detail. Not
+            // a full fix for these three files' own real assertions (real priority-aware rwlock
+            // reader/writer preference, which real Linux's own default pthread_rwlock doesn't
+            // implement either per a live host check -- 2-1.c/2-2.c genuinely `FAIL` on real
+            // musl/glibc too, only 2-3.c is expected to `PASS`), but closes the spurious
+            // `UNRESOLVED` every one of them hit before ever reaching that real assertion.
+            "pthread_rwlock_rdlock/2-1.c",
+            "pthread_rwlock_rdlock/2-2.c",
+            "pthread_rwlock_rdlock/2-3.c",
+            // Full sched_setscheduler directory, added alongside the do_sched_setscheduler fix
+            // above -- shared code path, want a regression caught immediately (same "add to this
+            // list, don't just replace it" discipline already established elsewhere).
+            "sched_setscheduler/10-1.c",
+            "sched_setscheduler/11-1.c",
+            "sched_setscheduler/1-1.c",
+            "sched_setscheduler/12-1.c",
+            "sched_setscheduler/13-1.c",
+            "sched_setscheduler/14-1.c",
+            "sched_setscheduler/15-1.c",
+            "sched_setscheduler/15-2.c",
+            "sched_setscheduler/16-1.c",
+            "sched_setscheduler/17-1.c",
+            "sched_setscheduler/17-2.c",
+            "sched_setscheduler/17-3.c",
+            "sched_setscheduler/17-4.c",
+            "sched_setscheduler/17-5.c",
+            "sched_setscheduler/17-6.c",
+            "sched_setscheduler/17-7.c",
+            "sched_setscheduler/19-1.c",
+            "sched_setscheduler/19-2.c",
+            "sched_setscheduler/19-3.c",
+            "sched_setscheduler/19-4.c",
+            "sched_setscheduler/19-5.c",
+            "sched_setscheduler/20-1.c",
+            "sched_setscheduler/21-1.c",
+            "sched_setscheduler/2-1.c",
+            "sched_setscheduler/22-1.c",
+            "sched_setscheduler/22-2.c",
+            "sched_setscheduler/4-1.c",
+            "sched_setscheduler/5-1.c",
+            "sched_setscheduler/6-1.c",
+            "sched_setscheduler/7-1.c",
+            "sched_setscheduler/9-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

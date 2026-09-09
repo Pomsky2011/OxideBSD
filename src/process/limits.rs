@@ -241,12 +241,31 @@ fn maybe_yield_for_priority(caller_pid: Pid) {
     }
 }
 
-/// **Real POSIX return value on success is the *former* scheduling policy, not `0`** (`man 2
-/// sched_setscheduler`: "Upon successful completion, the previous scheduling policy of the
-/// specified thread shall be returned") -- found live: `sched_setscheduler/16-1.c` explicitly
-/// checks `result == old_policy`, which the old unconditional `Ok(0)` only happened to satisfy
-/// when `old_policy` was already `SCHED_OTHER` (`0`) and silently failed for any other starting
-/// policy (real-time policies included).
+/// **Real success return value is plain `0`, not the former scheduling policy** -- a prior version
+/// of this function returned `old_policy` instead, reasoning (wrongly) from historical POSIX/SUSv2
+/// text ("the previous scheduling policy... shall be returned") that `sched_setscheduler/16-1.c`'s
+/// own `result == old_policy` check happens to match. But real Linux's actual kernel syscall
+/// returns `0` on success (`man 2 sched_setscheduler`: "On success, sched_setscheduler() returns
+/// 0"), and real, unmodified musl's own `sched_setscheduler()` wrapper
+/// (`third_party/musl/src/sched/sched_setscheduler.c`) is a pure passthrough of that raw value --
+/// it never computes or returns the former policy itself. `sched_setscheduler/16-1.c` only ever
+/// "PASS"es on any real system because it runs against a fresh process whose own `old_policy` is
+/// already `SCHED_OTHER` (`0`), making the two return-value conventions coincide by chance, not
+/// because the real ABI actually returns the former policy.
+///
+/// **Found live, a real regression from that wrong fix**: `pthread_setschedparam()`
+/// (`third_party/musl/src/thread/pthread_setschedparam.c`) computes
+/// `r = -__syscall(SYS_sched_setscheduler, t->tid, policy, param)`, matching real Linux's own `0`-
+/// on-success ABI (`-0 == 0`) -- but this kernel's old `old_policy`-returning behavior meant a
+/// caller whose *own* policy was already non-`SCHED_OTHER` (e.g. a thread that inherited real
+/// `SCHED_FIFO` from a parent that set it before spawning) got `r = -1` on a **successful** call,
+/// which `pthread_setschedparam()`'s own real, unmodified callers can't distinguish from a genuine
+/// error. Confirmed via `pthread_rwlock_rdlock/2-{1,2,3}.c`'s own real diagnostic output
+/// (`"Can't set policy to 1 and prio to 2"`, from a worker thread whose priority-scheduling setup
+/// silently failed this way) and independently reproduced against real, unmodified musl 1.2.6 on
+/// the host -- real musl's own `sched_setscheduler()` wrapper source proves this ABI choice, no
+/// live root-privileged repro needed. Reverting to plain `0` fixes this without regressing
+/// `sched_setscheduler/16-1.c` (its own `old_policy` is always `0` there, so `0 == 0` still holds).
 pub fn do_sched_setscheduler(
     caller_pid: Pid,
     pid: i64,
@@ -281,12 +300,11 @@ pub fn do_sched_setscheduler(
     {
         return Err(EPERM);
     }
-    let old_policy = proc.sched_policy;
     proc.sched_policy = policy;
     proc.sched_priority = param.sched_priority;
     drop(table);
     maybe_yield_for_priority(caller_pid);
-    Ok(old_policy as u64)
+    Ok(0)
 }
 
 /// `SYS_SCHED_SETPARAM`'s real logic -- upstream musl permanently stubs `sched_setparam(2)` to
