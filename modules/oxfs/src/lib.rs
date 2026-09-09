@@ -113,6 +113,10 @@ unsafe extern "C" {
         pread: extern "C" fn(u64, u64, u64, u64) -> i64,
         pwrite: extern "C" fn(u64, u64, u64, u64) -> i64,
     );
+    /// Overrides `fd`'s real `access_mode` callback -- see
+    /// `crate::fs::fd::oxidebsd_set_fd_access_mode`/`FdAccessMode`'s own doc comment (kernel tree).
+    /// `register_open_file` is the one caller here, right alongside `oxidebsd_set_fd_pread_pwrite`.
+    fn oxidebsd_set_fd_access_mode(fd: u64, access_mode: extern "C" fn(u64) -> i64);
     fn oxidebsd_get_cwd() -> u64;
     fn oxidebsd_set_cwd(inode: u64);
     fn oxidebsd_get_root() -> u64;
@@ -2512,8 +2516,40 @@ fn register_open_file(open_file: OpenFile) -> i64 {
         // variant" reasoning `oxfs_content_id` above already established. See `oxfs_pread`/
         // `oxfs_pwrite`'s own doc comments for what each real variant actually supports.
         oxidebsd_set_fd_pread_pwrite(fd, oxfs_pread, oxfs_pwrite);
+        oxidebsd_set_fd_access_mode(fd, oxfs_access_mode);
     };
     fd as i64
+}
+
+/// `access_mode` callback for `oxidebsd_set_fd_access_mode` -- see
+/// `crate::fs::fd::FdAccessMode`'s own doc comment (kernel tree) for the return-bits shape. Only
+/// `FileRead`/`Write` are ever real here (every other variant never reaches `do_mmap_file_backed`'s
+/// check at all -- `oxfs_content_id` already returns `-1` for them, so this is never even called
+/// against one, but the fallback is a harmless readable+writable default anyway):
+/// `FileRead` only ever exists for a real `O_RDONLY` open of an existing file (see `oxfs_open`'s own
+/// `want_write` branch) -- always readable, never writable. `Write` covers `O_WRONLY`/`O_RDWR`, and
+/// (via the create-path branch) a plain `O_RDONLY|O_CREAT` too -- `readonly` (real `O_RDONLY`) and
+/// `readwrite` (real `O_RDWR`) together already capture all three real access modes exactly:
+/// `readonly` or `readwrite` true means readable; anything but `readonly` means writable.
+extern "C" fn oxfs_access_mode(real_fd: u64) -> i64 {
+    match find_open_file(real_fd) {
+        Some(OpenFile::FileRead { .. }) => 0b01,
+        Some(OpenFile::Write {
+            readonly,
+            readwrite,
+            ..
+        }) => {
+            let mut bits = 0;
+            if *readonly || *readwrite {
+                bits |= 0b01;
+            }
+            if !*readonly {
+                bits |= 0b10;
+            }
+            bits
+        }
+        _ => 0b11,
+    }
 }
 
 /// `content_id` callback for `oxidebsd_register_fd_ops_with_content_id` — see that import's own

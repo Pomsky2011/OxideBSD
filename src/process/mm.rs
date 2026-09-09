@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 use x86_64::structures::paging::mapper::TranslateResult;
 
 use crate::memory::{self, with_frame_allocator};
-use crate::syscall::{EAGAIN, EBADF, EBUSY, EINVAL, ENODEV, ENOMEM, ENXIO, EOVERFLOW};
+use crate::syscall::{EACCES, EAGAIN, EBADF, EBUSY, EINVAL, ENODEV, ENOMEM, ENXIO, EOVERFLOW};
 use super::*;
 
 /// Fixed VA window for anonymous `SYS_MMAP` allocations — a fresh region, not reused from
@@ -41,12 +41,16 @@ static NEXT_MMAP_PAGE: Mutex<u64> = Mutex::new(MMAP_REGION_BASE);
 /// caller in this kernel's own call graph exercises the anonymous case at this scale.
 const MAX_MMAP_FILE_REGIONS: usize = 65530;
 
-/// Real `PROT_WRITE` (matches every real Unix's value) — the only `prot` bit `do_mmap` currently
-/// consults, to decide whether a real fd-backed mapping's frames get write-back on `munmap`/exit.
-/// Every mapped page is still unconditionally `WRITABLE` at the page-table level regardless
-/// (`do_mprotect`'s own doc comment already documents this kernel's total lack of real page
-/// protection enforcement) — this only gates the *software* write-back decision, not hardware
-/// access.
+/// Real `PROT_READ`/`PROT_WRITE` (match every real Unix's values). `do_mmap_anon` still maps every
+/// anonymous page unconditionally `PRESENT | WRITABLE` regardless of either bit (`do_mprotect`'s
+/// own doc comment documents this kernel's total lack of real page protection enforcement for the
+/// anonymous case) — these two bits are only ever consulted by `do_mmap_file_backed`: `PROT_WRITE`
+/// decides whether a real fd-backed mapping's frames get write-back on `munmap`/exit *and* whether
+/// the page table entry itself is `WRITABLE`; `PROT_READ`/`PROT_WRITE` together (real `PROT_NONE`
+/// when neither is set) decide whether a file-backed mapping's covered pages get a page-table entry
+/// at all — see that function's own doc comment for why leaving them unmapped is enough to produce
+/// a real `SIGSEGV` with no new machinery (`mmap/6-2.c`).
+const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
 
 /// Real `flags` bits `SYS_MMAP` understands, unpacked from `oxidebsd_sys_mmap`'s own `packed_prot`
@@ -208,6 +212,16 @@ pub fn do_mmap(
     // that function is already safe and idempotent against a range with nothing mapped in it (see
     // its own doc comment), and already does exactly the real cleanup a displaced fd-backed region
     // needs.
+    //
+    // **`ENOMEM`, not `EINVAL`, once alignment is past**: real POSIX's own `MAP_FIXED` clause reads
+    // "[ENOMEM] MAP_FIXED was specified, and the range [addr,addr+len) exceeds that allowed for the
+    // address space of a process" -- an `addr+len` that overflows `u64` entirely, or lands outside
+    // this arch's canonical 48-bit range, is exactly that clause, not a generic argument-shape
+    // `EINVAL` (reserved for real misalignment, checked separately just above). Found live:
+    // `mmap/24-2.c` requests `len == RLIMIT_AS` (this kernel's own default `rlim_cur` is
+    // `RLIM_INFINITY`/`u64::MAX`, see `Process::rlimits`'s own doc comment) at an already-valid
+    // `addr` -- `addr + len` overflows `u64` outright, so this never needed real `RLIMIT_AS`
+    // enforcement at all, just the correct errno for an address range that can't possibly exist.
     let fixed_base = if fixed {
         if !addr_hint.is_multiple_of(4096) {
             return Err(EINVAL);
@@ -215,9 +229,9 @@ pub fn do_mmap(
         let end_inclusive = addr_hint
             .checked_add(region_len)
             .and_then(|e| e.checked_sub(1))
-            .ok_or(EINVAL)?;
+            .ok_or(ENOMEM)?;
         if VirtAddr::try_new(addr_hint).is_err() || VirtAddr::try_new(end_inclusive).is_err() {
-            return Err(EINVAL);
+            return Err(ENOMEM);
         }
         let _ = do_munmap(caller_pid, addr_hint, region_len);
         Some(addr_hint)
@@ -382,6 +396,23 @@ fn do_mmap_file_backed(
     }
 
     let content_id = crate::fs::fd::content_id_of(fd).ok_or(ENODEV)?;
+
+    // Real POSIX MPR: "the file descriptor fildes shall have been opened with read permission,
+    // regardless of the protection options specified. If PROT_WRITE is specified, the application
+    // shall ensure that it has opened the file descriptor fildes with write permission unless
+    // MAP_PRIVATE is specified" (`mmap/6-4.c`/`6-6.c`) -- neither was ever checked before, since
+    // nothing before `crate::fs::fd::access_mode_of` existed queried a fd's real open-time access
+    // mode at all. `6-6.c` fails the first (unconditional) half: a `MAP_PRIVATE`+`PROT_READ`
+    // mapping of a fd opened `O_WRONLY` still needs read permission to populate the mapping's
+    // initial content, private-copy semantics notwithstanding. `6-4.c` fails the second: `PROT_WRITE`
+    // with `MAP_SHARED` on a fd opened `O_RDONLY`.
+    let (fd_readable, fd_writable) = crate::fs::fd::access_mode_of(fd);
+    if !fd_readable {
+        return Err(EACCES);
+    }
+    if prot & PROT_WRITE != 0 && !private && !fd_writable {
+        return Err(EACCES);
+    }
 
     if PROCESS_TABLE
         .lock()
@@ -569,11 +600,20 @@ fn do_mmap_file_backed(
     // SAFETY: see do_mmap's identical reasoning -- me.address_space is the currently active
     // address space.
     let mut mapper = unsafe { me.address_space.as_ref().expect("mm: caller has no address space").mapper(phys_offset) };
+    // Real `PROT_NONE` (`mmap/6-2.c`): neither `PROT_READ` nor `PROT_WRITE` set. Skipping the
+    // mapping loop entirely reuses `signal_for_user_fault`'s own existing default with zero new
+    // machinery -- that function already reports `SIGBUS` only for an address in a region's
+    // `[mapped_pages, npages)` reserved-but-unbacked tail, `SIGSEGV` for everything else unmapped.
+    // `mapped_pages` below is still recorded as the real `covered_pages` extent regardless (not
+    // `0`), so a reference anywhere in `[va_start, va_start + covered_pages*4096)` -- real content
+    // that exists but is genuinely off-limits under `PROT_NONE` -- correctly falls into that
+    // "everything else" `SIGSEGV` case rather than being misclassified as the reserved tail.
+    let prot_accessible = prot & (PROT_READ | PROT_WRITE) != 0;
     // Only `[base, base + covered_pages*4096)` is actually mapped -- `[covered_pages, page_count)`
     // is deliberately left with no page-table entry at all, real POSIX MPR (see MmapFileRegion's
     // own `mapped_pages` field doc comment); `covered_pages == 0` (the whole reservation is beyond
     // the object's own real content) skips this loop entirely.
-    if covered_pages > 0 {
+    if covered_pages > 0 && prot_accessible {
         let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
         let end_page =
             Page::<Size4KiB>::containing_address(VirtAddr::new(base + covered_pages * 4096 - 1));

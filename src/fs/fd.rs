@@ -86,12 +86,30 @@ extern "C" fn no_content_id(_real_fd: u64) -> i64 {
     -1
 }
 
+/// A fd's real, fixed-at-`open()`-time access mode -- bit 0 (`0b01`) readable, bit 1 (`0b10`)
+/// writable, queried live like `content_id` rather than cached at registration (same reasoning:
+/// simpler to let the owning module's own callback answer from its own already-authoritative state
+/// than to duplicate it here). Unlike `content_id`, this never actually changes over a fd's
+/// lifetime (POSIX has no call that changes an already-open fd's access mode), but the callback
+/// shape stays consistent with `content_id`'s own "discriminates by variant itself" convention
+/// (`crate::process::mm::do_mmap_file_backed`'s own real POSIX MPR access-mode check, `mmap/6-4.c`/
+/// `6-6.c`). The default (`default_access_mode` below, readable+writable) is correct for every fd
+/// kind except `modules/oxfs`'s own file-backed `OpenFile` variants -- every other kind (pipes,
+/// sockets, mqueues, devices) never reaches `do_mmap_file_backed`'s check at all, since
+/// `content_id_of` already returns `None`/`ENODEV` for them first.
+pub(crate) type FdAccessMode = extern "C" fn(u64) -> i64;
+
+extern "C" fn default_access_mode(_real_fd: u64) -> i64 {
+    0b11
+}
+
 #[derive(Clone, Copy)]
 struct FdOps {
     read: FdReadWrite,
     write: FdReadWrite,
     close: FdClose,
     content_id: FdContentId,
+    access_mode: FdAccessMode,
     pread: FdReadWriteAt,
     pwrite: FdReadWriteAt,
     /// The fd this entry's callbacks are actually invoked with — itself for a fresh registration,
@@ -244,12 +262,23 @@ fn register(
             write,
             close,
             content_id,
+            access_mode: default_access_mode,
             pread: no_pread_pwrite,
             pwrite: no_pread_pwrite,
             real_fd: fd,
         },
     );
     *REFCOUNTS.lock().entry(fd).or_insert(0) += 1;
+}
+
+/// Overrides `real_fd`'s `access_mode` callback after the fact -- same "separate post-hoc setter,
+/// not a `register`/`oxidebsd_register_fd_ops*` parameter" shape `oxidebsd_set_fd_pread_pwrite`
+/// already establishes, for the identical reason: every existing fd-registering call site keeps the
+/// `default_access_mode` `register` already sets. `modules/oxfs` is the one real caller today.
+pub(crate) extern "C" fn oxidebsd_set_fd_access_mode(fd: u64, access_mode: FdAccessMode) {
+    if let Some(ops) = TABLE.lock().get_mut(&(scheduler::current_tgid(), fd)) {
+        ops.access_mode = access_mode;
+    }
 }
 
 /// Overrides `real_fd`'s `pread`/`pwrite` callbacks after the fact — a separate setter, not a
@@ -486,6 +515,18 @@ pub(crate) fn content_id_of(fd: u64) -> Option<u64> {
     if id < 0 { None } else { Some(id as u64) }
 }
 
+/// `(readable, writable)`, per `FdAccessMode`'s own doc comment. `(true, true)` for a fd not found
+/// in `TABLE` at all -- inert in practice, since `crate::process::mm::do_mmap_file_backed`'s own
+/// caller (`do_mmap`) always calls `content_id_of` first and bails `ENODEV` before this could ever
+/// matter for an unregistered fd.
+pub(crate) fn access_mode_of(fd: u64) -> (bool, bool) {
+    let Some(ops) = TABLE.lock().get(&(scheduler::current_tgid(), fd)).copied() else {
+        return (true, true);
+    };
+    let bits = (ops.access_mode)(ops.real_fd);
+    (bits & 0b01 != 0, bits & 0b10 != 0)
+}
+
 /// Real fd-backed `MAP_SHARED` mmap (`crate::process::mm`) reads/writes content *directly* by
 /// `content_id` (a real inode number), not through a fd's own read/write callbacks — found live,
 /// not designed in up front: `modules/oxfs`'s `oxfs_read` unconditionally fails (`-EBADF`) for a
@@ -650,6 +691,7 @@ pub fn init() {
             write: stdout_write,
             close: stdio_close,
             content_id: no_content_id,
+            access_mode: default_access_mode,
             pread: no_pread_pwrite,
             pwrite: no_pread_pwrite,
             real_fd: 1,

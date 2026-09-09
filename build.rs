@@ -1743,6 +1743,62 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // raise silently succeeded. Fixed via `limits::sched_priority_raise_permitted`
             // (`src/process/limits.rs`), wired into both `do_sched_setscheduler`/`do_sched_setparam`.
             "sched_setparam/23-6.c",
+            // `mmap/6-2.c`: real `PROT_NONE` enforcement -- a mapping's covered pages simply never
+            // get a page-table entry when neither `PROT_READ` nor `PROT_WRITE` is set, reusing
+            // `signal_for_user_fault`'s existing default (`SIGSEGV` for anything not in a region's
+            // own reserved-but-unbacked tail) with no new machinery. `mmap/6-4.c`/`6-6.c`: real
+            // POSIX MPR fd-access-mode checks (`crate::fs::fd::access_mode_of`, backed by a new
+            // `oxfs_access_mode` callback) -- a fd must have been opened with read permission
+            // regardless of `prot`, and needs write permission too for `PROT_WRITE`+`MAP_SHARED`.
+            // `mmap/24-2.c`: `MAP_FIXED`'s own overflow/non-canonical-range check now returns real
+            // `ENOMEM` (the actual POSIX-mandated errno for "range exceeds the address space of a
+            // process") instead of `EINVAL` -- needed no real `RLIMIT_AS` enforcement at all, since
+            // `RLIMIT_AS`'s own default `RLIM_INFINITY` already makes `addr + len` overflow `u64`
+            // outright for this test's own request shape.
+            "mmap/6-2.c",
+            "mmap/6-4.c",
+            "mmap/6-6.c",
+            "mmap/24-2.c",
+            // Every other `mmap`/`munmap` file: `do_mmap`/`do_mmap_file_backed` are shared code
+            // paths every one of these already exercises -- added wholesale (not just the four
+            // above) so a regression in any of them is caught immediately, same "add to this list,
+            // don't just replace it" discipline this array's own doc comment establishes elsewhere.
+            "mmap/10-1.c",
+            "mmap/11-1.c",
+            "mmap/11-2.c",
+            "mmap/11-3.c",
+            "mmap/11-4.c",
+            "mmap/11-5.c",
+            "mmap/1-1.c",
+            "mmap/12-1.c",
+            "mmap/1-2.c",
+            "mmap/13-1.c",
+            "mmap/14-1.c",
+            "mmap/18-1.c",
+            "mmap/19-1.c",
+            "mmap/21-1.c",
+            "mmap/23-1.c",
+            "mmap/24-1.c",
+            "mmap/27-1.c",
+            "mmap/28-1.c",
+            "mmap/31-1.c",
+            "mmap/3-1.c",
+            "mmap/5-1.c",
+            "mmap/6-1.c",
+            "mmap/6-3.c",
+            "mmap/6-5.c",
+            "mmap/7-1.c",
+            "mmap/7-2.c",
+            "mmap/7-3.c",
+            "mmap/7-4.c",
+            "mmap/9-1.c",
+            "munmap/1-1.c",
+            "munmap/1-2.c",
+            "munmap/2-1.c",
+            "munmap/3-1.c",
+            "munmap/4-1.c",
+            "munmap/8-1.c",
+            "munmap/9-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
