@@ -1629,16 +1629,13 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // thread raced that thread's own exit (`__unmapself` unmapping the very memory holding
             // `detach_state`) badly enough to flakily `CRASH`/hang before that fix.
             "pthread_attr_setdetachstate/2-1.c",
-            // `pthread_cond_broadcast/2-3.c,4-2.c`/`pthread_cond_destroy/2-1.c`: also permanently
-            // hung (not just this one file) in the same supervised run before the fix above --
-            // confirmed via this exact canary mechanism to be the *same* underlying bug, not three
-            // separate ones. Now genuinely `TIMEOUT`s (real, bounded, `t0`-rescued) instead of
-            // freezing the whole boot -- a legitimate outcome in its own right (these are heavier
-            // real cross-process/multi-thread stress tests this kernel doesn't finish inside `t0`'s
-            // 40s bound), not something to chase further right now. Kept here specifically to catch
-            // any future regression back to a real, permanent hang.
-            "pthread_cond_broadcast/2-3.c",
-            "pthread_cond_broadcast/4-2.c",
+            // `pthread_cond_broadcast/2-3.c,4-2.c`: were permanently hung (not just this one file)
+            // in the same supervised run before the scheduler-quantum fix above -- confirmed via
+            // this exact canary mechanism to be the *same* underlying bug, not separate ones. Both
+            // now genuinely `PASS` -- see the later, dedicated `pthread_cond_broadcast` block below
+            // (the real `__NR_futex_requeue` name-collision fix) for why; kept here too as
+            // regression coverage for *this* file's own scheduler-quantum fix specifically.
+            // `pthread_cond_destroy/2-1.c`: same story, also closed by that same later fix.
             "pthread_cond_destroy/2-1.c",
             // `pthread_cond_init/4-2.c`: also flagged by that same supervised run, confirmed fixed
             // (or stale) -- passes cleanly now, kept here as regression coverage.
@@ -1860,6 +1857,25 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "sched_setscheduler/6-1.c",
             "sched_setscheduler/7-1.c",
             "sched_setscheduler/9-1.c",
+            // `pthread_cond_broadcast/{1-1,2-1,2-2,2-3,4-1,4-2}.c`: real bug, confirmed via direct
+            // host testing (all 6 pass cleanly on real musl 1.2.6 and real glibc, unlike the
+            // pthread_rwlock_rdlock/pthread-stale-tid clusters above). Root cause: a real syscall
+            // *name* collision on the musl `oxidebsd` branch -- this ABI's own invented
+            // `__NR_futex_requeue=557` (a collision-free *number*) reused a macro *name* the same
+            // vendored header already defines elsewhere for real Linux's own unrelated futex2-
+            // family syscall 456, which silently won the plain-C `#define` redefinition. Every
+            // private-condvar broadcast/signal chain-wake beyond the first directly-woken waiter
+            // issued syscall 456 (never registered here) instead of 557, permanently stranding the
+            // rest. Fixed by renaming the macro to `__NR_oxidebsd_futex_requeue` -- see
+            // `third_party/musl/arch/x86_64/bits/syscall.h.in`'s own doc comment on that macro for
+            // the full story. Also closes `pthread_cond_timedwait/2-5.c` (stuck `UNRESOLVED` for
+            // multiple prior sessions) and `pthread_cond_destroy/2-1.c` -- same root cause, one fix.
+            "pthread_cond_broadcast/1-1.c",
+            "pthread_cond_broadcast/2-1.c",
+            "pthread_cond_broadcast/2-2.c",
+            "pthread_cond_broadcast/2-3.c",
+            "pthread_cond_broadcast/4-1.c",
+            "pthread_cond_broadcast/4-2.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
