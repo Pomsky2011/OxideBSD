@@ -577,8 +577,44 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
 fn do_sigreturn(frame: &mut SyscallFrame) {
     let pid = crate::process::scheduler::current_pid();
     match crate::process::take_signal_saved_frame(pid) {
-        Some(saved) => {
+        Some((saved, ucontext_addr)) => {
             *frame = saved;
+            if ucontext_addr != 0 {
+                // Real sigreturn(2) semantics: restore machine state from the *real* ucontext_t
+                // the handler was actually given (and may have modified), not just the kernel's
+                // own pre-handler snapshot -- see `SignalStackFrame::ucontext_addr`'s own doc
+                // comment for the real bug this closes. `saved` above already covers the case
+                // where the handler never touched it (this overlay reproduces the exact same
+                // values then, since the ucontext was originally populated from `saved` itself).
+                // SAFETY: same known pointer-validation gap every other user-memory read in this
+                // file already has -- `ucontext_addr` was a real, live address on this exact
+                // process's own user stack when `deliver_pending_signal` wrote it, and a handler
+                // that corrupts/frees it before returning is the same class of real memory-safety
+                // violation as any other wild pointer a userspace program can commit.
+                let gregs = unsafe { (ucontext_addr as *const RawUcontext).read_unaligned() }
+                    .uc_mcontext
+                    .gregs;
+                frame.r8 = gregs[REG_R8] as u64;
+                frame.r9 = gregs[REG_R9] as u64;
+                frame.r10 = gregs[REG_R10] as u64;
+                frame.r12 = gregs[REG_R12] as u64;
+                frame.r13 = gregs[REG_R13] as u64;
+                frame.r14 = gregs[REG_R14] as u64;
+                frame.r15 = gregs[REG_R15] as u64;
+                frame.rdi = gregs[REG_RDI] as u64;
+                frame.rsi = gregs[REG_RSI] as u64;
+                frame.rbp = gregs[REG_RBP] as u64;
+                frame.rbx = gregs[REG_RBX] as u64;
+                frame.rdx = gregs[REG_RDX] as u64;
+                frame.rax = gregs[REG_RAX] as u64;
+                frame.user_rsp = gregs[REG_RSP] as u64;
+                // rcx/r11 double as resume RIP/RFLAGS (see SyscallFrame's own doc comment) --
+                // read back from REG_RIP/REG_EFL specifically, not REG_RCX/REG_R11, matching
+                // real Linux's own sigreturn (a handler redirects resume execution by writing
+                // MC_PC, i.e. gregs[REG_RIP] -- exactly what musl's own pthread_cancel() does).
+                frame.rcx = gregs[REG_RIP] as u64;
+                frame.r11 = gregs[REG_EFL] as u64;
+            }
             deliver_pending_signal(frame);
         }
         None => {
@@ -754,17 +790,8 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
             // comment for the real eligibility rules.
             let altstack = crate::process::begin_altstack_if_requested(pid, flags);
             // Snapshotted *before* frame is mutated below -- this is the exact state the
-            // interrupted syscall was about to resume into. `old_mask` is what that state was
-            // actually running under -- what `uc_sigmask` reports below, for the SA_SIGINFO case.
+            // interrupted syscall was about to resume into.
             let saved = *frame;
-            let old_mask =
-                crate::process::stash_signal_context(pid, saved, mask_to_add, altstack.is_some());
-            // A real handler is about to run -- defer the sigsuspend mask restore until it
-            // returns (`sigreturn`/`take_signal_saved_frame`) rather than doing it now, real
-            // POSIX semantics (see `do_sigsuspend`'s own doc comment).
-            if let Some(orig) = sigsuspend_restore {
-                crate::process::set_signal_saved_blocked_override(pid, orig);
-            }
 
             // A real alt stack runs fresh from its own top (no red-zone concern -- nothing else
             // has ever run here yet); the normal path keeps its existing 128-byte red-zone
@@ -774,6 +801,11 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
                 None => frame.user_rsp.wrapping_sub(128),
             };
 
+            // Addresses only, computed *before* `stash_signal_context` below (which needs
+            // `ucontext_addr` up front -- see `SignalStackFrame::ucontext_addr`'s own doc comment
+            // -- but whose own return value, `old_mask`, is in turn needed to actually populate
+            // `uc_sigmask` further down). Real POSIX MPR doesn't apply here (this is genuinely
+            // this process's own live stack, never a fd-backed mapping).
             let (siginfo_addr, ucontext_addr) = if flags & crate::process::SA_SIGINFO != 0 {
                 sp = sp.wrapping_sub(core::mem::size_of::<RawUcontext>() as u64);
                 sp &= !0xF;
@@ -782,7 +814,28 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
                 sp = sp.wrapping_sub(core::mem::size_of::<RawSiginfo>() as u64);
                 sp &= !0xF;
                 let siginfo_addr = sp;
+                (siginfo_addr, ucontext_addr)
+            } else {
+                (0, 0)
+            };
 
+            // `old_mask` is what the interrupted state was actually running under -- what
+            // `uc_sigmask` reports below, for the SA_SIGINFO case.
+            let old_mask = crate::process::stash_signal_context(
+                pid,
+                saved,
+                mask_to_add,
+                altstack.is_some(),
+                ucontext_addr,
+            );
+            // A real handler is about to run -- defer the sigsuspend mask restore until it
+            // returns (`sigreturn`/`take_signal_saved_frame`) rather than doing it now, real
+            // POSIX semantics (see `do_sigsuspend`'s own doc comment).
+            if let Some(orig) = sigsuspend_restore {
+                crate::process::set_signal_saved_blocked_override(pid, orig);
+            }
+
+            if flags & crate::process::SA_SIGINFO != 0 {
                 let mut gregs = [0i64; 23];
                 gregs[REG_R8] = saved.r8 as i64;
                 gregs[REG_R9] = saved.r9 as i64;
@@ -840,10 +893,7 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
                     (ucontext_addr as *mut RawUcontext).write_unaligned(ucontext);
                     (siginfo_addr as *mut RawSiginfo).write_unaligned(siginfo);
                 }
-                (siginfo_addr, ucontext_addr)
-            } else {
-                (0, 0)
-            };
+            }
 
             // 16-byte-align down, then back off 8 more bytes so the slot this writes to lands
             // exactly where an ordinary `call`'s own implicit return-address push would -- i.e.

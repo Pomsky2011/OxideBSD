@@ -1049,6 +1049,7 @@ pub(crate) fn stash_signal_context(
     saved: SyscallFrame,
     mask_to_add: u64,
     used_altstack: bool,
+    ucontext_addr: u64,
 ) -> u64 {
     let mut table = PROCESS_TABLE.lock();
     let Some(proc) = table.get_mut(&pid) else {
@@ -1060,6 +1061,7 @@ pub(crate) fn stash_signal_context(
         saved,
         blocked_before: old_mask,
         used_altstack,
+        ucontext_addr,
     });
     old_mask
 }
@@ -1077,7 +1079,11 @@ pub(crate) fn stash_signal_context(
 /// chained delivery (see this function's own doc comment above) may itself have pushed a further,
 /// non-`SA_ONSTACK` entry on top without ever leaving the stack — only the entry that actually
 /// requested it should ever clear it back.
-pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<SyscallFrame> {
+///
+/// Returns `(saved, ucontext_addr)` — `do_sigreturn` itself is responsible for actually reading
+/// the real `ucontext_t` back from `ucontext_addr` (when nonzero) and overlaying it onto `saved`;
+/// see `SignalStackFrame::ucontext_addr`'s own doc comment for why this step is load-bearing.
+pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<(SyscallFrame, u64)> {
     let mut table = PROCESS_TABLE.lock();
     let proc = table.get_mut(&pid)?;
     let entry = proc.signal_stack.pop()?;
@@ -1085,7 +1091,7 @@ pub(crate) fn take_signal_saved_frame(pid: Pid) -> Option<SyscallFrame> {
     if entry.used_altstack {
         proc.on_altstack = false;
     }
-    Some(entry.saved)
+    Some((entry.saved, entry.ucontext_addr))
 }
 
 /// Real `SA_ONSTACK` eligibility check (`sigaltstack/1-1.c`/`6-1.c`/`7-1.c`) -- called by

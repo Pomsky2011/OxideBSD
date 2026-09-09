@@ -642,6 +642,25 @@ pub(crate) struct SignalStackFrame {
     /// `Process::on_altstack` when popping an entry with this set, matching real POSIX: the alt
     /// stack is "active" for exactly the duration of the handler(s) actually running on it.
     pub(crate) used_altstack: bool,
+    /// Real, live user-stack address of the `ucontext_t` `deliver_pending_signal` built for this
+    /// delivery -- `0` for a non-`SA_SIGINFO` handler (no ucontext was ever constructed, nothing
+    /// to read back). **Load-bearing, not just informational**: real `sigreturn(2)` restores
+    /// machine state from *this* structure -- the exact one the handler's own third argument
+    /// pointed at, which the handler is fully entitled to have modified (`uc_mcontext.gregs[...]`)
+    /// before returning via its real POSIX restorer. `do_sigreturn` used to only ever restore its
+    /// own internally-stashed pre-handler `saved` frame above, silently discarding *any*
+    /// modification a handler made to its own ucontext -- invisible for the overwhelming majority
+    /// of handlers (which never touch it and just expect the interrupted code to resume exactly as
+    /// it was), but a real, load-bearing technique for real, unmodified musl's own deferred
+    /// `pthread_cancel()`: `cancel_handler` (`third_party/musl/src/thread/pthread_cancel.c`)
+    /// redirects `uc->uc_mcontext.MC_PC` to its own `__cp_cancel` stub when the interrupted PC
+    /// falls inside a real cancellation point, expecting that redirect to actually take effect on
+    /// return. Without reading it back, the thread resumed at the *original* interrupted RIP every
+    /// time instead -- which, for a real cancellation-point PC, re-triggers the exact same signal
+    /// delivery from scratch, over and over, forever (found live via `pthread_join/3-1.c`'s real
+    /// hang: `SYS_SIGRETURN` genuinely firing thousands of times with an identical restored RIP,
+    /// confirmed via direct kernel-side tracing before this fix, not guessed).
+    pub(crate) ucontext_addr: u64,
 }
 
 /// State genuinely shared by every thread in a real POSIX thread group (`CLONE_THREAD`), once
