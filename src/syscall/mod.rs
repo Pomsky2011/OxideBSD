@@ -526,7 +526,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
                     as *const u64)
             };
         }
-        deliver_pending_signal(frame);
+        deliver_pending_signal(frame, false);
         return;
     }
 
@@ -549,7 +549,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // a never-run process's very first launch (`spawn_trampoline_inner`, which can't have a signal
     // pending before it's even executed once) -- so checking here, once, covers every real case.
     // See `deliver_pending_signal`'s own doc comment.
-    deliver_pending_signal(frame);
+    deliver_pending_signal(frame, false);
 }
 
 /// Pops one entry off this process's own `Process::signal_stack` (see
@@ -615,7 +615,7 @@ fn do_sigreturn(frame: &mut SyscallFrame) {
                 frame.rcx = gregs[REG_RIP] as u64;
                 frame.r11 = gregs[REG_EFL] as u64;
             }
-            deliver_pending_signal(frame);
+            deliver_pending_signal(frame, true);
         }
         None => {
             frame.rax = EINVAL;
@@ -733,7 +733,15 @@ const _: () = assert!(core::mem::size_of::<RawUcontext>() == 936);
 /// documented gap here (a single `Option<SyscallFrame>` snapshot that a second deliverable signal
 /// during handler execution would silently clobber instead of nesting into) -- see
 /// `Process::signal_stack`'s own doc comment for the data-structure side of this fix.
-fn deliver_pending_signal(frame: &mut SyscallFrame) {
+///
+/// **`chained` distinguishes a genuine return-to-userspace call from `do_sigreturn`'s own
+/// synchronous chaining call** -- see `Process::cascade_budget`'s own doc comment for the real
+/// bug this closes (a handler-driven resend loop, e.g. musl's own `pthread_cancel()`, could
+/// otherwise spin forever inside a single sigreturn without the interrupted frame ever actually
+/// resuming). `false` at both of this function's non-`do_sigreturn` call sites (a completed
+/// syscall's own tail, and the fault trampoline) -- both are genuine "about to resume real
+/// userspace" points; `true` only from `do_sigreturn`'s own chained call below.
+fn deliver_pending_signal(frame: &mut SyscallFrame, chained: bool) {
     let pid = crate::process::scheduler::current_pid();
     if pid == 0 {
         // Boot time (module_init self-checks, etc.) -- no real Process to carry signal state.
@@ -743,7 +751,7 @@ fn deliver_pending_signal(frame: &mut SyscallFrame) {
     // function's own doc comment for why the mask restore has to happen here, not there, split
     // three ways below by how the woken signal actually resolves.
     let sigsuspend_restore = crate::process::take_sigsuspend_restore_mask(pid);
-    let Some(delivery) = crate::process::take_deliverable_signal(pid) else {
+    let Some(delivery) = crate::process::take_deliverable_signal(pid, chained) else {
         // Every pending-but-unblocked bit that woke sigsuspend turned out to be SIG_IGN/default-
         // Ignore -- no handler will ever run to restore the mask via sigreturn, so do it now.
         if let Some(orig) = sigsuspend_restore {

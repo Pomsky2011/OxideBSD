@@ -1876,6 +1876,27 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "pthread_cond_broadcast/2-3.c",
             "pthread_cond_broadcast/4-1.c",
             "pthread_cond_broadcast/4-2.c",
+            // `do_sigreturn`'s own synchronous signal-stack chaining used to redeliver a signal
+            // unconditionally, entirely *inside* the sigreturn syscall itself, before the restored
+            // frame was ever actually resumed as real userspace execution -- correct for signals
+            // already queued *before* the cascade began (sigqueue/4-1.c/8-1.c below, which need
+            // several already-queued instances delivered with no syscall in between an unblock and
+            // a check), but wrong for a signal that becomes pending only as a *side effect* of a
+            // handler running *during* the same cascade -- real, unmodified musl's own
+            // `pthread_cancel()` resend (`cancel_handler` issuing a raw `tkill(self, SIGCANCEL)`
+            // from inside itself) is exactly this shape, and could spin forever redelivering to
+            // the exact same restored RIP without it ever executing even once (found live via
+            // pthread_join/3-1.c's real hang: SYS_SIGRETURN firing thousands of times with an
+            // identical restored RIP). Fixed via `Process::cascade_budget` -- a real snapshot of
+            // what was already deliverable at the cascade's own outermost delivery, consulted only
+            // by `do_sigreturn`'s own chained call; once exhausted, chaining stops and the frame
+            // actually resumes, exactly like real hardware. Closes pthread_join/3-1.c and
+            // pthread_cancel/5-2.c (previously an accepted bounded livelock/TIMEOUT, now a clean
+            // PASS) without regressing sigqueue/4-1.c/8-1.c, which this list also re-verifies.
+            "sigqueue/4-1.c",
+            "sigqueue/8-1.c",
+            "pthread_join/3-1.c",
+            "pthread_cancel/5-2.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

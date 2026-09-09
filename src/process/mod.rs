@@ -1096,7 +1096,50 @@ pub struct Process {
     /// `fork`/`execve` (a fresh quantum, same as spawn) — this field describes *scheduling*
     /// standing, not process identity.
     pub quantum_ticks_left: u64,
+    /// Snapshotted budget of signal instances still owed to synchronous `do_sigreturn` chaining
+    /// (see "Real signal-stack chaining" -- the mechanism this closes a real gap in) for the
+    /// *current* delivery cascade; `None` when no cascade is in progress. Taken fresh every time
+    /// `take_deliverable_signal` is called from a genuine return-to-userspace point (a completed
+    /// syscall's own tail, or the fault trampoline) -- a real snapshot of what was *already*
+    /// pending at that exact moment, not touched again until the next such fresh call.
+    ///
+    /// **The real bug this closes**: `do_sigreturn`'s chaining used to re-check and redeliver
+    /// unconditionally, entirely *inside* the sigreturn syscall itself, before the restored frame
+    /// was ever actually resumed as real userspace execution. That's correct for signals that were
+    /// already queued *before* the cascade began (the intended case -- see
+    /// `sigqueue/4-1.c`/`8-1.c`, which need several already-queued instances all delivered with no
+    /// syscall in between an unblock and a check) -- but wrong for a signal that becomes pending
+    /// only as a *side effect* of a handler running during this same cascade (e.g. real,
+    /// unmodified musl's own `pthread_cancel()` resend: `cancel_handler` issues a raw
+    /// `tkill(self, SIGCANCEL)` from inside itself when the interrupted PC isn't a real
+    /// cancellation point). Real hardware never hits this, since a genuine `sigreturn` actually
+    /// transfers control back to userspace and only rechecks pending signals on the *next* trap --
+    /// requiring at least one real instruction of forward progress first. This kernel's own
+    /// synchronous chaining had no such gap, so a handler-driven resend loop could spin forever,
+    /// redelivering to the exact same restored RIP without that RIP ever executing even once
+    /// (found live via `pthread_join/3-1.c`'s real hang: `SYS_SIGRETURN` firing thousands of times
+    /// with an identical restored RIP).
+    ///
+    /// The budget restores real-hardware-equivalent semantics without losing the guarantee
+    /// `sigqueue/4-1.c`/`8-1.c` need: chaining may only consume instances that were part of the
+    /// snapshot taken at the cascade's own outermost delivery. Once exhausted, `do_sigreturn` stops
+    /// chaining and genuinely resumes the restored frame -- any signal that became pending mid-
+    /// cascade (including one a handler in this very cascade caused) stays real and pending, and
+    /// gets its own fresh, fair snapshot on the *next* genuine return-to-userspace point, exactly
+    /// like real hardware.
+    pub cascade_budget: Option<CascadeBudget>,
 }
+
+/// See `Process::cascade_budget`'s own doc comment for what this gates and why it exists.
+#[derive(Clone, Copy)]
+pub struct CascadeBudget {
+    /// Bitmask of standard (non-real-time) signal numbers still owed a chained delivery.
+    pub(crate) standard: u64,
+    /// Remaining real-time-signal instance counts still owed a chained delivery, indexed exactly
+    /// like `Process::rt_queue` (`sig - SIGRTMIN`).
+    pub(crate) rt: [u16; RT_SIGNAL_COUNT],
+}
+
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: Mutex<BTreeMap<Pid, Box<Process>>> = Mutex::new(BTreeMap::new());
 

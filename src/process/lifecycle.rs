@@ -170,6 +170,9 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         // A fresh process/thread always starts with a full quantum -- see `Process::
         // quantum_ticks_left`'s own doc comment.
         quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
+        // No cascade in progress for a process that hasn't run yet -- see `Process::
+        // cascade_budget`'s own doc comment.
+        cascade_budget: None,
     };
 
     {
@@ -481,6 +484,9 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         // A fresh process/thread always starts with a full quantum -- see `Process::
         // quantum_ticks_left`'s own doc comment.
         quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
+        // No cascade in progress for a process that hasn't run yet -- see `Process::
+        // cascade_budget`'s own doc comment.
+        cascade_budget: None,
     };
 
     {
@@ -714,6 +720,9 @@ pub fn do_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> Result<u64, u64
         // A fresh process/thread always starts with a full quantum -- see `Process::
         // quantum_ticks_left`'s own doc comment.
         quantum_ticks_left: crate::cpu::interrupts::PREEMPT_QUANTUM_TICKS,
+        // No cascade in progress for a process that hasn't run yet -- see `Process::
+        // cascade_budget`'s own doc comment.
+        cascade_budget: None,
     };
 
     {
