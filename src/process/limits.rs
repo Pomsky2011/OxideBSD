@@ -178,6 +178,28 @@ fn has_sched_permission(caller_uid: u32, target_uid: u32) -> bool {
     caller_uid == 0 || caller_uid == target_uid
 }
 
+/// Real Linux/POSIX "appropriate privilege" rule for *raising* a real-time priority: even a
+/// caller targeting its own process (already past `has_sched_permission`, which only checks
+/// uid-ownership) needs `CAP_SYS_NICE` to increase a `SCHED_FIFO`/`SCHED_RR` priority above what
+/// it already has -- real Linux additionally caps this at the caller's own `RLIMIT_RTPRIO`, which
+/// this codebase stores but never enforces (see CLAUDE.md's rlimits note), so the simplified rule
+/// applied here is exactly "no privilege" == "as if `RLIMIT_RTPRIO` were `0`", matching real
+/// Linux's own out-of-the-box default. Lowering (or leaving unchanged) is always allowed
+/// unprivileged; non-real-time policies have no such restriction. Found live:
+/// `sched_setparam/23-6.c` drops to a real non-root uid via `setuid()`, then tries to raise its
+/// own already-`SCHED_FIFO` priority by one -- nothing here ever checked this before, so the
+/// raise silently succeeded instead of the real `EPERM` the test expects.
+fn sched_priority_raise_permitted(
+    caller_uid: u32,
+    new_policy: i32,
+    new_priority: i32,
+    old_priority: i32,
+) -> bool {
+    caller_uid == 0
+        || !(new_policy == SCHED_FIFO || new_policy == SCHED_RR)
+        || new_priority <= old_priority
+}
+
 /// Real Linux's own set of *defined* scheduling policies -- `SCHED_ISO` (`4`) was reserved but
 /// never actually shipped, so `3`/`5`/`6` aren't contiguous with `0..=2`. Anything outside this set
 /// is a real `EINVAL` from `sched_setscheduler`/`sched_get_priority_max`/`_min`, not silently
@@ -255,6 +277,10 @@ pub fn do_sched_setscheduler(
     if !(min..=max).contains(&param.sched_priority) {
         return Err(EINVAL);
     }
+    if !sched_priority_raise_permitted(caller_uid, policy, param.sched_priority, proc.sched_priority)
+    {
+        return Err(EPERM);
+    }
     let old_policy = proc.sched_policy;
     proc.sched_policy = policy;
     proc.sched_priority = param.sched_priority;
@@ -296,6 +322,14 @@ pub fn do_sched_setparam(caller_pid: Pid, pid: i64, param_ptr: u64) -> Result<u6
     let (min, max) = sched_priority_range(proc.sched_policy);
     if !(min..=max).contains(&param.sched_priority) {
         return Err(EINVAL);
+    }
+    if !sched_priority_raise_permitted(
+        caller_uid,
+        proc.sched_policy,
+        param.sched_priority,
+        proc.sched_priority,
+    ) {
+        return Err(EPERM);
     }
     proc.sched_priority = param.sched_priority;
     drop(table);

@@ -93,16 +93,20 @@ As of 2026-09-04, the old single "v0.2.x goals" bucket below is split into three
 sequential releases — each ships standalone rather than bundling everything into one v0.2.0:
 
 - **v0.2.0 — POSIX pilot compliance.** The current focus. Close as much of the gap as practical
-  between OxideBSD's own Open POSIX Test Suite pilot run and a mature glibc/Linux baseline, using
-  the full ~1687-file corpus (not a curated subset — see `CLAUDE.md`'s "POSIX pilot: full corpus
-  expansion" section) as the measuring stick. Latest measured OxideBSD baseline (2026-09-07, a
-  fresh `--reset` full-corpus run, `scripts/run_posix_pilot_supervised.sh`): **87.4%** raw pass
-  rate / **92.8%** excluding UNTESTED (1474 PASS / 1686 total; 22 FAIL / 39 UNRESOLVED / 14 CRASH /
-  11 TIMEOUT / 29 UNSUPPORTED / 97 UNTESTED — `shm_open/23-1.c` needed excluding again, a known,
-  real single-core scheduling-throughput limit, not a new bug). Last real host-side comparison
-  (2026-09-06, not re-run this session — `scripts/run_posix_pilot_host.sh`, manual/root-only): a
-  mature glibc/Linux host at **89.5%** / **94.3%**, a ~2-point gap. Closing it means triaging the
-  full corpus's own remaining FAIL/UNRESOLVED set, not growing the corpus further — it's already
+  between OxideBSD's own Open POSIX Test Suite pilot run and a real Unix baseline, using the full
+  ~1687-file corpus (not a curated subset — see `CLAUDE.md`'s "POSIX pilot: full corpus expansion"
+  section) as the measuring stick. **The real comparison target is literal UNIX and the BSDs
+  (FreeBSD/NetBSD/OpenBSD), not Linux** — Linux/glibc is only used today because it's the one host
+  actually available to measure against (`scripts/run_posix_pilot_host.sh`, manual/root-only); a
+  real BSD-host run of the same corpus would be a truer number and isn't slotted yet (needs a BSD
+  box/VM to run it on). Latest measured OxideBSD baseline (2026-09-07, a fresh `--reset`
+  full-corpus run, `scripts/run_posix_pilot_supervised.sh`): **87.4%** raw pass rate / **92.8%**
+  excluding UNTESTED (1474 PASS / 1686 total; 22 FAIL / 39 UNRESOLVED / 14 CRASH / 11 TIMEOUT / 29
+  UNSUPPORTED / 97 UNTESTED — `shm_open/23-1.c` needed excluding again, a known, real single-core
+  scheduling-throughput limit, not a new bug). Last real host-side comparison (2026-09-06, not
+  re-run this session): the user's Artix (glibc/Linux) host at **89.5%** / **94.3%**, a ~2-point
+  gap — the closest available proxy, not the actual target. Closing it means triaging the full
+  corpus's own remaining FAIL/UNRESOLVED set, not growing the corpus further — it's already
   complete. Two clusters ruled out this session as real bugs (see `CLAUDE.md`'s own history and
   session memory for detail): `sigaction/17-{2,10,20,25,26}.c`'s FAILs were transient host-load
   timing flakiness (all 5 clean `PASS` in this same fresh run); `aio_suspend`'s 6 and `aio_cancel`'s
@@ -128,3 +132,14 @@ possible future nice-to-have, not currently sequenced into this list.
 applet (see `docs/BUSYBOX_APPLETS.md`); `nano` and full (non-BusyBox) `vim` are separate ports, for
 meaningfully better on-target text editing than the current applet-only story — not yet slotted
 into a specific release above.
+
+**`SCHED_SPORADIC` (POSIX Sporadic Server)** — the real-time scheduling policy behind
+`sched_setscheduler`/`sched_setparam`'s 13 `UNSUPPORTED` `_POSIX_SPORADIC_SERVER`-gated
+conformance files: a thread alternates between a normal and a low priority based on a real
+execution-time budget/replenishment-period pair, bounding an aperiodic task's CPU share without
+breaking periodic real-time schedulability analysis (an RTOS-space feature — QNX/VxWorks/RTEMS,
+not something glibc or upstream musl implement either). Doesn't move the Linux/glibc comparison
+number at all (real Linux distros are `UNSUPPORTED` here too) but would be a genuine feature this
+kernel doesn't have. Real implementation needs an extended `struct sched_param` (musl header
+patch), a per-thread budget/priority state machine, and timer-driven replenishment — a new
+scheduling primitive, not a quick fix. Not yet slotted into a specific release.

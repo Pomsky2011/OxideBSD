@@ -1736,6 +1736,13 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             // `shm_open/23-1.c`), with zero regressions across the rest of this canary suite.
             "pthread_detach/1-2.c",
             "pthread_detach/4-3.c",
+            // `sched_setparam/23-6.c`: drops to a real non-root uid via `setuid()`, then tries to
+            // raise its own already-`SCHED_FIFO` priority by one, expecting real `EPERM` --
+            // nothing in `do_sched_setparam` ever checked "appropriate privilege" (`CAP_SYS_NICE`
+            // on real Linux) before this, only uid-ownership (`has_sched_permission`), so the
+            // raise silently succeeded. Fixed via `limits::sched_priority_raise_permitted`
+            // (`src/process/limits.rs`), wired into both `do_sched_setscheduler`/`do_sched_setparam`.
+            "sched_setparam/23-6.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
