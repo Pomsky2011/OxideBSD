@@ -1799,6 +1799,20 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "munmap/4-1.c",
             "munmap/8-1.c",
             "munmap/9-1.c",
+            // `pthread_attr_setstack/{1,2,4,6,7}-1.c`: all five UNRESOLVED at the exact same,
+            // kernel-independent point -- real, unmodified musl's own `pthread_attr_getstack()`
+            // used to unconditionally EINVAL for a freshly `pthread_attr_init()`'d attr (before
+            // ever calling `pthread_attr_setstack()`), which every one of these files calls first
+            // purely to read back the attr's own current/default values. Confirmed a real musl bug
+            // (not intentional, not a POSIX ambiguity) live against the host's own real glibc: a
+            // fresh attr's `pthread_attr_getstack()` succeeds there, reporting `addr=NULL`. Fixed
+            // on the `oxidebsd` musl branch (`src/thread/pthread_attr_get.c`) -- see that fix's own
+            // comment for detail.
+            "pthread_attr_setstack/1-1.c",
+            "pthread_attr_setstack/2-1.c",
+            "pthread_attr_setstack/4-1.c",
+            "pthread_attr_setstack/6-1.c",
+            "pthread_attr_setstack/7-1.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();
