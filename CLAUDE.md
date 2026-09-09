@@ -201,6 +201,14 @@ twice already: `SYS_KILL`'s invented number collided with real Linux's inert `se
 collision-free — continue new invented numbers from there, or from this ABI's own highest already-
 assigned number, whichever is higher.
 
+**A collision-free *number* doesn't mean a collision-free *name*.** `__NR_futex_requeue=557`
+(correctly past 471) reused a macro *name* this same vendored header already defines elsewhere for
+real Linux's own unrelated futex2-family syscall `456` — plain C `#define` redefinition let the
+textually-later `456` silently win, so `unlock_requeue()`'s musl-side call issued syscall `456`
+(never registered here) instead of `557`, permanently and silently breaking every private-condvar
+chain-wake beyond the first directly-woken waiter (found live via `pthread_cond_broadcast/1-1.c`).
+Check the macro *name* for a collision too, not just the number, when adding a new `__NR_*`.
+
 errno **is meant to** use FreeBSD's values where Linux/BSD diverge, but whatever this file returns
 via the carry-flag ABI becomes musl's raw `errno` directly (see `syscall_arch.h`'s `jnc`/`neg`
 conversion) — it must match musl's own compiled-in `bits/errno.h`, not real FreeBSD.
