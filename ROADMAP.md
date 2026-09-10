@@ -117,13 +117,28 @@ sequential releases — each ships standalone rather than bundling everything in
   this ABI's own number/shape — see `CLAUDE.md`'s Syscall ABI section — diverges from Linux's or
   any real BSD's; not a promise to match Linux/BSD numbering or wire format) falls out of this same
   push, not a separate goal.
-- **v0.3.0 — GCC and Clang self-hosted ports.** What v0.2.0 used to target before the 2026-09-04
-  re-scope (see `CLAUDE.md`'s TinyCC section for why this is a much bigger lift than TinyCC — real
-  subprocess pipelines, likely real dynamic linking and threads beyond what exists today):
-  self-hosting C-side toolchain components running on-target (moving further into Phase 3's "build
-  itself" goal from the C side first), then retiring `tcc` once both GCC and Clang are real,
-  working on-target ports — TinyCC was always the first/easiest target, never the intended
-  long-term C compiler.
+- **v0.3.0 — GCC and Clang self-hosted ports, plus a real Rust `std` target.** What v0.2.0 used to
+  target before the 2026-09-04 re-scope (see `CLAUDE.md`'s TinyCC section for why this is a much
+  bigger lift than TinyCC — real subprocess pipelines, likely real dynamic linking and threads
+  beyond what exists today): self-hosting C-side toolchain components running on-target (moving
+  further into Phase 3's "build itself" goal from the C side first), then retiring `tcc` once both
+  GCC and Clang are real, working on-target ports — TinyCC was always the first/easiest target,
+  never the intended long-term C compiler. **Deferred into this same "toolchain maturity" release
+  (2026-09-09)**: a real Rust `std` target for OxideBSD userland — motivated by `rustrc` (the
+  user's own from-scratch, OpenRC-inspired init system, `git@github.com:Pomsky2011/RustRC.git`,
+  vendored as a submodule at `rustrc/`), which currently only boots as PID 1 on real `std` targets
+  (Linux/FreeBSD/NetBSD, some via `-Z build-std`/`cargo-zigbuild` for Tier 2/3) and has no path onto
+  OxideBSD without one. Recommended approach (not yet started): link `std` against the existing
+  musl fork rather than a from-scratch syscall backend — most of `std::sys::pal::unix`'s own
+  assumptions (real threads/futex-mutexes/TCP-UDP/fork-exec) already work correctly against it,
+  verified extensively by this same release's own POSIX conformance push. Real work: a new hosted
+  userland target spec (distinct from the kernel's own `panic=abort` one), a `sys::pal` backend for
+  `target_os = "oxidebsd"` (a fork of Rust's own `library/` sources, same vendor-and-patch pattern
+  as `third_party/musl`/`busybox`/`tinycc`), and — the biggest real unknown — a `libc`-crate fork
+  declaring this ABI's own struct layouts/constants (it has zero knowledge of this target today).
+  Defaulting userland `std` to `panic=abort` sidesteps real unwinding entirely, matching `rustrc`'s
+  own existing `Cargo.toml` profile. Scope narrow at first: only what `rustrc` itself needs (process
+  spawn/wait, signals, stdio, basic fs), not full `std` fidelity.
 - **v0.4.0 — a real glibc port**, alongside (not replacing) the existing native-ABI musl port.
 
 A separate idea — replacing some BusyBox utilities with Rust `uutils` ahead of GCC/Clang — was
