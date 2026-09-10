@@ -1897,6 +1897,16 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
             "sigqueue/8-1.c",
             "pthread_join/3-1.c",
             "pthread_cancel/5-2.c",
+            // `timer_gettime/1-4.c`: real `it_interval` round-trip bug -- `PosixTimer` used to
+            // only store a periodic timer's reload value as a tick count (`interval_ticks`,
+            // necessarily lossy at this kernel's fixed `TIMER_HZ=100`/10ms granularity), so
+            // `timer_gettime`/`timer_settime`'s own `old_value` reported a rounded, reconstructed
+            // interval instead of what the caller actually requested (a real 2ms fractional
+            // component came back as 10ms). Fixed via `Process::PosixTimer::interval_requested`,
+            // the exact caller-supplied `(sec, nsec)` remembered verbatim and reported unmodified
+            // -- `it_value`/remaining time still has to be genuinely tick-derived (no "exact"
+            // value to store), only the fixed interval itself benefits from this.
+            "timer_gettime/1-4.c",
         ];
         out.retain(|rel| CANARY.contains(&rel.as_str()));
         out.sort();

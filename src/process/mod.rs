@@ -461,8 +461,22 @@ pub struct PosixTimer {
     /// `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` one -- `clockid` above says which.
     pub deadline: Option<u64>,
     /// Reload value in ticks for a periodic timer; `0` means one-shot -- same convention
-    /// `real_timer_interval_ticks` above already uses.
+    /// `real_timer_interval_ticks` above already uses. This is the value the actual firing logic
+    /// (`interrupts::timer_interrupt_handler`) reads -- necessarily lossy at this kernel's fixed
+    /// `TIMER_HZ` tick granularity, see `interval_requested` below for the exact value a caller
+    /// gets back from `timer_gettime`.
     pub interval_ticks: u64,
+    /// The exact `(it_interval_sec, it_interval_nsec)` a caller last passed to `timer_settime` --
+    /// reported back verbatim by `timer_gettime`/`timer_settime`'s own `old_value` output, instead
+    /// of deriving it from `interval_ticks` (which real Linux/POSIX both document `timer_gettime`
+    /// as required to round-trip exactly, but this kernel's fixed `TIMER_HZ=100` (10ms) tick
+    /// granularity can only represent to the nearest 10ms -- a caller requesting a sub-tick
+    /// interval like 2ms used to get back a lossy, rounded-up value instead of what it actually
+    /// asked for, found live via `timer_gettime/1-4.c`). `it_value`/the remaining time still has to
+    /// be genuinely tick-derived (there's no "exact remaining time" to store verbatim), only the
+    /// interval itself -- a fixed, caller-supplied constant -- benefits from being remembered
+    /// exactly rather than reconstructed.
+    pub interval_requested: (i64, i64),
     /// Live wall-clock `(tv_sec, tv_nsec)` target -- `Some` only for a timer armed via
     /// `TIMER_ABSTIME` against `CLOCK_REALTIME`, `None` otherwise (including once such a timer has
     /// fired once -- a periodic reload falls back to `deadline`/`interval_ticks` alone, real

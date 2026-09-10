@@ -445,6 +445,7 @@ pub fn do_timer_create(pid: Pid, clockid: u64, evp_ptr: u64, timerid_ptr: u64) -
         signo,
         deadline: None,
         interval_ticks: 0,
+        interval_requested: (0, 0),
         realtime_target: None,
         overrun: 0,
     });
@@ -508,7 +509,7 @@ pub fn do_timer_settime(
             Some(deadline) => ticks_to_timespec(deadline.saturating_sub(timer_now(proc, clockid))),
             None => (0, 0),
         };
-        let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);
+        let (interval_sec, interval_nsec) = slot.interval_requested;
         // SAFETY: same known pointer-validation gap as above, for a write this time.
         unsafe {
             (old_ptr as *mut RawItimerspec).write_unaligned(RawItimerspec {
@@ -530,10 +531,12 @@ pub fn do_timer_settime(
     if new.it_value_sec == 0 && new.it_value_nsec == 0 {
         slot.deadline = None;
         slot.interval_ticks = 0;
+        slot.interval_requested = (0, 0);
         slot.realtime_target = None;
     } else if flags & TIMER_ABSTIME != 0 {
         slot.deadline = Some(abstime_to_ticks(clockid, new.it_value_sec, new.it_value_nsec));
         slot.interval_ticks = interval_ticks;
+        slot.interval_requested = (new.it_interval_sec, new.it_interval_nsec);
         slot.realtime_target = if clockid == CLOCK_REALTIME {
             Some((new.it_value_sec, new.it_value_nsec))
         } else {
@@ -542,6 +545,7 @@ pub fn do_timer_settime(
     } else {
         slot.deadline = Some(now + value_ticks);
         slot.interval_ticks = interval_ticks;
+        slot.interval_requested = (new.it_interval_sec, new.it_interval_nsec);
         slot.realtime_target = None;
     }
     slot.overrun = 0;
@@ -570,7 +574,7 @@ pub fn do_timer_gettime(pid: Pid, timerid: u64, val_ptr: u64) -> Result<u64, u64
         Some(deadline) => ticks_to_timespec(deadline.saturating_sub(timer_now(proc, slot.clockid))),
         None => (0, 0),
     };
-    let (interval_sec, interval_nsec) = ticks_to_timespec(slot.interval_ticks);
+    let (interval_sec, interval_nsec) = slot.interval_requested;
     // SAFETY: same known pointer-validation gap every other user-memory write in this codebase
     // already has.
     unsafe {
