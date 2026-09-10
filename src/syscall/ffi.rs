@@ -100,6 +100,50 @@ pub(crate) fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64>
     Ok(total)
 }
 
+/// Real, unremapped Linux `__NR_pwritev2=328`. Real `pwritev2(2)`'s wire format is 6 real
+/// arguments (`fd, iov, count, ofs_lo, ofs_hi, flags`) -- doesn't fit this ABI's 4-register
+/// convention, so `third_party/musl/src/linux/pwritev2.c`'s own call site is patched (`oxidebsd`
+/// branch) to pass just `(fd, iov, count, ofs)`: `ofs_lo`/`ofs_hi` collapse into one real 64-bit
+/// value (the split only ever existed for 32-bit-ABI portability shared across archs; real `off_t`
+/// is already 64-bit natively here), and `flags` (`RWF_DSYNC`/`RWF_HIPRI`/etc.) is dropped
+/// entirely -- none of those hints have any real effect on this filesystem's own always-durable-
+/// at-commit write model, so silently ignoring them (rather than plumbing a value nothing would
+/// ever consult) is honest, not a shortcut. `ofs == u64::MAX` (real `-1`) means "at the current
+/// file position" per real `pwritev2(2)` semantics -- exactly what musl's own wrapper already
+/// special-cased for the *non*-vectored, no-flags case (`writev`) before ever reaching this
+/// syscall at all; this handler covers every other case (a genuine offset, or any nonzero `flags`)
+/// uniformly through the one real code path. Same partial-write semantics as `sys_writev` above.
+pub(crate) fn sys_pwritev2(fd: u64, iov_ptr: u64, iovcnt: u64, ofs: u64) -> Result<u64, u64> {
+    #[repr(C)]
+    struct IoVec {
+        base: u64,
+        len: u64,
+    }
+
+    let mut total: u64 = 0;
+    let mut cur_ofs = ofs;
+    for i in 0..iovcnt {
+        // SAFETY: same known pointer-validation gap sys_read/sys_write already document.
+        let iov = unsafe { &*(iov_ptr as *const IoVec).add(i as usize) };
+        let result = if ofs == u64::MAX {
+            sys_write(fd, iov.base, iov.len)
+        } else {
+            match crate::fs::fd::pwrite(fd, iov.base, iov.len, cur_ofs) {
+                Some(raw) => ffi_result_to_result(raw),
+                None => Err(EBADF),
+            }
+        };
+        match result {
+            Ok(n) => {
+                total += n;
+                cur_ofs = cur_ofs.wrapping_add(n);
+            }
+            Err(errno) => return if total > 0 { Ok(total) } else { Err(errno) },
+        }
+    }
+    Ok(total)
+}
+
 /// `SYS_READV = 153` — OxideBSD's own invention, continuing the sequence past `SYS_SHUTDOWN =
 /// 152`. Added specifically because musl's stdio read path goes through `readv`, not plain
 /// `read`, whenever a `FILE*` has real internal buffering enabled (`third_party/musl`'s
@@ -150,6 +194,33 @@ pub(crate) fn sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, u64> 
 /// single-core, cooperatively-scheduled kernel.
 pub(crate) fn sys_pipe(fds_ptr: u64) -> Result<u64, u64> {
     crate::fs::pipe::do_pipe(fds_ptr)
+}
+
+/// Real, unremapped Linux `__NR_pipe2=293`. `pipe2.c`'s own real fallback (plain `pipe()` +
+/// `fcntl(F_SETFD)`/`fcntl(F_SETFL)` per requested flag, once for each end) already made this
+/// syscall's absence harmless -- registering it directly just collapses that into one round trip,
+/// applying the same `set_cloexec`/`set_nonblocking` calls `sys_fcntl`'s own `F_SETFD`/`F_SETFL`
+/// handling above uses, directly to both ends `do_pipe` just created.
+pub(crate) fn sys_pipe2(fds_ptr: u64, flags: u64) -> Result<u64, u64> {
+    crate::fs::pipe::do_pipe(fds_ptr)?;
+    // SAFETY: do_pipe just wrote two real, freshly allocated fd numbers here (same known
+    // pointer-validation gap every other user-memory read in this file already has).
+    let (read_fd, write_fd) = unsafe {
+        (
+            (fds_ptr as *const i32).read() as u64,
+            (fds_ptr as *const i32).add(1).read() as u64,
+        )
+    };
+    if flags & O_CLOEXEC != 0 {
+        let pid = crate::process::scheduler::current_tgid();
+        crate::fs::fd::set_cloexec(pid, read_fd, true);
+        crate::fs::fd::set_cloexec(pid, write_fd, true);
+    }
+    if flags & O_NONBLOCK != 0 {
+        crate::fs::fd::set_nonblocking(read_fd, true);
+        crate::fs::fd::set_nonblocking(write_fd, true);
+    }
+    Ok(0)
 }
 
 /// `SYS_DUP2` (`106`) — matches real `dup2(2)`'s exact `(oldfd, newfd)` signature (no
@@ -246,6 +317,11 @@ const O_NONBLOCK: u64 = 0o4000;
 /// `open(2)`'s own `O_CLOEXEC` flag value (`0o2000000`, consulted by `modules/oxfs`'s `oxfs_open`
 /// directly, not here).
 const FD_CLOEXEC: u64 = 1;
+/// `open(2)`/`pipe2(2)`'s own `O_CLOEXEC` flag value -- a real, classic POSIX gotcha: this is a
+/// *different* bit (`0o2000000`) from `fcntl(2)`'s `FD_CLOEXEC` (`1`) above, despite both meaning
+/// "close-on-exec". `sys_pipe2` below is the one place in this file that needs to accept it on the
+/// wire (matching real Linux's `pipe2(2)` flags argument) rather than just consult it internally.
+const O_CLOEXEC: u64 = 0o2000000;
 
 pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
     let Some(real_fd) = crate::fs::fd::real_fd_of(fd) else {
@@ -1416,6 +1492,10 @@ pub(crate) extern "C" fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64)
     result_to_ffi(sys_writev(fd, iov_ptr, iovcnt))
 }
 
+pub(crate) extern "C" fn oxidebsd_sys_pwritev2(fd: u64, iov_ptr: u64, iovcnt: u64, ofs: u64) -> i64 {
+    result_to_ffi(sys_pwritev2(fd, iov_ptr, iovcnt, ofs))
+}
+
 // `pub`, not `pub(crate)` -- same "kept public for test use" precedent above; `tests/
 // readv_smoke.rs` calls this directly.
 pub extern "C" fn oxidebsd_sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
@@ -1424,6 +1504,10 @@ pub extern "C" fn oxidebsd_sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 
 
 pub(crate) extern "C" fn oxidebsd_sys_pipe(fds_ptr: u64) -> i64 {
     result_to_ffi(sys_pipe(fds_ptr))
+}
+
+pub(crate) extern "C" fn oxidebsd_sys_pipe2(fds_ptr: u64, flags: u64) -> i64 {
+    result_to_ffi(sys_pipe2(fds_ptr, flags))
 }
 
 pub(crate) extern "C" fn oxidebsd_sys_dup2(oldfd: u64, newfd: u64) -> i64 {

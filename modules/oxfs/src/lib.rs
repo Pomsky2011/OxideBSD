@@ -252,6 +252,14 @@ const SYS_UMOUNT2: u64 = 176;
 /// `df`'s real `statvfs(3)` call.
 const SYS_FSYNC: u64 = 471;
 const SYS_SYNC: u64 = 472;
+/// Real, unremapped Linux `__NR_fdatasync=75` (confirmed unclaimed -- this ABI's own invented
+/// numbers start at 100, and `third_party/musl/src/unistd/fdatasync.c` issues this exact number
+/// directly, no OxideBSD-side remap needed, matching `SYS_PREAD`/`SYS_PWRITE`'s own precedent).
+/// Registered straight at `oxfs_fsync` -- this filesystem's commit-only-at-close write model makes
+/// no distinction between syncing data and syncing metadata (both happen atomically in the same
+/// `commit_write_buffer` call), so `fdatasync(2)`'s real, POSIX-permitted "may skip metadata"
+/// relaxation collapses to exactly `fsync(2)`'s own behavior here -- honest, not a stub.
+const SYS_FDATASYNC: u64 = 75;
 const SYS_FTRUNCATE: u64 = 473;
 const SYS_FALLOCATE: u64 = 474;
 const SYS_FLOCK: u64 = 475;
@@ -7521,6 +7529,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MOUNT_TMPFS, oxfs_mount_tmpfs);
         oxidebsd_register_syscall(SYS_UMOUNT2, oxfs_umount2);
         oxidebsd_register_syscall(SYS_FSYNC, oxfs_fsync);
+        oxidebsd_register_syscall(SYS_FDATASYNC, oxfs_fsync);
         oxidebsd_register_syscall(SYS_SYNC, oxfs_sync);
         oxidebsd_register_syscall(SYS_FTRUNCATE, oxfs_ftruncate);
         oxidebsd_register_syscall(SYS_FALLOCATE, oxfs_fallocate);

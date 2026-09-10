@@ -83,6 +83,7 @@ unsafe extern "C" {
     fn oxidebsd_sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
     fn oxidebsd_sys_set_tid_address(tidptr: u64) -> i64;
     fn oxidebsd_sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64;
+    fn oxidebsd_sys_pwritev2(fd: u64, iov_ptr: u64, iovcnt: u64, ofs: u64) -> i64;
     fn oxidebsd_sys_clone(flags: u64, newsp: u64, ptid: u64, ctid: u64) -> i64;
 }
 
@@ -110,6 +111,11 @@ const SYS_WRITEV: u64 = 104;
 const SYS_GETPPID: u64 = 107;
 const SYS_SET_TID_ADDRESS: u64 = 150;
 const SYS_READV: u64 = 153;
+/// Real, unremapped Linux `__NR_pwritev2=328` (confirmed unclaimed) -- see `sys_pwritev2`'s own
+/// doc comment in `src/syscall/ffi.rs` for the real wire-format-shrinking musl call-site patch
+/// this needs. Lives here, next to `SYS_WRITEV`/`SYS_READV`, not a feature module -- same
+/// "core vectored-I/O family" reasoning as those two.
+const SYS_PWRITEV2: u64 = 328;
 /// Continues the ABI's own invented-number sequence from `modules/oxfs`'s/`modules/posix_compat`'s
 /// `SYS_GETRUSAGE = 491` (the current highest assigned anywhere in this ABI as of this addition),
 /// not real Linux's `mprotect = 10` — same collision-avoidance discipline as that whole `471+`
@@ -217,6 +223,10 @@ extern "C" fn handle_writev(fd: u64, iov_ptr: u64, iovcnt: u64, _arg3: u64) -> i
     unsafe { oxidebsd_sys_writev(fd, iov_ptr, iovcnt) }
 }
 
+extern "C" fn handle_pwritev2(fd: u64, iov_ptr: u64, iovcnt: u64, ofs: u64) -> i64 {
+    unsafe { oxidebsd_sys_pwritev2(fd, iov_ptr, iovcnt, ofs) }
+}
+
 extern "C" fn handle_set_tid_address(tidptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_set_tid_address(tidptr) }
 }
@@ -247,6 +257,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_MSYNC, handle_msync);
         oxidebsd_register_syscall(SYS_SET_FS_BASE, handle_set_fs_base);
         oxidebsd_register_syscall(SYS_WRITEV, handle_writev);
+        oxidebsd_register_syscall(SYS_PWRITEV2, handle_pwritev2);
         oxidebsd_register_syscall(SYS_SET_TID_ADDRESS, handle_set_tid_address);
         oxidebsd_register_syscall(SYS_READV, handle_readv);
     }

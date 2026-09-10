@@ -122,6 +122,7 @@ unsafe extern "C" {
         handler: extern "C" fn(u64, u64, u64, u64) -> i64,
     ) -> i32;
     fn oxidebsd_sys_pipe(fds_ptr: u64) -> i64;
+    fn oxidebsd_sys_pipe2(fds_ptr: u64, flags: u64) -> i64;
     fn oxidebsd_sys_dup2(oldfd: u64, newfd: u64) -> i64;
     fn oxidebsd_sys_setpgid(pid: u64, pgid: u64) -> i64;
     fn oxidebsd_sys_getpgid(pid: u64) -> i64;
@@ -362,8 +363,34 @@ const SYS_SHMAT: u64 = 543;
 const SYS_SHMCTL: u64 = 544;
 const SYS_SHMDT: u64 = 545;
 
+/// Real, unremapped Linux `__NR_set_robust_list=273` (confirmed unclaimed) -- both of this musl
+/// fork's own real callers (`src/thread/pthread_create.c`, `src/thread/pthread_mutex_trylock.c`)
+/// issue it as pure best-effort bookkeeping and discard its return value entirely, so a real,
+/// honest no-op success is exactly as correct as a genuine robust-mutex-crash-recovery list would
+/// be from any caller's own perspective -- this kernel has no equivalent recovery mechanism to
+/// register into regardless (no crash-time futex-owner cleanup exists here at all).
+const SYS_SET_ROBUST_LIST: u64 = 273;
+/// Real, unremapped Linux `__NR_pipe2=293` (confirmed unclaimed). Was already reachable via
+/// `third_party/musl/src/unistd/pipe2.c`'s own `ENOSYS`-triggered fallback (plain `pipe()` +
+/// `fcntl(F_SETFD)`/`fcntl(F_SETFL)` per requested flag) -- registering the real syscall directly
+/// just collapses that into one round trip instead of up to three, real functional behavior
+/// unchanged either way.
+const SYS_PIPE2: u64 = 293;
+
 extern "C" fn handle_pipe(fds_ptr: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> i64 {
     unsafe { oxidebsd_sys_pipe(fds_ptr) }
+}
+
+extern "C" fn handle_set_robust_list(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    0
+}
+
+/// Real `pipe2(2)` -- thin delegator, same shape as `handle_pipe`/`handle_fcntl` above. The real
+/// logic (pipe creation plus applying `O_CLOEXEC`/`O_NONBLOCK` to both ends) stays kernel-resident
+/// in `oxidebsd_sys_pipe2` -- it needs `crate::process::scheduler::current_pid()` for
+/// `set_cloexec`, not reachable from a relocated module.
+extern "C" fn handle_pipe2(fds_ptr: u64, flags: u64, _arg2: u64, _arg3: u64) -> i64 {
+    unsafe { oxidebsd_sys_pipe2(fds_ptr, flags) }
 }
 
 extern "C" fn handle_dup2(oldfd: u64, newfd: u64, _arg2: u64, _arg3: u64) -> i64 {
@@ -632,6 +659,8 @@ extern "C" fn handle_shmdt(shmaddr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
 pub extern "C" fn module_init() -> i32 {
     unsafe {
         oxidebsd_register_syscall(SYS_PIPE, handle_pipe);
+        oxidebsd_register_syscall(SYS_PIPE2, handle_pipe2);
+        oxidebsd_register_syscall(SYS_SET_ROBUST_LIST, handle_set_robust_list);
         oxidebsd_register_syscall(SYS_DUP2, handle_dup2);
         oxidebsd_register_syscall(SYS_SETPGID, handle_setpgid);
         oxidebsd_register_syscall(SYS_GETPGID, handle_getpgid);
@@ -696,7 +725,7 @@ pub extern "C" fn module_init() -> i32 {
         oxidebsd_register_syscall(SYS_SHMDT, handle_shmdt);
     }
     log(
-        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_SETPARAM/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_FUTEX_REQUEUE/SYS_MLOCK/SYS_MUNLOCK/SYS_MLOCKALL/SYS_MUNLOCKALL/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
+        "[module] posix_compat: module_init running (registered SYS_PIPE/SYS_PIPE2/SYS_SET_ROBUST_LIST/SYS_DUP2/SYS_SETPGID/SYS_GETPGID/SYS_SETSID/SYS_GETSID/SYS_IOCTL/SYS_DUP/SYS_UNAME/SYS_SOCKETPAIR/SYS_FCNTL/SYS_SHUTDOWN/SYS_GETUID/SYS_GETEUID/SYS_GETGID/SYS_GETEGID/SYS_SETUID/SYS_SETGID/SYS_SETRESUID/SYS_GETGROUPS/SYS_SETGROUPS/SYS_PRLIMIT64/SYS_SETPRIORITY/SYS_GETPRIORITY/SYS_SCHED_SETSCHEDULER/SYS_SCHED_SETPARAM/SYS_SCHED_GETSCHEDULER/SYS_SCHED_GETPARAM/SYS_SCHED_GETAFFINITY/SYS_SCHED_GET_PRIORITY_MAX/SYS_SCHED_GET_PRIORITY_MIN/SYS_SCHED_RR_GET_INTERVAL/SYS_SCHED_YIELD/SYS_REBOOT/SYS_FUTEX/SYS_FUTEX_REQUEUE/SYS_MLOCK/SYS_MUNLOCK/SYS_MLOCKALL/SYS_MUNLOCKALL/SYS_UMASK/SYS_GETRUSAGE/SYS_TIMES/SYS_GETRANDOM/SYS_SYSINFO/SYS_MQ_OPEN/SYS_MQ_UNLINK/SYS_MQ_TIMEDSEND/SYS_MQ_TIMEDRECEIVE/SYS_MQ_NOTIFY/SYS_MQ_GETSETATTR/SYS_MSGGET/SYS_MSGSND/SYS_MSGRCV/SYS_MSGCTL/SYS_SEMGET/SYS_SEMOP/SYS_SEMCTL/SYS_SEMTIMEDOP/SYS_SHMGET/SYS_SHMAT/SYS_SHMCTL/SYS_SHMDT)\n",
     );
     0
 }
