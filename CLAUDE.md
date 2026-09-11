@@ -99,8 +99,15 @@ stdio`).
   `userland/*-syscall-smoke/`) for anything syscall-shaped added from here on.
 - Anything needing live interactive keyboard input (real Ctrl+C→SIGINT, `su`/`login` prompts,
   `sulogin`/`getty` tty takeover, persistence surviving a real QEMU restart, any `reboot`/halt/
-  poweroff success path) can't be scripted and is manual-QEMU-only — hand it to the user rather
-  than trying to drive it via a backgrounded `cargo run`.
+  poweroff success path) used to be flatly manual-QEMU-only — **partially superseded**: plain
+  keystroke injection (typing, Ctrl+C/Ctrl+Z/held-key-for-autorepeat) genuinely can be scripted
+  headlessly via the QEMU monitor's own `sendkey <combo> [hold-ms]` command (see the USB-input
+  section's own `OXIDEBSD_QEMU_MONITOR` doc comment) — this is how a real Ctrl+C/Ctrl+D bug got
+  found and confirmed fixed without a human at a display. Still genuinely manual-only: anything
+  needing a real human *decision* mid-session (`su`/`login`/`sulogin` credential entry), and
+  persistence-across-a-real-restart/`reboot`/halt/poweroff (there's no scripted way to observe the
+  VM coming back up cleanly, only to send keys into an already-running one) — hand those to the
+  user rather than trying to drive them via a backgrounded `cargo run`.
 
 ## Custom target spec (`x86_64-oxidebsd.json`)
 
@@ -2212,14 +2219,64 @@ ties both together and exposes `init`/`poll`.
   port scan wins), no hot-plug, US 104-key layout only (a handful of ISO/PrintScreen/Pause keys
   unmapped — real, narrow, deliberate gaps). Mouse/pointer input out of scope entirely — no GUI or
   pointer concept exists anywhere in this kernel to consume it yet.
+- **Real key auto-repeat** (`hid_keyboard::KeyboardDevice::repeat_usage`/`repeat_next_tick`,
+  checked every `poll()` tick) — a real USB HID boot-keyboard device reports a key exactly once per
+  state change and never again while it's held (unlike a PS/2 keyboard, whose own firmware
+  autonomously resends the make code — real hardware autorepeat, entirely transparent to this
+  kernel's decode pipeline, no kernel code needed). Typematic repeat is universally an OS-side
+  responsibility on real desktop systems, so it's synthesized here instead, driven by
+  `cpu::interrupts::ticks()` rather than by report arrival (a held key generates no further xHCI
+  Transfer Events at all). Only the single most-recently-pressed still-held key repeats, matching
+  real desktop-OS convention; modifiers never repeat.
 - QEMU test devices (`-device qemu-xhci -device usb-kbd`) are opt-in via `OXIDEBSD_QEMU_USB=1` in
   `scripts/qemu_runner.sh`, not default — QEMU's default i440fx machine already wires up a PS/2
   keyboard at the hardware-model level, so an always-on USB keyboard would double-push every
   keystroke typed into the QEMU window into stdin.
-- **Not covered**: real hardware (Surface Pro) itself — manual-QEMU-only precedent extends to
-  manual-real-hardware-only here; live interactive keystroke verification (Ctrl+C/history/shift
-  through the shared decode pipeline) is the same "can't be scripted" category CLAUDE.md's test-
-  architecture section already establishes for PS/2.
+- **Real hardware (Surface Pro) itself is genuinely manual-only** — but live interactive-keystroke
+  verification (Ctrl+C/history/shift through the shared decode pipeline) turned out **not** to need
+  a human at a real display after all: QEMU's own monitor `sendkey <combo> [hold-ms]` genuinely
+  synthesizes guest keystrokes (including held-key duration, for auto-repeat testing) over a plain
+  TCP socket (`scripts/qemu_runner.sh`'s opt-in `OXIDEBSD_QEMU_MONITOR=<port>`) — this is how the
+  real Ctrl+C/Ctrl+D bug in the next section was actually found and confirmed fixed, headlessly.
+  Revise CLAUDE.md's test-architecture section's "can't be scripted, manual-QEMU-only" framing
+  accordingly for anything keyboard-shaped specifically (still true for anything needing a real
+  human decision mid-session, e.g. `sulogin` credential entry).
+
+## A real, pre-existing (PS/2 *and* USB) bug found via scripted keystroke testing: Ctrl+C/Ctrl+D silently did nothing once BusyBox's line editor took over (`src/console/stdin.rs`)
+
+Found and fixed while validating the USB keyboard work above (via the new `OXIDEBSD_QEMU_MONITOR`
+`sendkey` capability, not a real keyboard) — but the bug itself predates USB entirely and affects
+plain PS/2 too, confirmed via the identical byte-level trace.
+
+- **Root cause**: `DEFAULT_TERMIOS.c_cc` (the fallback/initial `struct termios` `TCGETS` returns
+  before anything ever calls `TCSETS`) was all-zero. Real, unmodified BusyBox `libbb/lineedit.c`
+  deliberately clears `ISIG` when it takes over line editing (so it can implement Ctrl+C/Ctrl+D
+  itself on raw bytes, real upstream behavior, not an OxideBSD-side choice) — and recognizes them
+  by comparing each incoming byte against `initial_settings.c_cc[VINTR]`/`c_cc[VEOF]` (the
+  *original* termios it read via `TCGETS` right before switching to raw mode), each check
+  explicitly guarded by `!= 0` ("this control character is disabled"). An all-zero default silently
+  satisfied that guard as "disabled" — so Ctrl+C/Ctrl+D never did anything once `hush`'s own line
+  editor was driving the prompt (which is effectively always, interactively), regardless of the
+  real, independently-working `ISIG`-gated `SIGINT`/`SIGTSTP` interception path (`cpu::interrupts`)
+  or the real `TIOCSCTTY`/`TIOCSPGRP` session wiring (`console::stdin::foreground_pgid`) — both of
+  which traced out correctly and were never the actual problem, confirmed via the same live trace
+  before landing on the real cause.
+- **Fixed**: `DEFAULT_TERMIOS.c_cc` now holds the real POSIX/Linux default control-character values
+  (`VINTR=^C`/`VQUIT=^\`/`VERASE=DEL`/`VKILL=^U`/`VEOF=^D`/`VSTART=^Q`/`VSTOP=^S`/`VSUSP=^Z`/
+  `VREPRINT=^R`/`VDISCARD=^O`/`VWERASE=^W`/`VLNEXT=^V`, matching `third_party/musl`'s own
+  `arch/generic/bits/termios.h` index layout — the one every non-MIPS/PowerPC arch, x86_64
+  included, uses) instead of a comment claiming "nothing depends on exact default `c_cc` values" —
+  which was simply wrong, BusyBox's own line editor is exactly such a dependent, and a very common
+  one for any future port to hit again.
+- **Confirmed fixed live, headlessly**, via `OXIDEBSD_QEMU_MONITOR`'s `sendkey`: typed `sleep 100`,
+  waited for it to actually start, sent `ctrl-c` — real `^C` printed and a fresh prompt returned
+  immediately (not a 100-second wait), proving a real `SIGINT` reached the real foreground process
+  group. `ctrl-d` at an empty prompt cleanly ended the boot's own serial output (`hush`, pid 1,
+  exiting on real EOF, matching real Unix behavior — nothing left to schedule after that).
+- **Worth a v0.1.x backport**: this is a genuine, narrow, low-risk correctness bugfix (wrong
+  default constant values, nothing structural) in code that predates and is unrelated to the
+  Limine/USB work landing alongside it — real Ctrl+C/Ctrl+D affects every interactive session,
+  PS/2 included, on that branch too.
 
 ## Dependency notes
 

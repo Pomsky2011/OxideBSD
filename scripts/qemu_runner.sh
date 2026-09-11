@@ -122,6 +122,18 @@ xorriso -as mkisofs -R -r -J \
 # UEFI, since OVMF loads fine there via a single combined `-bios` image with no `-M` change needed.
 set -- -accel kvm -accel tcg -serial stdio -m 8192 -nic user,model=rtl8139
 
+# Opt-in QEMU monitor on a plain TCP port (e.g. OXIDEBSD_QEMU_MONITOR=4445), reachable with any
+# raw TCP client (`socat -,raw TCP:127.0.0.1:4445`, or a plain Python `socket`). Real, deliberate
+# use case beyond interactive debugging: the monitor's own `sendkey <combo>` command genuinely
+# synthesizes guest keystrokes, closing what CLAUDE.md's own test-architecture section otherwise
+# documents as "can't be scripted, manual-QEMU-only" for anything needing live keyboard input --
+# confirmed live tracking down a real Ctrl+C/Ctrl+D bug (see CLAUDE.md's session/controlling-tty
+# section) entirely headlessly, no human at a real display required. Off by default -- nothing
+# else in this project's own tooling needs it.
+if [ -n "${OXIDEBSD_QEMU_MONITOR:-}" ]; then
+    set -- "$@" -monitor "tcp:127.0.0.1:${OXIDEBSD_QEMU_MONITOR},server,nowait"
+fi
+
 # Real emulated xHCI controller + USB keyboard, opt-in only via OXIDEBSD_QEMU_USB=1 -- same
 # opt-in-env-var shape as OXIDEBSD_FIRMWARE/OXIDEBSD_QEMU_DISPLAY above. Deliberately NOT on by
 # default: QEMU's default i440fx machine already wires up a PS/2 keyboard at the hardware-model

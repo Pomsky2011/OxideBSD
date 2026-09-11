@@ -36,6 +36,20 @@ const BM_STD_DEV_TO_HOST: u8 = 0x80;
 const BM_STD_HOST_TO_DEV: u8 = 0x00;
 const BM_CLASS_INTERFACE_HOST_TO_DEV: u8 = 0x21;
 
+/// Ticks (at the 100 Hz timer rate every other duration constant in this codebase assumes -- see
+/// `cpu::pit`) before a newly-pressed, still-held key starts auto-repeating, and the interval
+/// between repeats thereafter -- real desktop-OS-typical values (~500ms initial delay, ~40ms/25cps
+/// repeat rate). **Not something the HID device itself provides**: a real USB HID boot-keyboard
+/// device reports a key exactly once per real state change (press, then nothing more until
+/// release) -- unlike a PS/2 keyboard, whose own firmware autonomously resends the make code while
+/// a key is held, entirely transparent to this kernel's decode pipeline. Typematic repeat for a
+/// USB keyboard is universally an OS-side responsibility (every real desktop OS implements it in
+/// software), so `KeyboardDevice::poll` has to synthesize it here, driven by `cpu::interrupts::
+/// ticks()` rather than by report arrival (a held key generates no further xHCI Transfer Events at
+/// all once the device stops seeing a change).
+const REPEAT_INITIAL_DELAY_TICKS: u64 = 50;
+const REPEAT_INTERVAL_TICKS: u64 = 4;
+
 /// A live, configured HID boot-keyboard device. Owns the one endpoint (the control endpoint's own
 /// transfer ring is only needed during bring-up, so it isn't kept) this driver ever talks to after
 /// setup: the interrupt-IN endpoint reports arrive on.
@@ -46,6 +60,11 @@ pub(crate) struct KeyboardDevice {
     report_buf_virt: VirtAddr,
     report_buf_phys: PhysAddr,
     prev_report: [u8; 8],
+    /// The one key currently auto-repeating (real desktop-OS convention: only the most recently
+    /// pressed still-held key repeats, not every held key at once), and the `ticks()` deadline for
+    /// its next repeat. `None` whenever nothing's held, or the repeating key was just released.
+    repeat_usage: Option<u8>,
+    repeat_next_tick: u64,
 }
 
 impl KeyboardDevice {
@@ -78,6 +97,18 @@ impl KeyboardDevice {
             enqueue_normal_in(&mut self.interrupt_ring, self.report_buf_phys, 8);
             controller.ring_endpoint_doorbell(self.slot_id, self.interrupt_ep_dci);
         }
+
+        // Auto-repeat: driven by the clock, not by report arrival -- see `REPEAT_INITIAL_DELAY_
+        // TICKS`'s own doc comment for why a held key generates no further events to react to here.
+        if let Some(usage) = self.repeat_usage {
+            let now = crate::cpu::interrupts::ticks();
+            if now >= self.repeat_next_tick {
+                if let Some((code, extended)) = hid_usage_to_scancode(usage) {
+                    feed_key(code, extended, true);
+                }
+                self.repeat_next_tick = now + REPEAT_INTERVAL_TICKS;
+            }
+        }
     }
 
     fn handle_report(&mut self, report: [u8; 8]) {
@@ -104,6 +135,9 @@ impl KeyboardDevice {
                 && let Some((code, extended)) = hid_usage_to_scancode(usage)
             {
                 feed_key(code, extended, false);
+                if self.repeat_usage == Some(usage) {
+                    self.repeat_usage = None;
+                }
             }
         }
         for &usage in &report[2..8] {
@@ -112,6 +146,9 @@ impl KeyboardDevice {
                 && let Some((code, extended)) = hid_usage_to_scancode(usage)
             {
                 feed_key(code, extended, true);
+                self.repeat_usage = Some(usage);
+                self.repeat_next_tick =
+                    crate::cpu::interrupts::ticks() + REPEAT_INITIAL_DELAY_TICKS;
             }
         }
         self.prev_report = report;
@@ -521,5 +558,7 @@ pub(crate) fn bring_up(
         report_buf_virt,
         report_buf_phys,
         prev_report: [0; 8],
+        repeat_usage: None,
+        repeat_next_tick: 0,
     })
 }

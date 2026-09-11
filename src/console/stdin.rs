@@ -118,18 +118,63 @@ pub(crate) const ECHO: u32 = 0o000010;
 /// cleared this bit wants raw Ctrl+C bytes instead of a real signal.
 pub(crate) const ISIG: u32 = 0o000001;
 
+/// Real `c_cc[]` indices (`third_party/musl`'s `arch/generic/bits/termios.h`, the one every
+/// non-MIPS/PowerPC arch including x86_64 uses).
+const VINTR: usize = 0;
+const VQUIT: usize = 1;
+const VERASE: usize = 2;
+const VKILL: usize = 3;
+const VEOF: usize = 4;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
+const VSUSP: usize = 10;
+const VREPRINT: usize = 12;
+const VDISCARD: usize = 13;
+const VWERASE: usize = 14;
+const VLNEXT: usize = 15;
+
+/// Real POSIX/Linux default control-character values for a freshly opened terminal (what a real
+/// `stty -a` on an untouched tty reports) — **found load-bearing, not decorative**: BusyBox's own
+/// `libbb/lineedit.c` deliberately clears `ISIG` (so it can handle line editing on raw bytes
+/// itself) and instead recognizes Ctrl+C/Ctrl+D by comparing each incoming byte against
+/// `initial_settings.c_cc[VINTR]`/`c_cc[VEOF]` — the *original* termios it read via `TCGETS` before
+/// switching to raw mode — guarded by `!= 0` (an explicit "this control character is disabled"
+/// check). The previous all-zero default silently satisfied that guard as "disabled", so Ctrl+C/
+/// Ctrl+D never did anything once BusyBox's own line editor was driving the prompt, on PS/2 or USB
+/// alike (both go through this exact same termios state) — found live via a synthetic-keystroke
+/// QEMU-monitor `sendkey` test, not a real physical keyboard's own behavior. Every other `c_cc`
+/// slot (`VEOL`/`VEOL2`/`VSWTC`) stays real-default `0` ("unset"), matching a real fresh tty.
+const DEFAULT_CC: [u8; 32] = {
+    let mut cc = [0u8; 32];
+    cc[VINTR] = 0x03; // ^C
+    cc[VQUIT] = 0x1C; // ^\
+    cc[VERASE] = 0x7F; // DEL
+    cc[VKILL] = 0x15; // ^U
+    cc[VEOF] = 0x04; // ^D
+    cc[VTIME] = 0;
+    cc[VMIN] = 1;
+    cc[VSTART] = 0x11; // ^Q
+    cc[VSTOP] = 0x13; // ^S
+    cc[VSUSP] = 0x1A; // ^Z
+    cc[VREPRINT] = 0x12; // ^R
+    cc[VDISCARD] = 0x0F; // ^O
+    cc[VWERASE] = 0x17; // ^W
+    cc[VLNEXT] = 0x16; // ^V
+    cc
+};
+
 /// A plausible "cooked mode" default (`ISIG | ICANON | ECHO`, real Unix convention for a freshly
-/// opened terminal) — matters only in that it must be *something* self-consistent: nothing in this
-/// kernel or the musl fork ever depends on exact default `c_cc`/speed values (every real caller
-/// reads the current settings via `TCGETS` before modifying and restoring them via `TCSETS`, never
-/// assumes a specific starting value beyond "cooked mode looks cooked").
+/// opened terminal) with real default `c_cc` values (`DEFAULT_CC`) — see that constant's own doc
+/// comment for why the values themselves, not just their presence, are load-bearing.
 const DEFAULT_TERMIOS: RawTermios = RawTermios {
     c_iflag: 0,
     c_oflag: 0,
     c_cflag: 0,
     c_lflag: ISIG | ICANON | ECHO,
     c_line: 0,
-    c_cc: [0; 32],
+    c_cc: DEFAULT_CC,
     c_ispeed: 0,
     c_ospeed: 0,
 };
