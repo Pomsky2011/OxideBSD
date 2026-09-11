@@ -170,7 +170,7 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
-    reboot();
+    terminate_faulting_ring3_or_reboot(&stack_frame, crate::process::SIGILL);
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
@@ -182,7 +182,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         error_code,
         stack_frame
     );
-    terminate_faulting_ring3_or_reboot(&stack_frame);
+    terminate_faulting_ring3_or_reboot(&stack_frame, crate::process::SIGSEGV);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -195,37 +195,38 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code,
         stack_frame
     );
-    terminate_faulting_ring3_or_reboot(&stack_frame);
+    terminate_faulting_ring3_or_reboot(&stack_frame, crate::process::SIGSEGV);
 }
 
-/// A real, deliberately narrow bugfix: a page fault or `#GP` from ring-3 code used to reboot the
-/// *entire* kernel unconditionally — any wild pointer dereference or invalid-access fault in *any*
-/// userland program (a bug in a BusyBox applet, a bug in a TinyCC-compiled program, ...) took the
-/// whole VM down. Real Unix terminates just the one offending process with `SIGSEGV` instead.
+/// A real, deliberately narrow bugfix: a page fault, `#GP`, or invalid-opcode fault from ring-3
+/// code used to reboot the *entire* kernel unconditionally — any wild pointer dereference,
+/// invalid access, or illegal instruction in *any* userland program (a bug in a BusyBox applet, a
+/// bug in a TinyCC-compiled program, ...) took the whole VM down. Real Unix terminates just the
+/// one offending process with the matching signal (`SIGSEGV`/`SIGILL`) instead.
 ///
 /// This is the minimal fix for that one safety property — **not** `master`/`0.2.0`'s full real
 /// fault-to-signal-delivery mechanism (a real, kernel-authored user-mode trampoline page plus a
 /// dedicated syscall to actually invoke an installed `SA_SIGINFO` handler from the fault itself,
-/// out of scope for a bugfix-only branch). A process with a real `SIGSEGV` handler installed is
-/// still just terminated outright here, matching this signal's real *default* disposition, rather
-/// than having that handler invoked — a documented, deliberately-accepted simplification (installing
-/// a `SIGSEGV` handler at all is rare), not a bug in its own right.
+/// out of scope for a bugfix-only branch). A process with a real handler installed for the signal
+/// is still just terminated outright here, matching that signal's real *default* disposition,
+/// rather than having the handler invoked — a documented, deliberately-accepted simplification
+/// (installing a handler for any of these is rare), not a bug in its own right.
 ///
 /// Reuses `process::do_exit` — the same self-termination-then-`schedule()` path a normal `SYS_EXIT`
 /// already goes through, just reached from inside a hardware exception handler instead of a
-/// syscall dispatch. Safe for the same reason that path already is: neither `page_fault_handler`
-/// nor `general_protection_fault_handler` use a dedicated IST stack (only `double_fault` does), so
-/// this still runs on the faulting process's own kernel stack — `scheduler::schedule()`'s context
-/// switch just abandons it (the process is `Zombie`, nothing will ever resume this exact call
-/// chain) and jumps into whatever's next, exactly as it already does for an ordinary `do_exit`.
+/// syscall dispatch. Safe for the same reason that path already is: none of these three handlers
+/// use a dedicated IST stack (only `double_fault` does), so this still runs on the faulting
+/// process's own kernel stack — `scheduler::schedule()`'s context switch just abandons it (the
+/// process is `Zombie`, nothing will ever resume this exact call chain) and jumps into whatever's
+/// next, exactly as it already does for an ordinary `do_exit`.
 ///
 /// Ring-0 faults (a genuine kernel bug) still reboot — there's no process to blame and no safe way
 /// to keep running kernel code past a fault in the kernel itself.
-fn terminate_faulting_ring3_or_reboot(stack_frame: &InterruptStackFrame) -> ! {
+fn terminate_faulting_ring3_or_reboot(stack_frame: &InterruptStackFrame, sig: u64) -> ! {
     if stack_frame.code_segment.0 & 0x3 == 3 {
         let pid = crate::scheduler::current_pid();
         if pid != 0 {
-            crate::process::do_exit(pid, 128 + crate::process::SIGSEGV as i32);
+            crate::process::do_exit(pid, 128 + sig as i32);
         }
     }
     reboot();
