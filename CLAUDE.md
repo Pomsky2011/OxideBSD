@@ -1039,6 +1039,12 @@ not.** A wild pointer deref in any userland program took the entire VM down.
 - Verified via `tests/mmap_syscall_smoke.rs` (4 parts, 3 run in isolated forked children since a
   fault kills whichever process it hits). **Not covered**: `SA_SIGINFO` invocation from a fault;
   dynamic re-check of a grown file's size against an already-mapped region.
+- **`invalid_opcode_handler` (`#UD`) had the identical gap, missed at the time this section
+  landed** — found later auditing a `v0.1.x` backport of this same fix for an unrelated reason
+  (`invalid_opcode_handler` was the one exception handler there that still rebooted the whole VM
+  unconditionally on any ring-3 fault), then confirmed `master` had never actually closed it for
+  this specific exception either, only `page_fault_handler`/`general_protection_fault_handler`.
+  Fixed identically (real `SIGILL`, matching real Linux's `#UD` mapping).
 
 ## Three more pilot fixes: signal-interruptible `nanosleep`, real `FD_CLOEXEC`, real per-process CPU-time clocks (`src/cpu/rtc.rs`, `src/process/timers.rs`, `src/process/signals.rs`, `src/fs/fd.rs`, `modules/oxfs/`)
 

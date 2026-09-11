@@ -183,7 +183,30 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
-extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+/// Ring-3 `#UD`s get the same fault-to-signal treatment `general_protection_fault_handler` below
+/// already documents in full -- found auditing this file for the same gap after `page_fault_handler`/
+/// `general_protection_fault_handler` had already been fixed: this handler still rebooted the whole
+/// VM unconditionally on *any* invalid-opcode fault, ring-3 included (a real `ud2`, or a genuinely
+/// corrupted jump into non-code memory, in any userland program). Real Linux maps every userland
+/// `#UD` to `SIGILL`.
+extern "x86-interrupt" fn invalid_opcode_handler(mut stack_frame: InterruptStackFrame) {
+    let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
+    if interrupted_ring3 {
+        let pid = crate::process::scheduler::current_pid();
+        if pid != 0 {
+            // Real, force-delivered self-signal -- see `signals::force_fault_signal`'s own doc
+            // comment for why a plain `do_kill` self-signal isn't safe here.
+            crate::process::signals::force_fault_signal(pid, crate::process::SIGILL);
+            // SAFETY: see page_fault_handler's own identical redirect.
+            unsafe {
+                stack_frame.as_mut().update(|f| {
+                    f.instruction_pointer =
+                        VirtAddr::new(crate::process::fault_trampoline::FAULT_TRAMPOLINE_VA);
+                });
+            }
+            return;
+        }
+    }
     serial_println!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
     reboot();
 }
