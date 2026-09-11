@@ -37,12 +37,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootloader"
-version = "0.9.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22d5a0b9e11dd5bee9d24a68885de6dc7ed367f897323b1c1286150fd469374"
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,6 +188,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "limine"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29363c0f37e66e18575fadf7141c56ee7ea04ae5fecbeb25eff303f77af203a9"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -252,8 +252,8 @@ version = "0.1.0"
 name = "oxidebsd"
 version = "0.2.0-dev"
 dependencies = [
- "bootloader",
  "chacha20",
+ "limine",
  "linked_list_allocator",
  "pc-keyboard",
  "sha2",

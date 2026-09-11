@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod boot;
 pub mod console;
 pub mod cpu;
 pub mod drivers;
@@ -22,9 +23,7 @@ pub mod syscall;
 
 use core::panic::PanicInfo;
 
-use bootloader::BootInfo;
-#[cfg(test)]
-use bootloader::entry_point;
+use boot::BootInfo;
 use qemu::{QemuExitCode, exit_qemu};
 
 /// Brings up the kernel: GDT/TSS, IDT, PIC + hardware interrupts, paging, and the heap.
@@ -57,8 +56,7 @@ pub fn init(
 
     let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator =
-        unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(boot_info.memory_map) };
 
     let heap_size = memory::allocator::compute_heap_size(memory::usable_ram_bytes());
     memory::allocator::init_heap(&mut mapper, &mut frame_allocator, heap_size)
@@ -110,7 +108,7 @@ pub fn hlt_loop() -> ! {
 }
 
 #[cfg(test)]
-entry_point!(test_kernel_main);
+crate::limine_entry_point!(test_kernel_main);
 
 #[cfg(test)]
 fn test_kernel_main(boot_info: &'static BootInfo) -> ! {

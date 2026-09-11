@@ -11,14 +11,15 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::net::oxidebsd_sys_poll;
 use oxidebsd::net::udp::{oxidebsd_sys_bind, oxidebsd_sys_socket};
 use oxidebsd::net::{ethernet, ipv4, rtl8139};
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 
-entry_point!(main);
+limine_entry_point!(main);
 
 const AF_INET: u64 = 2;
 const SOCK_DGRAM: u64 = 2;

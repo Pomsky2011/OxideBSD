@@ -7,7 +7,7 @@ pub mod allocator;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
+use limine::memmap::{Entry, MEMMAP_USABLE};
 use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
@@ -18,13 +18,14 @@ use x86_64::structures::paging::{
 
 use crate::serial_println;
 
-/// Builds a mapper over the bootloader's existing page tables.
+/// Builds a mapper over Limine's existing page tables.
 ///
 /// # Safety
 ///
-/// The complete physical memory must be mapped at `physical_memory_offset` (the bootloader does
-/// this when built with the `map_physical_memory` feature), and this function must be called at
-/// most once to avoid aliasing `&mut` references to the level 4 table.
+/// The complete physical memory must be mapped at `physical_memory_offset` (Limine's HHDM --
+/// Higher-Half Direct Map -- is already established by the time `kmain` runs, unconditionally, no
+/// feature flag needed), and this function must be called at most once to avoid aliasing `&mut`
+/// references to the level 4 table.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     serial_println!(
         "[boot] mapping page tables (physical memory offset {:?})",
@@ -50,7 +51,7 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 ///
 /// # Safety
 ///
-/// `physical_memory_offset` must be where the bootloader mapped all of physical memory (same
+/// `physical_memory_offset` must be where Limine's HHDM mapped all of physical memory (same
 /// requirement as `init`), `frame` must actually contain a valid, live page table, and the
 /// caller must ensure no other `&mut` view of the same frame exists concurrently.
 pub unsafe fn frame_to_page_table(
@@ -63,7 +64,7 @@ pub unsafe fn frame_to_page_table(
     unsafe { &mut *page_table_ptr }
 }
 
-/// A `FrameAllocator` that hands out frames from the bootloader-reported usable regions of the
+/// A `FrameAllocator` that hands out frames from Limine's reported usable regions of the
 /// physical memory map, in order, never reusing a frame.
 ///
 /// **Plain index/cursor state, not a rebuild-and-skip iterator.** This used to be `next: usize`
@@ -82,11 +83,11 @@ pub unsafe fn frame_to_page_table(
 /// this constructor makes (`Box::new` included) reliably panics ("memory allocation ... failed")
 /// with no heap to satisfy it -- a real chicken-and-egg dependency, not a hypothetical one, hit and
 /// diagnosed live. `region_index`/`frame_number` below is plain `Copy` state: `region_index` only
-/// ever increases, bounded by the memory map's own small, fixed region count (`MAX_MEMORY_MAP_SIZE
-/// = 64` in the `bootloader` crate), so total extra work *across the allocator's entire lifetime*
-/// is O(regions), not O(frames) -- no heap, no boxing, no dynamic dispatch needed at all.
+/// ever increases, bounded by Limine's own memory map's small, fixed region count, so total extra
+/// work *across the allocator's entire lifetime* is O(regions), not O(frames) -- no heap, no
+/// boxing, no dynamic dispatch needed at all.
 pub struct BootInfoFrameAllocator {
-    memory_map: &'static MemoryMap,
+    memory_map: &'static [&'static Entry],
     region_index: usize,
     frame_number: u64,
     /// Head of a real, reusable free list -- see `FrameDeallocator`'s own impl below for the
@@ -99,12 +100,12 @@ pub struct BootInfoFrameAllocator {
 impl BootInfoFrameAllocator {
     /// # Safety
     ///
-    /// The passed memory map must be valid; in particular, all frames it marks `Usable` must
-    /// actually be unused.
-    pub unsafe fn init(memory_map: &'static MemoryMap) -> Self {
+    /// The passed memory map must be valid; in particular, all frames it marks `MEMMAP_USABLE`
+    /// must actually be unused.
+    pub unsafe fn init(memory_map: &'static [&'static Entry]) -> Self {
         let usable_regions = memory_map
             .iter()
-            .filter(|region| region.region_type == MemoryRegionType::Usable)
+            .filter(|region| region.type_ == MEMMAP_USABLE)
             .count();
         let usable_bytes = usable_ram_bytes_in(memory_map);
         // Published globally (see `usable_ram_bytes` below) *before* anything downstream sizes
@@ -138,8 +139,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         // fall straight through to the bump path, never touching `phys_mem_offset()` at all.
         if let Some(frame) = self.free_list.take() {
             let offset = phys_mem_offset();
-            let next_ptr =
-                (offset + frame.start_address().as_u64()).as_ptr::<u64>();
+            let next_ptr = (offset + frame.start_address().as_u64()).as_ptr::<u64>();
             // SAFETY: frame was previously handed to deallocate_frame, which wrote a real next-
             // pointer (or the NONE sentinel) into its first 8 bytes through this same window.
             let next = unsafe { next_ptr.read() };
@@ -151,15 +151,20 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
             return Some(frame);
         }
         loop {
-            let region = self.memory_map.get(self.region_index)?;
-            if region.region_type != MemoryRegionType::Usable {
+            let region = self.memory_map.get(self.region_index).copied()?;
+            if region.type_ != MEMMAP_USABLE {
                 self.region_index += 1;
                 continue;
             }
-            if self.frame_number < region.range.start_frame_number {
-                self.frame_number = region.range.start_frame_number;
+            // Real Limine memory-map entries for USABLE regions are always 4096-byte aligned
+            // (protocol guarantee), so a plain byte-to-frame-number division is exact here --
+            // no rounding needed the way an arbitrary region's `base`/`length` might.
+            let start_frame_number = region.base / 4096;
+            let end_frame_number = (region.base + region.length) / 4096;
+            if self.frame_number < start_frame_number {
+                self.frame_number = start_frame_number;
             }
-            if self.frame_number >= region.range.end_frame_number {
+            if self.frame_number >= end_frame_number {
                 self.region_index += 1;
                 continue;
             }
@@ -206,11 +211,11 @@ impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
     }
 }
 
-fn usable_ram_bytes_in(memory_map: &MemoryMap) -> u64 {
+fn usable_ram_bytes_in(memory_map: &[&Entry]) -> u64 {
     memory_map
         .iter()
-        .filter(|region| region.region_type == MemoryRegionType::Usable)
-        .map(|region| region.range.end_addr() - region.range.start_addr())
+        .filter(|region| region.type_ == MEMMAP_USABLE)
+        .map(|region| region.length)
         .sum()
 }
 

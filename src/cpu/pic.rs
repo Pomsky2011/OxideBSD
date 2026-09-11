@@ -6,6 +6,7 @@
 //! controllers are reprogrammed here to a contiguous, exception-free range instead.
 
 use x86_64::instructions::port::Port;
+use x86_64::registers::model_specific::{ApicBase, ApicBaseFlags};
 
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -41,6 +42,36 @@ pub unsafe fn init() {
     let mut wait = || unsafe { wait_port.write(0) };
 
     unsafe {
+        // Real root cause, confirmed live via QEMU's own `info lapic`/`info pic` monitor
+        // commands, chasing why no PIC-delivered IRQ (timer *or* keyboard) ever reached this
+        // kernel under Limine, even after unmasking both lines (see `interrupts::init_pics`'s
+        // own doc comment) and forcing the IMCR below: the platform boots with the Local APIC
+        // genuinely *enabled* (`SPIV` showed "APIC enabled") but its `LVT0` entry -- the one that
+        // receives the legacy 8259's `INTR` output in "virtual wire" compatibility mode --
+        // *masked*. The 8259 itself was working correctly the whole time (`info pic` showed
+        // `irr=01`, a real pending IRQ0 request) but nothing ever delivered it to the CPU core,
+        // since the LAPIC (not the 8259) is what the CPU actually listens to whenever the LAPIC
+        // is enabled at all. Real BIOS/SeaBIOS + the old `bootloader` crate apparently never
+        // enabled the LAPIC in the first place, so the CPU fell back to the legacy direct-INTR
+        // 8259 path by construction; Limine (or OVMF/SeaBIOS's own more modern, ACPI-aware
+        // platform init once Limine hands off through them) leaves it enabled but not configured
+        // for virtual-wire passthrough. Fixed at the actual source, not by chasing the LAPIC's
+        // own MMIO-mapped LVT0 register (real APIC programming this kernel has no other use for
+        // and no driver for at all -- `cpu::interrupts` is purely 8259-based): disabling the
+        // LAPIC outright via `IA32_APIC_BASE`'s global-enable bit makes the CPU treat its `INTR`
+        // pin exactly like a pre-APIC system again, restoring direct 8259-to-CPU delivery
+        // unconditionally. The IMCR write below (a real PIIX-family chipset detail, ports
+        // 0x22/0x23 -- `1` would disconnect the 8259 pair in favor of IOAPIC routing) is kept as
+        // a defensive belt-and-suspenders measure alongside it, though the LAPIC disable alone
+        // was confirmed sufficient.
+        let (frame, flags) = ApicBase::read();
+        ApicBase::write(frame, flags & !ApicBaseFlags::LAPIC_ENABLE);
+
+        let mut imcr_select: Port<u8> = Port::new(0x22);
+        let mut imcr_data: Port<u8> = Port::new(0x23);
+        imcr_select.write(0x70);
+        imcr_data.write(0x00);
+
         let saved_mask1 = pic1_data.read();
         let saved_mask2 = pic2_data.read();
 

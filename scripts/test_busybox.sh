@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-BOOTIMAGE="target/x86_64-oxidebsd/debug/bootimage-oxidebsd.bin"
+KERNEL_ELF="target/x86_64-oxidebsd/debug/oxidebsd"
 LOG_FILE="$(mktemp /tmp/oxidebsd-busybox-boot.XXXXXX.log)"
 QEMU_PID=""
 
@@ -77,19 +77,15 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
     exit 0
 fi
 
-info "Building the bootable disk image"
-cargo bootimage --quiet
-[[ -f "$BOOTIMAGE" ]] || fail "expected bootimage at $BOOTIMAGE not found after 'cargo bootimage'"
-pass "bootimage ready: $BOOTIMAGE"
+[[ -f "$KERNEL_ELF" ]] || fail "expected kernel ELF at $KERNEL_ELF not found after 'cargo build'"
 
 info "Booting headlessly for up to ${BOOT_TIMEOUT}s to confirm hush (pid 1) starts cleanly with the BusyBox roster embedded"
-qemu-system-x86_64 \
-    -accel kvm -accel tcg \
-    -drive format=raw,file="$BOOTIMAGE" \
-    -serial stdio \
-    -display none \
-    -m 1024 \
-    -nic user,model=rtl8139 \
+# scripts/qemu_runner.sh stages the hybrid BIOS+UEFI ISO and invokes QEMU itself (see CLAUDE.md's
+# boot section) -- BIOS here specifically, since it needs no OVMF firmware dependency for this
+# automated check; OXIDEBSD_QEMU_DISPLAY=none keeps this headless the same way the old
+# `-display none` flag did.
+OXIDEBSD_FIRMWARE=bios OXIDEBSD_QEMU_DISPLAY=none \
+    scripts/qemu_runner.sh "$KERNEL_ELF" \
     > "$LOG_FILE" 2>&1 &
 QEMU_PID=$!
 

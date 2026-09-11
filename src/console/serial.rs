@@ -93,6 +93,10 @@ pub fn _print(args: fmt::Arguments) {
             .expect("printing to serial port failed");
     });
     crate::console::vga::_print(args);
+    // Rasterizes whatever `vga::_print` just applied to its own real ANSI-aware buffer -- see
+    // `console::framebuffer`'s own module doc comment. Takes no args of its own: it reads
+    // `vga`'s buffer directly rather than re-parsing the same bytes a second time.
+    crate::console::framebuffer::redraw();
 }
 
 #[macro_export]

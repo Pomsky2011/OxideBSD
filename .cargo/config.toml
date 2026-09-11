@@ -20,7 +20,13 @@ json-target-spec = true
 panic-abort-tests = true
 
 [target.'cfg(target_os = "none")']
-runner = "bootimage runner"
+# Replaces the retired `bootimage runner` (see CLAUDE.md's boot section for the Limine migration):
+# stages a hybrid BIOS+UEFI ISO from `target/limine-stage/` (populated by build.rs's
+# `build_limine_deploy_tool`) and the just-built kernel/test ELF, then runs it under QEMU. Path is
+# resolved against the workspace root, matching every other relative path this project's own
+# tooling (build.rs's disk images, this same rustflags block's linker script below) already
+# assumes.
+runner = "scripts/qemu_runner.sh"
 
 [target.x86_64-oxidebsd]
 # Forces `chacha20`'s own runtime-cpufeatures-detected SIMD backend selection (avx2/sse2, chosen
@@ -31,4 +37,13 @@ runner = "bootimage runner"
 # operator!` -- found bringing up src/random.rs's ChaCha20-backed /dev/urandom). `sha2`'s own
 # analogous flag (`force-soft`, see this crate's own Cargo.toml) is a real Cargo feature instead of
 # a raw `--cfg`, so it doesn't need duplicating here.
-rustflags = ["--cfg", "chacha20_backend=\"soft\""]
+#
+# `link-arg=-Tx86_64-oxidebsd.ld`: the kernel's own linker script (Limine migration -- see
+# CLAUDE.md's boot section). Applies uniformly to the main kernel binary *and* every `tests/*.rs`
+# binary, since they all share this same target+rustflags -- no per-binary duplication needed.
+# Not wired via the target-spec JSON's own `pre-link-args` instead, specifically to avoid two
+# mechanisms fighting over the same `-T` flag.
+rustflags = [
+    "--cfg", "chacha20_backend=\"soft\"",
+    "-C", "link-arg=-Tx86_64-oxidebsd.ld",
+]

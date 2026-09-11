@@ -35,12 +35,25 @@ impl PciDevice {
         (raw & 0x1 == 1).then_some((raw & 0xFFFC) as u16)
     }
 
-    /// The physical base address for BAR `n`, if it's a 32-bit memory-space BAR (bit 0 clear,
-    /// bits 2:1 == 0b00). No 64-bit BAR-pair merging -- nothing here uses a memory-space device
-    /// yet (rtl8139 is I/O-space only).
+    /// The physical base address for BAR `n`, if it's a memory-space BAR (bit 0 clear). Handles
+    /// both the 32-bit form (bits `2:1 == 0b00`) and the 64-bit form (bits `2:1 == 0b10`, where
+    /// BAR `n+1` holds the address's upper 32 bits, per the PCI spec) -- `drivers::usb::xhci`
+    /// needs the latter, since xHCI controllers commonly expose a 64-bit BAR0. `0b01` (the
+    /// obsolete "below 1 MiB" encoding) is treated as absent, same as an I/O-space BAR.
     pub fn mem_bar(&self, n: usize) -> Option<u64> {
         let raw = self.bars[n];
-        (raw & 0x1 == 0).then_some((raw & 0xFFFF_FFF0) as u64)
+        if raw & 0x1 != 0 {
+            return None;
+        }
+        let low = (raw & 0xFFFF_FFF0) as u64;
+        match (raw >> 1) & 0x3 {
+            0b00 => Some(low),
+            0b10 => {
+                let high = *self.bars.get(n + 1)? as u64;
+                Some((high << 32) | low)
+            }
+            _ => None,
+        }
     }
 
     /// Sets the bus-mastering bit (command register bit 2), letting this device initiate DMA.

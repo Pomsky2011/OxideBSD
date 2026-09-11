@@ -40,7 +40,8 @@ use core::panic::PanicInfo;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::net::nic::{NIC, NicDriver, NicError};
 use oxidebsd::net::tcp::{self, oxidebsd_sys_accept, oxidebsd_sys_listen};
 use oxidebsd::net::udp::{oxidebsd_sys_bind, oxidebsd_sys_socket};
@@ -49,7 +50,7 @@ use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 use oxidebsd::syscall::{oxidebsd_sys_fcntl, oxidebsd_sys_read, oxidebsd_sys_write};
 
-entry_point!(main);
+limine_entry_point!(main);
 
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;

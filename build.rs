@@ -68,8 +68,67 @@ fn build_jobs() -> usize {
 // cascade, found live).
 include!("build_busybox.rs");
 
+/// Builds Limine's small C deploy/install tool (`limine.c` -> `limine`) from the vendored
+/// `-binary`-branch submodule (`third_party/limine`, a personal fork pinned the same way as
+/// musl/busybox/tinycc), then stages it plus every prebuilt bootloader-stage blob this project
+/// needs into a fixed location, `target/limine-stage/`, that `scripts/qemu_runner.sh` reads from
+/// directly -- the runner never reaches into `third_party/limine` itself, mirroring how nothing
+/// else in this file hands another tool a path into `third_party/*` directly either (env-var/
+/// fixed-path handoff instead). The `-binary` branch ships every actual bootloader stage
+/// (`limine-bios.sys`, `limine-bios-cd.bin`, `limine-uefi-cd.bin`, `BOOTX64.EFI`, `BOOTIA32.EFI`)
+/// as pre-built, committed blobs -- `make` here only compiles the deploy tool itself (`limine.c`,
+/// a plain host-native C program with a trivial `.POSIX` Makefile that already does its own real
+/// incremental-rebuild tracking, unlike tinycc's own more elaborate out-of-tree build -- no
+/// separate staleness bookkeeping needed here, `make` is cheap to just always invoke).
+fn build_limine_deploy_tool() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let limine_dir = Path::new(manifest_dir).join("third_party/limine");
+    let stage_dir = Path::new(manifest_dir).join("target/limine-stage");
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        limine_dir.join("limine.c").display()
+    );
+
+    let status = Command::new("make")
+        .current_dir(&limine_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run make for third_party/limine: {e}"));
+    if !status.success() {
+        panic!("building limine's deploy tool failed: {status}");
+    }
+
+    std::fs::create_dir_all(&stage_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", stage_dir.display()));
+
+    // Everything scripts/qemu_runner.sh needs to stage a bootable hybrid BIOS+UEFI ISO: the
+    // deploy tool itself (for `limine bios-install`), both CD boot images, `limine-bios.sys`
+    // (BIOS boot from a raw/hybrid image), and the two EFI executables the ISO's `EFI/BOOT/`
+    // directory needs for UEFI (x86_64 32- and 64-bit).
+    const STAGE_FILES: &[&str] = &[
+        "limine",
+        "limine-bios.sys",
+        "limine-bios-cd.bin",
+        "limine-uefi-cd.bin",
+        "BOOTX64.EFI",
+        "BOOTIA32.EFI",
+    ];
+    for name in STAGE_FILES {
+        let src = limine_dir.join(name);
+        let dst = stage_dir.join(name);
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!(
+                "failed to stage {} -> {}: {e}",
+                src.display(),
+                dst.display()
+            )
+        });
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build_busybox.rs");
+    build_limine_deploy_tool();
     let ring3_smoke_elf_path = build_userland_crate("ring3-smoke", "RING3_SMOKE_ELF_PATH");
     build_userland_crate("stsh", "STSH_ELF_PATH");
     build_userland_crate("fork-exec-smoke", "FORK_EXEC_SMOKE_ELF_PATH");
@@ -103,10 +162,7 @@ fn main() {
         "pipe-backpressure-syscall-smoke",
         "PIPE_BACKPRESSURE_SYSCALL_SMOKE_ELF_PATH",
     );
-    build_userland_crate(
-        "dynlink-syscall-smoke",
-        "DYNLINK_SYSCALL_SMOKE_ELF_PATH",
-    );
+    build_userland_crate("dynlink-syscall-smoke", "DYNLINK_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
         "sa-siginfo-syscall-smoke",
         "SA_SIGINFO_SYSCALL_SMOKE_ELF_PATH",
@@ -115,18 +171,12 @@ fn main() {
         "getrandom-syscall-smoke",
         "GETRANDOM_SYSCALL_SMOKE_ELF_PATH",
     );
-    build_userland_crate(
-        "sysinfo-syscall-smoke",
-        "SYSINFO_SYSCALL_SMOKE_ELF_PATH",
-    );
+    build_userland_crate("sysinfo-syscall-smoke", "SYSINFO_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
         "sigaltstack-syscall-smoke",
         "SIGALTSTACK_SYSCALL_SMOKE_ELF_PATH",
     );
-    build_userland_crate(
-        "pause-syscall-smoke",
-        "PAUSE_SYSCALL_SMOKE_ELF_PATH",
-    );
+    build_userland_crate("pause-syscall-smoke", "PAUSE_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
         "sigsuspend-syscall-smoke",
         "SIGSUSPEND_SYSCALL_SMOKE_ELF_PATH",
@@ -136,18 +186,9 @@ fn main() {
         "POSIX_TIMER_SYSCALL_SMOKE_ELF_PATH",
     );
     build_userland_crate("mq-syscall-smoke", "MQ_SYSCALL_SMOKE_ELF_PATH");
-    build_userland_crate(
-        "sysv-msg-syscall-smoke",
-        "SYSV_MSG_SYSCALL_SMOKE_ELF_PATH",
-    );
-    build_userland_crate(
-        "sysv-sem-syscall-smoke",
-        "SYSV_SEM_SYSCALL_SMOKE_ELF_PATH",
-    );
-    build_userland_crate(
-        "sysv-shm-syscall-smoke",
-        "SYSV_SHM_SYSCALL_SMOKE_ELF_PATH",
-    );
+    build_userland_crate("sysv-msg-syscall-smoke", "SYSV_MSG_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("sysv-sem-syscall-smoke", "SYSV_SEM_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("sysv-shm-syscall-smoke", "SYSV_SHM_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("sig-syscall-smoke", "SIG_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
         "rt-signal-syscall-smoke",
@@ -160,14 +201,8 @@ fn main() {
     build_userland_crate("clock-syscall-smoke", "CLOCK_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("sched-syscall-smoke", "SCHED_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate("clone-syscall-smoke", "CLONE_SYSCALL_SMOKE_ELF_PATH");
-    build_userland_crate(
-        "pthread-syscall-smoke",
-        "PTHREAD_SYSCALL_SMOKE_ELF_PATH",
-    );
-    build_userland_crate(
-        "sem-open-syscall-smoke",
-        "SEM_OPEN_SYSCALL_SMOKE_ELF_PATH",
-    );
+    build_userland_crate("pthread-syscall-smoke", "PTHREAD_SYSCALL_SMOKE_ELF_PATH");
+    build_userland_crate("sem-open-syscall-smoke", "SEM_OPEN_SYSCALL_SMOKE_ELF_PATH");
     build_userland_crate(
         "pthread-cancel-crash-smoke",
         "PTHREAD_CANCEL_CRASH_SMOKE_ELF_PATH",
@@ -233,8 +268,7 @@ fn main() {
     // own doc comment for why.
     let posixtestsuite_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/posixtestsuite");
-    let posix_test_manifest_path =
-        write_posix_test_manifest(&musl_sysroot, &posixtestsuite_dir);
+    let posix_test_manifest_path = write_posix_test_manifest(&musl_sysroot, &posixtestsuite_dir);
 
     // Real PT_INTERP / dynamic-linking milestone 1: a real, separate shared musl build (see
     // `build_musl_sysroot_shared`'s own doc comment for why it can't reuse the static sysroot
@@ -250,8 +284,7 @@ fn main() {
     let dynlink_fixture_base: u64 = 0x8d00000;
     let dynlink_musl_sysroot = build_musl_sysroot_shared();
     let dynlink_libc_so_path = dynlink_musl_sysroot.join("lib/libc.so");
-    let dynlink_smoke_elf_path =
-        build_dynlink_smoke(&dynlink_musl_sysroot, dynlink_fixture_base);
+    let dynlink_smoke_elf_path = build_dynlink_smoke(&dynlink_musl_sysroot, dynlink_fixture_base);
 
     let busybox_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/busybox");
     println!("cargo:rerun-if-changed={}", busybox_dir.display());
@@ -720,7 +753,9 @@ fn build_musl_sysroot_shared() -> PathBuf {
             .arg(&musl_dir)
             .current_dir(&real_musl_dir)
             .status()
-            .unwrap_or_else(|e| panic!("failed to copy third_party/musl for the shared build: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("failed to copy third_party/musl for the shared build: {e}")
+            });
         if !status.success() {
             panic!("copying third_party/musl for the shared build failed: {status}");
         }
@@ -1170,10 +1205,8 @@ fn write_tcc_runtime_manifest(musl_sysroot: &Path, tinycc_dir: &Path) -> PathBuf
     // compiler-intrinsic headers). Confirmed against tcc's own `tcc.h`
     // (`CONFIG_TCC_SYSINCLUDEPATHS`'s first entry is `{B}/include`, `{B}` == `CONFIG_TCCDIR` ==
     // `/usr/lib/tcc`) that these belong at `tcc/include/*.h`, not flat under `tcc/`.
-    let mut tcc_runtime_files: Vec<(String, PathBuf)> = vec![(
-        "libtcc1.a".to_string(),
-        tinycc_dir.join("libtcc1.a"),
-    )];
+    let mut tcc_runtime_files: Vec<(String, PathBuf)> =
+        vec![("libtcc1.a".to_string(), tinycc_dir.join("libtcc1.a"))];
     let mut tcc_headers = collect_dir_files(&tinycc_dir.join("include"));
     tcc_headers.sort();
     tcc_runtime_files.extend(
@@ -1556,6 +1589,15 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
     // (as opposed to that path's file content, already watched above).
     println!("cargo:rerun-if-env-changed=POSIX_PILOT_CANARY_ONLY");
     println!("cargo:rerun-if-env-changed=POSIX_EXTRA_EXCLUDE_FILE");
+    println!("cargo:rerun-if-env-changed=POSIX_DEBUG_SINGLE_FILE");
+    // Ad-hoc single/few-file isolation for chasing a *specific* non-PASS result found by a full or
+    // canary run, without waiting on either -- pass a comma-separated list of exact
+    // `relative/path.c` entries (as printed by a prior run's own `PASS:`/`FAIL:`/etc. lines).
+    // Distinct from `POSIX_PILOT_CANARY_ONLY`'s fixed, curated regression-suite list: this one is
+    // meant to be thrown away/reused per investigation, not accumulated.
+    if let Ok(single) = std::env::var("POSIX_DEBUG_SINGLE_FILE") {
+        return single.split(',').map(|s| s.trim().to_string()).collect();
+    }
     if std::env::var("POSIX_PILOT_CANARY_ONLY").is_ok() {
         const CANARY: &[&str] = &[
             "fork/11-1.c",
@@ -1938,7 +1980,11 @@ fn discover_posix_test_files(interfaces_dir: &Path) -> Vec<String> {
         .unwrap_or_else(|_| "target/posix_extra_excludes.txt".to_string());
     println!("cargo:rerun-if-changed={extra_path}");
     if let Ok(contents) = std::fs::read_to_string(&extra_path) {
-        let extra: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let extra: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
         out.retain(|rel| !extra.contains(&rel.as_str()));
     }
     // Real, live-found reliability problem, not a static guess: individually excluding
@@ -2192,12 +2238,8 @@ fn write_posix_test_manifest(musl_sysroot: &Path, posixtestsuite_dir: &Path) -> 
     ));
 
     let manifest_txt_path = out_dir.join("posix_test_manifest.txt");
-    std::fs::write(&manifest_txt_path, &manifest_txt).unwrap_or_else(|e| {
-        panic!(
-            "failed to write {}: {e}",
-            manifest_txt_path.display()
-        )
-    });
+    std::fs::write(&manifest_txt_path, &manifest_txt)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", manifest_txt_path.display()));
     src.push_str(&format!(
         "    (\"manifest.txt\", include_bytes!({:?})),\n",
         manifest_txt_path.display()
@@ -2292,6 +2334,23 @@ fn build_userland_crate(crate_name: &str, env_var: &str) -> PathBuf {
         // from when *this* build script was invoked.
         .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("CARGO_PKG_NAME")
+        // Cargo's own rustflags-source priority is `CARGO_ENCODED_RUSTFLAGS` env var > `RUSTFLAGS`
+        // env var > `.cargo/config.toml`'s `[target.*] rustflags` -- and, found live via a real
+        // regression this exact gap caused, **cargo sets `CARGO_ENCODED_RUSTFLAGS` in a build
+        // script's own process environment** whenever the outer build resolved rustflags via
+        // config (this crate's own `[target.x86_64-oxidebsd] rustflags`), which then gets
+        // silently *inherited* by any `Command` this build script spawns unless explicitly
+        // cleared -- a plain `.env("RUSTFLAGS", ...)` override below is not enough by itself,
+        // since the still-present, higher-priority encoded var wins regardless. Without clearing
+        // it here, the kernel's own `-C link-arg=-Tx86_64-oxidebsd.ld` (`ENTRY(kmain)`) leaked into
+        // this nested build, fighting each crate's own `ENTRY(_start)` linker script (set via its
+        // own `build.rs`'s `cargo:rustc-link-arg=-T...`) and silently producing a broken ELF with
+        // no entry point/program headers.
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        // No userland crate needs the kernel's `chacha20_backend` cfg, so blanking `RUSTFLAGS`
+        // entirely (matching `build_module_crate`'s own precedent) is correct, not just a
+        // workaround.
+        .env("RUSTFLAGS", "")
         .status()
         .unwrap_or_else(|e| panic!("failed to run cargo for {crate_name}: {e}"));
 
@@ -2375,10 +2434,34 @@ fn build_module_crate(crate_name: &str, env_var: &str, extra_env: &[(&str, &str)
         ])
         .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("CARGO_PKG_NAME")
+        // See `build_userland_crate`'s own doc comment for why this is required, not just
+        // defensive: cargo silently inherits `CARGO_ENCODED_RUSTFLAGS` (higher-priority than the
+        // plain `RUSTFLAGS` env var set just below) from this build script's own process
+        // environment into any `Command` it spawns, which would otherwise let the kernel's own
+        // `[target.x86_64-oxidebsd] rustflags` silently override the `relocation-model=static`
+        // this nested build genuinely needs.
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         // See the doc comment above: eliminates GOT-indirected relocations everywhere, including
         // inside the precompiled core/alloc this nested `-Z build-std` invocation produces (which
         // doesn't inherit the trailing `--emit=obj`-style flags, only RUSTFLAGS).
-        .env("RUSTFLAGS", "-C relocation-model=static");
+        //
+        // `-C code-model=kernel`: found live, the *first* time `CARGO_ENCODED_RUSTFLAGS` above was
+        // actually cleared and `relocation-model=static` genuinely took effect for a module build
+        // (previously silently never applied -- see the doc comment above). LLVM's *default* code
+        // model under `relocation-model=static` (`small`) assumes absolute references fit the
+        // unsigned low 4 GiB and emits `R_X86_64_32` for them (e.g. a function pointer taken as an
+        // integer, as `module_init` does registering each syscall handler) -- correct for the old
+        // `MODULE_VA_BASE=0x10000000`, but `RelocationOverflow` for the current one
+        // (`0xffffffff90000000`, moved into the kernel's own top-2GiB region specifically so
+        // `R_X86_64_PC32`/`PLT32` calls into real kernel functions resolve -- see `src/module.rs`'s
+        // own `MODULE_VA_BASE` doc comment). `code-model=kernel` is x86_64 LLVM's dedicated model
+        // for exactly this placement: it emits sign-extending `R_X86_64_32S` instead, correctly
+        // representable for any address in the top 2 GiB (`0xffffffff80000000`-
+        // `0xffffffffffffffff`), which `MODULE_VA_BASE`/`MODULE_REGION_CEILING` both fall inside.
+        .env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C code-model=kernel",
+        );
     for (key, value) in extra_env {
         command.env(key, value);
     }

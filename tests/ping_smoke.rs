@@ -19,13 +19,14 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::net::udp::{oxidebsd_sys_recvfrom, oxidebsd_sys_sendto, oxidebsd_sys_socket};
 use oxidebsd::net::{ipv4, rtl8139};
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::{interrupts, serial_println};
 
-entry_point!(main);
+limine_entry_point!(main);
 
 const AF_INET: u64 = 2;
 const SOCK_RAW: u64 = 3;

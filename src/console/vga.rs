@@ -5,9 +5,37 @@ use spin::{Lazy, Mutex};
 use x86_64::instructions::interrupts;
 use x86_64::instructions::port::Port;
 
-const BUFFER_HEIGHT: usize = 25;
-const BUFFER_WIDTH: usize = 80;
-const VGA_BUFFER_ADDR: usize = 0xb8000;
+/// Real, fixed backing-storage extent -- generous enough for any real display at
+/// `console::framebuffer`'s native 8x16-pixel cell size (400*8 = 3200px wide, 200*16 = 3200px
+/// tall covers any real monitor resolution with real headroom). The *active* grid for this boot
+/// is `Writer.width`/`height` below, a real runtime value derived from the actual framebuffer
+/// resolution (falling back to the classic 80x25 if none is available) -- **not** a compile-time
+/// constant anymore, since "how many characters fit on screen" now genuinely depends on the real
+/// display, the same way it does for actual terminal emulators (found live: a fixed 80x25 grid,
+/// even rendered at a clean native/integer-scaled size instead of a stretched one, left a real
+/// display's own extra real estate as dead space rather than more visible text -- the actual
+/// terminal-emulator-like behavior wants *more rows/columns* on a bigger display, not bigger
+/// characters). Still a fixed-size array (not a heap allocation) so `write_char_at`'s existing
+/// `buffer.chars[row][col]` indexing needs no changes at all -- only the *bounds* every loop and
+/// comparison uses change, from a `const` to `self.width`/`height`.
+const MAX_BUFFER_WIDTH: usize = 400;
+const MAX_BUFFER_HEIGHT: usize = 200;
+
+/// Real hardware VGA text-mode memory (physical `0xb8000`) simply isn't backed by anything under
+/// Limine, on either BIOS or UEFI (see `console::framebuffer`'s own module doc comment for the
+/// live-confirmed page fault this found) -- so `Writer.buffer` below points at this ordinary,
+/// always-safe in-memory buffer instead of real VRAM. `static mut`, not `static`: a plain
+/// `static`, never written through a real `&mut`, gets interned into `.rodata` by the optimizer
+/// (same class of gotcha `cpu::gdt.rs`'s own ring-0 stacks document). This keeps the *entire* real
+/// ANSI/VT100 engine below completely unmodified and still fully exercised (`vi`, colored
+/// prompts, scroll regions, alt-screen, all of it) -- `console::framebuffer::redraw` is what
+/// actually renders this buffer's content onto real pixels, via `for_each_cell`/`cursor` below.
+static mut SHADOW_BUFFER: Buffer = Buffer {
+    chars: [[ScreenChar {
+        ascii_character: b' ',
+        color_code: ColorCode(0x07),
+    }; MAX_BUFFER_WIDTH]; MAX_BUFFER_HEIGHT],
+};
 
 /// CRTC index/data port pair (standard VGA, unchanged since the original IBM CGA/MDA days) --
 /// used only to move/show/hide the real blinking hardware cursor. Text content itself never goes
@@ -121,12 +149,15 @@ struct ScreenChar {
 
 #[repr(transparent)]
 struct Buffer {
-    chars: [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT],
+    chars: [[ScreenChar; MAX_BUFFER_WIDTH]; MAX_BUFFER_HEIGHT],
 }
 
 /// A full screen's worth of content, detached from `Buffer`'s own fixed VRAM address -- what
-/// `enter_alt_screen`/`exit_alt_screen` snapshot to/from the heap.
-type ScreenGrid = [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT];
+/// `enter_alt_screen`/`exit_alt_screen` snapshot to/from the heap. Always the full
+/// `MAX_BUFFER_WIDTH`x`MAX_BUFFER_HEIGHT` backing extent, matching `Buffer` itself, regardless of
+/// this boot's real active `width`/`height` -- simplest correct option (a snapshot the size of
+/// whatever's actually active would need its own separate, dynamically-chosen type).
+type ScreenGrid = [[ScreenChar; MAX_BUFFER_WIDTH]; MAX_BUFFER_HEIGHT];
 
 /// Where a byte stream sits relative to an ANSI/VT100 escape sequence. Only `CSI` (`ESC [ ... `)
 /// is actually interpreted -- see `handle_escape_byte`/`handle_csi_byte`.
@@ -150,6 +181,11 @@ struct SavedCursorState {
 }
 
 struct Writer {
+    /// This boot's real, active grid size -- see `MAX_BUFFER_WIDTH`'s own doc comment for why
+    /// this is a runtime field, not `MAX_BUFFER_WIDTH`/`HEIGHT` themselves. Set once, at
+    /// construction, never changed afterward.
+    width: usize,
+    height: usize,
     cursor_row: usize,
     cursor_col: usize,
     /// Whether the hardware cursor should actually be drawn (`ESC[?25l`/`h`) -- tracked
@@ -221,8 +257,10 @@ impl Writer {
             b'\n' => self.line_feed(),
             // Carriage return: back to column 0 on the current row, no row change.
             b'\r' => self.cursor_col = 0,
-            // Tab: advance to the next multiple-of-8 stop. The distance is at most 8 (and
-            // BUFFER_WIDTH is itself a multiple of 8), so this can cross at most one line wrap.
+            // Tab: advance to the next multiple-of-8 stop, one space at a time -- `put_char`'s
+            // own general wrap-on-overflow handling (correct for any `self.width`, not just a
+            // multiple of 8) is what actually keeps this correct if the stop lands past the
+            // real right edge.
             b'\t' => {
                 let next_stop = (self.cursor_col / 8 + 1) * 8;
                 for _ in self.cursor_col..next_stop {
@@ -342,8 +380,8 @@ impl Writer {
             b'H' | b'f' => {
                 let row = self.csi_param(0, 1).saturating_sub(1) as usize;
                 let col = self.csi_param(1, 1).saturating_sub(1) as usize;
-                self.cursor_row = row.min(BUFFER_HEIGHT - 1);
-                self.cursor_col = col.min(BUFFER_WIDTH - 1);
+                self.cursor_row = row.min(self.height - 1);
+                self.cursor_col = col.min(self.width - 1);
             }
             // CUU/CUD/CUF/CUB: relative cursor moves, clamped to the screen (no scrolling).
             b'A' => {
@@ -353,11 +391,11 @@ impl Writer {
             }
             b'B' => {
                 self.cursor_row =
-                    (self.cursor_row + self.csi_param(0, 1) as usize).min(BUFFER_HEIGHT - 1)
+                    (self.cursor_row + self.csi_param(0, 1) as usize).min(self.height - 1)
             }
             b'C' => {
                 self.cursor_col =
-                    (self.cursor_col + self.csi_param(0, 1) as usize).min(BUFFER_WIDTH - 1)
+                    (self.cursor_col + self.csi_param(0, 1) as usize).min(self.width - 1)
             }
             b'D' => {
                 self.cursor_col = self
@@ -410,8 +448,8 @@ impl Writer {
     fn erase_in_display(&mut self, mode: u16) {
         match mode {
             0 => {
-                self.clear_row_range(self.cursor_row, self.cursor_col, BUFFER_WIDTH);
-                for row in (self.cursor_row + 1)..BUFFER_HEIGHT {
+                self.clear_row_range(self.cursor_row, self.cursor_col, self.width);
+                for row in (self.cursor_row + 1)..self.height {
                     self.clear_row(row);
                 }
             }
@@ -422,7 +460,7 @@ impl Writer {
                 self.clear_row_range(self.cursor_row, 0, self.cursor_col + 1);
             }
             _ => {
-                for row in 0..BUFFER_HEIGHT {
+                for row in 0..self.height {
                     self.clear_row(row);
                 }
             }
@@ -433,7 +471,7 @@ impl Writer {
     /// row.
     fn erase_in_line(&mut self, mode: u16) {
         match mode {
-            0 => self.clear_row_range(self.cursor_row, self.cursor_col, BUFFER_WIDTH),
+            0 => self.clear_row_range(self.cursor_row, self.cursor_col, self.width),
             1 => self.clear_row_range(self.cursor_row, 0, self.cursor_col + 1),
             _ => self.clear_row(self.cursor_row),
         }
@@ -505,8 +543,8 @@ impl Writer {
     /// there's no error to report over this byte stream anyway).
     fn restore_cursor(&mut self) {
         if let Some(saved) = self.saved_cursor {
-            self.cursor_row = saved.row.min(BUFFER_HEIGHT - 1);
-            self.cursor_col = saved.col.min(BUFFER_WIDTH - 1);
+            self.cursor_row = saved.row.min(self.height - 1);
+            self.cursor_col = saved.col.min(self.width - 1);
             self.sgr_fg = saved.sgr_fg;
             self.sgr_bg = saved.sgr_bg;
             self.sgr_bold = saved.sgr_bold;
@@ -553,7 +591,7 @@ impl Writer {
         let mut saved = [[ScreenChar {
             ascii_character: b' ',
             color_code: self.color_code,
-        }; BUFFER_WIDTH]; BUFFER_HEIGHT];
+        }; MAX_BUFFER_WIDTH]; MAX_BUFFER_HEIGHT];
         for (row, row_slice) in saved.iter_mut().enumerate() {
             for (col, cell) in row_slice.iter_mut().enumerate() {
                 *cell = self.read_char_at(row, col);
@@ -589,7 +627,7 @@ impl Writer {
         if !self.cursor_visible {
             return;
         }
-        let position = (self.cursor_row * BUFFER_WIDTH + self.cursor_col) as u16;
+        let position = (self.cursor_row * self.width + self.cursor_col) as u16;
         let mut index_port: Port<u8> = Port::new(CRTC_INDEX_PORT);
         let mut data_port: Port<u8> = Port::new(CRTC_DATA_PORT);
         // SAFETY: 0x3D4/0x3D5 are the standard VGA CRTC index/data ports, always present on this
@@ -644,7 +682,7 @@ impl Writer {
     /// Write one visible glyph at the cursor and advance it, wrapping (and scrolling, if already
     /// on the last row) at the end of a line.
     fn put_char(&mut self, byte: u8) {
-        if self.cursor_col >= BUFFER_WIDTH {
+        if self.cursor_col >= self.width {
             self.line_feed();
         }
 
@@ -684,7 +722,7 @@ impl Writer {
         self.cursor_col = 0;
         if self.cursor_row == self.scroll_bottom {
             self.scroll_region_up_by(self.scroll_top, self.scroll_bottom, 1);
-        } else if self.cursor_row + 1 < BUFFER_HEIGHT {
+        } else if self.cursor_row + 1 < self.height {
             self.cursor_row += 1;
         }
     }
@@ -718,7 +756,7 @@ impl Writer {
         let n = n.min(bottom - top + 1);
         for _ in 0..n {
             for row in (top + 1)..=bottom {
-                for col in 0..BUFFER_WIDTH {
+                for col in 0..self.width {
                     let character = self.read_char_at(row, col);
                     self.write_char_at(row - 1, col, character);
                 }
@@ -743,7 +781,7 @@ impl Writer {
         for _ in 0..n {
             let mut row = bottom;
             while row > top {
-                for col in 0..BUFFER_WIDTH {
+                for col in 0..self.width {
                     let character = self.read_char_at(row - 1, col);
                     self.write_char_at(row, col, character);
                 }
@@ -759,15 +797,15 @@ impl Writer {
     /// also home the cursor after this -- there's no DECOM (origin mode) here, so that's always
     /// absolute `0,0`.
     fn set_scroll_region(&mut self) {
-        let top = (self.csi_param(0, 1).saturating_sub(1) as usize).min(BUFFER_HEIGHT - 1);
+        let top = (self.csi_param(0, 1).saturating_sub(1) as usize).min(self.height - 1);
         let bottom =
-            (self.csi_param(1, BUFFER_HEIGHT as u16).saturating_sub(1) as usize).min(BUFFER_HEIGHT - 1);
+            (self.csi_param(1, self.height as u16).saturating_sub(1) as usize).min(self.height - 1);
         if top < bottom {
             self.scroll_top = top;
             self.scroll_bottom = bottom;
         } else {
             self.scroll_top = 0;
-            self.scroll_bottom = BUFFER_HEIGHT - 1;
+            self.scroll_bottom = self.height - 1;
         }
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -802,11 +840,11 @@ impl Writer {
     fn insert_chars(&mut self, n: usize) {
         let row = self.cursor_row;
         let from_col = self.cursor_col;
-        if from_col >= BUFFER_WIDTH {
+        if from_col >= self.width {
             return;
         }
-        let n = n.min(BUFFER_WIDTH - from_col);
-        let mut col = BUFFER_WIDTH;
+        let n = n.min(self.width - from_col);
+        let mut col = self.width;
         while col > from_col + n {
             col -= 1;
             let character = self.read_char_at(row, col - n);
@@ -820,19 +858,19 @@ impl Writer {
     fn delete_chars(&mut self, n: usize) {
         let row = self.cursor_row;
         let from_col = self.cursor_col;
-        if from_col >= BUFFER_WIDTH {
+        if from_col >= self.width {
             return;
         }
-        let n = n.min(BUFFER_WIDTH - from_col);
-        for col in from_col..(BUFFER_WIDTH - n) {
+        let n = n.min(self.width - from_col);
+        for col in from_col..(self.width - n) {
             let character = self.read_char_at(row, col + n);
             self.write_char_at(row, col, character);
         }
-        self.clear_row_range(row, BUFFER_WIDTH - n, BUFFER_WIDTH);
+        self.clear_row_range(row, self.width - n, self.width);
     }
 
     fn clear_row(&mut self, row: usize) {
-        self.clear_row_range(row, 0, BUFFER_WIDTH);
+        self.clear_row_range(row, 0, self.width);
     }
 
     fn clear_row_range(&mut self, row: usize, start_col: usize, end_col: usize) {
@@ -840,7 +878,7 @@ impl Writer {
             ascii_character: b' ',
             color_code: self.color_code,
         };
-        for col in start_col..end_col.min(BUFFER_WIDTH) {
+        for col in start_col..end_col.min(self.width) {
             self.write_char_at(row, col, blank);
         }
     }
@@ -853,8 +891,27 @@ impl fmt::Write for Writer {
     }
 }
 
+/// This boot's real, active grid size -- as many `console::framebuffer::GLYPH_WIDTH`x`_HEIGHT`
+/// (8x16) cells as actually fit the real framebuffer resolution, clamped to `MAX_BUFFER_WIDTH`/
+/// `HEIGHT`'s own generous bound; falls back to the classic 80x25 if Limine reported no usable
+/// framebuffer at all (matches this Writer's own pre-Limine-migration default, and keeps
+/// `serial_println!`'s very first calls -- before `console::framebuffer` could possibly know a
+/// real resolution either way -- working identically either way).
+fn real_grid_size() -> (usize, usize) {
+    match crate::boot::primary_framebuffer() {
+        Some(fb) => (
+            ((fb.width as usize) / 8).clamp(1, MAX_BUFFER_WIDTH),
+            ((fb.height as usize) / 16).clamp(1, MAX_BUFFER_HEIGHT),
+        ),
+        None => (80, 25),
+    }
+}
+
 static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
+    let (width, height) = real_grid_size();
     let writer = Writer {
+        width,
+        height,
         cursor_row: 0,
         cursor_col: 0,
         cursor_visible: true,
@@ -870,12 +927,12 @@ static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
         csi_cur_present: false,
         csi_private: false,
         scroll_top: 0,
-        scroll_bottom: BUFFER_HEIGHT - 1,
+        scroll_bottom: height - 1,
         saved_cursor: None,
         alt_screen_saved: None,
-        // SAFETY: 0xb8000 is the VGA text-mode buffer's physical address, identity-mapped by the
-        // bootloader; this Writer is the only thing that ever accesses it.
-        buffer: unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) },
+        // See `SHADOW_BUFFER`'s own doc comment for why this points here instead of real VRAM.
+        // This Writer is the only thing that ever accesses it.
+        buffer: unsafe { &mut *(&raw mut SHADOW_BUFFER) },
     };
     // Establish a known cursor shape/position at boot -- the BIOS's own leftover cursor state is
     // otherwise whatever it happened to be, not necessarily even at 0,0.
@@ -893,4 +950,67 @@ pub fn _print(args: fmt::Arguments) {
             .write_fmt(args)
             .expect("printing to VGA buffer failed");
     });
+}
+
+/// Fixed upper bound on the real, per-boot `width()`/`height()` below -- what
+/// `console::framebuffer`'s own `PREV_CELLS` static sizes itself to, since that static (unlike
+/// this module's own `SHADOW_BUFFER`) is declared before any real grid size is known.
+pub const MAX_WIDTH: usize = MAX_BUFFER_WIDTH;
+pub const MAX_HEIGHT: usize = MAX_BUFFER_HEIGHT;
+
+/// This boot's real, active grid size -- see `real_grid_size`'s own doc comment for how it's
+/// derived. Functions, not `const`s, since (unlike the old fixed 80x25) this is now genuinely a
+/// runtime value; cheap to call repeatedly (`WRITER`'s `Lazy` only actually runs its init closure
+/// once, on first access, same as any other read of it).
+pub fn width() -> usize {
+    interrupts::without_interrupts(|| WRITER.lock().width)
+}
+
+pub fn height() -> usize {
+    interrupts::without_interrupts(|| WRITER.lock().height)
+}
+
+/// One cell's real content, in a shape `console::framebuffer` can rasterize without this module
+/// leaking its own private `ScreenChar`/`ColorCode` representation. `fg`/`bg` are real VGA
+/// palette indices (0-15, see `Color`'s own discriminants above).
+pub struct Cell {
+    pub ascii: u8,
+    pub fg: u8,
+    pub bg: u8,
+}
+
+/// Snapshots the current buffer content, cell by cell, bounded to this boot's real active
+/// `width()`x`height()` (not `SHADOW_BUFFER`'s own larger `MAX_BUFFER_WIDTH`x`HEIGHT` backing
+/// extent -- everything beyond the real grid is permanently blank, unused space) --
+/// `console::framebuffer::redraw`'s only way to see what this module's own ANSI engine has
+/// actually produced. Takes a callback rather than returning an owned copy: this module already
+/// holds the real lock for the whole snapshot anyway (consistent with a concurrent write), so
+/// there's no reason to copy out further than the caller's own destination buffer.
+pub fn for_each_cell(mut f: impl FnMut(usize, usize, Cell)) {
+    interrupts::without_interrupts(|| {
+        let writer = WRITER.lock();
+        for row in 0..writer.height {
+            for col in 0..writer.width {
+                let sc = writer.buffer.chars[row][col];
+                f(
+                    row,
+                    col,
+                    Cell {
+                        ascii: sc.ascii_character,
+                        fg: sc.color_code.0 & 0x0F,
+                        bg: (sc.color_code.0 >> 4) & 0x0F,
+                    },
+                );
+            }
+        }
+    });
+}
+
+/// `(row, col, visible)` -- the real cursor state `console::framebuffer::redraw` draws on top of
+/// the snapshotted cell grid.
+pub fn cursor() -> (usize, usize, bool) {
+    interrupts::without_interrupts(|| {
+        let writer = WRITER.lock();
+        (writer.cursor_row, writer.cursor_col, writer.cursor_visible)
+    })
 }

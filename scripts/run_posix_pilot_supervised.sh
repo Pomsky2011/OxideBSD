@@ -124,7 +124,16 @@ while [ "$MAX_ITERATIONS" -eq 0 ] || [ "$iteration" -lt "$MAX_ITERATIONS" ]; do
     # iteration's own QEMU fail outright with "Failed to get \"write\" lock" -- a real, found-live
     # failure mode, not a stall (so the stall-detection loop below never catches it). Clear the
     # decks unconditionally before every iteration, not just after a detected stall.
-    pkill -f "bootimage-posix_conformance_smoke" 2>/dev/null || true
+    #
+    # `target/qemu_runner.pid` (written by scripts/qemu_runner.sh, this project's own
+    # `bootimage runner` replacement -- see CLAUDE.md's boot section), not a `pkill -f` name
+    # match: every test now stages the identical `target/oxidebsd.iso`, so there's no longer a
+    # per-test-binary-named QEMU process to match on the way the old
+    # `bootimage-posix_conformance_smoke` binary path once let this do.
+    if [ -f target/qemu_runner.pid ]; then
+        kill "$(cat target/qemu_runner.pid)" 2>/dev/null || true
+        rm -f target/qemu_runner.pid
+    fi
     sleep 1
 
     POSIX_EXTRA_EXCLUDE_FILE="$COMBINED_SKIP_FILE" cargo test --test posix_conformance_smoke \
@@ -150,7 +159,10 @@ while [ "$MAX_ITERATIONS" -eq 0 ] || [ "$iteration" -lt "$MAX_ITERATIONS" ]; do
 
     if [ "$stalled" -eq 1 ]; then
         echo "=== iteration $iteration: no new result for ${STALL_SECONDS}s -- treating as a real kernel-level wedge, killing QEMU ==="
-        pkill -f "bootimage-posix_conformance_smoke" 2>/dev/null || true
+        if [ -f target/qemu_runner.pid ]; then
+            kill "$(cat target/qemu_runner.pid)" 2>/dev/null || true
+            rm -f target/qemu_runner.pid
+        fi
         wait "$test_pid" 2>/dev/null || true
         status="stalled"
     else

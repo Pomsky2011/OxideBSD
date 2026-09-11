@@ -15,3 +15,7 @@
 	path = third_party/posixtestsuite
 	url = https://github.com/Pomsky2011/posixtestsuite.git
 	branch = oxidebsd
+[submodule "third_party/limine"]
+	path = third_party/limine
+	url = https://github.com/Pomsky2011/limine-oxidebsd.git
+	branch = oxidebsd

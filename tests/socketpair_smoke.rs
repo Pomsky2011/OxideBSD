@@ -20,8 +20,9 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
 use oxidebsd::fs::fd::oxidebsd_close_fd;
+use oxidebsd::limine_entry_point;
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 use oxidebsd::syscall::{
@@ -29,7 +30,7 @@ use oxidebsd::syscall::{
     oxidebsd_sys_socketpair, oxidebsd_sys_write,
 };
 
-entry_point!(main);
+limine_entry_point!(main);
 
 const AF_UNIX: u64 = 1;
 const SOCK_STREAM: u64 = 1;

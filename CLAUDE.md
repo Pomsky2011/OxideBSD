@@ -2159,6 +2159,68 @@ musl branch: `pthread_detach()` now returns `EINVAL` here instead of ever reachi
 `__pthread_join()`. `4-3.c` now cleanly `TIMEOUT`s (a real, heavy workload hitting `t0`'s bound, same
 class as `shm_open/23-1.c`) instead of crashing. Full corpus: 87.5%→88.4%.
 
+## USB input: xHCI + HID boot-protocol keyboard (`src/drivers/usb/`, `src/drivers/pci.rs`, `src/cpu/interrupts.rs`)
+
+This kernel's first real-hardware (not just QEMU) boot target is a Surface Pro, which has no PS/2
+controller at all — this closes that gap. `src/drivers/usb/xhci.rs` is the xHCI host-controller
+driver (register access, command/event rings, device-slot enable/address/configure); `hid_keyboard.rs`
+is a HID **Boot Protocol** keyboard on top of it (no general HID Report Descriptor parsing); `mod.rs`
+ties both together and exposes `init`/`poll`.
+
+- **Polling, not IRQ-driven, deliberately** — matches `drivers::ata`'s own established
+  polling-only precedent. This kernel has no IOAPIC/MSI support, and legacy PCI `INTx` routing on
+  a modern UEFI-only chipset is a real, unquantified risk not worth taking for a few ms of
+  keystroke latency a human typist won't notice. `usb::poll()` runs once per timer tick, draining
+  the shared Event Ring — `IMAN.IE`/`USBCMD.INTE` are deliberately left clear.
+- **32-byte device contexts only** (`HCCPARAMS1.CSZ == 0`) — what QEMU's `qemu-xhci` and the
+  overwhelming majority of real platforms use. `CSZ == 1` is logged and treated as unsupported
+  hardware.
+- **A real bug found live, not by spec-reading**: an early version trusted Limine's HHDM to cover
+  the xHCI BAR's physical range unconditionally (same reasoning `console::framebuffer` uses for
+  Limine's framebuffer). **Wrong for a 64-bit BAR** — a real boot under OVMF (UEFI) placed
+  `qemu-xhci`'s BAR0 at physical `0x800000000` (32 GiB; the same boot under SeaBIOS placed it at a
+  conventional `0xfebd0000`, which would have worked fine and masked the bug). Real firmware parks
+  large/64-bit BARs in a high MMIO window specifically to avoid the low 32-bit PCI hole; Limine's
+  HHDM only guarantees "at least 4 GiB, plus whatever the memory map itself reports" — nowhere
+  near a firmware-placed hole that far up. The very first capability-register read through the
+  unmapped HHDM address page-faulted immediately. Fixed with a real, explicit two-phase mapping in
+  `Xhci::init` (`map_bar_pages`, `NO_CACHE`, via the same `Mapper::map_to` primitive
+  `module::map_region` already uses): map one page first (enough to read the Capability registers
+  and learn `DBOFF`/`RTSOFF`/port count), then map however many pages the real needed extent
+  turns out to be. **Confirmed on both BIOS and UEFI boots** (`OXIDEBSD_QEMU_USB=1 cargo run`,
+  both `OXIDEBSD_FIRMWARE` values) before landing.
+- **Real BIOS/SMM-to-OS ownership handoff** (USB Legacy Support Capability, walked via
+  `HCCPARAMS1.xECP` inside xHCI's own MMIO space — a real *xHCI extended capability*, entirely
+  separate from the PCI config-space capability list) — real Intel platforms (this project's own
+  real-hardware target's chipset included) can leave the controller SMM-owned by default. QEMU
+  doesn't implement this capability at all, so every QEMU boot logs "no USB Legacy Support
+  capability" and moves on — this path is untested by QEMU and only actually exercised on real
+  hardware.
+- **`drivers::pci::PciDevice::mem_bar` gained real 64-bit BAR-pair merging** (bits `2:1 == 0b10`,
+  BAR `n+1` holds the high 32 bits) — xHCI controllers commonly use a 64-bit BAR0; the old
+  32-bit-only version silently truncated it.
+- **Reuses `cpu::interrupts`'s existing PS/2 decode pipeline wholesale, not a second implementation.**
+  `keyboard_interrupt_handler`'s post-decode logic (echo/Ctrl+C→`SIGINT`/Ctrl+Z→`SIGTSTP`/`push_byte`)
+  is factored into `handle_decoded_key`, called by both the real PS/2 IRQ handler and a new
+  `feed_synthetic_scancode` entry point `hid_keyboard` calls once per synthesized PS/2 Scan Code
+  Set 1 byte (diffed from each HID boot report against the previous one, including the `0xE0`
+  extended-key prefix). Shift state, Caps Lock, signal interception, and echo all come along for
+  free. **`feed_synthetic_scancode` never touches the PIC** — only `keyboard_interrupt_handler`
+  (the one actually inside a real hardware IRQ) sends its own EOI, unconditionally, after calling
+  `handle_decoded_key` regardless of whether it returned early.
+- One keyboard device for v1 (first HID boot-keyboard endpoint found during `usb::init`'s one-time
+  port scan wins), no hot-plug, US 104-key layout only (a handful of ISO/PrintScreen/Pause keys
+  unmapped — real, narrow, deliberate gaps). Mouse/pointer input out of scope entirely — no GUI or
+  pointer concept exists anywhere in this kernel to consume it yet.
+- QEMU test devices (`-device qemu-xhci -device usb-kbd`) are opt-in via `OXIDEBSD_QEMU_USB=1` in
+  `scripts/qemu_runner.sh`, not default — QEMU's default i440fx machine already wires up a PS/2
+  keyboard at the hardware-model level, so an always-on USB keyboard would double-push every
+  keystroke typed into the QEMU window into stdin.
+- **Not covered**: real hardware (Surface Pro) itself — manual-QEMU-only precedent extends to
+  manual-real-hardware-only here; live interactive keystroke verification (Ctrl+C/history/shift
+  through the shared decode pipeline) is the same "can't be scripted" category CLAUDE.md's test-
+  architecture section already establishes for PS/2.
+
 ## Dependency notes
 
 - `x86_64` crate: `default-features = false, features = ["instructions", "abi_x86_interrupt"]` —

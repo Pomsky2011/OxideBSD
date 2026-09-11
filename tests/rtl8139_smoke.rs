@@ -9,12 +9,13 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::net::{nic, rtl8139};
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::{interrupts, serial_println};
 
-entry_point!(main);
+limine_entry_point!(main);
 
 /// SLIRP's default guest IP under QEMU's `-nic user` backend.
 const GUEST_IP: [u8; 4] = [10, 0, 2, 15];

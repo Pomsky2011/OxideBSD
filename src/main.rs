@@ -6,10 +6,10 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
 use oxidebsd::serial_println;
 
-entry_point!(kernel_main);
+oxidebsd::limine_entry_point!(kernel_main);
 
 #[cfg(test)]
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
@@ -51,6 +51,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // continues regardless of whether a supported device was found. No protocol stack, no
     // syscalls, no `modules/net` yet -- just raw Ethernet frame TX/RX, IRQ-driven.
     oxidebsd::net::rtl8139::init(&mut frame_allocator, physical_memory_offset);
+
+    // A real xHCI USB host controller + HID boot-protocol keyboard, if either is present -- this
+    // kernel's only input path on hardware with no PS/2 controller (a Surface Pro; see
+    // `oxidebsd::drivers::usb`'s own module doc comment). Not fatal either way, same "logged,
+    // boot continues regardless" precedent as `rtl8139::init` just above. Before module loading so
+    // a USB keyboard is live before `hush` is spawned.
+    oxidebsd::drivers::usb::init(&mut frame_allocator, &mut mapper, physical_memory_offset);
 
     const HELLO_MOD: &[u8] = include_bytes!(env!("HELLO_MOD_PATH"));
     const HELLO_PANIC_SYMBOL: &str = env!("HELLO_MOD_PANIC_SYMBOL");
@@ -130,7 +137,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // oxfs's module_init needs to know whether a data disk is attached to decide between its
     // mount-existing-disk and format-fresh-disk/pure-in-memory paths. Never fatal: absence just
     // means oxfs falls back to its original 100%-in-memory behavior for this boot.
-    oxidebsd::drivers::ata::init();
+    //
+    // Skipped entirely when booted with `no-ata` on the Limine command line -- see
+    // `oxidebsd::boot::ata_disabled`'s own doc comment for why this exists (a real safety gate
+    // for a first real-hardware boot attempt, not something this project's own QEMU workflow
+    // needs). Skipping the probe forces oxfs into its always-safe in-memory fallback below.
+    if oxidebsd::boot::ata_disabled() {
+        serial_println!("[boot] no-ata on kernel command line: skipping ATA disk probe");
+    } else {
+        oxidebsd::drivers::ata::init();
+    }
 
     // The live filesystem (see CLAUDE.md's oxfs section) -- modules/fat32 is kept in the workspace
     // (still built and self-checked by build.rs on every `cargo build`) but deliberately not

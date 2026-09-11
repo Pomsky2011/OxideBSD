@@ -13,12 +13,13 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::net::{icmp, ipv4, nic, rtl8139};
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::{interrupts, serial_println};
 
-entry_point!(main);
+limine_entry_point!(main);
 
 const ECHO_ID: u16 = 0x1234;
 const ECHO_SEQ: u16 = 1;

@@ -61,24 +61,36 @@ const PAGE_SIZE: u64 = 4096;
 
 /// Fixed base of the kernel-module virtual address region, and its ceiling. Modules are mapped
 /// into the kernel's own, currently active address space (not a separate one -- unlike userland
-/// demos, module code always runs in kernel context), at addresses well clear of the kernel
-/// image, heap (`0x_4444_4444_0000`), and userland demo load addresses (`0x400000`-`0x600000`).
+/// demos, module code always runs in kernel context).
 ///
-/// The low-2 GiB ceiling is load-bearing, not arbitrary: `build.rs` compiles every module with
-/// `-C relocation-model=static`, which -- confirmed empirically -- eliminates GOT-indirected
+/// **Moved into the kernel's own top-2-GiB canonical region (the Limine migration -- see
+/// CLAUDE.md's boot section) from the old low `0x2000_0000..0x8000_0000` range.** `build.rs`
+/// compiles every module with `-C relocation-model=static`, eliminating GOT-indirected
 /// relocations entirely (a real GOT would need lazy-vs-eager-binding decisions and its own
-/// alignment bookkeeping this loader doesn't implement), in exchange for every relocation being a
-/// simple absolute or PC-relative 32-bit write. Those don't just prefer small addresses, they
-/// silently corrupt if a resolved address doesn't actually fit -- `apply_relocation` below
-/// validates every truncating write and errors loudly rather than trust the range implicitly.
-// 0x10000000 -> 0x20000000: the whole low-VA userland/BusyBox/tcc/POSIX-pilot fixed-address
-// family below this (`0x4000000`-`0xE300000` at the time of this change) shifted up by
-// `+0x4000000` once the kernel's own image grew past it (see `userland/ring3-smoke/linker.ld`'s
-// own doc comment for the full "why" and how to re-derive this again) -- moved further still, not
-// just enough to clear that one collision, so the new gap between the top of that family and this
-// ceiling has real headroom for the next few rounds of growth too.
-const MODULE_VA_BASE: u64 = 0x_2000_0000;
-const MODULE_REGION_CEILING: u64 = 0x_8000_0000;
+/// alignment bookkeeping this loader doesn't implement) in exchange for every kernel-API call/
+/// reference compiling as a plain **PC-relative** 32-bit relocation (`R_X86_64_PC32`/`PLT32`) --
+/// only reachable when module code and the kernel function it's calling are within `+-2 GiB` of
+/// each other. That was true for free under `bootloader` v0.9 (kernel also lived at a low
+/// address); found live, the hard way, once the kernel moved to a genuine higher-half address
+/// (`0xffffffff80000000`+, per the Limine protocol): the first `module::load` call
+/// (`hello`) failed with `RelocationOverflow` on exactly this class of relocation, since a
+/// call site down at `0x2000_0000` is *~18 exabytes* away from a kernel function up at
+/// `0xffffffff80000000` -- nowhere close to representable in 32 bits. Fixed by moving the module
+/// region itself into the same top-2-GiB canonical range as the kernel, comfortably above the
+/// kernel image's own current end (confirmed via `readelf -l target/x86_64-oxidebsd/debug/oxidebsd
+/// | grep -A1 LOAD`, same re-derivation method `userland/ring3-smoke/linker.ld`'s own doc comment
+/// documents for the analogous userland-side constraint) -- keeping every module-to-kernel
+/// PC-relative reference within the real `+-2 GiB` window `R_X86_64_PC32`/`PLT32` can encode.
+/// **Absolute** relocations (`R_X86_64_32S`, sign-extended) also still work at this new home: any
+/// address in the canonical top-2-GiB range sign-extends losslessly from its low 32 bits by
+/// construction -- the same property that makes `-mcmodel=kernel`-style addressing work for real
+/// kernels generally, not something specific to this fix. Plain **unsigned** absolute
+/// (`R_X86_64_32`) is the one relocation type this new placement *doesn't* help (a huge canonical
+/// address is nowhere near representable as an unsigned 32-bit value either) -- not observed in
+/// practice for any module so far, but `apply_relocation`'s own overflow check would still catch
+/// it loudly rather than silently corrupt if one ever appears.
+const MODULE_VA_BASE: u64 = 0xffff_ffff_9000_0000;
+const MODULE_REGION_CEILING: u64 = 0xffff_ffff_f000_0000;
 
 static NEXT_MODULE_PAGE: Mutex<u64> = Mutex::new(MODULE_VA_BASE);
 
@@ -736,7 +748,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
         "oxidebsd_sys_pipe2" => Some(crate::syscall::oxidebsd_sys_pipe2 as *const () as u64),
         "oxidebsd_sys_dup2" => Some(crate::syscall::oxidebsd_sys_dup2 as *const () as u64),
         "oxidebsd_alloc_fd" => Some(crate::fs::fd::oxidebsd_alloc_fd as *const () as u64),
-        "oxidebsd_register_fd_ops" => Some(crate::fs::fd::oxidebsd_register_fd_ops as *const () as u64),
+        "oxidebsd_register_fd_ops" => {
+            Some(crate::fs::fd::oxidebsd_register_fd_ops as *const () as u64)
+        }
         "oxidebsd_register_fd_ops_with_content_id" => {
             Some(crate::fs::fd::oxidebsd_register_fd_ops_with_content_id as *const () as u64)
         }
@@ -963,7 +977,9 @@ fn resolve_external_symbol(name: &str, panic_symbol: &str) -> Option<u64> {
             Some(crate::drivers::ata::oxidebsd_block_device_present as *const () as u64)
         }
         "oxidebsd_block_read" => Some(crate::drivers::ata::oxidebsd_block_read as *const () as u64),
-        "oxidebsd_block_write" => Some(crate::drivers::ata::oxidebsd_block_write as *const () as u64),
+        "oxidebsd_block_write" => {
+            Some(crate::drivers::ata::oxidebsd_block_write as *const () as u64)
+        }
         _ => None,
     }
 }

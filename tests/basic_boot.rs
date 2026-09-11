@@ -3,11 +3,12 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::{serial_print, serial_println};
 
-entry_point!(main);
+limine_entry_point!(main);
 
 fn main(boot_info: &'static BootInfo) -> ! {
     oxidebsd::init(boot_info);

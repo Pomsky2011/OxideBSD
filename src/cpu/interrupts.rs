@@ -151,8 +151,9 @@ pub fn init_idt() {
     serial_println!("[boot] IDT loaded");
 }
 
-/// Remaps the PIC pair's interrupt vectors and unmasks them. Must run after `init_idt` and
-/// before interrupts are enabled, so every unmasked IRQ already has a handler installed.
+/// Remaps the PIC pair's interrupt vectors and unmasks the timer/keyboard lines. Must run after
+/// `init_idt` and before interrupts are enabled, so every unmasked IRQ already has a handler
+/// installed.
 pub fn init_pics() {
     serial_println!(
         "[boot] remapping PIC1/PIC2 to vectors {:#x}/{:#x}",
@@ -161,6 +162,19 @@ pub fn init_pics() {
     );
     unsafe {
         pic::init();
+        // Explicit, not inherited from `pic::init()`'s own mask save/restore -- that preserves
+        // whatever mask was already in place, which under real BIOS + the old `bootloader` crate
+        // happened to leave IRQ0 (PIT timer)/IRQ1 (keyboard) unmasked by default, so this was
+        // never needed before. Limine masks *both* the legacy PIC and the IOAPIC unconditionally
+        // before handing off to the kernel (a real, documented protocol guarantee, not a bug) --
+        // found live: with no explicit unmask here, `cpu::tsc::init()`'s own PIT-tick calibration
+        // busy-wait (see that module's doc comment) spun forever, since the timer IRQ genuinely
+        // never fired. Every other IRQ line (e.g. `net::rtl8139`'s own) already unmasks itself
+        // explicitly once its own handler is registered -- timer/keyboard get the same treatment
+        // here instead of relying on inherited firmware state, which is the more robust design
+        // regardless of boot protocol.
+        pic::unmask_irq(0);
+        pic::unmask_irq(1);
     }
     serial_println!("[boot] PICs initialized and unmasked");
 }
@@ -248,9 +262,7 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
-    if interrupted_ring3
-        && let Ok(fault_addr) = Cr2::read()
-    {
+    if interrupted_ring3 && let Ok(fault_addr) = Cr2::read() {
         let pid = crate::process::scheduler::current_pid();
         if pid != 0 {
             let sig = crate::process::signal_for_user_fault(pid, fault_addr.as_u64());
@@ -541,6 +553,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
         pic::notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
 
+    // Polled, not IRQ-driven -- see `drivers::usb`'s own module doc comment for why. Once per
+    // tick (100 Hz) is plenty for human typing speed; cost when no USB keyboard was ever found is
+    // a single relaxed atomic load. A no-op until `drivers::usb::init` has actually found and
+    // brought up a controller + HID boot-keyboard device.
+    crate::drivers::usb::poll();
+
     // Ring check via the CPU's own saved CS RPL bits (`& 0x3`), not e.g. `scheduler::current_pid()`
     // state -- see this function's own doc comment for why ring-3-only is the deliberate scope.
     let interrupted_ring3 = stack_frame.code_segment.0 & 0x3 == 3;
@@ -649,8 +667,8 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
         let should_redirect = {
             let mut table = crate::process::table().lock();
             table.get_mut(&pid).is_some_and(|p| {
-                let deliverable = p.pending_signals & !p.blocked_signals != 0
-                    && p.signal_stack.is_empty();
+                let deliverable =
+                    p.pending_signals & !p.blocked_signals != 0 && p.signal_stack.is_empty();
                 if deliverable && p.preempted_resume.is_none() {
                     p.preempted_resume = Some((
                         stack_frame.instruction_pointer.as_u64(),
@@ -678,6 +696,90 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
     }
 }
 
+/// Runs one already-decoded key through the same echo/Ctrl+C/Ctrl+Z/`push_byte` handling
+/// `keyboard_interrupt_handler` always has -- factored out so `drivers::usb::hid_keyboard`'s
+/// synthetic PS/2-shaped byte feed (see `feed_synthetic_scancode` below) gets identical shift-
+/// state, caps-lock, signal-interception, and echo behavior for free, with zero duplicated logic.
+/// A USB keyboard only ever has to produce Scan Code Set 1 bytes; everything past decode is
+/// shared. Deliberately never touches the PIC -- `keyboard_interrupt_handler` (the only caller
+/// actually inside a real hardware IRQ) sends its own EOI unconditionally after calling this,
+/// whether or not this returns early.
+fn handle_decoded_key(key: DecodedKey) {
+    match key {
+        DecodedKey::Unicode(character) => {
+            // Non-ASCII is silently dropped here -- a US keyboard layout won't produce it,
+            // and it keeps sys_read's contract (raw bytes, not full UTF-8) simple.
+            if character.is_ascii() {
+                let byte = character as u8;
+                // Only echo printable characters and newline directly here. Control bytes
+                // (backspace, delete, Ctrl+C, Ctrl+D, ...) are still pushed to stdin below,
+                // but *how* they should look on screen (erasing a character, printing "^C",
+                // etc.) is a userland concern -- see `userland/stsh/`'s `read_line` -- and
+                // echoing them raw here just produces VGA's placeholder glyph for anything
+                // outside 0x20..=0x7e, which isn't useful for any of them.
+                //
+                // Gated on the console's own current termios ECHO bit (see `src/stdin.rs`) --
+                // a program that's switched to raw mode with ECHO cleared (e.g. a real
+                // line-editing shell) does its own echoing; echoing here on top of that would
+                // double every keystroke. Defaults to on, matching this kernel's original,
+                // always-echo behavior before real termios existed.
+                // Real tty-driver INTR behavior: once a real session has actually claimed the
+                // controlling terminal and set a foreground process group (`TIOCSCTTY`/
+                // `TIOCSPGRP` -- see CLAUDE.md's session/controlling-tty notes), Ctrl+C (ASCII
+                // ETX, `0x03`) is intercepted here and turned into a real `SIGINT` delivered to
+                // that whole group, exactly like a real terminal driver consuming INTR before
+                // it ever reaches a reading process's buffer -- it is deliberately *not* also
+                // pushed to stdin in this case. Gated on the console's own `ISIG` bit (real
+                // convention: a program that's cleared it, same as `ECHO` above, wants raw
+                // bytes instead, e.g. a line editor that means to handle Ctrl+C itself). Until
+                // some session actually does this (the common case today -- nothing calls
+                // `setsid`/`TIOCSCTTY` yet outside `sulogin`/`getty`), `foreground_pgid()` stays
+                // `None` and this falls through to the original behavior below: the raw byte is
+                // pushed to stdin and a userland reader (`stsh`'s own `read_line`, BusyBox
+                // `hush`'s line editor) handles it itself, unchanged from before this existed.
+                if byte == 0x03
+                    && crate::console::stdin::get_termios().c_lflag & crate::console::stdin::ISIG
+                        != 0
+                    && let Some(pgid) = crate::console::stdin::foreground_pgid()
+                {
+                    serial_print!("^C\n");
+                    crate::process::signal_foreground_group(pgid, crate::process::SIGINT);
+                    return;
+                }
+                // Real tty-driver SUSP behavior, same shape as the Ctrl+C/SIGINT interception
+                // directly above (ASCII SUB, `0x1a`, is Ctrl+Z's real terminal-driver INTR-
+                // family byte) -- delivers a real SIGTSTP to the foreground group instead of
+                // SIGINT (see `ProcState::Stopped`/`process::signals`'s `Action::Stop` for what
+                // happens next: the target genuinely stops, observable via `wait4(WUNTRACED)`,
+                // resumable via a later `SIGCONT` -- `hush`'s own `fg`/`bg`/`jobs` builtins
+                // already send/observe that real machinery unmodified). Same `ISIG`/
+                // `foreground_pgid()` gating and not-also-pushed-to-stdin behavior.
+                if byte == 0x1a
+                    && crate::console::stdin::get_termios().c_lflag & crate::console::stdin::ISIG
+                        != 0
+                    && let Some(pgid) = crate::console::stdin::foreground_pgid()
+                {
+                    serial_print!("^Z\n");
+                    crate::process::signal_foreground_group(pgid, crate::process::SIGTSTP);
+                    return;
+                }
+                if crate::console::stdin::echo_enabled()
+                    && (byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte))
+                {
+                    serial_print!("{character}");
+                }
+                crate::console::stdin::push_byte(byte);
+            }
+        }
+        // Modifier/lock keys (Shift, Ctrl, CapsLock, ...) and any other non-Unicode key --
+        // nothing to echo or push to stdin. These used to be logged via `{key:?}` for
+        // debugging during early keyboard-decode bring-up, but that printed raw debug names
+        // like "LControl" inline with real typed text (e.g. right before a Ctrl+C's "^C"),
+        // which is exactly the kind of noise a real shell shouldn't produce.
+        DecodedKey::RawKey(_) => {}
+    }
+}
+
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut port: Port<u8> = Port::new(0x60);
     // SAFETY: 0x60 is the PS/2 controller's data port; reading it is how a keyboard IRQ is
@@ -693,86 +795,25 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode)
         && let Some(key) = keyboard.process_keyevent(key_event)
     {
-        match key {
-            DecodedKey::Unicode(character) => {
-                // Non-ASCII is silently dropped here -- a US keyboard layout won't produce it,
-                // and it keeps sys_read's contract (raw bytes, not full UTF-8) simple.
-                if character.is_ascii() {
-                    let byte = character as u8;
-                    // Only echo printable characters and newline directly here. Control bytes
-                    // (backspace, delete, Ctrl+C, Ctrl+D, ...) are still pushed to stdin below,
-                    // but *how* they should look on screen (erasing a character, printing "^C",
-                    // etc.) is a userland concern -- see `userland/stsh/`'s `read_line` -- and
-                    // echoing them raw here just produces VGA's placeholder glyph for anything
-                    // outside 0x20..=0x7e, which isn't useful for any of them.
-                    //
-                    // Gated on the console's own current termios ECHO bit (see `src/stdin.rs`) --
-                    // a program that's switched to raw mode with ECHO cleared (e.g. a real
-                    // line-editing shell) does its own echoing; echoing here on top of that would
-                    // double every keystroke. Defaults to on, matching this kernel's original,
-                    // always-echo behavior before real termios existed.
-                    // Real tty-driver INTR behavior: once a real session has actually claimed the
-                    // controlling terminal and set a foreground process group (`TIOCSCTTY`/
-                    // `TIOCSPGRP` -- see CLAUDE.md's session/controlling-tty notes), Ctrl+C (ASCII
-                    // ETX, `0x03`) is intercepted here and turned into a real `SIGINT` delivered to
-                    // that whole group, exactly like a real terminal driver consuming INTR before
-                    // it ever reaches a reading process's buffer -- it is deliberately *not* also
-                    // pushed to stdin in this case. Gated on the console's own `ISIG` bit (real
-                    // convention: a program that's cleared it, same as `ECHO` above, wants raw
-                    // bytes instead, e.g. a line editor that means to handle Ctrl+C itself). Until
-                    // some session actually does this (the common case today -- nothing calls
-                    // `setsid`/`TIOCSCTTY` yet outside `sulogin`/`getty`), `foreground_pgid()` stays
-                    // `None` and this falls through to the original behavior below: the raw byte is
-                    // pushed to stdin and a userland reader (`stsh`'s own `read_line`, BusyBox
-                    // `hush`'s line editor) handles it itself, unchanged from before this existed.
-                    if byte == 0x03
-                        && crate::console::stdin::get_termios().c_lflag & crate::console::stdin::ISIG != 0
-                        && let Some(pgid) = crate::console::stdin::foreground_pgid()
-                    {
-                        serial_print!("^C\n");
-                        crate::process::signal_foreground_group(pgid, crate::process::SIGINT);
-                        unsafe {
-                            pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-                        }
-                        return;
-                    }
-                    // Real tty-driver SUSP behavior, same shape as the Ctrl+C/SIGINT interception
-                    // directly above (ASCII SUB, `0x1a`, is Ctrl+Z's real terminal-driver INTR-
-                    // family byte) -- delivers a real SIGTSTP to the foreground group instead of
-                    // SIGINT (see `ProcState::Stopped`/`process::signals`'s `Action::Stop` for what
-                    // happens next: the target genuinely stops, observable via `wait4(WUNTRACED)`,
-                    // resumable via a later `SIGCONT` -- `hush`'s own `fg`/`bg`/`jobs` builtins
-                    // already send/observe that real machinery unmodified). Same `ISIG`/
-                    // `foreground_pgid()` gating and not-also-pushed-to-stdin behavior.
-                    if byte == 0x1a
-                        && crate::console::stdin::get_termios().c_lflag & crate::console::stdin::ISIG != 0
-                        && let Some(pgid) = crate::console::stdin::foreground_pgid()
-                    {
-                        serial_print!("^Z\n");
-                        crate::process::signal_foreground_group(pgid, crate::process::SIGTSTP);
-                        unsafe {
-                            pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-                        }
-                        return;
-                    }
-                    if crate::console::stdin::echo_enabled()
-                        && (byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte))
-                    {
-                        serial_print!("{character}");
-                    }
-                    crate::console::stdin::push_byte(byte);
-                }
-            }
-            // Modifier/lock keys (Shift, Ctrl, CapsLock, ...) and any other non-Unicode key --
-            // nothing to echo or push to stdin. These used to be logged via `{key:?}` for
-            // debugging during early keyboard-decode bring-up, but that printed raw debug names
-            // like "LControl" inline with real typed text (e.g. right before a Ctrl+C's "^C"),
-            // which is exactly the kind of noise a real shell shouldn't produce.
-            DecodedKey::RawKey(_) => {}
-        }
+        handle_decoded_key(key);
     }
 
     unsafe {
         pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+/// Feeds one synthesized PS/2 Scan Code Set 1 byte through the exact same decode pipeline a real
+/// PS/2 IRQ uses (`KEYBOARD`'s `add_byte`/`process_keyevent`, then `handle_decoded_key`) -- the
+/// integration point `drivers::usb::hid_keyboard` calls once per synthesized make/break byte
+/// after diffing a HID boot-keyboard report against its previous one. Not itself inside a real
+/// hardware IRQ (called from `drivers::usb::poll()`, in turn called once per timer tick), so
+/// unlike `keyboard_interrupt_handler` it never touches the PIC.
+pub(crate) fn feed_synthetic_scancode(byte: u8) {
+    let mut keyboard = KEYBOARD.lock();
+    if let Ok(Some(key_event)) = keyboard.add_byte(byte)
+        && let Some(key) = keyboard.process_keyevent(key_event)
+    {
+        handle_decoded_key(key);
     }
 }

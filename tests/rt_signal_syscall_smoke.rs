@@ -13,12 +13,13 @@
 
 use core::panic::PanicInfo;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 use oxidebsd::syscall::oxidebsd_register_syscall;
 
-entry_point!(main);
+limine_entry_point!(main);
 
 /// Must match `userland/rt-signal-syscall-smoke/src/main.rs`'s own `SYS_TEST_EXIT` constant -- no
 /// shared crate across this ABI boundary, same convention every other userland/kernel pair here
@@ -79,7 +80,8 @@ fn main(boot_info: &'static BootInfo) -> ! {
         "SYS_TEST_EXIT registration failed -- number collided with a real syscall?"
     );
 
-    const RT_SIGNAL_SYSCALL_SMOKE_ELF: &[u8] = include_bytes!(env!("RT_SIGNAL_SYSCALL_SMOKE_ELF_PATH"));
+    const RT_SIGNAL_SYSCALL_SMOKE_ELF: &[u8] =
+        include_bytes!(env!("RT_SIGNAL_SYSCALL_SMOKE_ELF_PATH"));
     serial_println!(
         "rt_signal_syscall_smoke: spawning rt-signal-syscall-smoke as pid 1 ({} byte ELF)",
         RT_SIGNAL_SYSCALL_SMOKE_ELF.len()

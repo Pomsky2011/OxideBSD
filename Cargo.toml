@@ -60,7 +60,7 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-bootloader = { version = "0.9", features = ["map_physical_memory"] }
+limine = "0.6"
 linked_list_allocator = { version = "0.10", default-features = false }
 pc-keyboard = "0.9"
 spin = "0.9"
@@ -272,83 +272,11 @@ harness = false
 name = "posix_conformance_smoke"
 harness = false
 
-# -m 8192 (was QEMU's own unstated default, ~128 MiB, then 1024 once the BusyBox roster grew to
-# ~300 applets): modules/oxfs's own in-memory block pool grew to 32 MiB at that point (see
-# CLAUDE.md's BusyBox section), then to 64 MiB once the POSIX conformance pilot's own embedded
-# corpus grew from 68 to 492 files (see CLAUDE.md's "POSIX conformance pilot" sections) -- and --
-# since src/memory.rs's frame allocator never reclaims and this kernel maps every module page
-# eagerly, not on demand -- that pool is a real physical-memory commitment from the moment
-# modules/oxfs loads, on top of the kernel image/heap/stacks and the module's own embedded ELF
-# bytes (~18 MiB BusyBox + the pilot corpus) also resident at the same time. Bumped again, 1024 ->
-# 8192, alongside src/allocator.rs's own HEAP_SIZE_CEILING (128 -> 1024 MiB, same 1/8-of-RAM
-# scaling, see that constant's own doc comment) once running the expanded 492-file pilot corpus in
-# one continuous boot -- several hundred real `fork`+`execve`+`wait4` cycles, none of it ever
-# reclaimed by this kernel's own design -- genuinely exhausted the old 128 MiB heap ceiling around
-# the ~140th file. 8192 MiB leaves generous headroom over the whole corpus, not just enough to
-# barely finish, and scales src/allocator.rs's own RAM-proportional heap size up to its new 1024 MiB
-# ceiling too -- safe to do now that src/allocator.rs's init_heap and src/module.rs's map_region
-# both map freshly allocated pages with `.ignore()` instead of `.flush()` (a real, measured
-# multi-minute boot stall otherwise: the original 128 -> 1024 MiB RAM bump alone, before that fix,
-# pushed the heap to ~32,000 pages, each individually `invlpg`-flushed and trapped under QEMU's
-# software TCG emulation).
-[package.metadata.bootimage]
-# -accel kvm -accel tcg: neither test-args nor run-args ever requested an accelerator before, so
-# QEMU silently ran pure-software TCG the whole time -- normally fine (this kernel boots in a
-# couple seconds under it), but TCG's per-instruction interpretation overhead is entirely at the
-# mercy of host CPU contention, and under load this boot went from ~4s to well past a minute,
-# indistinguishable from a genuine hang (confirmed: the exact same stall reproduces on a clean
-# pre-networking master checkout with plain `cargo run`, so it was never caused by any of this
-# branch's own code -- see this repo's networking plan/session history for the investigation).
-# Two repeated `-accel` flags, not the single-flag `kvm:tcg` list form -- this QEMU build rejects
-# that syntax outright (`invalid accelerator kvm:tcg`); passing `-accel` twice is the form that
-# actually falls back to tcg when `/dev/kvm` isn't available (nested VMs, CI, sandboxes).
-# -nic user,model=rtl8139: an rtl8139 NIC on QEMU's built-in SLIRP user-mode network backend, no
-# host tap/bridge setup required. `bootimage` shares one test-args list across every `[[test]]`
-# target, so this also boots basic_boot/fork_wait with the device present -- harmless, since
-# neither calls oxidebsd::net::rtl8139::init. See tests/rtl8139_smoke.rs and this repo's
-# networking plan.
-#
-# -drive if=none,id=oxfsdisk,... -device ide-hd,drive=oxfsdisk,bus=ide.1,unit=0: real disk
-# persistence (see src/ata.rs and modules/oxfs's own "Real disk persistence" section). `bootimage`
-# always attaches this kernel's own boot image as `-drive format=raw,file=<image>` with no explicit
-# `if=`, which QEMU resolves to the *primary* IDE master (`ide.0`, unit 0) on this project's
-# implicit `i440fx` machine type -- so this pins the data disk explicitly to the *secondary*
-# channel's master (`ide.1`, unit 0) by bus name, rather than a second bare `-drive` and hoping
-# QEMU's own index-assignment heuristics land somewhere that doesn't collide. `target/
-# oxfs_test_disk.img` (build.rs, always freshly zeroed) here vs. `target/oxfs_disk.img` (build.rs,
-# created once and left alone) in run-args below -- same "shared across every test target,
-# harmless for the ones that don't use it" reasoning as `-nic` above, but tests get their own
-# disposable disk rather than sharing `cargo run`'s real persistent one.
-test-args = [
-  "-accel", "kvm",
-  "-accel", "tcg",
-  "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-  "-serial", "stdio",
-  "-display", "none",
-  "-m", "8192",
-  "-nic", "user,model=rtl8139",
-  "-drive", "if=none,id=oxfsdisk,format=raw,file=target/oxfs_test_disk.img",
-  "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
-]
-test-success-exit-code = 33
-# 28800 (was 7200, before that 1800/900/300): shared across every [[test]] target (bootimage's own
-# per-binary timeout, not per-check), bumped again for posix_conformance_smoke -- the pilot corpus
-# grew from a 488-file curated dedup to the full ~1700-file Open POSIX Test Suite (see build.rs's
-# `discover_posix_test_files`), a further ~3.5x on top of the growth that justified 1800 -> 7200,
-# now also running real `pthread_*`/`aio_*` content for the first time ever (real threading landed
-# since the old baseline -- see CLAUDE.md's "Real threading" section) with no prior data on how
-# many of those burn their own full 40s `t0` budget rather than finishing fast. Harmless headroom
-# for every faster existing test target sharing this same value.
-test-timeout = 28800
-run-args = [
-  "-accel", "kvm",
-  "-accel", "tcg",
-  "-serial", "stdio",
-  "-m", "8192",
-  "-nic", "user,model=rtl8139",
-  "-drive", "if=none,id=oxfsdisk,format=raw,file=target/oxfs_disk.img",
-  "-device", "ide-hd,drive=oxfsdisk,bus=ide.1,unit=0",
-]
+# QEMU run/test args (accel/serial/RAM size/NIC/the real ATA data-disk attachment) used to live
+# here as `[package.metadata.bootimage]` -- moved to `scripts/qemu_runner.sh` (this project's own
+# replacement for the retired `bootimage` tool/Limine migration) verbatim, including that script's
+# own copy of the historical reasoning comments for each flag. See that file for the current
+# `-m`/`-accel`/`-nic`/disk-attachment/exit-code/timeout logic.
 
 [profile.dev]
 panic = "abort"

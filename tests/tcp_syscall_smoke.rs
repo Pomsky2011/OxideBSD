@@ -28,7 +28,8 @@ use core::panic::PanicInfo;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use bootloader::{BootInfo, entry_point};
+use oxidebsd::boot::BootInfo;
+use oxidebsd::limine_entry_point;
 use oxidebsd::net::nic::{NIC, NicDriver, NicError};
 use oxidebsd::net::tcp;
 use oxidebsd::net::{ethernet, ipv4};
@@ -36,7 +37,7 @@ use oxidebsd::qemu::{QemuExitCode, exit_qemu};
 use oxidebsd::serial_println;
 use oxidebsd::syscall::oxidebsd_register_syscall;
 
-entry_point!(main);
+limine_entry_point!(main);
 
 /// Must match `userland/tcp-syscall-smoke/src/main.rs`'s own constants.
 const SYS_TEST_EXIT: u64 = 9999;
