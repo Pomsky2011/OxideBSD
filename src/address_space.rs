@@ -70,10 +70,12 @@ impl AddressSpace {
     /// MMU's own hierarchical walk requires to be set at *every* level down to a user page (so a
     /// clear `USER_ACCESSIBLE` bit anywhere guarantees nothing user-facing exists beneath it, safe
     /// to alias as-is).
+    /// `None` on real frame exhaustion -- see `fork`'s own doc comment for why this and `fork`
+    /// no longer panic on that specific failure the way they used to.
     pub(crate) fn new_excluding_user(
         physical_memory_offset: VirtAddr,
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    ) -> Self {
+    ) -> Option<Self> {
         Self::build_from_active(physical_memory_offset, frame_allocator, false)
     }
 
@@ -87,12 +89,20 @@ impl AddressSpace {
     /// copy, matching this codebase's existing correctness-over-cleverness bias (see e.g.
     /// `BootInfoFrameAllocator`'s own no-reuse policy).
     ///
-    /// # Panics
-    ///
-    /// Panics (via `expect`) on frame exhaustion or an unexpected huge page -- this codebase has
-    /// no established error-propagation convention for OOM during address-space setup yet (`new`
-    /// and every `elf::load` caller panic the same way today), and nothing here creates a huge
-    /// page, so encountering one means a future change violated that assumption.
+    /// `None` on real frame exhaustion — **found live as a real bug, the same class
+    /// `KernelStack::try_new` closes**: this (and `new_excluding_user`, and the recursive
+    /// `copy_table_level` walk both share) used to hard-`expect()` on `allocate_frame()`
+    /// returning `None`, meaning an ordinary, unprivileged fork bomb (`do_fork_from_current`'s own
+    /// call site) or even just real memory pressure during an ordinary `execve()` (`do_execve`'s
+    /// call site) could panic the *entire* kernel over real, exhaustible physical memory — not a
+    /// hypothetical, `-m 1024`'s default RAM budget included. Both real callers already have a
+    /// `Result`-returning signature to report a real `ENOMEM` through instead. Doesn't attempt to
+    /// free whatever frames a partially-completed copy already allocated before hitting
+    /// exhaustion -- this codebase has no frame deallocation anywhere yet (a known, accepted,
+    /// pre-existing gap for the whole branch), so leaving that partial allocation unfreed here is
+    /// consistent with everything else already leaking, not a new inconsistency this fix
+    /// introduces. Still panics (via `expect`) on an unexpected huge page -- a real logic-invariant
+    /// violation (nothing here creates one), not a resource limit, so still worth a hard stop.
     ///
     /// # Safety requirement, not enforced by the type system
     ///
@@ -106,20 +116,19 @@ impl AddressSpace {
         &self,
         physical_memory_offset: VirtAddr,
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    ) -> AddressSpace {
+    ) -> Option<AddressSpace> {
         Self::build_from_active(physical_memory_offset, frame_allocator, true)
     }
 
     /// Shared implementation behind `new_excluding_user`/`fork`: allocates a fresh level 4 table
-    /// and recursively walks it against the currently active one via `copy_table_level`.
+    /// and recursively walks it against the currently active one via `copy_table_level`. `None` on
+    /// real frame exhaustion -- see `fork`'s own doc comment.
     fn build_from_active(
         physical_memory_offset: VirtAddr,
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
         copy_user_leaves: bool,
-    ) -> AddressSpace {
-        let new_frame = frame_allocator
-            .allocate_frame()
-            .expect("out of memory allocating a new address space's level 4 table");
+    ) -> Option<AddressSpace> {
+        let new_frame = frame_allocator.allocate_frame()?;
         let (active_frame, _flags) = Cr3::read();
 
         // SAFETY: physical_memory_offset is the bootloader's phys-memory mapping (same
@@ -139,11 +148,12 @@ impl AddressSpace {
             physical_memory_offset,
             frame_allocator,
             copy_user_leaves,
-        );
+        )
+        .ok()?;
 
-        AddressSpace {
+        Some(AddressSpace {
             level_4_frame: new_frame,
-        }
+        })
     }
 
     /// Builds a mapper over this address space's own level 4 table, independent of whichever
@@ -198,7 +208,7 @@ fn copy_table_level(
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     copy_user_leaves: bool,
-) {
+) -> Result<(), ()> {
     for i in 0..512usize {
         let entry = &parent[i];
         if !entry.flags().contains(PageTableFlags::PRESENT) {
@@ -223,9 +233,7 @@ fn copy_table_level(
                 continue;
             }
             let src_frame = entry.frame().expect("present leaf entry must have a frame");
-            let new_frame = frame_allocator
-                .allocate_frame()
-                .expect("out of memory copying an address space");
+            let new_frame = frame_allocator.allocate_frame().ok_or(())?;
             let src = (physical_memory_offset + src_frame.start_address().as_u64()).as_ptr::<u8>();
             let dst =
                 (physical_memory_offset + new_frame.start_address().as_u64()).as_mut_ptr::<u8>();
@@ -243,9 +251,7 @@ fn copy_table_level(
         let parent_next = entry
             .frame()
             .expect("present non-leaf entry must have a frame");
-        let child_next_frame = frame_allocator
-            .allocate_frame()
-            .expect("out of memory copying an address space");
+        let child_next_frame = frame_allocator.allocate_frame().ok_or(())?;
         // SAFETY: physical_memory_offset is the bootloader's phys-memory mapping; parent_next is a
         // real, live next-level table (entry is PRESENT and not a leaf at this level);
         // child_next_frame was just allocated, so nothing else can be viewing it yet.
@@ -264,6 +270,7 @@ fn copy_table_level(
             physical_memory_offset,
             frame_allocator,
             copy_user_leaves,
-        );
+        )?;
     }
+    Ok(())
 }

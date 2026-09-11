@@ -257,14 +257,25 @@ struct KernelStack {
 }
 
 impl KernelStack {
-    fn new() -> Self {
+    /// `None` on real allocation failure — **found live as a real bug**: this used to be a hard
+    /// `assert!`, meaning a single userspace process genuinely exhausting the kernel heap (an
+    /// ordinary, unprivileged fork bomb, or any buggy program that `fork()`s in a loop without
+    /// reaping — needs no special privilege at all) panicked the *entire* kernel, not just that
+    /// one `fork()` call. `do_fork_from_current` (the only caller with anywhere to report a real
+    /// failure to) now propagates a real `ENOMEM` instead — see that function's own doc comment.
+    /// `process::spawn`'s own boot-time call site still panics on `None`: it runs before any
+    /// syscall caller exists to report `ENOMEM` to, the same precedent every other boot-time
+    /// allocation failure in this codebase already follows.
+    fn try_new() -> Option<Self> {
         let stack_size = kernel_stack_size();
         let layout =
             core::alloc::Layout::from_size_align(stack_size, 16).expect("bad kernel stack layout");
         // SAFETY: layout has non-zero size (stack_size >= KERNEL_STACK_SIZE_FLOOR > 0).
         let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
-        assert!(!base.is_null(), "out of memory allocating a kernel stack");
-        KernelStack { base, layout }
+        if base.is_null() {
+            return None;
+        }
+        Some(KernelStack { base, layout })
     }
 
     fn top(&self) -> VirtAddr {
@@ -534,7 +545,10 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
     // for `/proc/1/stat`'s `(comm)` field than reusing that same "(init)" placeholder verbatim.
     let comm = b"hush".to_vec();
     let cmdline = build_cmdline(&[b"(init)"]);
-    let kernel_stack = KernelStack::new();
+    // Boot-time only: nothing to report a real ENOMEM to yet, same precedent every other
+    // boot-time allocation failure in this codebase already follows -- see `KernelStack::
+    // try_new`'s own doc comment for why the *other* (real fork syscall) call site doesn't panic.
+    let kernel_stack = KernelStack::try_new().expect("out of memory allocating a kernel stack");
     let kernel_stack_top = kernel_stack.top();
     let rsp = crate::context_switch::seed_spawn_frame(kernel_stack_top);
 
@@ -726,7 +740,21 @@ pub fn do_fork_from_current() -> Result<u64, u64> {
         )
     };
 
-    let kernel_stack = KernelStack::new();
+    // Real ENOMEM instead of panicking the whole kernel on allocation failure -- see
+    // `AddressSpace::fork`'s own doc comment (an ordinary, unprivileged fork bomb is a completely
+    // real way to exhaust physical memory, not a hypothetical).
+    let Some(child_address_space) = child_address_space else {
+        return Err(ENOMEM);
+    };
+
+    // Real ENOMEM instead of panicking the whole kernel on allocation failure -- see
+    // `KernelStack::try_new`'s own doc comment. Deliberately doesn't tear down `child_address_space`
+    // (already built above) on this path -- this codebase has no frame deallocation anywhere yet
+    // (a known, accepted, pre-existing gap for the whole branch), so leaking it here is consistent
+    // with everything else already leaking, not a new inconsistency this fix introduces.
+    let Some(kernel_stack) = KernelStack::try_new() else {
+        return Err(ENOMEM);
+    };
     let kernel_stack_top = kernel_stack.top();
     // SAFETY: parent_frame is the caller's own live SyscallFrame, valid for the duration of this
     // call (we're still inside sys_fork's own handling of it).
@@ -1002,8 +1030,15 @@ pub fn do_execve(
     // calling process's own, already-populated one (execve runs mid-syscall, on the caller's own
     // kernel stack, with its own CR3 still live) -- AddressSpace::new would shallow-copy that
     // process's *user* mappings too, aliasing them into what's supposed to be a fresh image.
-    let new_address_space =
-        with_frame_allocator(|fa| AddressSpace::new_excluding_user(phys_offset, fa));
+    // Real ENOMEM instead of panicking the whole kernel on allocation failure -- see
+    // `AddressSpace::fork`'s own doc comment (shared by `new_excluding_user`): ordinary memory
+    // pressure during a completely routine `execve()` is a real way to exhaust physical memory,
+    // not a hypothetical.
+    let Some(new_address_space) =
+        with_frame_allocator(|fa| AddressSpace::new_excluding_user(phys_offset, fa))
+    else {
+        return Err(ENOMEM);
+    };
     // SAFETY: phys_offset is the bootloader's phys-memory mapping; this is the only live view of
     // new_address_space's own (not-yet-active) level 4 table right now.
     let mut mapper = unsafe { new_address_space.mapper(phys_offset) };
