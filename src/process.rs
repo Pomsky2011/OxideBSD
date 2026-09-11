@@ -1217,6 +1217,13 @@ fn terminate_process(pid: Pid, code: i32) {
         Some(me) => me.state = ProcState::Zombie(code),
         None => return,
     }
+    // Real bug, found live: without this, a process killed while sitting `Ready` (not the one
+    // currently running -- e.g. `kill %1` on a backgrounded job) left a stale `READY_QUEUE` entry
+    // that `scheduler::schedule()` would later pop and resurrect instead of actually terminating.
+    // Unconditional and harmless for the self-`do_exit` path too: a process calling that on itself
+    // is never `Ready` at that exact moment (it's the one currently `Running`), so it was never
+    // queued in the first place -- see `scheduler::remove_ready`'s own doc comment.
+    scheduler::remove_ready(pid);
     let parent_pid = table.get(&pid).and_then(|p| p.parent);
     if let Some(parent_pid) = parent_pid
         && let Some(parent) = table.get_mut(&parent_pid)

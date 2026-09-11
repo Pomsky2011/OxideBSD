@@ -59,6 +59,22 @@ pub fn enqueue_ready(pid: Pid) {
     READY_QUEUE.lock().push_back(pid);
 }
 
+/// Removes every occurrence of `pid` from `READY_QUEUE`, if present — must be called whenever a
+/// process is terminated (`process::terminate_process`) by anything *other than itself*
+/// (`do_kill`/`signal_foreground_group`'s default-disposition-terminate paths; a process calling
+/// `do_exit` on itself is never `Ready` at that moment, so it can never be queued in the first
+/// place). **Found live, a real bug, not theoretical**: without this, killing a process that
+/// happens to be sitting `Ready` (waiting for its next turn — completely ordinary, e.g. `kill %1`
+/// on a backgrounded job that isn't the one currently running) leaves a stale entry in the queue.
+/// `scheduler::schedule()` eventually pops it and `activate_and_prepare` doesn't distinguish
+/// "missing from the table" (a real bug, panics) from "present but `Zombie`" (silently sets its
+/// state back to `Running` and resumes it from wherever it last yielded) — the killed process
+/// gets *resurrected* instead of actually terminating, while its own table entry is simultaneously
+/// eligible for a real `wait4()` reap out from under it.
+pub fn remove_ready(pid: Pid) {
+    READY_QUEUE.lock().retain(|&queued| queued != pid);
+}
+
 /// Voluntarily gives up the CPU. If the caller is still `Ready` or `Running` (i.e. it didn't just
 /// block or exit), it's re-enqueued so it gets another turn later — a caller that transitioned to
 /// `Blocked`/`Zombie` just before calling this is deliberately *not* re-enqueued, which is how
