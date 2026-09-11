@@ -1,3 +1,40 @@
+# OxideBSD 0.1.2
+
+A bugfix-only release on top of 0.1.1 — no new capabilities, same `v0.1.x` policy as always.
+
+## Fixed since 0.1.1
+
+- **Ctrl+C/Ctrl+D silently did nothing once BusyBox's own line editor was driving the interactive
+  prompt** (which is effectively always) — found first on `master` while validating unrelated
+  work, then confirmed to affect this branch too. Root cause: the default `struct termios`
+  `TCGETS` reports before anything ever calls `TCSETS` had an all-zero `c_cc[]` control-character
+  array. BusyBox's own `libbb/lineedit.c` deliberately disables the kernel's `ISIG`-based signal
+  generation while it's editing a line (real upstream behavior) and instead recognizes Ctrl+C/
+  Ctrl+D itself by comparing raw bytes against the *original* termios' `c_cc[VINTR]`/`c_cc[VEOF]`
+  — each check guarded by "is this control character even enabled (nonzero)?". An all-zero default
+  silently satisfied that guard as "disabled." Fixed: real POSIX/Linux default `c_cc` values.
+  Confirmed live: `sleep 100` + Ctrl+C now returns to a fresh prompt immediately (a real `SIGINT`
+  reaching the real foreground process group) instead of waiting out the full sleep; Ctrl+D at an
+  empty prompt now ends the shell on real EOF.
+- **A real page fault or `#GP` from *any* ring-3 program rebooted the entire kernel** — a wild
+  pointer dereference in any userland program (a bug in a BusyBox applet, a bug in a program
+  compiled with the on-target `tcc`, ...) took the whole VM down instead of just that one process.
+  Fixed with a real, minimal fix for this one safety property specifically (not the larger real
+  fault-to-signal-delivery mechanism `master`/`0.2.0` eventually grew): a ring-3 fault now
+  terminates just the offending process with `SIGSEGV`, reusing the same self-termination path a
+  normal `exit()` already goes through. Ring-0 faults (a genuine kernel bug) still reboot, as
+  before. Confirmed live: a `tcc`-compiled program dereferencing a null pointer now cleanly prints
+  "Segmentation fault" and returns to a live, responsive prompt.
+- **Killing a process that's waiting its turn (not the one currently running — an entirely
+  ordinary case, e.g. `kill` on a backgrounded job) resurrected it instead of actually terminating
+  it.** The scheduler's ready queue never had the killed process's entry removed, so it would later
+  get popped and resumed from wherever it last yielded — while its own process-table entry was
+  simultaneously marked exited and eligible for a real `wait4()` reap out from under it. Fixed by
+  dequeuing on termination. Confirmed live: backgrounding a long `sleep`, then killing it, now
+  leaves no trace in the shell's own job list — no resurrection, no crash.
+
+---
+
 # OxideBSD 0.1.1
 
 A bugfix-only release on top of 0.1.0 — no new capabilities. `v0.1.x` is this project's
