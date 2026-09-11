@@ -499,7 +499,11 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
         .map_err(SpawnError::Elf)?;
 
     let stack_top = VirtAddr::new(USER_STACK_TOP);
-    let mapped_pages = map_user_stack(&mut mapper, stack_top);
+    // Boot-time only: nothing to report a real ENOMEM to yet, same precedent every other
+    // boot-time allocation failure in this codebase already follows -- see `map_user_stack`'s own
+    // doc comment for why the *other* (real execve syscall) call site doesn't panic.
+    let mapped_pages =
+        map_user_stack(&mut mapper, stack_top).expect("out of memory mapping a user stack");
     // spawn() has no real invocation path to use as argv[0] (unlike do_execve, which knows exactly
     // what path it opened) -- this is only ever pid 1, built directly from an embedded ELF at
     // boot, so a fixed placeholder is all there is to give. pid 1 is a real musl-linked binary
@@ -621,37 +625,49 @@ pub fn spawn(elf_bytes: &[u8], parent: Option<Pid>) -> Result<Pid, SpawnError> {
 /// page it just mapped — `user_stack::build` needs this to write the argv/envp/auxv image into the
 /// right physical frames afterward, the same way `elf::load` already tracks its own mapped pages
 /// for BSS zeroing.
+///
+/// `None` on real frame exhaustion — same class of bug `KernelStack::try_new`/`AddressSpace::fork`
+/// close: both the leaf frame itself *and* `map_to`'s own possible intermediate page-table frame
+/// (a fresh address space's page-table hierarchy for this range mostly doesn't exist yet) are real
+/// allocations that can fail under real memory pressure, reachable on every `execve()` — this used
+/// to hard-panic the whole kernel on either. Only `MapToError::FrameAllocationFailed` is treated as
+/// this real, expected failure; `ParentEntryHugePage`/`PageAlreadyMapped` stay a hard panic — real
+/// logic-invariant violations (always-fresh addresses in a brand-new address space), not a
+/// resource limit, so still worth a hard stop if one ever fires.
 fn map_user_stack(
     mapper: &mut impl Mapper<Size4KiB>,
     stack_top: VirtAddr,
-) -> BTreeMap<Page<Size4KiB>, PhysFrame<Size4KiB>> {
+) -> Option<BTreeMap<Page<Size4KiB>, PhysFrame<Size4KiB>>> {
     let stack_bottom_page = Page::containing_address(stack_top - user_stack_pages() * 4096);
     let stack_top_page = Page::containing_address(stack_top - 1u64);
     let mut mapped_pages = BTreeMap::new();
-    with_frame_allocator(|fa| {
+    let result = with_frame_allocator(|fa| {
         for page in Page::range_inclusive(stack_bottom_page, stack_top_page) {
-            let frame = fa
-                .allocate_frame()
-                .expect("out of memory mapping a user stack");
+            let frame = fa.allocate_frame().ok_or(())?;
             // SAFETY: frame was just allocated (unused, per BootInfoFrameAllocator's contract),
             // and page falls in this address space's own, not-yet-active range.
             unsafe {
-                mapper
-                    .map_to(
-                        page,
-                        frame,
-                        PageTableFlags::PRESENT
-                            | PageTableFlags::WRITABLE
-                            | PageTableFlags::USER_ACCESSIBLE,
-                        fa,
-                    )
-                    .expect("failed to map a user stack page")
-                    .flush();
+                match mapper.map_to(
+                    page,
+                    frame,
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE,
+                    fa,
+                ) {
+                    Ok(flush) => flush.flush(),
+                    Err(x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed) => {
+                        return Err(());
+                    }
+                    Err(e) => panic!("failed to map a user stack page: {e:?}"),
+                }
             }
             mapped_pages.insert(page, frame);
         }
+        Ok(())
     });
-    mapped_pages
+    result.ok()?;
+    Some(mapped_pages)
 }
 
 /// `stack_top` minus enough room for `user_stack::build`'s image to always fit, regardless of
@@ -1045,7 +1061,11 @@ pub fn do_execve(
     let entry = with_frame_allocator(|fa| elf::load(&elf, &mut mapper, fa, phys_offset))
         .map_err(|_| ENOEXEC)?;
     let stack_top = VirtAddr::new(USER_STACK_TOP);
-    let mapped_pages = map_user_stack(&mut mapper, stack_top);
+    // Real ENOMEM instead of panicking the whole kernel on allocation failure -- see
+    // `map_user_stack`'s own doc comment.
+    let Some(mapped_pages) = map_user_stack(&mut mapper, stack_top) else {
+        return Err(ENOMEM);
+    };
     // raw_argv (read above, while the caller's own address space was still active) is the caller's
     // complete, real argv[] -- including a real, caller-chosen argv[0], which need not equal
     // path_bytes (see RawArgvEntry's own doc comment). An empty raw_argv (argv_ptr == 0, or a
