@@ -16,15 +16,27 @@ A bugfix-only release on top of 0.1.1 — no new capabilities, same `v0.1.x` pol
   Confirmed live: `sleep 100` + Ctrl+C now returns to a fresh prompt immediately (a real `SIGINT`
   reaching the real foreground process group) instead of waiting out the full sleep; Ctrl+D at an
   empty prompt now ends the shell on real EOF.
-- **A real page fault or `#GP` from *any* ring-3 program rebooted the entire kernel** — a wild
-  pointer dereference in any userland program (a bug in a BusyBox applet, a bug in a program
+- **A real page fault, `#GP`, or invalid-opcode fault from *any* ring-3 program rebooted the entire
+  kernel** — a wild pointer dereference, invalid access, or illegal instruction (a real `ud2`, or a
+  genuinely corrupted jump) in any userland program (a bug in a BusyBox applet, a bug in a program
   compiled with the on-target `tcc`, ...) took the whole VM down instead of just that one process.
   Fixed with a real, minimal fix for this one safety property specifically (not the larger real
   fault-to-signal-delivery mechanism `master`/`0.2.0` eventually grew): a ring-3 fault now
-  terminates just the offending process with `SIGSEGV`, reusing the same self-termination path a
-  normal `exit()` already goes through. Ring-0 faults (a genuine kernel bug) still reboot, as
-  before. Confirmed live: a `tcc`-compiled program dereferencing a null pointer now cleanly prints
-  "Segmentation fault" and returns to a live, responsive prompt.
+  terminates just the offending process with the matching signal (`SIGSEGV`/`SIGILL`), reusing the
+  same self-termination path a normal `exit()` already goes through. Ring-0 faults (a genuine
+  kernel bug) still reboot, as before. Confirmed live: a `tcc`-compiled program dereferencing a
+  null pointer now cleanly prints "Segmentation fault," and one executing a bare `ud2` prints
+  "Illegal instruction" — both return to a live, responsive prompt instead of taking the VM down.
+- **`fork()`/`execve()` could panic the entire kernel on real, ordinary memory exhaustion** — the
+  kernel stack allocation every `fork()` needs, the deep address-space copy `fork()` makes, and the
+  fresh user-stack mapping every `execve()` makes all hard-panicked on the frame/heap allocator
+  running out, rather than failing that one syscall. None of this needed anything malicious: an
+  ordinary, unprivileged fork bomb, or simply enough real memory pressure during a routine command,
+  could already take the whole system down before this fix. Fixed: all three now return a real
+  `ENOMEM` to the syscall that hit the limit instead of panicking (the one exception, matching
+  existing precedent for every other boot-time allocation in this codebase, is `pid 1`'s own
+  original `spawn()` at boot, which still panics — there's no syscall caller to report `ENOMEM` to
+  that early). Confirmed live: ordinary fork/exec (every shell command) still works identically.
 - **Killing a process that's waiting its turn (not the one currently running — an entirely
   ordinary case, e.g. `kill` on a backgrounded job) resurrected it instead of actually terminating
   it.** The scheduler's ready queue never had the killed process's entry removed, so it would later
